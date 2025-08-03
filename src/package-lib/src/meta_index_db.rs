@@ -250,6 +250,7 @@ impl MetaIndexDb {
         
         let versions = match version_exp.to_range_int() {
             Ok((min_version, max_version)) => {
+                debug!("get_pkg_meta_by_version_expr:pkg_name {} min_version {} max_version {}", pkg_name, min_version, max_version);
                 // 如果能获取版本范围，使用数据库查询加速
                 Self::get_versions_in_range(&conn, pkg_name, min_version, max_version, tag.as_deref())?
             },
@@ -703,6 +704,7 @@ mod tests {
 
     #[test]
     fn test_version_db_operations() -> PkgResult<()> {
+        buckyos_kit::init_logging("package-lib test", false);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_versions.db");
         
@@ -740,16 +742,36 @@ mod tests {
         test_pkg_meta5.version = "0.9.0".to_string();
         let test_pkg_meta_str5 = serde_json::to_string(&test_pkg_meta5).unwrap();
         meta_db.add_pkg_meta("meta5", &test_pkg_meta_str5, "author1", Some("pk1".to_string()))?;
-        
+
+        let mut test_pkg_meta6 = test_pkg_meta1.clone();
+        test_pkg_meta6.pkg_name = "test-pkg2".to_string();
+        test_pkg_meta6.version = "0.4.0".to_string();
+        let test_pkg_meta_str6 = serde_json::to_string(&test_pkg_meta6).unwrap();
+        meta_db.add_pkg_meta("meta6", &test_pkg_meta_str6, "author1", Some("pk1".to_string()))?;
+        let mut test_pkg_meta7 = test_pkg_meta1.clone();
+        test_pkg_meta7.pkg_name = "test-pkg2".to_string();
+        test_pkg_meta7.version = "0.4.0+build250724".to_string();
+        let test_pkg_meta_str7 = serde_json::to_string(&test_pkg_meta7).unwrap();
+        meta_db.add_pkg_meta("meta7", &test_pkg_meta_str7, "author1", Some("pk1".to_string()))?;
+
         // 设置包版本
         meta_db.set_pkg_version("test-pkg", "author1", "1.0.0", "meta1", Some("stable"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "1.1.0", "meta2", Some("stable"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "1.2.0", "meta3", Some("beta"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "2.0.0", "meta4", Some("alpha"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "0.9.0", "meta5", Some("old"))?;
+        meta_db.set_pkg_version("test-pkg2", "author1", "0.4.0", "meta6", Some("alpha"))?;
+        meta_db.set_pkg_version("test-pkg2", "author1", "0.4.0+build250724", "meta7", Some("alpha"))?;
+
+        let latest = meta_db.get_pkg_meta("test-pkg2");
+        assert!(latest.is_ok());
+        let latest = latest.unwrap();
+        assert!(latest.is_some());
+        let (metaobjid, pkg_meta) = latest.unwrap();
+        assert_eq!(metaobjid, "meta7"); 
         
         // 测试获取最新版本（应该是2.0.0）
-        let latest = meta_db.get_pkg_meta("test-pkg#*")?;
+        let latest = meta_db.get_pkg_meta("test-pkg")?;
         assert!(latest.is_some());
         let (metaobjid, pkg_meta) = latest.unwrap();
         assert_eq!(metaobjid, "meta4");

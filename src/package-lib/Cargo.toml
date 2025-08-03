@@ -11,6 +11,7 @@ log = "*"
 thiserror = "*"
 tokio = { version = "*", features = ["full"] }
 reqwest = { version = "*", features = ["json", "stream"] }
+fs_extra = "*"
 futures-util = "*"
 futures = "*"
 regex = "*"

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use version_compare::Cmp;
 use std::str::FromStr;
 
+use log::info;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionExpType {
     None,
@@ -204,7 +206,10 @@ impl VersionExp {
 
     pub fn compare_versions(v1: &str, v2: &str) -> std::cmp::Ordering {
         match (semver::Version::parse(v1), semver::Version::parse(v2)) {
-            (Ok(v1), Ok(v2)) => v1.cmp(&v2),
+            (Ok(v1), Ok(v2)) => {
+                //info!("compare_versions: v1 {} v2 {}", v1, v2);
+                v1.cmp(&v2)
+            },
             // 处理非标准版本格式的情况
             _ => {
                 // 自定义比较逻辑，使用我们的整数表示进行比较
@@ -400,8 +405,11 @@ mod tests {
             ("1.2.3.4", 0x01_0002_0003_000004),
             ("10.20.30.40", 0x0A_0014_001E_000028),
             ("0.0.0.0", 0x00_0000_0000_000000),
-            ("1.0.3-build250326", 0x01_0000_0003_03d1d6),
+            ("1.0.3", 0x01_0000_0003_000000),
+            ("1.0.3-250326", 0x01_0000_0003_03d1d6),
             ("1.0.0-alpha_123", 0x01_0000_0000_00007b),
+            ("0.4.0-250724", 0x00_0004_0000_03d364),
+            ("0.4.0",0x00_0004_0000_000000),
             (">1.0.3-build250326", 0x01_0000_0003_03d1d6),
         ];
 
@@ -426,6 +434,7 @@ mod tests {
 
     #[test]
     fn test_version_comparison() -> PkgResult<()> {
+        buckyos_kit::init_logging("package-lib test", false);
         // 测试标准semver格式的版本比较
         let semver_test_cases = vec![
             ("1.0.0", "1.0.0", Ordering::Equal),
@@ -440,6 +449,7 @@ mod tests {
             ("1.0.0-alpha", "1.0.0-beta", Ordering::Less),
             ("1.0.0-beta", "1.0.0-alpha", Ordering::Greater),
             ("1.0.0-beta", "1.0.0-alpha+323ad", Ordering::Greater),
+            ("1.0.0", "1.0.0+250725", Ordering::Less),
         ];
 
         for (v1, v2, expected) in semver_test_cases {

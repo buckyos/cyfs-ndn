@@ -114,6 +114,39 @@ impl ChunkHasher {
         Ok((self.hasher.finalize().to_vec(), total_read))
     }
 
+    //size表示从reader中计算的长度
+    pub async fn calc_from_reader_with_length<T: AsyncRead + Unpin>(
+        mut self,
+        reader: &mut T,
+        cacl_len: u64,
+    ) -> NdnResult<(Vec<u8>, u64)> {        
+        let mut total_read = 0;
+        loop {
+            let mut buffer_len = cacl_len - total_read;
+            if buffer_len > CALC_HASH_PIECE_SIZE {
+                buffer_len = CALC_HASH_PIECE_SIZE
+            }
+            let mut buffer = vec![0u8; buffer_len as usize];
+            let n = reader.read(&mut buffer).await.map_err(|e| {
+                warn!("ChunkHasher: read failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+
+            // 如果读取到0字节，表示已经到达EOF
+            if n == 0 {
+                break;
+            }
+
+            // 更新哈希计算器
+            self.hasher.update_from_bytes(&buffer[..n]);
+            total_read += n as u64;
+        }
+
+        self.hash_length += total_read;
+
+        Ok((self.hasher.finalize().to_vec(), total_read))
+    }
+
     pub fn calc_from_bytes(mut self, bytes: &[u8]) -> Vec<u8> {
         self.hash_length += bytes.len() as u64;
         self.hasher.update_from_bytes(bytes);

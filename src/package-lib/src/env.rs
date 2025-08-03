@@ -129,6 +129,7 @@ use tokio::fs as tokio_fs;
 use tokio::sync::{Mutex as TokioMutex, oneshot};
 use async_trait::async_trait;
 use log::*;
+use fs_extra::dir::*;
 
 //use std::fs::File;
 //use std::io;
@@ -585,7 +586,7 @@ impl PackageEnv {
             #[cfg(target_family = "windows")]
             std::os::windows::fs::symlink_dir(&synlink_target, &symlink_path)?;
             info!("create version symlink: {} -> {}", symlink_path.display(), synlink_target.as_str());
-        }
+        } 
 
         let pkg_id = pkg_meta.get_package_id();
         if self.is_latest_version(&pkg_id).await? {
@@ -600,7 +601,16 @@ impl PackageEnv {
                 #[cfg(target_family = "windows")]
                 std::os::windows::fs::symlink_dir(&synlink_target, &latest_symlink_path)?;
                 info!("create latest symlink: {} -> {}", latest_symlink_path.display(), synlink_target.as_str());
-            } 
+            } else {
+                info!("enable_link is false, copy folder  {} => {}", target_dir.display(),synlink_target.as_str());
+                let mut options = CopyOptions::new();
+                options.overwrite = true;
+                fs_extra::dir::copy(&target_dir, &synlink_target, &options)
+                    .map_err(|e| PkgError::InstallError(
+                        meta_obj_id.to_owned(),
+                        format!("Failed to copy folder: {}", e),
+                    ))?;
+            }
         }
 
         Ok(())

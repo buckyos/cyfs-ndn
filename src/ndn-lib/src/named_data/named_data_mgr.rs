@@ -3,7 +3,7 @@ use crate::{
     build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState,
     FileObject, NamedDataStore, NdnError, NdnResult, PathObject,
 };
-use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId};
+use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
 use buckyos_kit::{
     buckyos_get_unix_timestamp, get_buckyos_root_dir, get_by_json_path, get_relative_path,
@@ -823,6 +823,7 @@ impl NamedDataMgr {
         fileobj_template: &mut FileObject,
         user_id: &str,
         app_id: &str,
+        use_chunklist: bool,
     ) -> NdnResult<()> {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
         if named_mgr.is_none() {
@@ -834,17 +835,30 @@ impl NamedDataMgr {
             "start pub local_file_as_fileobj, local_file_path:{}",
             local_file_path.display()
         );
+        let file_size = tokio::fs::metadata(local_file_path).await.unwrap().len();
+        let mut is_use_chunklist = false;
+        let mut chunk_size = CHUNK_NORMAL_SIZE as u64;
+
+        if file_size > CHUNK_NORMAL_SIZE as u64 {
+            if use_chunklist {
+                is_use_chunklist = true;
+            } else {
+                chunk_size = file_size;
+            }
+        }
+
         let mut file_reader = tokio::fs::File::open(local_file_path).await.map_err(|e| {
             error!("open local_file_path failed, err:{}", e);
             NdnError::IoError(format!("open local_file_path failed, err:{}", e))
         })?;
         debug!("open local_file_path success");
+        let mut read_pos = 0;
+
         let mut chunk_hasher = ChunkHasher::new(None).unwrap();
         let chunk_type = chunk_hasher.hash_method.clone();
-
-        file_reader.seek(SeekFrom::Start(0)).await;
+        file_reader.seek(SeekFrom::Start(read_pos)).await;
         let (chunk_raw_id, chunk_size) = chunk_hasher
-            .calc_from_reader(&mut file_reader)
+            .calc_from_reader_with_length(&mut file_reader, chunk_size)
             .await
             .unwrap();
 
