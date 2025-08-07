@@ -245,7 +245,7 @@ impl PackageEnv {
                     is_dev_mode = false;
                     info!("pkg_env {} load pkg.cfg.json OK.", work_dir.display());
                     if env_config.parent.is_some() {
-                        if env_config.parent.as_ref().unwrap().starts_with(".") {
+                        if env_config.parent.as_ref().unwrap().is_relative() {
                             let parent_path = format!("{}/{}", work_dir.display(), env_config.parent.as_ref().unwrap().display());
                             let parent_path = buckyos_kit::normalize_path(&parent_path);
                             let parent_path = PathBuf::from(parent_path);
