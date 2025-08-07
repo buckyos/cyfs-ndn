@@ -243,16 +243,19 @@ impl PackageEnv {
                 if  config_result.is_ok() {
                     env_config = config_result.unwrap();
                     is_dev_mode = false;
-                    info!("pkg_env load pkg.cfg.json OK.");
+                    info!("pkg_env {} load pkg.cfg.json OK.", work_dir.display());
                     if env_config.parent.is_some() {
                         if env_config.parent.as_ref().unwrap().starts_with(".") {
                             let parent_path = work_dir.join(env_config.parent.as_ref().unwrap());
-                            info!("pkg_env parent abs path: {}", parent_path.display());
+                            info!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
                             env_config.parent = Some(parent_path);
-                        } 
+                        } else {
+                            let parent_path = env_config.parent.as_ref().unwrap();
+                            info!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
+                        }
                     }
                 } else {
-                    info!("pkg_env load pkg.cfg.json failed. {}",config_result.err().unwrap());
+                    warn!("pkg_env {} load pkg.cfg.json failed. {}", work_dir.display(),config_result.err().unwrap());
                 }
             }
         } 
@@ -529,9 +532,24 @@ impl PackageEnv {
         Ok(meta_obj_id)   
     }
 
-    pub async fn is_latest_version(&self,pkg_id: &PackageId) -> PkgResult<bool> {
+    pub fn is_latest_version(&self,pkg_id: &PackageId) -> PkgResult<bool> {
         let meta_db = MetaIndexDb::new(self.get_meta_db_path(),true)?;
-        meta_db.is_latest_version(pkg_id)
+        let is_latest = meta_db.is_latest_version(pkg_id);
+        if is_latest.is_ok() {
+            let is_latest = is_latest.unwrap();
+            if is_latest {
+                return Ok(true);
+            }
+        }
+
+        if self.config.parent.is_some() {
+            let parent_env = PackageEnv::new(self.config.parent.as_ref().unwrap().clone());
+            let is_latest = parent_env.is_latest_version(pkg_id)?;
+            if is_latest {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     async fn extract_pkg_from_chunk(&self, pkg_meta: &PackageMeta,meta_obj_id: &str,chunk_reader: ChunkReader,force_install: bool) -> PkgResult<()> {
@@ -572,24 +590,24 @@ impl PackageEnv {
         archive.unpack(&target_dir).await?;
 
         // Create symbolic links
-        if self.config.enable_link {
-            let symlink_path = format!("./{}#{}", link_pkg_name, pkg_meta.version);
-            let symlink_path = self.work_dir.join(symlink_path);
-            // 如果链接存在则删除
-            if tokio::fs::symlink_metadata(&symlink_path).await.is_ok() {
-                tokio::fs::remove_file(&symlink_path).await?;
-            }
+        // if self.config.enable_link {
+        //     let symlink_path = format!("./{}#{}", link_pkg_name, pkg_meta.version);
+        //     let symlink_path = self.work_dir.join(symlink_path);
+        //     // 如果链接存在则删除
+        //     if tokio::fs::symlink_metadata(&symlink_path).await.is_ok() {
+        //         tokio::fs::remove_file(&symlink_path).await?;
+        //     }
 
-            // 创建新的符号链接(使用相对路径)
-            #[cfg(target_family = "unix")]
-            tokio::fs::symlink(&synlink_target, &symlink_path).await?;
-            #[cfg(target_family = "windows")]
-            std::os::windows::fs::symlink_dir(&synlink_target, &symlink_path)?;
-            info!("create version symlink: {} -> {}", symlink_path.display(), synlink_target.as_str());
-        } 
+        //     // 创建新的符号链接(使用相对路径)
+        //     #[cfg(target_family = "unix")]
+        //     tokio::fs::symlink(&synlink_target, &symlink_path).await?;
+        //     #[cfg(target_family = "windows")]
+        //     std::os::windows::fs::symlink_dir(&synlink_target, &symlink_path)?;
+        //     info!("create version symlink: {} -> {}", symlink_path.display(), synlink_target.as_str());
+        // } 
 
         let pkg_id = pkg_meta.get_package_id();
-        if self.is_latest_version(&pkg_id).await? {
+        if self.is_latest_version(&pkg_id)? {
             if self.config.enable_link {
                 let latest_symlink_path = format!("./{}", link_pkg_name);
                 let latest_symlink_path = self.work_dir.join(latest_symlink_path);
