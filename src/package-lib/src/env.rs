@@ -247,8 +247,16 @@ impl PackageEnv {
                     if env_config.parent.is_some() {
                         if env_config.parent.as_ref().unwrap().starts_with(".") {
                             let parent_path = work_dir.join(env_config.parent.as_ref().unwrap());
-                            info!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
-                            env_config.parent = Some(parent_path);
+                            // 尝试将相对路径转换为绝对路径
+                            let canonical_parent_path = match parent_path.canonicalize() {
+                                Ok(abs_path) => abs_path,
+                                Err(_) => {
+                                    // 如果canonicalize失败（比如路径不存在），使用join的结果
+                                    parent_path
+                                }
+                            };
+                            info!("pkg_env {} parent abs path: {}", work_dir.display(), canonical_parent_path.display());
+                            env_config.parent = Some(canonical_parent_path);
                         } else {
                             let parent_path = env_config.parent.as_ref().unwrap();
                             info!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
