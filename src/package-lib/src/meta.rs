@@ -1,8 +1,9 @@
 use ndn_lib::{build_named_object_by_json, ObjId, OBJ_TYPE_PKG};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, str::EncodeUtf16};
-use serde_json::Value;
+use serde_json::{Value,json};
 use name_lib::*;
+use buckyos_kit::buckyos_get_unix_timestamp;
 use crate::{PkgResult, PkgError,PackageId};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackageMeta {
@@ -33,6 +34,26 @@ pub struct PackageMeta {
 }
 
 impl PackageMeta {
+
+    pub fn new(pkg_name: &str, version: &str, author: &str, tag: Option<&str>) -> Self {
+        let now = buckyos_kit::buckyos_get_unix_timestamp();
+        let exp = now + 3600 * 24 * 30;
+        Self {
+            pkg_name: pkg_name.to_string(),
+            version: version.to_string(),
+            author: author.to_string(),
+            tag: tag.map(|s| s.to_string()),
+            category: None,
+            chunk_id: None,
+            chunk_url: None,
+            chunk_size: None,
+            pub_time: now,
+            exp: exp,
+            deps: HashMap::new(),
+            extra_info: HashMap::new(),
+            description: json!({}),
+        }
+    }
     pub fn from_str(meta_str: &str) -> PkgResult<Self> {
         let pkg_meta_doc = EncodedDocument::from_str(meta_str.to_string())
             .map_err(|e| PkgError::ParseError(meta_str.to_string(), e.to_string()))?;

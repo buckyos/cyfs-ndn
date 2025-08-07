@@ -169,13 +169,16 @@ impl MetaIndexDb {
         if pkg_meta.is_some() {
             let (_,pkg_meta) = pkg_meta.unwrap();
             let latest_pkg_id = pkg_meta.get_package_id();
+            debug!("pkg_id {} latest_pkg_id {}", pkg_id.to_string(), latest_pkg_id.to_string());
             return Ok(pkg_id == &latest_pkg_id)
         } else {
+            debug!("pkg_id {} latest_pkg_id not found", &pkg_name);
             let latest_version = format!("{}#*",pkg_name);
             let pkg_meta = self.get_pkg_meta(&latest_version)?;
             if pkg_meta.is_some() {
                 let (_,pkg_meta) = pkg_meta.unwrap();
                 let latest_pkg_id = pkg_meta.get_package_id();
+                debug!("pkg_name {} 's latest_pkg_id {}", pkg_name, latest_pkg_id.to_string());
                 return Ok(pkg_id == &latest_pkg_id)
             }
         }
@@ -302,6 +305,7 @@ impl MetaIndexDb {
 
         // 如果没有找到任何版本，直接返回None
         if versions.is_empty() {
+            debug!("get_pkg_meta_by_version_expr:pkg_name {} version_req {} versions is empty", pkg_name, version_req.to_string());
             return Ok(None);
         }
 
@@ -704,9 +708,11 @@ mod tests {
 
     #[test]
     fn test_version_db_operations() -> PkgResult<()> {
+        std::env::set_var("BUCKY_LOG", "debug");
         buckyos_kit::init_logging("package-lib test", false);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_versions.db");
+        info!("db_path:{}", db_path.to_string_lossy());
         
         let meta_db = MetaIndexDb::new(db_path,false)?;
         let mut test_pkg_meta1 = PackageMeta {
@@ -726,33 +732,31 @@ mod tests {
         };  
         let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
         meta_db.add_pkg_meta("meta1", &test_pkg_meta_str1, "author1", Some("pk1".to_string()))?;
-        let mut test_pkg_meta2 = test_pkg_meta1.clone();
-        test_pkg_meta2.version = "1.1.0".to_string();
+
+        let mut test_pkg_meta2 = PackageMeta::new("test-pkg","1.1.0","author1",None);
         let test_pkg_meta_str2 = serde_json::to_string(&test_pkg_meta2).unwrap();
         meta_db.add_pkg_meta("meta2", &test_pkg_meta_str2, "author1", Some("pk1".to_string()))?;
-        let mut test_pkg_meta3 = test_pkg_meta1.clone();
-        test_pkg_meta3.version = "1.2.0".to_string();
+
+        let mut test_pkg_meta3 = PackageMeta::new("test-pkg","1.2.0","author1",None);
         let test_pkg_meta_str3 = serde_json::to_string(&test_pkg_meta3).unwrap();
         meta_db.add_pkg_meta("meta3", &test_pkg_meta_str3, "author1", Some("pk1".to_string()))?;
-        let mut test_pkg_meta4 = test_pkg_meta1.clone();
-        test_pkg_meta4.version = "2.0.0".to_string();
+        
+        let mut test_pkg_meta4 = PackageMeta::new("test-pkg","2.0.0","author1",None);
         let test_pkg_meta_str4 = serde_json::to_string(&test_pkg_meta4).unwrap();
         meta_db.add_pkg_meta("meta4", &test_pkg_meta_str4, "author1", Some("pk1".to_string()))?;
-        let mut test_pkg_meta5 = test_pkg_meta1.clone();
-        test_pkg_meta5.version = "0.9.0".to_string();
+        
+        let mut test_pkg_meta5 = PackageMeta::new("test-pkg","0.9.0","author1",None);
         let test_pkg_meta_str5 = serde_json::to_string(&test_pkg_meta5).unwrap();
         meta_db.add_pkg_meta("meta5", &test_pkg_meta_str5, "author1", Some("pk1".to_string()))?;
 
-        let mut test_pkg_meta6 = test_pkg_meta1.clone();
-        test_pkg_meta6.pkg_name = "test-pkg2".to_string();
-        test_pkg_meta6.version = "0.4.0".to_string();
+        let mut test_pkg_meta6 = PackageMeta::new("test-pkg2","0.4.0","author1",None);
         let test_pkg_meta_str6 = serde_json::to_string(&test_pkg_meta6).unwrap();
         meta_db.add_pkg_meta("meta6", &test_pkg_meta_str6, "author1", Some("pk1".to_string()))?;
-        let mut test_pkg_meta7 = test_pkg_meta1.clone();
-        test_pkg_meta7.pkg_name = "test-pkg2".to_string();
-        test_pkg_meta7.version = "0.4.0+build250724".to_string();
+
+        let mut test_pkg_meta7 = PackageMeta::new("test-pkg2","0.4.0+build250724","author1",None);
         let test_pkg_meta_str7 = serde_json::to_string(&test_pkg_meta7).unwrap();
         meta_db.add_pkg_meta("meta7", &test_pkg_meta_str7, "author1", Some("pk1".to_string()))?;
+
 
         // 设置包版本
         meta_db.set_pkg_version("test-pkg", "author1", "1.0.0", "meta1", Some("stable"))?;
@@ -761,7 +765,7 @@ mod tests {
         meta_db.set_pkg_version("test-pkg", "author1", "2.0.0", "meta4", Some("alpha"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "0.9.0", "meta5", Some("old"))?;
         meta_db.set_pkg_version("test-pkg2", "author1", "0.4.0", "meta6", Some("alpha"))?;
-        meta_db.set_pkg_version("test-pkg2", "author1", "0.4.0+build250724", "meta7", Some("alpha"))?;
+        meta_db.set_pkg_version("test-pkg2", "author1", "0.4.0+build250724", "meta7", None)?;
 
         let latest = meta_db.get_pkg_meta("test-pkg2");
         assert!(latest.is_ok());
@@ -769,7 +773,10 @@ mod tests {
         assert!(latest.is_some());
         let (metaobjid, pkg_meta) = latest.unwrap();
         assert_eq!(metaobjid, "meta7"); 
-        
+        assert_eq!(pkg_meta.version, "0.4.0+build250724");
+        let pkg_id = PackageId::from_str("test-pkg2#0.4.0+build250724").unwrap();
+        let is_latest = meta_db.is_latest_version(&pkg_id)?;
+        assert!(is_latest);
         // 测试获取最新版本（应该是2.0.0）
         let latest = meta_db.get_pkg_meta("test-pkg")?;
         assert!(latest.is_some());

@@ -36,7 +36,6 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tokio-tar = "*"
 ndn-lib = { path = "../ndn-lib" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" }
-
+buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
 [dev-dependencies]
 tempfile = "*"
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
