@@ -611,8 +611,13 @@ impl PackageEnv {
             if self.config.enable_link {
                 let latest_symlink_path = format!("./{}", link_pkg_name);
                 let latest_symlink_path = self.work_dir.join(latest_symlink_path);
-                if tokio::fs::symlink_metadata(&latest_symlink_path).await.is_ok() {
-                    tokio::fs::remove_file(&latest_symlink_path).await?;
+                //如果latest_symlink_path,则删除（不管是链接还是目录)
+                if latest_symlink_path.exists() {
+                    if tokio::fs::symlink_metadata(&latest_symlink_path).await.is_ok() {
+                        tokio::fs::remove_file(&latest_symlink_path).await?;
+                    } else {
+                        tokio::fs::remove_dir(&latest_symlink_path).await?;
+                    }
                 }
                 #[cfg(target_family = "unix")]
                 tokio::fs::symlink(&synlink_target, &latest_symlink_path).await?;
