@@ -8,6 +8,8 @@ pub enum PkgError {
     DownloadError(String, String),
     #[error("Install {0} error: {1}")]
     InstallError(String, String),
+    #[error("Package already installed: {0}")]
+    PackageAlreadyInstalled(String),
     #[error("Load {0} error: {1}")]
     LoadError(String, String),
     #[error("Parse {0} error: {1}")]

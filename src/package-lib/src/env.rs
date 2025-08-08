@@ -525,7 +525,22 @@ impl PackageEnv {
 
             for (dep_meta_obj_id, dep_pkg_meta) in deps.iter() {
                 info!("install dep pkg {}#{}", dep_pkg_meta.pkg_name, dep_pkg_meta.version);
-                    self.install_pkg_impl(dep_meta_obj_id, &dep_pkg_meta, force_install).await?;
+                
+                let install_result = self.install_pkg_impl(dep_meta_obj_id, &dep_pkg_meta, force_install).await;
+                match install_result {
+                    Ok(_) => {},
+                    Err(e) => {
+                        match e {
+                            PkgError::PackageAlreadyInstalled(pkg_id) => {
+                                info!("dep pkg {} already installed, skip", pkg_id);
+                                continue;
+                            }
+                            _ => {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -569,16 +584,14 @@ impl PackageEnv {
         
         let synlink_target = format!("./pkgs/{}/{}", pkg_meta.pkg_name, meta_real_obj_id.to_filename());
         let target_dir = self.work_dir.join(synlink_target.clone());
-        //如果target_dir存在？则根据是否强制安装决定是否删除后继续
-        if force_install {
-            tokio::fs::remove_dir_all(&target_dir).await;
-        }
 
         if target_dir.exists() {
-            return Err(PkgError::InstallError(
-                meta_obj_id.to_owned(),
-                "Package already installed".to_owned(),
-            ));
+            if force_install {
+                info!("force install pkg {}, remove target dir {}", meta_obj_id, target_dir.display());
+                tokio::fs::remove_dir_all(&target_dir).await;
+            } else {
+                return Err(PkgError::PackageAlreadyInstalled(meta_obj_id.to_owned()));
+            } 
         }
 
         let link_pkg_name;
