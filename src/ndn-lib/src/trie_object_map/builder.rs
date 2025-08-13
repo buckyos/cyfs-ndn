@@ -132,7 +132,7 @@ impl TrieObjectMapBuilder {
         self.storage.traverse(callback)
     }
 
-    pub async fn build(self) -> NdnResult<TrieObjectMap> {
+    pub async fn build(mut self) -> NdnResult<TrieObjectMap> {
         let root_hash = self.storage.root();
         let root_hash_str = Base32Codec::to_base32(&root_hash);
 
@@ -161,6 +161,17 @@ impl TrieObjectMapBuilder {
                 )
                 .await?
         } else {
+            GLOBAL_TRIE_OBJECT_MAP_STORAGE_FACTORY
+                .get()
+                .unwrap()
+                .save(&obj_id, &mut *self.storage)
+                .await
+                .map_err(|e| {
+                    let msg = format!("Error saving trie object map: {}", e);
+                    error!("{}", msg);
+                    e
+                })?;
+
             self.storage
         };
 
