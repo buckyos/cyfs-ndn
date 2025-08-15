@@ -18,6 +18,7 @@ use tokio::{
     fs::{self, File, OpenOptions},
     io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
 };
+use fs2::FileExt;
 
 // 每个Local Chunk Store基于一个目录独立存在
 // Chunk Manage由多个Local Chunk Store组成(目前版本先搞定单OOD)
@@ -367,6 +368,13 @@ impl NamedDataStore {
                         NdnError::IoError(e.to_string())
                     })?;
 
+                let std_file = file.into_std().await;
+                let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+                    warn!("open_chunk_writer: lock file failed! {}", e.to_string());
+                    NdnError::IoError(e.to_string())
+                })?;
+                let mut file = tokio::fs::File::from_std(std_file);
+
                 if offset != 0 {
                     file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
                         warn!("open_chunk_writer: seek file failed! {}", e.to_string());
@@ -412,6 +420,13 @@ impl NamedDataStore {
                 NdnError::IoError(e.to_string())
             })?;
 
+            let std_file = file.into_std().await;
+            let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+                warn!("open_chunk_writer: lock file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+            let file = tokio::fs::File::from_std(std_file);
+
             //创建chunk_item
             let chunk_item = ChunkItem::new(&chunk_id, chunk_size, None);
             self.named_db.set_chunk_item(&chunk_item).await?;
@@ -445,10 +460,18 @@ impl NamedDataStore {
             })?;
         }
 
+        //已独占写模式创建文件
         let file = File::create(&chunk_path).await.map_err(|e| {
             warn!("open_chunk_writer: create file failed! {}", e.to_string());
             NdnError::IoError(e.to_string())
         })?;
+
+        let std_file = file.into_std().await;
+        let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+            warn!("open_new_chunk_writer: lock file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        let file = tokio::fs::File::from_std(std_file);
 
         let chunk_item = ChunkItem::new(chunk_id, chunk_size, None);
         self.named_db.set_chunk_item(&chunk_item).await?;

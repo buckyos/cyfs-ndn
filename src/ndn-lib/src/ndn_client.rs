@@ -141,7 +141,8 @@ impl NdnClient {
         return Ok(());
     }
 
-    pub async fn query_chunk_state(&self,chunk_id:ChunkId,target_url:Option<String>)->NdnResult<ChunkState> {
+    //return (chunk_state,already_uploaded_size)
+    pub async fn query_chunk_state(&self,chunk_id:&ChunkId,target_url:Option<String>)->NdnResult<(ChunkState,u64)> {
         let chunk_url;
         if target_url.is_some() {
             chunk_url = target_url.unwrap();
@@ -157,18 +158,28 @@ impl NdnClient {
         let head_res = client.head(&chunk_url)
             .send()
             .await
-            .map_err(|e| NdnError::RemoteError(format!("HEAD request failed: {}", e)))?;
+            .map_err(|e| NdnError::RemoteError(format!("query chunk state request by HEAD ({}) failed: {}", chunk_url, e)))?;
         debug!("SEND HEAD request, head_res:{}",head_res.status());
+        let content_length = head_res.content_length();
         // 如果chunk已存在，则不需要再次上传
         match head_res.status() {
             StatusCode::OK => {
-                return Ok(ChunkState::Completed);
+                if content_length.is_some() {
+                    return Ok((ChunkState::Completed,content_length.unwrap()));
+                }
+                return Ok((ChunkState::Completed,0));
             },
             StatusCode::NOT_FOUND => {
-                return Ok(ChunkState::NotExist);
+                return Ok((ChunkState::NotExist,0));
             },
             StatusCode::PARTIAL_CONTENT => {
-                return Ok(ChunkState::Incompleted);
+                if content_length.is_some() {
+                    return Ok((ChunkState::Incompleted,content_length.unwrap()));
+                }
+                return Ok((ChunkState::Incompleted,0));
+            },
+            StatusCode::CREATED => {
+                return Ok((ChunkState::New,0));
             },
             _ => {
                 return Err(NdnError::RemoteError(format!("HEAD request failed: {}", head_res.status())));
@@ -177,13 +188,6 @@ impl NdnClient {
     }       
 
     pub async fn push_chunk(&self,chunk_id:ChunkId,target_url:Option<String>)->NdnResult<()> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
-            .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
-        let real_named_mgr = named_mgr.lock().await;
-        let (mut chunk_reader,len) = real_named_mgr.open_chunk_reader_impl(&chunk_id,SeekFrom::Start(0),false).await?;
-        debug!("push_chunk:local chunk_reader open success");
-        drop(real_named_mgr);
-        
         let chunk_url;
         if target_url.is_some() {
             chunk_url = target_url.unwrap();
@@ -191,26 +195,37 @@ impl NdnClient {
             chunk_url = self.gen_chunk_url(&chunk_id, None);
         }
 
-        let chunk_state = self.query_chunk_state(chunk_id,Some(chunk_url.clone())).await?;
-        if chunk_state == ChunkState::Completed {
-            info!("push_chunk:remote chunk already exists, skip");
-            return Ok(());
+        let (chunk_state,already_uploaded_size) = self.query_chunk_state(&chunk_id,Some(chunk_url.clone())).await?;
+        match chunk_state {
+            ChunkState::Completed => {
+                info!("push_chunk:remote chunk already exists, skip");
+                return Ok(());
+            },
+            ChunkState::Link(link_data) => {
+                info!("push_chunk:remote chunk is a link, skip");
+                return Ok(());
+            }
+            _ => {}
         }
 
-        if chunk_state != ChunkState::NotExist {
-            return Err(NdnError::InvalidId("invlaid remote chunk state".to_string()));
-        }
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
+            .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
+        let real_named_mgr = named_mgr.lock().await;
+        let (mut chunk_reader,len) = real_named_mgr.open_chunk_reader_impl(&chunk_id,SeekFrom::Start(already_uploaded_size),false).await?;
+        debug!("push_chunk:local chunk_reader open success");
+        drop(real_named_mgr);
 
         let mut client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| NdnError::Internal(format!("Failed to create client: {}", e)))?;
 
-        let stream = tokio_util::io::ReaderStream::new(chunk_reader);
+        let stream: tokio_util::io::ReaderStream<Pin<Box<dyn AsyncRead + Send + Unpin>>> = tokio_util::io::ReaderStream::new(chunk_reader);
         info!("SEND PUT chunk request, chunk_url:{}",chunk_url);
         let res = client.put(chunk_url.clone())
             .header("Content-Type", "application/octet-stream")
             .header("cyfs-chunk-size", len.to_string())
+            .header("cyfs-chunk-offset", already_uploaded_size.to_string())
             .body(Body::wrap_stream(stream))
             .send()
             .await
