@@ -236,7 +236,7 @@ impl NdnClient {
                 format!("HTTP error: {} for {}", res.status(), chunk_url)
             ));
         }
-        
+        info!("# PUSH CHUNK {} => {} success.",chunk_id.to_string(),chunk_url);
         Ok(())
     }
 
