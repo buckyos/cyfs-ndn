@@ -584,14 +584,14 @@ impl NdnClient {
         Ok((obj_id, file_obj))
     }
 
-    pub async fn local_is_better(&self,url:&str,local_path:&PathBuf) -> NdnResult<bool> {
+    pub async fn remote_is_better(&self,url:&str,local_path:&PathBuf) -> NdnResult<bool> {
         // 1. 通过url下载fileojbect对象
         // 2. 计算本地文件的hash 
         // 3. 比较fileobj的hcontent和本地文件的hash
 
         if !local_path.exists() {
-            warn!("local_is_better: local file does not exist: {:?}", local_path);
-            return Ok(false);
+            warn!("remote_is_better: local file does not exist: {:?}", local_path);
+            return Ok(true);
         }
 
         let mut file = tokio::fs::File::open(local_path).await
@@ -600,8 +600,14 @@ impl NdnClient {
             .map_err(|e| NdnError::IoError(format!("Failed to get file metadata: {}", e)))?
             .len();
 
-        info!("start download remote fileobj!");
-        let (obj_id, file_obj_json) = self.get_obj_by_url(url, None).await?;
+        debug!("start download remote fileobj!");
+        let get_result = self.get_obj_by_url(url, None).await;
+        if get_result.is_err() {
+            debug!("get fileobj from remote failed:{}",get_result.err().unwrap().to_string());
+            return Ok(false);
+        }
+
+        let (obj_id, file_obj_json) = get_result.unwrap();
         let file_obj: FileObject = serde_json::from_value(file_obj_json)
             .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
         let content_chunk_id = ChunkId::new(file_obj.content.as_str())
@@ -609,22 +615,22 @@ impl NdnClient {
 
         let local_fileobj_file = PathBuf::from(format!("{}.fileobj",local_path.to_string_lossy()));
         if local_fileobj_file.exists() {
-            info!("local_is_better: local fileobj file exists: {:?}", local_fileobj_file);
+            info!("remote_is_better: local fileobj file exists: {:?}", local_fileobj_file);
             let local_fileobj = tokio::fs::read_to_string(local_path.with_extension("fileobj")).await
                 .map_err(|e| NdnError::IoError(format!("Failed to read local fileobj file: {}", e)))?;
             let local_fileobj: FileObject = serde_json::from_str(&local_fileobj)
                 .map_err(|e| NdnError::Internal(format!("Failed to parse local fileobj file: {}", e)))?;
             if local_fileobj.create_time >= file_obj.create_time {
-                return Ok(true);
+                return Ok(false);
             }
         }
 
         if file_size != file_obj.size {
-            info!("local_is_better: file size not match, remote:{} local:{}",file_obj.size,file_size);
-            return Ok(false);
+            info!("remote_is_better: file size not match, remote:{} local:{}",file_obj.size,file_size);
+            return Ok(true);
         }
 
-        info!("start calculate hash!");
+        debug!("start calculate hash!");
 
         let mut hasher = ChunkHasher::new(None)
             .map_err(|e| NdnError::Internal(format!("Failed to create chunk hasher: {}", e)))?;
@@ -633,7 +639,7 @@ impl NdnClient {
             .map_err(|e| NdnError::Internal(format!("Failed to calculate hash: {}", e)))?;
         let file_chunk_id = ChunkId::from_mix_hash_result_by_hash_method(file_size, &hash_result, chunk_type)?;
  
-        Ok(file_chunk_id == content_chunk_id)
+        Ok(file_chunk_id != content_chunk_id)
     }
 
     pub async fn pull_chunk_by_url(&self, chunk_url:String,chunk_id:ChunkId,mgr_id:Option<&str>)->NdnResult<u64> {
