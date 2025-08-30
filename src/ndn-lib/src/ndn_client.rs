@@ -618,7 +618,7 @@ impl NdnClient {
         let content_chunk_id = ChunkId::new(file_obj.content.as_str())
             .map_err(|e| NdnError::Internal(format!("Failed to parse content chunk id: {}", e)))?;
 
-        let local_fileobj_file = PathBuf::from(format!("{}.fileobj",local_path.to_string_lossy()));
+        let local_fileobj_file = local_path.with_extension("fileobj");
         if local_fileobj_file.exists() {
             info!("remote_is_better: local fileobj file exists: {:?}", local_fileobj_file);
             let local_fileobj = tokio::fs::read_to_string(local_path.with_extension("fileobj")).await
