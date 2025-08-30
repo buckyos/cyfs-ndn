@@ -580,6 +580,11 @@ impl NdnClient {
                 chunk_size, file_obj.size
             )));
         }
+
+        let local_file_obj_path = local_path.with_extension("fileobj");
+        //dump file_obj to local_file_obj_path
+        tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
+            .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
         
         Ok((obj_id, file_obj))
     }
