@@ -21,10 +21,10 @@ impl Serialize for LinkData {
     }
 }
 
-impl<'de> Deserialize<'de> for LinkData {
+impl<'a> Deserialize<'a> for LinkData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: serde::Deserializer<'a>,
     {
         let s = String::deserialize(deserializer)?;
         LinkData::from_string(&s).map_err(serde::de::Error::custom)

@@ -314,7 +314,7 @@ impl NamedDataMgr {
     pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
         for local_store in self.local_store_list.iter() {
             //TODO: select best local store to write?
-            local_store.put_object(obj_id, obj_data, false).await?;
+            local_store.put_object(obj_id, obj_data).await?;
             break;
         }
         Ok(())

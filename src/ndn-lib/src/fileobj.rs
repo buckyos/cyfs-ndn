@@ -9,6 +9,7 @@ use serde_json::Value;
 // 思路：Object如果引用了另一个Object,要区分这个引用是强引用(依赖）还是弱引用，
 #[derive(Serialize,Deserialize,Clone)]
 pub struct FileObject {
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub name:String,
     pub size:u64,
     pub content:String,//chunkid or chunklistid

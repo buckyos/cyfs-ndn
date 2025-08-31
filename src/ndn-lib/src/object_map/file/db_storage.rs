@@ -79,7 +79,7 @@ impl ObjectMapSqliteStorageChunkIterator {
             })?;
 
         for row in rows {
-            let row = row
+            let row:Result<(String, ObjId, Option<u64>),NdnError> = row
                 .map(|(key, value, mtree_index)| {
                     let obj_id = ObjId::new(&value).map_err(|e| {
                         let msg = format!("Failed to parse ObjId from value: {}, {}", value, e);

@@ -129,19 +129,9 @@ impl NamedDataStore {
     pub async fn put_object(
         &self,
         obj_id: &ObjId,
-        obj_str: &str,
-        need_verify: bool,
+        obj_str: &str
     ) -> NdnResult<()> {
-        if need_verify {
-            // Add verification logic here if needed
-            let build_obj_id = crate::build_obj_id("sha256", obj_str);
-            if obj_id.obj_hash != build_obj_id.obj_hash {
-                return Err(NdnError::InvalidId(format!(
-                    "object id not match! {}",
-                    obj_id.to_string()
-                )));
-            }
-        }
+
         self.named_db
             .set_object(obj_id, obj_id.obj_type.as_str(), obj_str)
             .await

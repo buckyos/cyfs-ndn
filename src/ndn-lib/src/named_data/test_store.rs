@@ -127,7 +127,7 @@ async fn test_object_operations() -> NdnResult<()> {
     //let obj_id = ObjId::new("object1".to_string());
 
     // Test putting object
-    store.put_object(&obj_id, &obj_str, false).await?;
+    store.put_object(&obj_id, &obj_str).await?;
     info!("put object ok! {}", obj_id.to_string());
 
     // Verify object exists

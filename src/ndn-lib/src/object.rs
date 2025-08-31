@@ -290,6 +290,17 @@ pub fn build_named_object_by_json(
     (obj_id, json_str)
 }
 
+pub fn build_named_object_by_jwt(
+    obj_type: &str,
+    jwt_str: &str
+) -> NdnResult<(ObjId, String)> {
+    let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
+        .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
+    let (obj_id, json_str) = build_named_object_by_json(obj_type, &claims);
+    Ok((obj_id, json_str))
+}
+
+
 pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bool {
     let (obj_id2, json_str) = build_named_object_by_json(obj_id.obj_type.as_str(), json_value);
     if obj_id2 != *obj_id {
@@ -308,6 +319,8 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
     }
     return Ok(true);
 }
+
+
 
 pub fn named_obj_str_to_jwt(
     obj_json_str: &String,

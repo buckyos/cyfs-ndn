@@ -7,12 +7,15 @@ mod named_data;
 mod cyfs_http;
 mod ndn_client;
 mod fileobj;
+mod dirobj;
 mod mtree;
 mod hash;
 mod object_map;
 mod trie_object_map;
 mod object_array;
 mod coll;
+mod tools;
+//mod example;
 
 pub use object::*;
 pub use chunk::*;
@@ -21,6 +24,7 @@ pub use named_data::*;
 pub use cyfs_http::*;
 pub use ndn_client::*;
 pub use fileobj::*;
+pub use dirobj::*;
 pub use hash::*;
 pub use mtree::*;
 pub use object_map::*;
@@ -92,6 +96,12 @@ impl NdnError {
 
 pub type NdnResult<T> = std::result::Result<T, NdnError>;
 
+impl From<std::io::Error> for NdnError {
+    fn from(err: std::io::Error) -> Self {
+        NdnError::IoError(err.to_string())
+    }
+}
+
 
 pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
@@ -101,15 +111,15 @@ pub const OBJ_TYPE_PACK: &str = "cypack"; // object set
 pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
 pub const OBJ_TYPE_TRIE_SIMPLE: &str = "cytrie-s"; // simple trie object map
 
-pub const OBJ_TYPE_OBJMAP: &str = "cymap"; // object map
-pub const OBJ_TYPE_OBJMAP_SIMPLE: &str = "cymap-s"; // simple object map
+pub const OBJ_TYPE_OBJMAP: &str = "cymap-mtp"; // object map
+pub const OBJ_TYPE_OBJMAP_SIMPLE: &str = "cymap"; // simple object map
 
-pub const OBJ_TYPE_LIST: &str = "cylist"; // object list
-pub const OBJ_TYPE_LIST_SIMPLE: &str = "cylist-s"; // simple object list
+pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
+pub const OBJ_TYPE_LIST_SIMPLE: &str = "cylist"; // simple object list
 
 pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
 pub const OBJ_TYPE_CHUNK_LIST_SIMPLE: &str = "cl-s"; // simple chunk list with variable size
-pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "cl-f"; // normal chunk list with fixed size
+pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "chunklist"; // normal chunk list with fixed size
 pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
 
 pub const OBJ_TYPE_PKG: &str = "pkg"; // package

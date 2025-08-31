@@ -38,7 +38,7 @@ impl<'a, H: Hasher> TrieObjectMapInnerStorageWrapperIterator<'a, H> {
     ) -> NdnResult<Self> {
         let trie_db = GenericTrieDBBuilder::new(&*db as &dyn HashDBRef<H, Vec<u8>>, root).build();
 
-        let mut ret = Self::try_new(root, trie_db, |trie_db| {
+        let mut ret = Self::try_new(root, trie_db, |trie_db| -> NdnResult<Box<dyn Iterator<Item = (String, ObjId)>>> {
             // Create an iterator over the trie database
             let iter = trie_db.iter().map_err(|e| {
                 let msg = format!("Failed to create iterator: {:?}", e);
@@ -74,7 +74,7 @@ impl<'a, H: Hasher> TrieObjectMapInnerStorageWrapperIterator<'a, H> {
                 Some((key, value))
             });
 
-            Ok(Box::new(iter))
+            Ok(Box::new(iter) as Box<dyn Iterator<Item = (String, ObjId)>>)
         })?;
 
         Ok(ret)
@@ -320,11 +320,6 @@ where
     fn traverse(&self, callback: &mut dyn FnMut(String, ObjId) -> NdnResult<()>) -> NdnResult<()> {
         let db = &self.db.as_hash_db() as &dyn HashDBRef<H, Vec<u8>>;
         let trie = GenericTrieDBBuilder::new(db, &self.root).build();
-        let iter = trie.iter().map_err(|e| {
-            let msg = format!("Failed to create iterator: {:?}", e);
-            error!("{}", msg);
-            NdnError::DbError(msg)
-        })?;
         let iter = trie.iter().map_err(|e| {
             let msg = format!("Failed to create iterator: {:?}", e);
             error!("{}", msg);

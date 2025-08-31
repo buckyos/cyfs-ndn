@@ -98,10 +98,10 @@ impl Serialize for HashMethod {
     }
 }
 
-impl<'de> Deserialize<'de> for HashMethod {
+impl<'a> Deserialize<'a> for HashMethod {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: Deserializer<'de>,
+        D: Deserializer<'a>,
     {
         let s = String::deserialize(deserializer)?;
         HashMethod::from_str(&s).map_err(serde::de::Error::custom)
