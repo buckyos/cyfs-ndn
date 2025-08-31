@@ -269,7 +269,17 @@ chunklist的构造一定是非均质的，可以参考git的命令模式
 
 ### pull chunk
 
+
 ### push chunk
+push chunk是client直接向server upload chunk, server会根据一些通用逻辑（非应用逻辑）进行默认处理
+- 通常在同zone内，会使用push chunk，server默认会接受同zone client的push chunk
+- server正在pull chunk,此时会默认接受push chunk 
+- 不管如何触发的，server都会在最后进行验证
+- 在push之前，客户端可以通过HEAD先查询服务器端状态，再带断点续传的push
+
+### pull chunk list
+- 当server通过明文协议pull chunk list时，路由器可以安排其它节点主动向server push chunk, 实现标准的NDN 路由
+
 
 ### get named object
 
