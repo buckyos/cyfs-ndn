@@ -91,6 +91,7 @@ pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_
             will_process_file.push(sub_path);
         }
     }
+    
     for file in will_process_file {
         //println!("file: {}", file.display());
         let file_object = cacl_file_object(&file,file_obj_template,true,ndn_mgr).await?;

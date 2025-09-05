@@ -1,6 +1,6 @@
 use super::named_data_mgr_db::NamedDataMgrDB;
 use crate::{
-    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, LinkData, NamedDataStore, NdnError, NdnResult, PathObject
+    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, LinkData, NamedDataStore, NdnError, NdnResult, PathObject, SimpleChunkList, SimpleChunkListReader, OBJ_TYPE_CHUNK_LIST_SIMPLE
 };
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
@@ -616,6 +616,10 @@ impl NamedDataMgr {
         seek_from: SeekFrom,
         auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
+        if chunklist_id.obj_type != OBJ_TYPE_CHUNK_LIST_SIMPLE {
+            return Err(NdnError::InvalidParam(format!("chunklist_id is not OBJ_TYPE_CHUNK_LIST_SIMPLE id:{}", chunklist_id.to_string())));
+        }
+
         // 1. Get named data manager by id
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id)
             .await
@@ -632,10 +636,14 @@ impl NamedDataMgr {
             mgr.get_object_impl(chunklist_id, None).await?
         };
 
-        let chunk_list = ChunkList::open(obj_data).await?;
-        let total_size = chunk_list.total_size();
+        let chunk_ids : Vec<ChunkId> = serde_json::from_value(obj_data).map_err(|e| {
+            NdnError::InvalidData(format!("parse chunk_ids failed:{}", e.to_string()))
+        })?;
 
-        let reader = ChunkListReader::new(named_mgr, chunk_list, seek_from, auto_cache).await?;
+        let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let total_size = chunk_list.total_size;
+
+        let reader = SimpleChunkListReader::new(named_mgr, chunk_list, seek_from, auto_cache).await?;
 
         Ok((Box::pin(reader), total_size))
     }
