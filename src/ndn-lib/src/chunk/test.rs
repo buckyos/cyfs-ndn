@@ -167,7 +167,7 @@ async fn test_chunk_list_main() {
     }
 
     let config = NamedDataMgrConfig {
-        local_stores: vec![test_dir.to_str().unwrap().to_string()],
+        local_store: test_dir.to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };

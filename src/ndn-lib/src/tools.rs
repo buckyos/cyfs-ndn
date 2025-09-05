@@ -1,5 +1,6 @@
-use crate::{NamedDataMgr, NdnResult, DirObject,FileObject,NdnError,CHUNK_NORMAL_SIZE,ChunkHasher};
+use crate::{ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, SimpleChunkList, CHUNK_NORMAL_SIZE};
 use std::path::Path;
+use std::collections::HashMap;
 use tokio::fs;
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
@@ -11,6 +12,8 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
     
     let mut is_use_chunklist = false;
     let mut chunk_size = CHUNK_NORMAL_SIZE as u64;
+    let mut chunk_list:SimpleChunkList = SimpleChunkList::new();
+    let mut chunk_id:ChunkId;
 
     if file_size > CHUNK_NORMAL_SIZE as u64 {
         if use_chunklist {
@@ -26,29 +29,42 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
     })?;
     debug!("open local_file_path success");
     let mut read_pos = 0;
+    
+    while read_pos < file_size {
+        let mut chunk_hasher = ChunkHasher::new(None).unwrap();
+        let chunk_type = chunk_hasher.hash_method.clone();
+        //file_reader.seek(SeekFrom::Start(read_pos)).await;
+        let (chunk_raw_id, chunk_size) = chunk_hasher
+            .calc_from_reader_with_length(&mut file_reader, chunk_size)
+            .await
+            .unwrap();
 
-    let mut chunk_hasher = ChunkHasher::new(None).unwrap();
-    let chunk_type = chunk_hasher.hash_method.clone();
-    file_reader.seek(SeekFrom::Start(read_pos)).await;
-    let (chunk_raw_id, chunk_size) = chunk_hasher
-        .calc_from_reader_with_length(&mut file_reader, chunk_size)
-        .await
-        .unwrap();
+        chunk_id = ChunkId::from_mix_hash_result_by_hash_method(chunk_size, &chunk_raw_id, chunk_type)?;
+        info!(
+            "cacl_file_object:calc chunk_id success,chunk_id:{},chunk_size:{}",
+            chunk_id.to_string(),
+            chunk_size
+        );
 
-    let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(chunk_size, &chunk_raw_id, chunk_type)?;
-    info!(
-        "cacl_file_object:calc chunk_id success,chunk_id:{},chunk_size:{}",
-        chunk_id.to_string(),
-        chunk_size
-    );
-
-    let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await.unwrap();
-    if !is_exist {
-        //使用软链接的方法写入ndn_mgr
-        
+        let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await.unwrap();
+        if !is_exist {
+            ndn_mgr.link_chunk_to_local_impl(&chunk_id, &local_file_path).await?;
+        } 
+        if is_use_chunklist {
+            chunk_list.append_chunk(chunk_id.clone())?;
+        } else {
+            file_obj_result.content = chunk_id.to_string();
+        }
+        read_pos += chunk_size;
+    }
+    if is_use_chunklist {
+        //gen chunk list id
+        let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
+        ndn_mgr.put_object_impl(&chunk_list_id, &chunk_list_str).await?;
+        file_obj_result.content = chunk_list_id.to_string();
     } 
-    file_obj_result.content = chunk_id.to_string();
-    file_obj_result.size = chunk_size;
+
+    file_obj_result.size = file_size;
     file_obj_result.create_time = None;
 
     Ok(file_obj_result)
@@ -77,7 +93,7 @@ pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_
     }
     for file in will_process_file {
         //println!("file: {}", file.display());
-        let file_object = cacl_file_object(&file,file_obj_template,false,ndn_mgr).await?;
+        let file_object = cacl_file_object(&file,file_obj_template,true,ndn_mgr).await?;
         let file_object_str = serde_json::to_string(&file_object).unwrap();
         let file_object_json = serde_json::to_value(&file_object).unwrap();
         let (file_object_id, _) = file_object.gen_obj_id();
@@ -103,7 +119,7 @@ mod test {
         init_logging("ndn-lib-test", false);
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig {
-            local_stores: vec![test_dir.path().to_str().unwrap().to_string()],
+            local_store: test_dir.path().to_str().unwrap().to_string(),
             local_cache: None,
             mmap_cache_dir: None,
         };
@@ -123,6 +139,5 @@ mod test {
         let (dir_object_id, dir_obj_str_for_gen_obj_id) = dir_object.gen_obj_id().unwrap();
         println!("dir_object_id: {}", dir_object_id.to_string());
         println!("dir_obj_str_for_gen_obj_id: {}", dir_obj_str_for_gen_obj_id);
-
     }
 }

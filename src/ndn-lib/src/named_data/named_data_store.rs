@@ -131,7 +131,6 @@ impl NamedDataStore {
         obj_id: &ObjId,
         obj_str: &str
     ) -> NdnResult<()> {
-
         self.named_db
             .set_object(obj_id, obj_id.obj_type.as_str(), obj_str)
             .await
@@ -140,6 +139,10 @@ impl NamedDataStore {
     pub async fn link_object(&self, obj_id: &ObjId, target_obj: &ObjId) -> NdnResult<()> {
         let link = LinkData::SameAs(target_obj.clone());
         self.named_db.set_object_link(obj_id, &link).await
+    }
+
+    pub async fn link(&self,obj_id: &ObjId, link_data: &LinkData) -> NdnResult<()> {
+        self.named_db.set_object_link(obj_id, link_data).await
     }
 
     pub async fn query_link_refs(&self, ref_obj_id: &ObjId) -> NdnResult<Vec<ObjId>> {
@@ -262,15 +265,8 @@ impl NamedDataStore {
                 LinkData::PartOf(link_obj_id, range) => {
                     return Ok((ChunkState::Link(obj_link2), range.end - range.start));
                 }
-                _ => {
-                    warn!(
-                        "query_chunk_by_id: link data not supported! {}",
-                        chunk_id.to_string()
-                    );
-                    return Err(NdnError::InvalidLink(format!(
-                        "link data not supported! {}",
-                        chunk_id.to_string()
-                    )));
+                LinkData::LocalFile(file_path,file_size) => {
+                    return Ok((ChunkState::Link(obj_link2), file_size));
                 }
             }
         }

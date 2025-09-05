@@ -118,8 +118,8 @@ pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
 pub const OBJ_TYPE_LIST_SIMPLE: &str = "cylist"; // simple object list
 
 pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
-pub const OBJ_TYPE_CHUNK_LIST_SIMPLE: &str = "cl-s"; // simple chunk list with variable size
-pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "chunklist"; // normal chunk list with fixed size
+pub const OBJ_TYPE_CHUNK_LIST_SIMPLE: &str = "clist"; // simple chunk list with mixhash chunk
+pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list with fixed size
 pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
 
 pub const OBJ_TYPE_PKG: &str = "pkg"; // package

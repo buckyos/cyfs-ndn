@@ -8,6 +8,7 @@ use base58::{FromBase58, ToBase58};
 use crypto_common::hazmat::{SerializableState, SerializedState};
 use hex;
 use log::*;
+use serde::{Deserialize, Serialize, Serializer, Deserializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
@@ -202,6 +203,25 @@ impl ChunkIdHashHelper {
 pub struct ChunkId {
     pub chunk_type: ChunkType,
     pub hash_result: Vec<u8>,
+}
+
+impl Serialize for ChunkId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'a> Deserialize<'a> for ChunkId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 //TODO: add mix hash support

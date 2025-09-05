@@ -11,7 +11,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     // Create a temporary directory for testing
     let test_dir = tempdir().unwrap();
     let config = NamedDataMgrConfig {
-        local_stores: vec![test_dir.path().to_str().unwrap().to_string()],
+        local_store: test_dir.path().to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };
@@ -59,7 +59,7 @@ async fn test_base_operations() -> NdnResult<()> {
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
     let config = NamedDataMgrConfig {
-        local_stores: vec![test_dir.path().to_str().unwrap().to_string()],
+        local_store: test_dir.path().to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };
@@ -222,7 +222,7 @@ async fn test_find_longest_matching_path_edge_cases() -> NdnResult<()> {
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
     let config = NamedDataMgrConfig {
-        local_stores: vec![test_dir.path().to_str().unwrap().to_string()],
+        local_store: test_dir.path().to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };
@@ -371,7 +371,7 @@ async fn test_concurrent_path_access() -> NdnResult<()> {
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
     let config = NamedDataMgrConfig {
-        local_stores: vec![test_dir.path().to_str().unwrap().to_string()],
+        local_store: test_dir.path().to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };

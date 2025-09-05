@@ -7,6 +7,7 @@ use crate::{ObjId,ChunkId,NdnResult,NdnError};
 #[derive(Debug, Clone,Eq, PartialEq)]
 pub enum LinkData {
     SameAs(ObjId),//Same ChunkId
+    LocalFile(String,u64),//Local File Path, File Size
     //ComposedBy(ChunkId,ObjMapId),// Base ChunkId + Diff Action Items
     PartOf(ChunkId,Range<u64>), //Object Id + Range
     //IndexOf(ObjId,u64),//Object Id + Index
@@ -39,6 +40,7 @@ impl LinkData {
                 let range_str = format!("{}..{}",range.start,range.end);
                 format!("part_of->{}@{}",range_str,chunk_id.to_string())
             }
+            LinkData::LocalFile(file_path,file_size) => format!("file->{}@{}",file_path,file_size),
         }
     }
 
@@ -65,6 +67,13 @@ impl LinkData {
                 let end = range[1].parse::<u64>().unwrap();
                 Ok(LinkData::PartOf(ChunkId::new(parts[1])?,Range{start,end}))
             }
+            "file" => {
+                let parts = link_data.split("@").collect::<Vec<&str>>();
+                if parts.len() != 2 {
+                    return Err(NdnError::InvalidLink(format!("invalid link string:{}",link_str)));
+                }
+                Ok(LinkData::LocalFile(parts[0].to_string(),parts[1].parse::<u64>().unwrap()))
+            }
             _ => Err(NdnError::InvalidLink(format!("invalid link type:{}",link_type))),
         }
     }
@@ -90,6 +99,13 @@ mod tests {
 
         let chunk_id = ChunkId::new("sha256:1234567890").unwrap();
         let link_data = LinkData::PartOf(chunk_id,Range{start:0,end:100});
+        let link_str = link_data.to_string();
+        println!("link_str {}",link_str);
+        let link_data2 = LinkData::from_string(&link_str).unwrap();
+        assert_eq!(link_data,link_data2);
+
+        let chunk_id = ChunkId::new("sha256:1234567890AE").unwrap();
+        let link_data = LinkData::LocalFile("/Users/liuzhicong/Downloads/te  st.txt".to_string(),1024);
         let link_str = link_data.to_string();
         println!("link_str {}",link_str);
         let link_data2 = LinkData::from_string(&link_str).unwrap();

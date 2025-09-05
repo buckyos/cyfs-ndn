@@ -1,7 +1,6 @@
 use super::named_data_mgr_db::NamedDataMgrDB;
 use crate::{
-    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState,
-    FileObject, NamedDataStore, NdnError, NdnResult, PathObject,
+    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, LinkData, NamedDataStore, NdnError, NdnResult, PathObject
 };
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
@@ -22,7 +21,7 @@ use std::io as std_io;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::{path::PathBuf, pin::Pin};
+use std::{path::PathBuf, path::Path,pin::Pin};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
@@ -32,13 +31,13 @@ use tokio_util::io::StreamReader;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedDataMgrConfig {
-    pub local_stores: Vec<String>,
+    pub local_store: String,
     pub local_cache: Option<String>,
     pub mmap_cache_dir: Option<String>,
 }
 
 pub struct NamedDataMgr {
-    local_store_list: Vec<NamedDataStore>, //Real chunk store
+    local_store: NamedDataStore, //Real chunk store
     local_cache: Option<NamedDataStore>,   //Cache at local disk
     mmap_cache_dir: Option<String>,        //Cache at memory
     mgr_id: Option<String>,
@@ -77,7 +76,7 @@ impl NamedDataMgr {
         let mgr_json_file = root_path.join("ndn_mgr.json");
         if !mgr_json_file.exists() {
             mgr_config = NamedDataMgrConfig {
-                local_stores: vec!["./".to_string()],
+                local_store: "./".to_string(),
                 local_cache: None,
                 mmap_cache_dir: None,
             };
@@ -157,18 +156,16 @@ impl NamedDataMgr {
     ) -> NdnResult<Self> {
         let db_path = root_path.join("ndn_mgr.db").to_str().unwrap().to_string();
         let db = NamedDataMgrDB::new(db_path)?;
-        let mut local_store_list = vec![];
-        for local_store_path in config.local_stores.iter() {
-            let real_local_store_path;
-            if local_store_path.starts_with(".") {
-                real_local_store_path = root_path.join(local_store_path);
-            } else {
-                real_local_store_path = PathBuf::from(local_store_path);
-            }
-            let local_store =
-                NamedDataStore::new(real_local_store_path.to_str().unwrap().to_string()).await?;
-            local_store_list.push(local_store);
+
+        let real_local_store_path;
+        if config.local_store.starts_with(".") {
+            real_local_store_path = root_path.join(config.local_store);
+        } else {
+            real_local_store_path = PathBuf::from(config.local_store);
         }
+        let local_store = NamedDataStore::new(real_local_store_path.to_str().unwrap().to_string()).await?;
+
+        
         let local_cache;
         if config.local_cache.is_some() {
             local_cache =
@@ -177,7 +174,7 @@ impl NamedDataMgr {
             local_cache = None;
         }
         Ok(Self {
-            local_store_list: local_store_list,
+            local_store: local_store,
             local_cache: local_cache,
             mmap_cache_dir: config.mmap_cache_dir,
             mgr_id: mgr_id,
@@ -266,14 +263,11 @@ impl NamedDataMgr {
             }
         }
 
-        for local_store in self.local_store_list.iter() {
-            let obj_result = local_store.get_object(&obj_id).await;
-            if obj_result.is_ok() {
-                obj_body = Some(obj_result.unwrap());
-                break;
-            }
+        let obj_result = self.local_store.get_object(&obj_id).await;
+        if obj_result.is_ok() {
+            obj_body = Some(obj_result.unwrap());
         }
-
+        
         if obj_body.is_some() {
             let obj_body = obj_body.unwrap();
             let obj_body = obj_body.to_json_value().map_err(|e| {
@@ -312,11 +306,7 @@ impl NamedDataMgr {
     }
 
     pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
-        for local_store in self.local_store_list.iter() {
-            //TODO: select best local store to write?
-            local_store.put_object(obj_id, obj_data).await?;
-            break;
-        }
+        self.local_store.put_object(obj_id, obj_data).await?;
         Ok(())
     }
 
@@ -491,17 +481,8 @@ impl NamedDataMgr {
     }
 
     pub async fn is_chunk_exist_impl(&self, chunk_id: &ChunkId) -> NdnResult<bool> {
-        for local_store in self.local_store_list.iter() {
-            let query_result = local_store.is_chunk_exist(chunk_id, None).await;
-            if query_result.is_err() {
-                continue;
-            }
-            let (is_exist, chunk_size) = query_result.unwrap();
-            if is_exist {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        let (is_exist, chunk_size) = self.local_store.is_chunk_exist(chunk_id, None).await?;
+        return Ok(is_exist);
     }
 
     pub async fn have_chunk(chunk_id: &ChunkId, mgr_id: Option<&str>) -> bool {
@@ -522,13 +503,11 @@ impl NamedDataMgr {
         &self,
         chunk_id: &ChunkId,
     ) -> NdnResult<(ChunkState, u64, String)> {
-        for local_store in self.local_store_list.iter() {
-            let (chunk_state, chunk_size, progress) =
-                local_store.query_chunk_state(chunk_id).await?;
-            if chunk_state != ChunkState::NotExist {
-                return Ok((chunk_state, chunk_size, progress));
-            }
+        let (chunk_state, chunk_size, progress) = self.local_store.query_chunk_state(chunk_id).await?;
+        if chunk_state != ChunkState::NotExist {
+            return Ok((chunk_state, chunk_size, progress));
         }
+        
         Ok((ChunkState::NotExist, 0, "".to_string()))
     }
 
@@ -543,6 +522,18 @@ impl NamedDataMgr {
         let named_mgr = named_mgr.unwrap();
         let named_mgr = named_mgr.lock().await;
         named_mgr.query_chunk_state_impl(chunk_id).await
+    }
+
+    pub async fn link_chunk_to_local_impl(&self, chunk_id: &ChunkId, local_file_path: &Path) -> NdnResult<()> {
+        let file_meta = local_file_path.metadata().map_err(|e| {
+            warn!("link_chunk_to_local: get file metadata failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        let file_size = file_meta.len();
+        let link_data = LinkData::LocalFile(local_file_path.to_string_lossy().to_string(),file_size);
+        let obj_id = chunk_id.to_obj_id();
+        self.local_store.link(&obj_id, &link_data).await?;
+        Ok(())
     }
 
     pub async fn open_chunk_reader_impl(
@@ -593,14 +584,7 @@ impl NamedDataMgr {
         }
 
         debug!("get_chunk_reader: no cache file:{}", chunk_id.to_string());
-        for local_store in self.local_store_list.iter() {
-            let local_reader = local_store.open_chunk_reader(chunk_id, seek_from).await;
-            if local_reader.is_ok() {
-                //TODO:将结果数据添加到自动cache管理中
-                //caceh是完整的，还是可以支持部分？
-                return local_reader;
-            }
-        }
+        let local_reader = self.local_store.open_chunk_reader(chunk_id, seek_from).await?;
 
         Err(NdnError::NotFound(chunk_id.to_string()))
     }
@@ -663,8 +647,7 @@ impl NamedDataMgr {
         chunk_size: u64,
         offset: u64,
     ) -> NdnResult<(ChunkWriter, String)> {
-        let default_store = self.local_store_list.first().unwrap();
-        let (writer, chunk_progress_info) = default_store
+        let (writer, chunk_progress_info) = self.local_store
             .open_chunk_writer(chunk_id, chunk_size, offset)
             .await?;
         Ok((writer, chunk_progress_info))
@@ -692,8 +675,7 @@ impl NamedDataMgr {
         chunk_id: &ChunkId,
         progress: String,
     ) -> NdnResult<()> {
-        let default_store = self.local_store_list.first().unwrap();
-        default_store
+        self.local_store
             .update_chunk_progress(chunk_id, progress)
             .await
     }
@@ -715,8 +697,7 @@ impl NamedDataMgr {
     }
 
     pub async fn complete_chunk_writer_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        let default_store = self.local_store_list.first().unwrap();
-        default_store.complete_chunk_writer(chunk_id).await
+        self.local_store.complete_chunk_writer(chunk_id).await
     }
 
     pub async fn complete_chunk_writer(mgr_id: Option<&str>, chunk_id: &ChunkId) -> NdnResult<()> {
