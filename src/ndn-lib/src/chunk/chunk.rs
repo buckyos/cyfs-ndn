@@ -15,11 +15,11 @@ use std::str::FromStr;
 use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
 
-pub const CALC_HASH_PIECE_SIZE: u64 = 1024 * 1024;
+pub const CALC_HASH_PIECE_SIZE: u64 = 1024 * 1024 * 4;
 pub const QCID_HASH_PIECE_SIZE: u64 = 4096;
 pub const MAX_CHUNK_SIZE: u64 = 1024 * 1024 * 1024 * 2;
 pub const COPY_CHUNK_BUFFER_SIZE: usize = CALC_HASH_PIECE_SIZE as usize;
-pub const CHUNK_NORMAL_SIZE: u64 = 1024 * 1024 * 64;
+pub const CHUNK_NORMAL_SIZE: u64 = 1024 * 1024 * 16;
 pub type ChunkReader = Pin<Box<dyn AsyncRead + Unpin + Send>>;
 pub type ChunkWriter = Pin<Box<dyn AsyncWrite + Unpin + Send>>;
 

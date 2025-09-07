@@ -14,7 +14,9 @@ mod object_map;
 mod trie_object_map;
 mod object_array;
 mod coll;
+mod packed_obj_pipline;
 mod tools;
+
 //mod example;
 
 pub use object::*;
@@ -31,7 +33,7 @@ pub use object_map::*;
 pub use trie_object_map::*;
 pub use object_array::*;
 pub use coll::*;
-
+pub use packed_obj_pipline::*;
 use reqwest::StatusCode;
 use thiserror::Error;
 

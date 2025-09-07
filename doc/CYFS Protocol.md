@@ -307,6 +307,14 @@ push chunk是client直接向server upload chunk, server会根据一些通用逻�
 根据Http post header里的字段，找到等待中的stream session
 匹配成功后，将stream session的resp通过http post body发送
 
+基于rhttp协议，客户端upload dir的流程变成server download dir,流程如下
+1. client访问服务器的业务接口，得到upload dir的tunnel session
+2. server启动dir download session
+3.1 client使用cyfs rhttp tunnel协议与服务器建立websocket连接
+3.2 client运行一个ndn_router在本地，准备处理来自server的get_obj和pull_chunk请求
+4. server的dir download session创建成功，持有一个tunnel session对象
+5. server运行dir download logic，会基于该tunnel来创建get_obj和pull_chunk
+
 
 ## 标准对象参考
 

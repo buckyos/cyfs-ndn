@@ -1,12 +1,16 @@
-use crate::{ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, SimpleChunkList, CHUNK_NORMAL_SIZE};
+use crate::{ObjId, ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, PackedObjItem, SimpleChunkList, CHUNK_NORMAL_SIZE};
 use std::path::Path;
 use std::collections::HashMap;
 use tokio::fs;
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
 use crate::chunk::ChunkId;
+use crate::packed_obj_pipline::{PackedObjPiplineWriter, PackedObjPiplineReader, ChunkChannelSourceWriter};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
-pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject,use_chunklist:bool,ndn_mgr:&NamedDataMgr) -> NdnResult<FileObject> {
+pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject,use_chunklist:bool,
+    ndn_mgr:&NamedDataMgr,packed_obj_pipline:Option<Arc<Mutex<dyn PackedObjPiplineWriter>>>) -> NdnResult<FileObject> {
     let mut file_obj_result = fileobj_template.clone();
     let file_size = tokio::fs::metadata(local_file_path).await.unwrap().len();
     
@@ -59,9 +63,15 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
     }
     if is_use_chunklist {
         //gen chunk list id
+        let sub_item_count = chunk_list.body.len();
         let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
         ndn_mgr.put_object_impl(&chunk_list_id, &chunk_list_str).await?;
         file_obj_result.content = chunk_list_id.to_string();
+        if packed_obj_pipline.is_some() {
+            let mut packed_obj_pipline = packed_obj_pipline.unwrap();
+            let mut packed_obj_pipline = packed_obj_pipline.lock().await;
+            packed_obj_pipline.push(PackedObjItem { obj_id: chunk_list_id, sub_item_count: sub_item_count }).await;
+        }
     } 
 
     file_obj_result.size = file_size;
@@ -70,7 +80,8 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
     Ok(file_obj_result)
 }
 
-pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_mgr:&NamedDataMgr) -> NdnResult<DirObject> {
+pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,
+    ndn_mgr:&NamedDataMgr,packed_obj_pipline:Option<Arc<Mutex<dyn PackedObjPiplineWriter>>>) -> NdnResult<DirObject> {
     //遍历source_dir下的所有文件和子目录
     let mut read_dir = fs::read_dir(source_dir).await?;
     let mut will_process_file = Vec::new();
@@ -79,7 +90,7 @@ pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_
         let sub_path = entry.path();
         if sub_path.is_dir() {
             //println!("dir: {}", sub_path.display());
-            let sub_dir_obj = Box::pin(cacl_dir_object(&sub_path,file_obj_template,ndn_mgr)).await?;
+            let sub_dir_obj = Box::pin(cacl_dir_object(&sub_path,file_obj_template,ndn_mgr,packed_obj_pipline.clone())).await?;
             let sub_total_size = sub_dir_obj.total_size;
             let sub_dir_obj_str = serde_json::to_string(&sub_dir_obj).unwrap();
             let (sub_dir_obj_id, _) = sub_dir_obj.gen_obj_id()?;
@@ -94,7 +105,7 @@ pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_
     
     for file in will_process_file {
         //println!("file: {}", file.display());
-        let file_object = cacl_file_object(&file,file_obj_template,true,ndn_mgr).await?;
+        let file_object = cacl_file_object(&file,file_obj_template,true,ndn_mgr,packed_obj_pipline.clone()).await?;
         let file_object_str = serde_json::to_string(&file_object).unwrap();
         let file_object_json = serde_json::to_value(&file_object).unwrap();
         let (file_object_id, _) = file_object.gen_obj_id();
@@ -105,8 +116,26 @@ pub async fn cacl_dir_object(source_dir:&Path,file_obj_template:&FileObject,ndn_
     return Ok(this_dir_obj);
 }
 
-pub async fn restore_dir_object(dir_object:&DirObject,ndn_mgr:&NamedDataMgr,target_dir:&Path) -> NdnResult<()> {
+pub async fn restore_dir_object(root_object:ObjId,ndn_mgr:&NamedDataMgr,target_dir:&Path) -> NdnResult<()> {
+    /**
+     * get dir object by root_object
+     * restore sub items
+     */
     unimplemented!()
+}
+
+pub async fn restore_dir_object_from_source(root_object:FileObject,
+    source_pipline:Arc<Mutex<dyn PackedObjPiplineReader>>,
+    source_chunk_channel:Arc<Mutex<dyn ChunkChannelSourceWriter>>,
+    local_ndn_mgr:&NamedDataMgr,target_dir:&Path) -> NdnResult<()> {
+    //get dir object by root_object_id
+    //if local_ndn_mgr.is_exist: jump a big group
+    //get object from source_pipline
+    //get chunk from channel + other source(optional)
+    //
+    
+    unimplemented!()
+
 }
 
 mod test {
@@ -134,7 +163,7 @@ mod test {
 
         
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let dir_object = cacl_dir_object(&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&named_mgr).await.unwrap();
+        let dir_object = cacl_dir_object(&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&named_mgr,None).await.unwrap();
         let dir_object_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_str: {}", dir_object_str);
         let (dir_object_id, dir_obj_str_for_gen_obj_id) = dir_object.gen_obj_id().unwrap();
