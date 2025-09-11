@@ -586,7 +586,7 @@ impl NamedDataMgr {
         debug!("get_chunk_reader: no cache file:{}", chunk_id.to_string());
         let local_reader = self.local_store.open_chunk_reader(chunk_id, seek_from).await?;
 
-        Err(NdnError::NotFound(chunk_id.to_string()))
+        return Ok(local_reader);
     }
 
     pub async fn open_chunk_reader(
