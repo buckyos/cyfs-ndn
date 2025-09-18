@@ -54,7 +54,7 @@ impl SimpleChunkList {
         self.total_size += chunk_size.unwrap();
         Ok(())
     }
-
+    //TODO:这种特殊的obj-id可能会对obj-id的验证产生影响
     pub fn gen_obj_id(self) -> (ObjId, String) {
         let (obj_id, obj_str) = build_named_object_by_json(OBJ_TYPE_CHUNK_LIST_SIMPLE, &serde_json::to_value(self.body.clone()).unwrap());
         let chunk_list_id_raw =ChunkId::mix_length_and_hash_result(self.total_size, &obj_id.obj_hash);

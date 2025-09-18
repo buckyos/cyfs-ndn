@@ -1,7 +1,8 @@
+use arrow::ipc::UnionMode;
 use buckyos_kit::get_relative_path;
 use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, DID};
 use name_client::resolve_auth_key;
-use tokio::io::{AsyncRead,AsyncWrite,AsyncWriteExt,AsyncReadExt};
+use tokio::io::{AsyncRead,AsyncWrite,AsyncWriteExt,AsyncReadExt,AsyncSeekExt};
 use url::Url;
 use log::*;
 use reqwest::{Body, Client, StatusCode};
@@ -14,9 +15,10 @@ use std::pin::Pin;
 use tokio::io::{BufReader,BufWriter};
 use std::collections::HashMap;
 use futures::Future;
+use futures::future::BoxFuture;
 use rand::RngCore;
 
-use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, CYFSHttpRespHeaders, ChunkState, FileObject, HashMethod, PathObject, ProgressCallback};
+use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, CYFSHttpRespHeaders, ChunkState, DirObject, FileObject, HashMethod, PathObject, ProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
 
 
 pub enum ChunkWorkState {
@@ -84,6 +86,17 @@ impl NdnClient {
         //去掉多余的/
         //let result = result.replace("//", "/");
         result
+    }
+
+    pub fn gen_obj_url(&self,obj_id:&ObjId,base_url:Option<String>)->String {
+        let real_base_url;
+        if base_url.is_some() {
+            real_base_url = base_url.unwrap();
+        } else {
+            real_base_url = self.default_remote_url.as_ref().unwrap().clone();
+        }
+
+        format!("{}/{}",real_base_url,obj_id.to_base32())
     }
 
     fn verify_obj_id(obj_id:&ObjId,obj_str:&str)->NdnResult<serde_json::Value> {
@@ -240,8 +253,25 @@ impl NdnClient {
         Ok(())
     }
 
+    pub async fn get_obj_by_id(&self,obj_id:ObjId) -> NdnResult<serde_json::Value> {
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
+            .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
+        let real_named_mgr = named_mgr.lock().await;
+        let obj_data = real_named_mgr.get_object_impl(&obj_id, None).await;
+        if obj_data.is_ok() {
+            return obj_data;
+        } else {
+            info!("get_obj_by_id: get obj by id failed:{}, try to get obj from remote",obj_id.to_string());
+            let obj_url = self.gen_obj_url(&obj_id, None);
+            let (_,obj_data) = self.get_obj_by_url(&obj_url, Some(obj_id)).await?;
+            return Ok(obj_data);
+        }
+    }
+    
+
     //helper function
     // 使用标准HTTP协议打开URL获取对象,返回obj_id和obj_str
+    // 调用该函数一定会产生网络操作
     pub async fn get_obj_by_url(&self,url:&str,known_obj_id:Option<ObjId>) -> NdnResult<(ObjId,serde_json::Value)> {
         let mut obj_id_from_url: Option<ObjId> = None;
         let mut obj_inner_path: Option<String> = None;     
@@ -490,7 +520,6 @@ impl NdnClient {
                 cache_path_obj = real_named_mgr.get_cache_path_obj(chunk_url);
             }
             
-
             if cache_path_obj.is_some() {
                 let cache_path_obj = cache_path_obj.unwrap();
                 if cache_path_obj == path_obj {
@@ -518,10 +547,8 @@ impl NdnClient {
         }        
     }
 
-
-
     //返回成功下载的chunk_id和chunk_size,下载成功后named mgr种chunk存在于cache中
-    pub async fn download_chunk_to_local(&self,chunk_url:&str,chunk_id:ChunkId,local_path:&PathBuf,no_verify:Option<bool>) -> NdnResult<(ChunkId,u64)> {
+    pub async fn download_chunk_to_local(&self,chunk_url:&str,chunk_id:ChunkId,local_path:&PathBuf,offset:u64,no_verify:Option<bool>) -> NdnResult<(ChunkId,u64)> {
         // 首先从URL下载chunk到本地缓存
         let chunk_size = self.pull_chunk_by_url(chunk_url.to_string(), chunk_id.clone(), self.default_ndn_mgr_id.as_deref()).await?;
  
@@ -535,6 +562,9 @@ impl NdnClient {
         let mut file = tokio::fs::File::create(local_path)
             .await
             .map_err(|e| NdnError::IoError(format!("Failed to create file: {}", e)))?;
+
+        file.seek(SeekFrom::Start(offset)).await
+            .map_err(|e| NdnError::IoError(format!("Failed to seek file: {}", e)))?;
         
         // 从named-data-mgr中获取chunk reader，因为pull_chunk已经将chunk写入named-data-mgr
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
@@ -561,32 +591,108 @@ impl NdnClient {
         // 解析FileObject
         let file_obj: FileObject = serde_json::from_value(file_obj_json)
             .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
-        
-        // 2. 得到fileobj的content chunkid
-        let content_chunk_id = ChunkId::new(file_obj.content.as_str())
+
+        let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+        if content_obj_id.is_chunk() {
+            // 2. 得到fileobj的content chunkid
+            let content_chunk_id = ChunkId::new(file_obj.content.as_str())
             .map_err(|e| NdnError::Internal(format!("Failed to parse content chunk id: {}", e)))?;
-        
-        // 构建content chunk的URL
-        let content_chunk_url = self.gen_chunk_url(&content_chunk_id, None);
-        info!("download_fileobj_to_local: content_chunk_url {}",content_chunk_url);
-        
-        // 3. 使用download_chunk_to_local将chunk下载到本地指定文件
-        let (_, chunk_size) = self.download_chunk_to_local(&content_chunk_url, content_chunk_id, local_path, no_verify).await?;
-        
-        // 验证下载的文件大小与FileObject中声明的大小是否一致
-        if chunk_size != file_obj.size {
+
+            // 构建content chunk的URL
+            let content_chunk_url = self.gen_chunk_url(&content_chunk_id, None);
+            info!("download_fileobj_to_local: content_chunk_url {}",content_chunk_url);
+
+            // 3. 使用download_chunk_to_local将chunk下载到本地指定文件
+            let (_, chunk_size) = self.download_chunk_to_local(&content_chunk_url, content_chunk_id, local_path, 0, no_verify).await?;
+
+            // 验证下载的文件大小与FileObject中声明的大小是否一致
+            if chunk_size != file_obj.size {
             return Err(NdnError::Internal(format!(
                 "Downloaded file size ({}) doesn't match expected size ({})",
                 chunk_size, file_obj.size
             )));
-        }
+            }
 
-        let local_file_obj_path = local_path.with_extension("fileobj");
-        //dump file_obj to local_file_obj_path
-        tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
+            let local_file_obj_path = local_path.with_extension("fileobj");
+            //dump file_obj to local_file_obj_path
+            tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
             .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
-        
-        Ok((obj_id, file_obj))
+
+            return Ok((obj_id, file_obj));
+        } else {
+            if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+                let chunk_list_obj_data = self.get_obj_by_id(content_obj_id.clone()).await?;
+                let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
+                    .map_err(|e| NdnError::Internal(format!("Failed to parse SimpleChunkList: {}", e)))?;
+                let mut offset = 0;
+                for chunk_id in chunk_list {
+                    let chunk_url = self.gen_chunk_url(&chunk_id, None);
+                    let (_, chunk_size) = self.download_chunk_to_local(&chunk_url, chunk_id, local_path, offset, no_verify).await?;
+                    offset += chunk_size;
+                }
+
+                let local_file_obj_path = local_path.with_extension("fileobj");
+                //dump file_obj to local_file_obj_path
+                tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
+                .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
+
+                
+                return Ok((obj_id, file_obj));
+            } else {
+                return Err(NdnError::Internal(format!("Unsupported content obj type: {}", content_obj_id.obj_type)));
+            }
+            
+        }
+    }
+
+
+    pub async fn pull_file_imp(&self,file_obj:FileObject) -> NdnResult<()>{
+        let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+        if content_obj_id.is_chunk() {
+            let chunk_id = ChunkId::new(file_obj.content.as_str())?;
+            self.pull_chunk(chunk_id, None).await?;
+            return Ok(());
+        } else {
+            if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+                let chunk_list_obj_data = self.get_obj_by_id(content_obj_id.clone()).await?;
+                let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
+                    .map_err(|e| NdnError::Internal(format!("Failed to parse SimpleChunkList: {}", e)))?;
+                let mut offset = 0;
+                for chunk_id in chunk_list {
+                    self.pull_chunk(chunk_id, None).await?;
+                }
+                return Ok(());
+            } else {
+                return Err(NdnError::Internal(format!("Unsupported content obj type: {}", content_obj_id.obj_type)));
+            }
+        }
+    }
+    
+    pub async fn pull_dir_imp(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject) -> NdnResult<()>{
+        //TODO: ndn_mgr需要有一个可信的，容器对象都存在的标签，来快速检查
+        for (sub_name,sub_item) in dir_obj.iter() {
+            let sub_item_type = sub_item.get_obj_type();
+            match sub_item_type.as_str() {
+                OBJ_TYPE_DIR => {
+                    let sub_item_obj = sub_item.get_obj()?;
+                    let sub_dir: DirObject = serde_json::from_value(sub_item_obj)
+                        .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
+                    Box::pin(self.pull_dir_imp(ndn_mgr_id,sub_dir)).await?;
+                }
+                OBJ_TYPE_FILE => {
+                    // placeholder for file handling
+                    let sub_item_obj = sub_item.get_obj()?;
+                    let sub_file: FileObject = serde_json::from_value(sub_item_obj)
+                        .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
+                    self.pull_file_imp(sub_file).await?;
+                }
+                _ => {
+                    warn!("pull_dir: unknown sub item type:{}",sub_item_type);
+                    continue;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn remote_is_better(&self,url:&str,local_path:&PathBuf) -> NdnResult<bool> {

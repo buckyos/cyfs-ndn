@@ -1,5 +1,6 @@
+use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify};
 use serde_json::Value;
-use crate::{build_named_object_by_json, build_named_object_by_jwt, object::ObjId, NdnResult, OBJ_TYPE_OBJMAP_SIMPLE};
+use crate::{build_named_object_by_json, build_named_object_by_jwt, object::ObjId, NdnError, NdnResult, OBJ_TYPE_OBJMAP_SIMPLE};
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
@@ -18,6 +19,18 @@ impl SimpleMapItem {
             SimpleMapItem::Object(obj_type, _) => obj_type.clone(),
             SimpleMapItem::ObjId(obj_id) => obj_id.obj_type.clone(),
             SimpleMapItem::ObjectJwt(obj_type, _) => obj_type.clone(),
+        }
+    }
+
+    pub fn get_obj(&self) -> NdnResult<Value> {
+        match self {
+            SimpleMapItem::Object(_, obj_value) => Ok(obj_value.clone()),
+            SimpleMapItem::ObjId(_) => Err(NdnError::InvalidParam("ObjId is not a object".to_string())),
+            SimpleMapItem::ObjectJwt(_, obj_value) => {
+                let result = decode_jwt_claim_without_verify(obj_value.as_str())
+                    .map_err(|e| NdnError::InvalidParam(format!("decode jwt failed:{}", e.to_string())))?;
+                return Ok(result);
+            }
         }
     }
 }

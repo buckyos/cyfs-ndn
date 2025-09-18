@@ -2031,7 +2031,7 @@ async fn init_ndn_server(ndn_mgr_id: &str) -> (NdnClient, NdnServerHost) {
         .expect("create temp dir failed.");
 
     let config = NamedDataMgrConfig {
-        local_stores: vec![temp_dir.to_str().unwrap().to_string()],
+        local_store:temp_dir.to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };

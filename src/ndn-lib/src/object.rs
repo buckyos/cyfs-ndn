@@ -309,6 +309,15 @@ pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bo
     return true;
 }
 
+pub fn verify_named_object_from_str(obj_id: &ObjId, obj_str: &str) -> NdnResult<serde_json::Value> {
+    let obj_json = serde_json::from_str(obj_str)
+        .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
+    if !verify_named_object(obj_id, &obj_json)  {
+        return Err(NdnError::InvalidId(format!("verify named object failed:{}",obj_str)));
+    }
+    Ok(obj_json)
+}
+
 pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<bool> {
     let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
         .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;

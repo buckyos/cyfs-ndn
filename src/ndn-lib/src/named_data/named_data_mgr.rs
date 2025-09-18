@@ -232,6 +232,8 @@ impl NamedDataMgr {
         Ok((obj_id, path_obj_jwt, relative_path))
     }
 
+    
+
     pub async fn select_obj_id_by_path(
         mgr_id: Option<&str>,
         path: &str,
