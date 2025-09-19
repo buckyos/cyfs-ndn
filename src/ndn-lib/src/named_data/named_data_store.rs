@@ -10,6 +10,7 @@ use name_lib::EncodedDocument;
 use rusqlite::types::{FromSql, ToSql, ValueRef};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde_json::json;
+use std::ops::Range;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, io::SeekFrom};
@@ -159,7 +160,7 @@ impl NamedDataStore {
         match link_data {
             LinkData::SameAs(link_obj_id) => {
                 let real_chunk = ChunkId::from_obj_id(&link_obj_id);
-                let real_chunk_item = self.named_db.get_chunk(&real_chunk).await;
+                let real_chunk_item = self.named_db.get_chunk_item(&real_chunk).await;
                 if real_chunk_item.is_ok() {
                     let real_chunk_item = real_chunk_item.unwrap();
                     return Ok(real_chunk_item);
@@ -188,7 +189,7 @@ impl NamedDataStore {
     }
 
     async fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
-        let chunk_item = self.named_db.get_chunk(chunk_id).await;
+        let chunk_item = self.named_db.get_chunk_item(chunk_id).await;
         if chunk_item.is_ok() {
             return Ok(chunk_item.unwrap());
         }
@@ -213,8 +214,8 @@ impl NamedDataStore {
         chunk_id: &ChunkId,
         is_auto_add: Option<bool>,
     ) -> NdnResult<(bool, u64)> {
-        let chunk_state = self.query_chunk_by_id(chunk_id).await?;
-        let (chunk_state, chunk_size) = chunk_state;
+        let chunk_state = self.query_chunkstate_by_id(chunk_id).await?;
+        let (chunk_state, chunk_size,_progress) = chunk_state;
         match chunk_state {
             ChunkState::Completed => Ok((true, chunk_size)),
             ChunkState::Link(link_data) => {
@@ -229,28 +230,11 @@ impl NamedDataStore {
         }
     }
 
-    pub async fn query_chunk_state(
-        &self,
-        chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkState, u64, String)> {
-        let chunk_item_result = self.named_db.get_chunk(chunk_id).await;
+    pub async fn query_chunkstate_by_id(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkState, u64,String)> {
+        let chunk_item_result = self.named_db.get_chunk_item(chunk_id).await;
         if chunk_item_result.is_ok() {
             let chunk_item = chunk_item_result.unwrap();
-            return Ok((
-                chunk_item.chunk_state,
-                chunk_item.chunk_size,
-                chunk_item.progress,
-            ));
-        } else {
-            return Ok((ChunkState::NotExist, 0, "".to_string()));
-        }
-    }
-
-    pub async fn query_chunk_by_id(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkState, u64)> {
-        let chunk_item_result = self.named_db.get_chunk(chunk_id).await;
-        if chunk_item_result.is_ok() {
-            let chunk_item = chunk_item_result.unwrap();
-            return Ok((chunk_item.chunk_state, chunk_item.chunk_size));
+            return Ok((chunk_item.chunk_state, chunk_item.chunk_size, chunk_item.progress));
         }
 
         let link_obj_result = self.named_db.get_object_link(&chunk_id.to_obj_id()).await;
@@ -260,55 +244,76 @@ impl NamedDataStore {
             let obj_link2 = obj_link.clone();
             match obj_link {
                 LinkData::SameAs(link_obj_id) => {
-                    return Ok((ChunkState::Link(obj_link2), 0));
+                    return Ok((ChunkState::Link(obj_link2), 0, "".to_string()));
                 }
                 LinkData::PartOf(link_obj_id, range) => {
-                    return Ok((ChunkState::Link(obj_link2), range.end - range.start));
+                    return Ok((ChunkState::Link(obj_link2), range.end - range.start, "".to_string()));
                 }
-                LinkData::LocalFile(file_path,file_size) => {
-                    return Ok((ChunkState::Link(obj_link2), file_size));
+                LinkData::LocalFile(file_path,range) => {
+                    return Ok((ChunkState::Link(obj_link2), range.end - range.start, "".to_string()));
                 }
             }
         }
 
-        return Ok((ChunkState::NotExist, 0));
+        return Ok((ChunkState::NotExist, 0, "".to_string()));
     }
 
-    //查询多个chunk的状态
-    pub async fn query_chunk_state_by_list(
-        &self,
-        chunk_list: &mut Vec<ChunkItem>,
-    ) -> NdnResult<()> {
-        unimplemented!()
-    }
 
     pub async fn open_chunk_reader(
         &self,
         chunk_id: &ChunkId,
-        offset: SeekFrom,
+        offset: u64,
     ) -> NdnResult<(ChunkReader, u64)> {
-        let chunk_item = self.get_chunk_item(chunk_id).await?;
-        if chunk_item.chunk_state != ChunkState::Completed {
-            return Err(NdnError::InComplete(format!(
-                "chunk not completed! {}",
-                chunk_id.to_string()
-            )));
+        let (chunk_state, chunk_size,_progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        let chunk_real_path;
+        let chunk_range:Range<u64>;
+        match chunk_state {
+            ChunkState::Completed => {
+                chunk_real_path = self.get_chunk_path(chunk_id);
+                chunk_range = Range{start:0,end:chunk_size};
+            }
+            ChunkState::Link(link_data) => {
+                match link_data {
+                    LinkData::SameAs(link_obj_id) => {
+                        let link_chunk_id = ChunkId::from_obj_id(&link_obj_id);
+                        return Box::pin(self.open_chunk_reader(&link_chunk_id, offset)).await;
+                    }
+                    LinkData::PartOf(link_obj_id,range) => {
+                        return Err(NdnError::Internal(("not supported".to_string())));
+                    }
+                    LinkData::LocalFile(file_path,range) => {
+                        chunk_real_path = file_path;
+                        chunk_range = range;
+                    }
+                }
+            }
+            _ => {
+                return Err(NdnError::InComplete(format!(
+                    "chunk {} state not support open reader! state:{}",
+                    chunk_id.to_string(),
+                    chunk_state.to_str()
+                )));
+            }
         }
-        let real_chunk_id = chunk_item.chunk_id;
-        let chunk_size = chunk_item.chunk_size;
 
-        let chunk_path = self.get_chunk_path(&real_chunk_id);
         let mut file = OpenOptions::new()
             .read(true) // 设置只读模式
-            .open(&chunk_path)
+            .open(&chunk_real_path)
             .await
             .map_err(|e| {
                 warn!("open_chunk_reader: open file failed! {}", e.to_string());
                 NdnError::IoError(e.to_string())
             })?;
+        
+        if chunk_range.start != 0 {
+            file.seek(SeekFrom::Start(chunk_range.start)).await.map_err(|e| {
+                warn!("open_chunk_reader: seek file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+        }
 
-        if offset != SeekFrom::Start(0) {
-            file.seek(offset).await.map_err(|e| {
+        if offset > 0 {
+            file.seek(SeekFrom::Current(offset as i64)).await.map_err(|e| {
                 warn!("open_chunk_reader: seek file failed! {}", e.to_string());
                 NdnError::IoError(e.to_string())
             })?;
@@ -324,21 +329,16 @@ impl NamedDataStore {
         chunk_size: u64,
         offset: u64,
     ) -> NdnResult<(ChunkWriter, String)> {
-        let chunk_item = self.named_db.get_chunk(chunk_id).await;
+        let (chunk_state, chunk_size,progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        if !chunk_state.can_open_writer() {
+            return Err(NdnError::Internal(format!(
+                "chunk {} state not support open writer! {}",
+                chunk_id.to_string(),chunk_state.to_str()
+            )));
+        }
+        //let chunk_item = self.named_db.get_chunk_item(chunk_id).await;
         let chunk_path = self.get_chunk_path(chunk_id);
-        if chunk_item.is_ok() {
-            let chunk_item = chunk_item.unwrap();
-            if chunk_item.chunk_state == ChunkState::Completed {
-                warn!(
-                    "open_chunk_writer: chunk completed! {} cannot write!",
-                    chunk_id.to_string()
-                );
-                return Err(NdnError::AlreadyExists(format!(
-                    "chunk completed! {} cannot write!",
-                    chunk_id.to_string()
-                )));
-            }
-
+        if chunk_state == ChunkState::Incompleted {
             let file_meta = fs::metadata(&chunk_path).await.map_err(|e| {
                 warn!("open_chunk_writer: get metadata failed! {}", e.to_string());
                 NdnError::IoError(e.to_string())
@@ -373,14 +373,14 @@ impl NamedDataStore {
                     })?;
                 }
 
-                if chunk_item.progress.len() < 2 {
+                if progress.len() < 2 {
                     let progress = json!({
                         "pos":file_meta.len(),
                     })
                     .to_string();
                     return Ok((Box::pin(file), progress));
                 }
-                return Ok((Box::pin(file), chunk_item.progress));
+                return Ok((Box::pin(file), progress));
             } else {
                 warn!(
                     "open_chunk_writer: offset too large! {}",
@@ -426,11 +426,11 @@ impl NamedDataStore {
         chunk_id: &ChunkId,
         chunk_size: u64,
     ) -> NdnResult<ChunkWriter> {
-        let chunk_item = self.named_db.get_chunk(chunk_id).await;
-        if chunk_item.is_ok() {
-            return Err(NdnError::AlreadyExists(format!(
-                "chunk already exists! {}",
-                chunk_id.to_string()
+        let (chunk_state, chunk_size,progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        if !chunk_state.can_open_new_writer() {
+            return Err(NdnError::Internal(format!(
+                "chunk {} state not support open new writer! {}",
+                chunk_id.to_string(),chunk_state.to_str()
             )));
         }
         let chunk_path = self.get_chunk_path(&chunk_id);
@@ -477,7 +477,7 @@ impl NamedDataStore {
 
     //writer已经写入完成，此时可以进行一次可选的hash校验
     pub async fn complete_chunk_writer(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        let mut chunk_item = self.named_db.get_chunk(chunk_id).await;
+        let mut chunk_item = self.named_db.get_chunk_item(chunk_id).await;
         if chunk_item.is_err() {
             return Err(NdnError::NotFound(format!(
                 "chunk not found! {}",
@@ -515,7 +515,7 @@ impl NamedDataStore {
     //针对小于1MB的 chunk,推荐直接返回内存
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
         let (mut chunk_reader, chunk_size) =
-            self.open_chunk_reader(chunk_id, SeekFrom::Start(0)).await?;
+            self.open_chunk_reader(chunk_id, 0).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         chunk_reader.read_to_end(&mut buffer).await.map_err(|e| {
             warn!("get_chunk_data: read file failed! {}", e.to_string());
@@ -527,10 +527,10 @@ impl NamedDataStore {
     pub async fn get_chunk_piece(
         &self,
         chunk_id: &ChunkId,
-        offset: SeekFrom,
+        offset: u64,
         piece_size: u32,
     ) -> NdnResult<Vec<u8>> {
-        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, offset).await?;
+        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, 0).await?;
         let mut buffer = vec![0u8; piece_size as usize];
         reader.read_exact(&mut buffer).await.map_err(|e| {
             warn!("get_chunk_piece: read file failed! {}", e.to_string());
@@ -539,14 +539,6 @@ impl NamedDataStore {
         Ok(buffer)
     }
 
-    //一口气写入一组chunk(通常是小chunk)
-    pub async fn put_chunklist(
-        &self,
-        chunk_list: HashMap<ChunkId, Vec<u8>>,
-        need_verify: bool,
-    ) -> NdnResult<()> {
-        unimplemented!()
-    }
     //写入一个在内存中的完整的chunk
     pub async fn put_chunk(
         &self,

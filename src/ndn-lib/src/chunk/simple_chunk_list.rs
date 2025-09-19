@@ -134,7 +134,7 @@ impl SimpleChunkListReader {
     ) -> std::io::Result<ChunkReader> {
         let mut mgr = named_data_mgr.lock().await;
         let (reader, _) = mgr
-            .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(offset), auto_cache)
+            .open_chunk_reader_impl(&chunk_id, offset, auto_cache)
             .await
             .map_err(|e| {
                 warn!(

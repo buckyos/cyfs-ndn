@@ -1,4 +1,5 @@
 use crate::{ObjId, ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, PackedObjItem, SimpleChunkList, CHUNK_NORMAL_SIZE};
+use std::ops::Range;
 use std::path::Path;
 use std::collections::HashMap;
 use tokio::fs;
@@ -52,7 +53,9 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
 
         let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await.unwrap();
         if !is_exist {
-            ndn_mgr.link_chunk_to_local_impl(&chunk_id, &local_file_path).await?;
+            //TODO: link时需要指定Range
+            let range = Range{start:read_pos,end:read_pos + chunk_size};
+            ndn_mgr.link_chunk_to_local_impl(&chunk_id, &local_file_path,range).await?;
         } 
         if is_use_chunklist {
             chunk_list.append_chunk(chunk_id.clone())?;

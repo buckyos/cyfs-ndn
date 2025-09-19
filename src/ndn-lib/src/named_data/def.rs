@@ -48,6 +48,22 @@ impl ChunkState {
             ChunkState::Link(link_data) => link_data.to_string(),
         }
     }
+
+    pub fn can_open_writer(&self) -> bool {
+        match self {
+            ChunkState::Incompleted => true,
+            ChunkState::New => true,
+            ChunkState::NotExist => true,
+            _ => false,
+        }
+    }
+
+    pub fn can_open_new_writer(&self) -> bool {
+        match self {
+            ChunkState::New => true,
+            _ => false,
+        }
+    }
 }
 
 impl ToSql for ChunkState {

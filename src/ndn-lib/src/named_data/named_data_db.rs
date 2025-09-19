@@ -118,7 +118,7 @@ impl NamedDataDb {
         Ok(())
     }
 
-    pub async fn get_chunk(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
+    pub async fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
         let conn = self.conn.lock().await;
         let mut stmt = conn
             .prepare("SELECT * FROM chunk_items WHERE chunk_id = ?1")

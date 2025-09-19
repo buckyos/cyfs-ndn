@@ -19,6 +19,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::io as std_io;
 use std::io::SeekFrom;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::{path::PathBuf, path::Path,pin::Pin};
@@ -327,7 +328,7 @@ impl NamedDataMgr {
         path: &str,
         user_id: &str,
         app_id: &str,
-        seek_from: SeekFrom,
+        offset: u64,
     ) -> NdnResult<(ChunkReader, u64, ChunkId)> {
         let obj_id = self.db.get_path_target_objid(path)?;
 
@@ -345,7 +346,7 @@ impl NamedDataMgr {
 
         let chunk_id = ChunkId::from_obj_id(&obj_id.0);
         let (chunk_reader, chunk_size) = self
-            .open_chunk_reader_impl(&chunk_id, seek_from, true)
+            .open_chunk_reader_impl(&chunk_id, offset, true)
             .await?;
         //let access_time = buckyos_get_unix_timestamp();
         //self.db.update_obj_access_time(&obj_id.0, access_time)?;
@@ -357,7 +358,7 @@ impl NamedDataMgr {
         path: &str,
         user_id: &str,
         app_id: &str,
-        seek_from: SeekFrom,
+        offset: u64,
     ) -> NdnResult<(ChunkReader, u64, ChunkId)> {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
         if named_mgr.is_none() {
@@ -366,7 +367,7 @@ impl NamedDataMgr {
         let named_mgr = named_mgr.unwrap();
         let named_mgr = named_mgr.lock().await;
         named_mgr
-            .get_chunk_reader_by_path_impl(path, user_id, app_id, seek_from)
+            .get_chunk_reader_by_path_impl(path, user_id, app_id, offset)
             .await
     }
 
@@ -505,12 +506,7 @@ impl NamedDataMgr {
         &self,
         chunk_id: &ChunkId,
     ) -> NdnResult<(ChunkState, u64, String)> {
-        let (chunk_state, chunk_size, progress) = self.local_store.query_chunk_state(chunk_id).await?;
-        if chunk_state != ChunkState::NotExist {
-            return Ok((chunk_state, chunk_size, progress));
-        }
-        
-        Ok((ChunkState::NotExist, 0, "".to_string()))
+        self.local_store.query_chunkstate_by_id(chunk_id).await
     }
 
     pub async fn query_chunk_state(
@@ -526,13 +522,13 @@ impl NamedDataMgr {
         named_mgr.query_chunk_state_impl(chunk_id).await
     }
 
-    pub async fn link_chunk_to_local_impl(&self, chunk_id: &ChunkId, local_file_path: &Path) -> NdnResult<()> {
+    pub async fn link_chunk_to_local_impl(&self, chunk_id: &ChunkId, local_file_path: &Path,range:Range<u64>) -> NdnResult<()> {
         let file_meta = local_file_path.metadata().map_err(|e| {
             warn!("link_chunk_to_local: get file metadata failed! {}", e.to_string());
             NdnError::IoError(e.to_string())
         })?;
         let file_size = file_meta.len();
-        let link_data = LinkData::LocalFile(local_file_path.to_string_lossy().to_string(),file_size);
+        let link_data = LinkData::LocalFile(local_file_path.to_string_lossy().to_string(),range);
         let obj_id = chunk_id.to_obj_id();
         self.local_store.link(&obj_id, &link_data).await?;
         Ok(())
@@ -541,7 +537,7 @@ impl NamedDataMgr {
     pub async fn open_chunk_reader_impl(
         &self,
         chunk_id: &ChunkId,
-        seek_from: SeekFrom,
+        offset: u64,
         auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
         // memroy cache ==> local disk cache ==> local store
@@ -558,8 +554,8 @@ impl NamedDataMgr {
             if file.is_ok() {
                 let mut file = file.unwrap();
                 let file_meta = file.metadata().await.unwrap();
-                if seek_from != SeekFrom::Start(0) {
-                    file.seek(seek_from).await.map_err(|e| {
+                if offset > 0 {
+                    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
                         warn!(
                             "get_chunk_reader: seek cache file failed! {}",
                             e.to_string()
@@ -572,10 +568,10 @@ impl NamedDataMgr {
             }
         }
 
-        debug!("get_chunk_reader: CACHE MISS :{}", chunk_id.to_string());
+        //debug!("get_chunk_reader: CACHE MISS :{}", chunk_id.to_string());
         if self.local_cache.is_some() {
             let local_cache = self.local_cache.as_ref().unwrap();
-            let local_reader = local_cache.open_chunk_reader(chunk_id, seek_from).await;
+            let local_reader = local_cache.open_chunk_reader(chunk_id, offset).await;
             if local_reader.is_ok() {
                 info!(
                     "get_chunk_reader:return local cache file:{}",
@@ -583,18 +579,18 @@ impl NamedDataMgr {
                 );
                 return local_reader;
             }
+            debug!("get_chunk_reader: no cache file:{}", chunk_id.to_string());
         }
 
-        debug!("get_chunk_reader: no cache file:{}", chunk_id.to_string());
-        let local_reader = self.local_store.open_chunk_reader(chunk_id, seek_from).await?;
-
+      
+        let local_reader = self.local_store.open_chunk_reader(chunk_id, offset).await?;
         return Ok(local_reader);
     }
 
     pub async fn open_chunk_reader(
         mgr_id: Option<&str>,
         chunk_id: &ChunkId,
-        seek_from: SeekFrom,
+        offset: u64,
         auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
@@ -607,7 +603,7 @@ impl NamedDataMgr {
         let named_mgr = named_mgr.unwrap();
         let named_mgr = named_mgr.lock().await;
         named_mgr
-            .open_chunk_reader_impl(chunk_id, seek_from, auto_cache)
+            .open_chunk_reader_impl(chunk_id, offset, auto_cache)
             .await
     }
 
