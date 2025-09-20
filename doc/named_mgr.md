@@ -103,6 +103,7 @@ get_chunk_reader_by_url (支持chunklist?)
 
 - pull_chunk（list) 从远端同步一个chunk到ndn-client绑定的named_mgr
 如果pull的时候，不需要保存在Named_mgr中，则直接下载到local file(会失去进度保存能力和多线程能力）
+   用户需要pull完成后手工添加local link才会让link生效
 如果pull的时候，named_mgr中chunk已经存在，则直接将chunk复制到local file
 如果pull的时候，同时需要保存在named_mgr和local file中，则先下载到named_mgr中，再复制到local file(由于有chunklist，这对大文件还是比较友好的)
 如果pull的时候，需要保存在named_mgr中，且已经有已知的local file,会先尝试从local file中copy,再复制

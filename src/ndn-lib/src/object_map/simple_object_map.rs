@@ -33,6 +33,20 @@ impl SimpleMapItem {
             }
         }
     }
+
+    pub fn get_obj_id(&self) -> NdnResult<(ObjId,String)> {
+        match self {
+            SimpleMapItem::ObjId(obj_id) => Ok((obj_id.clone(),"".to_string())),
+            SimpleMapItem::Object(obj_type, obj_value) => {
+                let (obj_id, obj_str) = build_named_object_by_json(obj_type, obj_value);
+                Ok((obj_id, obj_str))
+            },
+            SimpleMapItem::ObjectJwt(obj_type, obj_value) => {
+                let (obj_id, obj_str) = build_named_object_by_jwt(obj_type, obj_value)?;
+                Ok((obj_id, obj_str))
+            }
+        }
+    }
 }
 
 impl Serialize for SimpleMapItem {
