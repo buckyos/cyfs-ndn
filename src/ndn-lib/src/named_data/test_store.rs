@@ -41,7 +41,7 @@ async fn test_put_and_get_chunk() -> NdnResult<()> {
     assert_eq!(size, data.len() as u64);
 
     let (mut reader, chunk_size) = store
-        .open_chunk_reader(&chunk_id, SeekFrom::Start(0))
+        .open_chunk_reader(&chunk_id, 0)
         .await?;
     let mut buffer = vec![0u8; data.len()];
     reader.read_exact(&mut buffer).await.unwrap();
@@ -110,7 +110,7 @@ async fn test_open_chunk_writer() -> NdnResult<()> {
     assert_eq!(size, data.len() as u64);
 
     let (mut reader, chunk_size) = store
-        .open_chunk_reader(&chunk_id, SeekFrom::Start(0))
+        .open_chunk_reader(&chunk_id, 0)
         .await?;
     let mut buffer = vec![0u8; data.len()];
     reader.read_exact(&mut buffer).await.unwrap();

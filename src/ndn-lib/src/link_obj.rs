@@ -42,7 +42,7 @@ impl LinkData {
             }
             LinkData::LocalFile(file_path,range) =>  {
                 let range_str = format!("{}..{}",range.start,range.end);
-                format!("file->{}@{}",file_path,range_str)
+                format!("file->{}@{}",range_str,file_path)
             }
         
         }
@@ -82,7 +82,7 @@ impl LinkData {
                 }
                 let start = range[0].parse::<u64>().unwrap();
                 let end = range[1].parse::<u64>().unwrap();
-                Ok(LinkData::LocalFile(parts[0].to_string(),Range{start,end}))
+                Ok(LinkData::LocalFile(parts[1].to_string(),Range{start,end}))
             }
             _ => Err(NdnError::InvalidLink(format!("invalid link type:{}",link_type))),
         }

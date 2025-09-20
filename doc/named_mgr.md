@@ -88,7 +88,8 @@ pathObject (可验证内容创建者的path)
 通过qcid加快cacl local dir的方法
   对本地文件计算qcid,如果
 
-在本地的2个named_mgr之间同步数据？ （tools.rs)
+在本地的2个named_mgr之间同步数据 （tools.rs)
+  
   等backup lib处理disk 2 disk的备份时添加
 
 

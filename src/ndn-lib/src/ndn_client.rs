@@ -42,6 +42,16 @@ impl PullMode {
         }
     }
 
+    pub fn gen_sub_pull_mode(&self,sub_item_name:&String)->Self {
+        match self {
+            PullMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
+                PullMode::LocalFile(local_path.clone().join(sub_item_name), 
+                0..0, *need_pull_to_named_mgr)
+            }
+            _ => self.clone(),
+        }
+    }
+
     pub fn need_pull_to_named_mgr(&self) -> bool {
         match self {
             PullMode::LocalFile(_,_,need_pull_to_named_mgr) => *need_pull_to_named_mgr,
@@ -641,6 +651,7 @@ impl NdnClient {
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::new(file_obj.content.as_str())?;
             self.pull_chunk(chunk_id, PullMode::default()).await?;
+            //TODO: add link to local file?
             return Ok(());
         } else {
             if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
@@ -662,6 +673,8 @@ impl NdnClient {
                     let sub_item_obj = self.get_obj_by_id(sub_item_obj_id).await?;
                     let sub_dir: DirObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
+                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name));
+                    
                     Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone())).await?;
                 }
                 OBJ_TYPE_FILE => {
@@ -672,6 +685,7 @@ impl NdnClient {
                     let sub_file: FileObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
                     NamedDataMgr::put_object(ndn_mgr_id, &sub_item_obj_id, &sub_item_obj_str).await?;
+                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
                     self.pull_file(sub_file,pull_mode.clone()).await?;
                 }
                 _ => {

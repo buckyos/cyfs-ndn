@@ -40,7 +40,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
 
     // Read and verify chunk
     let (mut reader, size) = chunk_mgr
-        .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(0), true)
+        .open_chunk_reader_impl(&chunk_id, 0, true)
         .await
         .unwrap();
     assert_eq!(size, test_data.len() as u64);
@@ -102,7 +102,7 @@ async fn test_base_operations() -> NdnResult<()> {
             test_path.as_str(),
             "test_user",
             "test_app",
-            SeekFrom::Start(0),
+            0,
         )
         .await?;
 
@@ -146,7 +146,7 @@ async fn test_base_operations() -> NdnResult<()> {
             test_path.as_str(),
             "test_user",
             "test_app",
-            SeekFrom::Start(0),
+            0,
         )
         .await;
     assert!(result.is_err());
@@ -188,7 +188,7 @@ async fn test_get_chunk_mgr_by_id() -> NdnResult<()> {
     {
         let chunk_mgr = chunk_mgr.lock().await;
         let (mut reader, size) = chunk_mgr
-            .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(0), true)
+            .open_chunk_reader_impl(&chunk_id, 0, true)
             .await?;
         assert_eq!(size, test_data.len() as u64);
         drop(chunk_mgr);

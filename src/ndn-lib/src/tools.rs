@@ -51,7 +51,7 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
             chunk_size
         );
 
-        let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await.unwrap();
+        let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await?;
         if !is_exist {
             //TODO: link时需要指定Range
             let range = Range{start:read_pos,end:read_pos + chunk_size};
