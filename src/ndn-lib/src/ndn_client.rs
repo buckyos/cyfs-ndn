@@ -673,7 +673,7 @@ impl NdnClient {
                     let sub_item_obj = self.get_obj_by_id(sub_item_obj_id).await?;
                     let sub_dir: DirObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
-                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name));
+                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
                     
                     Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone())).await?;
                 }
