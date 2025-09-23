@@ -3,12 +3,14 @@ use buckyos_kit::get_relative_path;
 use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, DID};
 use name_client::resolve_auth_key;
 use tokio::io::{AsyncRead,AsyncWrite,AsyncWriteExt,AsyncReadExt,AsyncSeekExt};
+use tokio::sync::Mutex;
 use url::Url;
 use log::*;
 use reqwest::{Body, Client, StatusCode};
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs::OpenOptions;
 use tokio_util::io::StreamReader;
 use futures_util::StreamExt;
@@ -20,6 +22,14 @@ use futures::future::BoxFuture;
 use rand::RngCore;
 
 use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, verify_named_object_from_str, CYFSHttpRespHeaders, ChunkState, ChunkWriter, DirObject, FileObject, HashMethod, PathObject, ProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+pub enum PullAction {
+    PullFileOK(u64),
+    PullChunkOK(u64),
+    Skip(u64),
+}
+// PullProgressCallback(inner_path, action), return true if continue, false if stop
+pub type PullProgressCallback = Box<dyn FnMut(String, PullAction) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'static>> + Send>;
+
 
 #[derive(Clone,Debug,PartialEq)]
 pub enum PullMode {
@@ -646,7 +656,7 @@ impl NdnClient {
     // }
 
 
-    pub async fn pull_file(&self,file_obj:FileObject,pull_mode:PullMode) -> NdnResult<()>{
+    pub async fn pull_file(&self,file_obj:FileObject,pull_mode:PullMode,mut progress_callback: Option<Arc<Mutex<PullProgressCallback>>>) -> NdnResult<()>{
         let content_obj_id = ObjId::new(file_obj.content.as_str())?;
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::new(file_obj.content.as_str())?;
@@ -655,15 +665,21 @@ impl NdnClient {
             return Ok(());
         } else {
             if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
-                self.pull_chunklist(&content_obj_id, pull_mode).await?;
+                self.pull_chunklist(&content_obj_id, pull_mode,progress_callback).await?;
                 return Ok(());
             } else {
                 return Err(NdnError::Internal(format!("Unsupported content obj type: {}", content_obj_id.obj_type)));
             }
         }
     }
+
+    //准备dir_object,并列出所有需要下载的chunk
+    pub async fn prepare_dir_object(&self,dir_obj:&ObjId,last_dir_obj:Option<ObjId>) -> NdnResult<()>{
+        unimplemented!()
+    }
     
-    pub async fn pull_dir(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject,pull_mode:PullMode) -> NdnResult<()>{
+    pub async fn pull_dir(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject,
+        pull_mode:PullMode, progress_callback: Option<Arc<Mutex<PullProgressCallback>>>) -> NdnResult<()>{
         //TODO: ndn_mgr需要有一个可信的，容器对象都存在的标签，来快速检查
         for (sub_name,sub_item) in dir_obj.iter() {
             let sub_item_type = sub_item.get_obj_type();
@@ -675,7 +691,7 @@ impl NdnClient {
                         .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
                     let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
                     
-                    Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone())).await?;
+                    Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone(),progress_callback.clone())).await?;
                 }
                 OBJ_TYPE_FILE => {
                     // placeholder for file handling
@@ -684,15 +700,27 @@ impl NdnClient {
                 
                     let sub_file: FileObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
+                    let sub_file_size = sub_file.size;
                     NamedDataMgr::put_object(ndn_mgr_id, &sub_item_obj_id, &sub_item_obj_str).await?;
+                    
                     let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
-                    self.pull_file(sub_file,pull_mode.clone()).await?;
+                    self.pull_file(sub_file,pull_mode.clone(),progress_callback.clone()).await?;
+                    if let Some(progress_callback) = progress_callback.clone() {
+                        let mut progress_callback = progress_callback.lock().await;
+                        let is_continue = progress_callback(sub_name.clone(), PullAction::PullFileOK(sub_file_size)).await?;
+                        if !is_continue {
+                            info!("pull_dir: stopped by progress callback");
+                            return Ok(());
+                        }
+                    }
+                    
                 }
                 _ => {
                     warn!("pull_dir: unknown sub item type:{}",sub_item_type);
                     continue;
                 }
             }
+
         }
         Ok(())
     }
@@ -707,7 +735,7 @@ impl NdnClient {
             .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
         let file_obj_size = file_obj.size;
 
-        self.pull_file(file_obj.clone(), PullMode::LocalFile(local_path.clone(), 0..file_obj_size, false)).await?;
+        self.pull_file(file_obj.clone(), PullMode::LocalFile(local_path.clone(), 0..file_obj_size, false), None).await?;
 
         let local_file_obj_path = local_path.with_extension("fileobj");
             //dump file_obj to local_file_obj_path
@@ -774,7 +802,7 @@ impl NdnClient {
         Ok(file_chunk_id != content_chunk_id)
     }
 
-    pub async fn pull_chunklist(&self, chunk_list_id:&ObjId,pull_mode:PullMode)->NdnResult<u64>{
+    pub async fn pull_chunklist(&self, chunk_list_id:&ObjId,pull_mode:PullMode,mut progress_callback: Option<Arc<Mutex<PullProgressCallback>>>)->NdnResult<u64>{
         //在chunklist下载中，允许使用多源
         let chunk_list_obj_data = self.get_obj_by_id(chunk_list_id.clone()).await?;
         let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
@@ -963,6 +991,7 @@ impl NdnClient {
         }
     }
 
+    
     
     //async fn open_chunk_writer_by_url(&self,chunk_url:String,open_mode:ChunkWriterOpenMode)->NdnResult<(ChunkWriter,Option<ChunkHasher>)> {
     //    unimplemented!()
