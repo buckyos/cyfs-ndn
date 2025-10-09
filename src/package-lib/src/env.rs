@@ -473,7 +473,7 @@ impl PackageEnv {
                 //TODO:ndn client要支持 1个zone内地址(none) ，2个zone外地址（发布者+传播者) 的多源模式
                 let zone_ndn_url = "http://127.0.0.1/ndn/";
                 let ndn_client = NdnClient::new(zone_ndn_url.to_string(),None,self.config.named_mgr_name.clone());
-                let chunk_size = ndn_client.pull_chunk(chunk_id.clone(),None).await
+                let chunk_size = ndn_client.pull_chunk(chunk_id.clone(),PullMode::StoreInNamedMgr).await
                     .map_err(|e| PkgError::DownloadError(
                         pkg_id.clone(),
                         format!("Failed to download chunk: {}", e),
@@ -482,7 +482,7 @@ impl PackageEnv {
             }
 
             let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader(self.config.named_mgr_name.as_deref(),
-                &chunk_id,SeekFrom::Start(0),false).await
+                &chunk_id,0,false).await
                 .map_err(|e| PkgError::LoadError(
                     pkg_id.clone(),
                     format!("Failed to open chunk reader: {}", e),
