@@ -1,6 +1,6 @@
 use crate::{
     build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState,
-    FileObject, NamedDataStore, NdnError, NdnResult, PathObject,
+    FileObject, NdnError, NdnResult, PathObject, LinkData, ObjectLink,
 };
 use buckyos_kit::get_buckyos_named_data_dir;
 use buckyos_kit::{
@@ -12,7 +12,7 @@ use lazy_static::lazy_static;
 use log::*;
 use memmap::Mmap;
 use name_lib::decode_jwt_claim_without_verify;
-use rusqlite::Connection;
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -29,6 +29,13 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::io::StreamReader;
 
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId};
+use super::def::{ChunkItem, ndn_get_time_now};
+
+pub struct LocalFileInfo {
+    pub qcid: String,
+    pub last_modify_time: u64,
+    pub content:String
+}
 
 impl From<NdnError> for std_io::Error {
     fn from(err: NdnError) -> Self {
@@ -46,29 +53,12 @@ impl NamedDataMgrDB {
             warn!("NamedDataMgrDB: open db failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
-
-        // Create tables if they don't exist
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS objs (
-                obj_id TEXT PRIMARY KEY,
-                ref_count INTEGER NOT NULL DEFAULT 0,
-                access_time INTEGER NOT NULL,
-                size INTEGER NOT NULL DEFAULT 0
-            )",
-            [],
-        )
-        .map_err(|e| {
-            warn!(
-                "NamedDataMgrDB: create objs table failed! {}",
-                e.to_string()
-            );
-            NdnError::DbError(e.to_string())
-        })?;
-
+        
         conn.execute(
             "CREATE TABLE IF NOT EXISTS paths (
                 path TEXT PRIMARY KEY,
                 obj_id TEXT NOT NULL,
+                obj_type TEXT NOT NULL,
                 path_obj_jwt TEXT,
                 app_id TEXT NOT NULL,
                 user_id TEXT NOT NULL
@@ -78,6 +68,102 @@ impl NamedDataMgrDB {
         .map_err(|e| {
             warn!(
                 "NamedDataMgrDB: create paths table failed! {}",
+                e.to_string()
+            );
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS path_metas (
+                path TEXT PRIMARY KEY,
+                meta_json TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: create local file info table failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS local_file_info (
+                local_file_path TEXT PRIMARY KEY,
+                qcid TEXT NOT NULL,
+                last_modify_time INTEGER NOT NULL,
+                content TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: create local file info table failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        // Create tables from NamedDataDb
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chunk_items (
+                chunk_id TEXT PRIMARY KEY,
+                chunk_size INTEGER NOT NULL, 
+                chunk_state TEXT NOT NULL,
+                progress TEXT,
+                description TEXT NOT NULL,
+                create_time INTEGER NOT NULL,
+                update_time INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!(
+                "NamedDataMgrDB: create table chunk_items failed! {}",
+                e.to_string()
+            );
+            NdnError::DbError(e.to_string())
+        })?;
+
+        //create ref_count update queue table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS obj_ref_update_queue (
+                obj_id TEXT PRIMARY KEY, 
+                ref_count INTEGER NOT NULL,
+                update_time INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: create table obj_ref_update_queue failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        // Create objects table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS objects (
+                obj_id TEXT PRIMARY KEY,
+                obj_type TEXT NOT NULL,
+                obj_data TEXT,
+                ref_count INTEGER NOT NULL,
+                create_time INTEGER NOT NULL,
+                last_access_time INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!(
+                "NamedDataMgrDB: create objects table failed! {}",
+                e.to_string()
+            );
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS object_links (
+                link_obj_id TEXT PRIMARY KEY,
+                obj_link TEXT NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!(
+                "NamedDataMgrDB: create table object_links failed! {}",
                 e.to_string()
             );
             NdnError::DbError(e.to_string())
@@ -97,11 +183,6 @@ impl NamedDataMgrDB {
             db_path,
             conn: Mutex::new(conn),
         })
-    }
-
-    // 路径规范化函数
-    pub fn normalize_path(path: &str) -> String {
-        path.replace("//", "/").trim_start_matches("./").to_string()
     }
 
     //return (result_path, obj_id,path_obj_jwt,relative_path)
@@ -173,26 +254,11 @@ impl NamedDataMgrDB {
         Ok((obj_id, path_obj_jwt))
     }
 
-    pub fn update_obj_access_time(&self, obj_id: &ObjId, access_time: u64) -> NdnResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE objs SET access_time = ?1 WHERE obj_id = ?2",
-            [&access_time.to_string(), &obj_id.to_string()],
-        )
-        .map_err(|e| {
-            warn!(
-                "NamedDataMgrDB: update obj access time failed! {}",
-                e.to_string()
-            );
-            NdnError::DbError(e.to_string())
-        })?;
-        Ok(())
-    }
-
     pub fn create_path(
         &self,
-        obj_id: &ObjId,
         path: &str,
+        obj_id: &ObjId,
+        obj_data:Option<&str>,
         app_id: &str,
         user_id: &str,
     ) -> NdnResult<()> {
@@ -203,7 +269,7 @@ impl NamedDataMgrDB {
         }
 
         let mut conn = self.conn.lock().unwrap();
-        let obj_id = obj_id.to_string();
+        let obj_id_str = obj_id.to_string();
         let tx = conn.transaction().map_err(|e| {
             warn!(
                 "NamedDataMgrDB: tx.transaction error, create path failed! {}",
@@ -212,18 +278,36 @@ impl NamedDataMgrDB {
             NdnError::DbError(e.to_string())
         })?;
 
+        // 检查父目录冲突
+        let conflict_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM paths WHERE obj_type = ?1 AND ?2 LIKE (path || '/%') AND path != ?2",
+            [crate::OBJ_TYPE_DIR, &path],
+            |row| row.get(0)
+        ).map_err(|e| {
+            warn!("NamedDataMgrDB: check parent dir conflict failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        
+        if conflict_count > 0 {
+            return Err(NdnError::AlreadyExists(
+                format!("Cannot set path {}: parent directory already exists", path)
+            ));
+        }
+
         tx.execute(
-            "INSERT INTO paths (path, obj_id, app_id, user_id) VALUES (?1, ?2, ?3, ?4)",
-            [&path, obj_id.as_str(), app_id, user_id],
+            "INSERT INTO paths (path, obj_id, obj_type, app_id, user_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            [&path, obj_id_str.as_str(), &obj_id.obj_type, app_id, user_id],
         )
         .map_err(|e| {
             warn!(
                 "NamedDataMgrDB: tx.execute error, create path failed! {:?}",
-                &e
+                &e  
             );
 
             NdnError::DbError(e.to_string())
         })?;
+
+        Self::update_obj_ref_count(&tx, obj_id, obj_data, 1)?;
 
         tx.commit().map_err(|e| {
             warn!(
@@ -235,14 +319,16 @@ impl NamedDataMgrDB {
         Ok(())
     }
 
+    //if new_obj_data is not None, will insert obj into objects table
     pub fn set_path(
         &self,
         path: &str,
         new_obj_id: &ObjId,
+        new_obj_data:Option<&str>,
         path_obj_str: String,
         app_id: &str,
         user_id: &str,
-    ) -> NdnResult<()> {
+    ) -> NdnResult<Option<ObjId>> {
         //如果不存在路径则创建，否则更新已经存在的路径指向的chunk
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| {
@@ -257,27 +343,54 @@ impl NamedDataMgrDB {
             });
 
         let obj_id_str = new_obj_id.to_string();
+        let mut old_obj_id = None;
 
         match existing_obj_id {
-            Ok(obj_id) => {
+            Ok(existing_obj_id) => {
                 // Path exists, update the obj_id
+                let the_old_obj_id = ObjId::new(&existing_obj_id)?;
+
                 tx.execute(
-                    "UPDATE paths SET obj_id = ?1, path_obj_jwt = ?2, app_id = ?3, user_id = ?4 WHERE path = ?5",
-                    [obj_id_str.as_str(), path_obj_str.as_str(), app_id, user_id, &path],
+                    "UPDATE paths SET obj_id = ?1, obj_type = ?2, path_obj_jwt = ?3, app_id = ?4, user_id = ?5 WHERE path = ?6",
+                    [obj_id_str.as_str(), &new_obj_id.obj_type, path_obj_str.as_str(), app_id, user_id, &path],
                 ).map_err(|e| {
                     warn!("NamedDataMgrDB: set path failed! {}", e.to_string());
                     NdnError::DbError(e.to_string())
                 })?;
+                Self::update_obj_ref_count(&tx, &the_old_obj_id, None, -1)?;
+                Self::update_obj_ref_count(&tx, new_obj_id, new_obj_data, 1)?;
+
+                old_obj_id = Some(the_old_obj_id);
             }
             Err(_) => {
                 // Path does not exist, create a new path
+
+                // 检查父目录冲突
+                let conflict_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM paths WHERE obj_type = ?1 AND ?2 LIKE (path || '/%') AND path != ?2",
+                        [crate::OBJ_TYPE_DIR, &path],
+                        |row| row.get(0)
+                    )
+                    .map_err(|e| {
+                        warn!("NamedDataMgrDB: check parent dir conflict failed! {}", e.to_string());
+                        NdnError::DbError(e.to_string())
+                    })?;
+                
+                if conflict_count > 0 {
+                    return Err(NdnError::AlreadyExists(
+                        format!("Cannot set path {}: parent directory already exists", path)
+                    ));
+                }
+                
                 tx.execute(
-                    "INSERT INTO paths (path, obj_id, path_obj_jwt, app_id, user_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    [&path, obj_id_str.as_str(), path_obj_str.as_str(), app_id, user_id],
+                    "INSERT INTO paths (path, obj_id, obj_type, path_obj_jwt, app_id, user_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    [&path, obj_id_str.as_str(), &new_obj_id.obj_type, path_obj_str.as_str(), app_id, user_id],
                 ).map_err(|e| {
                     warn!("NamedDataMgrDB: set path failed! {}", e.to_string());
                     NdnError::DbError(e.to_string())
                 })?;
+                Self::update_obj_ref_count(&tx, new_obj_id, new_obj_data, 1)?;
             }
         }
 
@@ -285,17 +398,17 @@ impl NamedDataMgrDB {
             warn!("NamedDataMgrDB: set path failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
-        Ok(())
+        Ok(old_obj_id)
     }
 
-    pub fn remove_path(&self, path: &str) -> NdnResult<()> {
+    pub fn remove_path(&self, path: &str,app_id: &str, user_id: &str) -> NdnResult<ObjId> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| {
             warn!("NamedDataMgrDB: remove path failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
 
-        // Get the chunk_id for this path
+        // Get the obj_id for this path
         let obj_id: String = tx
             .query_row("SELECT obj_id FROM paths WHERE path = ?1", [&path], |row| {
                 row.get(0)
@@ -312,55 +425,15 @@ impl NamedDataMgrDB {
                 NdnError::DbError(e.to_string())
             })?;
 
+        Self::update_obj_ref_count(&tx, &ObjId::new(&obj_id)?, None, -1)?;
+
         tx.commit().map_err(|e| {
             warn!("NamedDataMgrDB: remove path failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
-        Ok(())
+        Ok(ObjId::new(&obj_id)?)
     }
 
-    pub fn remove_dir_path(&self, path: &str) -> NdnResult<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e| {
-            warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-
-        // Get all paths and their chunk_ids that start with the given directory path
-        let mut stmt = tx
-            .prepare("SELECT path, obj_id FROM paths WHERE path LIKE ?1")
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
-
-        let rows = stmt
-            .query_map([format!("{}%", path)], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
-
-        let path_objs: Vec<(String, String)> = rows.filter_map(Result::ok).collect();
-
-        // Remove paths and update chunk ref counts within the transaction
-        for (path, obj_id) in path_objs {
-            // Remove the path
-            tx.execute("DELETE FROM paths WHERE path = ?1", [&path])
-                .map_err(|e| {
-                    warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
-                    NdnError::DbError(e.to_string())
-                })?;
-        }
-
-        drop(stmt);
-        tx.commit().map_err(|e| {
-            warn!("ChunkMgrDB: remove dir path failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-
-        Ok(())
-    }
 
     pub fn set_path_obj_jwt(&self, path: &str, path_obj_jwt: &str) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
@@ -373,5 +446,459 @@ impl NamedDataMgrDB {
             NdnError::DbError(e.to_string())
         })?;
         Ok(())
+    }
+
+    // pub fn remove_dir_path(&self, path: &str) -> NdnResult<()> {
+    //     let mut conn = self.conn.lock().unwrap();
+    //     let tx = conn.transaction().map_err(|e| {
+    //         warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+
+    //     // Get all paths and their chunk_ids that start with the given directory path
+    //     let mut stmt = tx
+    //         .prepare("SELECT path, obj_id FROM paths WHERE path LIKE ?1")
+    //         .map_err(|e| {
+    //             warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
+    //             NdnError::DbError(e.to_string())
+    //         })?;
+
+    //     let rows = stmt
+    //         .query_map([format!("{}%", path)], |row| Ok((row.get(0)?, row.get(1)?)))
+    //         .map_err(|e| {
+    //             warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
+    //             NdnError::DbError(e.to_string())
+    //         })?;
+
+    //     let path_objs: Vec<(String, String)> = rows.filter_map(Result::ok).collect();
+
+    //     // Remove paths and update chunk ref counts within the transaction
+    //     for (path, obj_id) in path_objs {
+    //         // Remove the path
+    //         tx.execute("DELETE FROM paths WHERE path = ?1", [&path])
+    //             .map_err(|e| {
+    //                 warn!("NamedDataMgrDB: remove dir path failed! {}", e.to_string());
+    //                 NdnError::DbError(e.to_string())
+    //             })?;
+    //     }
+
+    //     drop(stmt);
+    //     tx.commit().map_err(|e| {
+    //         warn!("ChunkMgrDB: remove dir path failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+
+    //     Ok(())
+    // }
+
+
+    // Chunk related methods from NamedDataDb
+    pub fn set_chunk_item(&self, chunk_item: &ChunkItem) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO chunk_items 
+            (chunk_id, chunk_size, chunk_state, progress, 
+             description, create_time, update_time)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                chunk_item.chunk_id.to_string(),
+                chunk_item.chunk_size,
+                chunk_item.chunk_state,
+                chunk_item.progress,
+                chunk_item.description,
+                chunk_item.create_time,
+                chunk_item.update_time,
+            ],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT * FROM chunk_items WHERE chunk_id = ?1")
+            .map_err(|e| {
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let chunk = stmt
+            .query_row(params![chunk_id.to_string()], |row| {
+                Ok(ChunkItem {
+                    chunk_id: chunk_id.clone(),
+                    chunk_size: row.get(1)?,
+                    chunk_state: row.get(2)?,
+                    progress: row.get(3)?,
+                    description: row.get(4)?,
+                    create_time: row.get(5)?,
+                    update_time: row.get(6)?,
+                })
+            })
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: get_chunk failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        Ok(chunk)
+    }
+
+    pub fn put_chunk_list(&self, chunk_list: Vec<ChunkItem>) -> NdnResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| {
+            warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        for chunk in chunk_list {
+            tx.execute(
+                "INSERT OR REPLACE INTO chunk_items 
+                (chunk_id, chunk_size, chunk_state, progress, description, create_time, update_time)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    chunk.chunk_id.to_string(),
+                    chunk.chunk_size,
+                    chunk.chunk_state,
+                    chunk.progress,
+                    chunk.description,
+                    chunk.create_time,
+                    chunk.update_time,
+                ],
+            )
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+        }
+
+        tx.commit().map_err(|e| {
+            warn!("NamedDataMgrDB: commit failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        Ok(())
+    }
+
+    pub fn update_chunk_progress(&self, chunk_id: &ChunkId, progress: String) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE chunk_items SET progress = ?1, chunk_state = 'incompleted', update_time = ?2 WHERE chunk_id = ?3",
+            params![progress, ndn_get_time_now(), chunk_id.to_string()],
+        ).map_err(|e| {
+            warn!("NamedDataMgrDB: update chunk progress failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| {
+            warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        tx.execute(
+            "DELETE FROM chunk_items WHERE chunk_id = ?1",
+            params![chunk_id.to_string()],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: delete chunk failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        tx.commit().map_err(|e| {
+            warn!("NamedDataMgrDB: commit failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    // Object related methods from NamedDataDb
+    pub fn set_object(&self, obj_id: &ObjId, obj_type: &str, obj_str: &str) -> NdnResult<()> {
+        let now_time = ndn_get_time_now();
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| {
+            warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        
+        // 先检查旧数据
+        let old_obj_data: Option<(String, i32)> = tx.query_row(
+            "SELECT obj_data,ref_count FROM objects WHERE obj_id = ?1",
+            params![obj_id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        ).ok(); // 使用 ok() 处理记录不存在的情况
+        
+        // 执行更新
+        tx.execute(
+            "INSERT OR REPLACE INTO objects (obj_id, obj_type, obj_data, ref_count, create_time, last_access_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![obj_id.to_string(), obj_type, obj_str, 0, now_time, now_time],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: insert object failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        
+        // 如果从 null 变成非 null，执行ref_count更新
+        if old_obj_data.is_some() {
+            let (old_obj_data, old_ref_count) = old_obj_data.unwrap();
+            if old_obj_data.len() < 0 && old_ref_count > 0 {
+                Self::update_obj_ref_count(&tx, obj_id, Some(&old_obj_data), old_ref_count)?;
+            }
+        }
+        
+        tx.commit().map_err(|e| {
+            warn!("NamedDataMgrDB: commit failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn get_object(&self, obj_id: &ObjId) -> NdnResult<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT obj_type, obj_data FROM objects WHERE obj_id = ?1")
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query object failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let obj_data = stmt
+            .query_row(params![obj_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query object failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        Ok(obj_data)
+    }
+
+    fn push_obj_id_to_add_ref_count_queue<'a>(
+        tx: &Transaction<'a>, 
+        obj_id: &str, 
+        add_ref_count: i32
+    ) -> NdnResult<()> {
+        let now_time = ndn_get_time_now();
+        
+        // 先执行 upsert
+        tx.execute(
+            "INSERT INTO obj_ref_update_queue (obj_id, ref_count, update_time)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(obj_id) DO UPDATE SET
+                 ref_count = ref_count + excluded.ref_count,
+                 update_time = ?3",
+            params![obj_id, add_ref_count, now_time],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: push obj id to add ref count queue failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        
+        // 然后删除 ref_count 为 0 的记录。 这里留在queue work时统一批量处理会更快速
+        // tx.execute(
+        //     "DELETE FROM obj_ref_update_queue WHERE obj_id = ?1 AND ref_count = 0",
+        //     params![obj_id],
+        // )
+        // .map_err(|e| {
+        //     warn!("NamedDataMgrDB: delete zero ref count record failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
+        
+        Ok(())
+    }
+
+    fn update_obj_ref_count<'a>(tx: &Transaction<'a>, obj_id: &ObjId, obj_data: Option<&str>, add_ref_count: i32) -> NdnResult<()> {
+        if obj_id.is_container() {
+            let obj_id_str = obj_id.to_string();
+            Self::push_obj_id_to_add_ref_count_queue(tx, obj_id_str.as_str(), add_ref_count)?;
+        } else {
+            tx.execute(
+                "UPDATE objects SET ref_count = ref_count + (?1) WHERE obj_id = ?2",
+                params![add_ref_count, obj_id.to_string()],
+            )
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: update object ref count failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+            //可识别的标准对象，还需要获取其子对象，并执行update_obj_ref_count
+        }
+
+        Ok(())
+    }
+
+    pub fn start_gc_thread(&self) -> NdnResult<()> {
+       unimplemented!();
+    }
+    
+    // pub async fn remove_object(&self, obj_id: &ObjId) -> NdnResult<()> {
+    //     let conn = self.conn.lock().unwrap();
+    //     conn.execute(
+    //         "DELETE FROM objects WHERE obj_id = ?1",
+    //         params![obj_id.to_string()],
+    //     )
+    //     .map_err(|e| {
+    //         warn!("NamedDataMgrDB: remove object failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+
+    //     Ok(())
+    // }
+
+
+
+    // Object link related methods from NamedDataDb
+    pub fn set_object_link(&self, obj_id: &ObjId, obj_link: &LinkData) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO object_links (link_obj_id, obj_link)
+             VALUES (?1, ?2)",
+            params![obj_id.to_string(), obj_link.to_string()],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: insert object link failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn query_object_link_ref(&self, ref_obj_id: &ObjId) -> NdnResult<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT link_obj_id FROM object_links WHERE obj_link LIKE ?1")
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let ref_obj_id_str = format!("%{}%", ref_obj_id.to_string());
+        let mut rows = stmt.query(params![ref_obj_id_str]).map_err(|e| {
+            warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        let mut link_obj_ids = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| {
+            warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })? {
+            let link_obj_id: String = row.get(0).map_err(|e| {
+                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+            link_obj_ids.push(link_obj_id);
+        }
+
+        Ok(link_obj_ids)
+    }
+
+    pub fn get_object_link(&self, obj_id: &ObjId) -> NdnResult<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT obj_link FROM object_links WHERE link_obj_id = ?1")
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let obj_link = stmt
+            .query_row(params![obj_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+        Ok(obj_link)
+    }
+
+    pub fn remove_object_link(&self, obj_id: &ObjId) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM object_links WHERE link_obj_id = ?1",
+            params![obj_id.to_string()],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: remove object link failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn set_local_file_info(&self, local_file_path: &str, local_file_info: &LocalFileInfo) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO local_file_info (local_file_path, qcid, last_modify_time, content)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![local_file_path, local_file_info.qcid.as_str(), local_file_info.last_modify_time, local_file_info.content.as_str()],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: add local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn remove_local_file_info(&self, local_file_path: &str) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM local_file_info WHERE local_file_path = ?1",
+            params![local_file_path],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: remove local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
+    pub fn query_local_file_info(&self, local_file_path: &str) -> NdnResult<Option<LocalFileInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT qcid, last_modify_time, content FROM local_file_info WHERE local_file_path = ?1")
+            .map_err(|e| {
+                warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let mut rows = stmt.query(params![local_file_path]).map_err(|e| {
+            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        let row = rows.next().map_err(|e| {
+            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        if row.is_none() {
+            return Ok(None);
+        }
+
+        let row = row.unwrap();
+        let qcid: String = row.get(0).map_err(|e| {
+            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        let last_modify_time: u64 = row.get(1).map_err(|e| {
+            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        let content: String = row.get(2).map_err(|e| {
+            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        let local_file_info = LocalFileInfo {
+            qcid,
+            last_modify_time,
+            content,
+        };
+        
+        Ok(Some(local_file_info))
     }
 }

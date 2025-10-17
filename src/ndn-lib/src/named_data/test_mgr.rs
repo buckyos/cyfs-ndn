@@ -8,10 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn test_basic_chunk_operations() -> NdnResult<()> {
+    init_logging("ndn-lib test", false);
     // Create a temporary directory for testing
     let test_dir = tempdir().unwrap();
     let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
         local_cache: None,
         mmap_cache_dir: None,
     };
@@ -58,11 +58,7 @@ async fn test_base_operations() -> NdnResult<()> {
     // Create a temporary directory for testing
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+    let config = NamedDataMgrConfig::default();
 
     let named_mgr = NamedDataMgr::from_config(
         Some("test".to_string()),
@@ -154,78 +150,13 @@ async fn test_base_operations() -> NdnResult<()> {
     Ok(())
 }
 
-//test get_chunk_mgr_by_id，然后再创建并写入一个chunk，再读取
-#[tokio::test]
-async fn test_get_chunk_mgr_by_id() -> NdnResult<()> {
-    // Get ChunkMgr by id
-    let random_mgr_id = rand::random::<u64>();
-    //println!("random_mgr_id: {}", random_mgr_id);
-    let chunk_mgr_id = format!("test_{}", random_mgr_id);
-    let mgr_id = Some(chunk_mgr_id.as_str());
-    let chunk_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-    assert!(chunk_mgr.is_some());
-    let chunk_mgr = chunk_mgr.unwrap();
-
-    // Create test data
-    let test_data = b"Hello, ChunkMgr Test!";
-    let chunk_id = ChunkId::new("sha256:abcdef1234567890AB").unwrap();
-
-    // Write chunk
-    {
-        let mut chunk_mgr = chunk_mgr.lock().await;
-        let (mut writer, _) = chunk_mgr
-            .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
-            .await
-            .unwrap();
-        writer.write_all(test_data).await.unwrap();
-        chunk_mgr
-            .complete_chunk_writer_impl(&chunk_id)
-            .await
-            .unwrap();
-    }
-
-    // Read chunk and verify
-    {
-        let chunk_mgr = chunk_mgr.lock().await;
-        let (mut reader, size) = chunk_mgr
-            .open_chunk_reader_impl(&chunk_id, 0, true)
-            .await?;
-        assert_eq!(size, test_data.len() as u64);
-        drop(chunk_mgr);
-
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(&buffer, test_data);
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_path_normalization() {
-    let test_cases = vec![
-        ("//a//b//c", "/a/b/c"),
-        ("./a/b/c", "a/b/c"),
-        ("/a/b/c", "/a/b/c"),
-        ("a/b/c", "a/b/c"),
-    ];
-
-    for (input, expected) in test_cases {
-        let result = NamedDataMgrDB::normalize_path(input);
-        assert_eq!(result, expected, "Failed to normalize path: {}", input);
-    }
-}
 
 #[tokio::test]
 async fn test_find_longest_matching_path_edge_cases() -> NdnResult<()> {
     // Create a temporary directory for testing
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+    let config = NamedDataMgrConfig::default();
 
     let chunk_mgr = NamedDataMgr::from_config(
         Some("test".to_string()),
@@ -370,11 +301,7 @@ async fn test_find_longest_matching_path_edge_cases() -> NdnResult<()> {
 async fn test_concurrent_path_access() -> NdnResult<()> {
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+    let config = NamedDataMgrConfig::default();
 
     let named_mgr = Arc::new(tokio::sync::Mutex::new(
         NamedDataMgr::from_config(

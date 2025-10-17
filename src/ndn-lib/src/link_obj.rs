@@ -7,7 +7,7 @@ use crate::{ObjId,ChunkId,NdnResult,NdnError};
 #[derive(Debug, Clone,Eq, PartialEq)]
 pub enum LinkData {
     SameAs(ObjId),//Same ChunkId
-    LocalFile(String,Range<u64>),//Local File Path, Range in file
+    LocalFile(String,Range<u64>,u64,String),//Local File Path, Range in file, file last modify time, qcid
     //ComposedBy(ChunkId,ObjMapId),// Base ChunkId + Diff Action Items
     PartOf(ChunkId,Range<u64>), //Object Id + Range
     //IndexOf(ObjId,u64),//Object Id + Index
@@ -40,9 +40,9 @@ impl LinkData {
                 let range_str = format!("{}..{}",range.start,range.end);
                 format!("part_of->{}@{}",range_str,chunk_id.to_string())
             }
-            LinkData::LocalFile(file_path,range) =>  {
+            LinkData::LocalFile(file_path,range,last_modify_time,qcid) =>  {
                 let range_str = format!("{}..{}",range.start,range.end);
-                format!("file->{}@{}",range_str,file_path)
+                format!("file->{}@{}@{}@{}",range_str,file_path,last_modify_time,qcid)
             }
         
         }
@@ -73,7 +73,7 @@ impl LinkData {
             }
             "file" => {
                 let parts = link_data.split("@").collect::<Vec<&str>>();
-                if parts.len() != 2 {
+                if parts.len() != 4 {
                     return Err(NdnError::InvalidLink(format!("invalid link string:{}",link_str)));
                 }
                 let range = parts[0].split("..").collect::<Vec<&str>>();
@@ -82,7 +82,7 @@ impl LinkData {
                 }
                 let start = range[0].parse::<u64>().unwrap();
                 let end = range[1].parse::<u64>().unwrap();
-                Ok(LinkData::LocalFile(parts[1].to_string(),Range{start,end}))
+                Ok(LinkData::LocalFile(parts[1].to_string(),Range{start,end},parts[2].parse::<u64>().unwrap(),parts[3].to_string()))
             }
             _ => Err(NdnError::InvalidLink(format!("invalid link type:{}",link_type))),
         }
@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(link_data,link_data2);
 
         let chunk_id = ChunkId::new("sha256:1234567890AE").unwrap();
-        let link_data = LinkData::LocalFile("/Users/liuzhicong/Downloads/te  st.txt".to_string(),Range{start:0,end:1024});
+        let link_data = LinkData::LocalFile("/Users/liuzhicong/Downloads/te  st.txt".to_string(),Range{start:0,end:1024},1717862400,"_".to_string());
         let link_str = link_data.to_string();
         println!("link_str {}",link_str);
         let link_data2 = LinkData::from_string(&link_str).unwrap();

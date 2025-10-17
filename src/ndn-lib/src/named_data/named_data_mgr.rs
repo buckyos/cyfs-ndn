@@ -1,6 +1,7 @@
+use super::def::{ChunkItem, ObjectState, ChunkState};
 use super::named_data_mgr_db::NamedDataMgrDB;
 use crate::{
-    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, LinkData, NamedDataStore, NdnError, NdnResult, PathObject, SimpleChunkList, SimpleChunkListReader, OBJ_TYPE_CHUNK_LIST_SIMPLE
+    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, FileObject, LinkData, LocalFileInfo, NdnError, NdnResult, PathObject, SimpleChunkList, SimpleChunkListReader, OBJ_TYPE_CHUNK_LIST_SIMPLE
 };
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
@@ -12,7 +13,7 @@ use futures_util::stream::StreamExt;
 use lazy_static::lazy_static;
 use log::*;
 use memmap::Mmap;
-use name_lib::decode_jwt_claim_without_verify;
+use name_lib::{decode_jwt_claim_without_verify, EncodedDocument};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,17 +30,30 @@ use tokio::{
 };
 use tokio_util::bytes::BytesMut;
 use tokio_util::io::StreamReader;
+use fs2::FileExt;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedDataMgrConfig {
-    pub local_store: String,
     pub local_cache: Option<String>,
     pub mmap_cache_dir: Option<String>,
 }
 
+impl Default for NamedDataMgrConfig {
+    fn default() -> Self {
+        Self {
+            local_cache: None,
+            mmap_cache_dir: None,
+        }
+    }
+}
+
 pub struct NamedDataMgr {
-    local_store: NamedDataStore, //Real chunk store
-    local_cache: Option<NamedDataStore>,   //Cache at local disk
+    // Store configuration fields (merged from NamedDataStore)
+    base_dir: PathBuf,
+    read_only: bool,
+    
+    // Cache configuration
+    local_cache_base_dir: Option<String>,   //Cache at local disk
     mmap_cache_dir: Option<String>,        //Cache at memory
     mgr_id: Option<String>,
     db: NamedDataMgrDB,
@@ -77,7 +91,6 @@ impl NamedDataMgr {
         let mgr_json_file = root_path.join("ndn_mgr.json");
         if !mgr_json_file.exists() {
             mgr_config = NamedDataMgrConfig {
-                local_store: "./".to_string(),
                 local_cache: None,
                 mmap_cache_dir: None,
             };
@@ -158,29 +171,32 @@ impl NamedDataMgr {
         let db_path = root_path.join("ndn_mgr.db").to_str().unwrap().to_string();
         let db = NamedDataMgrDB::new(db_path)?;
 
-        let real_local_store_path;
-        if config.local_store.starts_with(".") {
-            real_local_store_path = root_path.join(config.local_store);
-        } else {
-            real_local_store_path = PathBuf::from(config.local_store);
-        }
-        let local_store = NamedDataStore::new(real_local_store_path.to_str().unwrap().to_string()).await?;
-
         
-        let local_cache;
-        if config.local_cache.is_some() {
-            local_cache =
-                Some(NamedDataStore::new(config.local_cache.as_ref().unwrap().clone()).await?);
-        } else {
-            local_cache = None;
-        }
+        // Create base directory if it doesn't exist
+        tokio::fs::create_dir_all(&root_path).await.map_err(|e| {
+            warn!("NamedDataMgr: create base dir failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+
         Ok(Self {
-            local_store: local_store,
-            local_cache: local_cache,
+            base_dir: root_path,
+            read_only: false,
+            local_cache_base_dir: config.local_cache,
             mmap_cache_dir: config.mmap_cache_dir,
             mgr_id: mgr_id,
             db: db,
         })
+    }
+
+    fn get_chunk_path(&self, chunk_id: &ChunkId) -> PathBuf {
+        //根据ChunkId的HashResult,产生一个三层的目录结构
+        let hex_str = hex::encode(chunk_id.hash_result.clone());
+        let dir1 = &hex_str[0..2];
+        let dir2 = &hex_str[2..4];
+        let file_name = &hex_str[4..];
+
+        self.base_dir.join(dir1).join(dir2).join(file_name).join(chunk_id.chunk_type.to_string())
+
     }
 
     fn get_cache_mmap_path(&self, chunk_id: &ChunkId) -> Option<String> {
@@ -194,6 +210,7 @@ impl NamedDataMgr {
     pub fn update_cache_path_obj(&self, url: &str, path_obj: PathObject) -> NdnResult<()> {
         Ok(())
     }
+
 
     //return path_obj_jwt
     async fn get_path_obj(&self, path: &str) -> NdnResult<Option<String>> {
@@ -233,8 +250,6 @@ impl NamedDataMgr {
         Ok((obj_id, path_obj_jwt, relative_path))
     }
 
-    
-
     pub async fn select_obj_id_by_path(
         mgr_id: Option<&str>,
         path: &str,
@@ -248,6 +263,72 @@ impl NamedDataMgr {
         named_mgr.select_obj_id_by_path_impl(path).await
     }
 
+    pub async fn is_object_exist(&self, obj_id: &ObjId) -> NdnResult<bool> {
+        let obj_state = self.query_object_by_id(obj_id).await?;
+        match obj_state {
+            ObjectState::Exist => Ok(true),
+            ObjectState::Link(_) => Ok(true),
+            ObjectState::Object(_) => Ok(true),
+            ObjectState::Reader(_, _) => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    pub async fn query_object_by_id(&self, obj_id: &ObjId) -> NdnResult<ObjectState> {
+        let real_obj_result = self.db.get_object(obj_id);
+        if real_obj_result.is_ok() {
+            let (obj_type, obj_str) = real_obj_result.unwrap();
+            return Ok(ObjectState::Object(obj_str));
+        }
+
+        let link_obj_result = self.db.get_object_link(obj_id);
+        if link_obj_result.is_ok() {
+            let link_obj = link_obj_result.unwrap();
+            let obj_link = LinkData::from_string(&link_obj)?;
+            return Ok(ObjectState::Link(obj_link));
+        }
+
+        return Ok(ObjectState::NotExist);
+    }
+
+    pub async fn get_real_object_impl(&self, obj_id: &ObjId) -> NdnResult<EncodedDocument> {
+        let obj_state = self.query_object_by_id(obj_id).await?;
+        match obj_state {
+            ObjectState::Object(obj_str) => {
+                let doc = EncodedDocument::from_str(obj_str).map_err(|e| {
+                    warn!("get_object: decode object failed! {}", e.to_string());
+                    NdnError::DecodeError(e.to_string())
+                })?;
+                Ok(doc)
+            }
+            ObjectState::Link(obj_link) => match obj_link {
+                LinkData::SameAs(link_obj_id) => Box::pin(self.get_real_object_impl(&link_obj_id)).await,
+                _ => Err(NdnError::InvalidLink(format!(
+                    "object link not supported! {}",
+                    obj_id.to_string()
+                ))),
+            },
+            _ => Err(NdnError::NotFound(format!(
+                "object not found! {}",
+                obj_id.to_string()
+            ))),
+        }
+    }
+
+    pub async fn get_object(
+        mgr_id: Option<&str>,
+        obj_id: &ObjId,
+        inner_obj_path: Option<String>,
+    ) -> NdnResult<serde_json::Value> {
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
+        if named_mgr.is_none() {
+            return Err(NdnError::NotFound(format!("named data mgr not found")));
+        }
+        let named_mgr = named_mgr.unwrap();
+        let named_mgr = named_mgr.lock().await;
+        named_mgr.get_object_impl(obj_id, inner_obj_path).await
+    }
+
     pub async fn get_object_impl(
         &self,
         obj_id: &ObjId,
@@ -258,15 +339,12 @@ impl NamedDataMgr {
         }
 
         let mut obj_body = None;
-        if self.local_cache.is_some() {
-            let local_cache = self.local_cache.as_ref().unwrap();
-            let obj_result = local_cache.get_object(&obj_id).await;
-            if obj_result.is_ok() {
-                obj_body = Some(obj_result.unwrap());
-            }
-        }
+        // TODO: Add local cache support if needed
+        // if self.local_cache_base_dir.is_some() {
+        //     // Handle local cache
+        // }
 
-        let obj_result = self.local_store.get_object(&obj_id).await;
+        let obj_result = self.get_real_object_impl(&obj_id).await;
         if obj_result.is_ok() {
             obj_body = Some(obj_result.unwrap());
         }
@@ -294,23 +372,80 @@ impl NamedDataMgr {
         Err(NdnError::NotFound(obj_id.to_string()))
     }
 
-    pub async fn get_object(
-        mgr_id: Option<&str>,
-        obj_id: &ObjId,
-        inner_obj_path: Option<String>,
-    ) -> NdnResult<serde_json::Value> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-        if named_mgr.is_none() {
-            return Err(NdnError::NotFound(format!("named data mgr not found")));
-        }
-        let named_mgr = named_mgr.unwrap();
-        let named_mgr = named_mgr.lock().await;
-        named_mgr.get_object_impl(obj_id, inner_obj_path).await
-    }
 
     pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
-        self.local_store.put_object(obj_id, obj_data).await?;
-        Ok(())
+        self.db
+            .set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
+    }
+
+    pub async fn link_object(&self, obj_id: &ObjId, target_obj: &ObjId) -> NdnResult<()> {
+        let link = LinkData::SameAs(target_obj.clone());
+        self.db.set_object_link(obj_id, &link)
+    }
+
+    pub async fn link(&self, obj_id: &ObjId, link_data: &LinkData) -> NdnResult<()> {
+        self.db.set_object_link(obj_id, link_data)
+    }
+
+    pub async fn query_link_refs(&self, ref_obj_id: &ObjId) -> NdnResult<Vec<ObjId>> {
+        let link_obj_ids = self.db.query_object_link_ref(ref_obj_id)?;
+        let mut ref_obj_ids = Vec::new();
+        for link_obj_id in link_obj_ids {
+            let ref_obj_id = ObjId::new(link_obj_id.as_str())?;
+            ref_obj_ids.push(ref_obj_id);
+        }
+        Ok(ref_obj_ids)
+    }
+
+    async fn get_real_chunk_item(&self, link_data: LinkData) -> NdnResult<ChunkItem> {
+        match link_data {
+            LinkData::SameAs(link_obj_id) => {
+                let real_chunk = ChunkId::from_obj_id(&link_obj_id);
+                let real_chunk_item = self.db.get_chunk_item(&real_chunk);
+                if real_chunk_item.is_ok() {
+                    let real_chunk_item = real_chunk_item.unwrap();
+                    return Ok(real_chunk_item);
+                } else {
+                    let link_obj = self.db.get_object_link(&link_obj_id);
+                    if link_obj.is_ok() {
+                        let link_obj = link_obj.unwrap();
+                        let obj_link: LinkData = LinkData::from_string(&link_obj)?;
+                        return Box::pin(self.get_real_chunk_item(obj_link)).await;
+                    } else {
+                        return Err(NdnError::NotFound(format!(
+                            "real chunk not found! {}",
+                            link_obj_id.to_string()
+                        )));
+                    }
+                }
+            }
+            LinkData::PartOf(link_obj_id, range) => {
+                unimplemented!();
+            }
+            _ => Err(NdnError::InvalidLink(format!(
+                "link data not supported! {}",
+                link_data.to_string()
+            ))),
+        }
+    }
+
+    async fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
+        let chunk_item = self.db.get_chunk_item(chunk_id);
+        if chunk_item.is_ok() {
+            return Ok(chunk_item.unwrap());
+        }
+
+        let link_obj_result = self.db.get_object_link(&chunk_id.to_obj_id());
+        if link_obj_result.is_ok() {
+            let link_obj = link_obj_result.unwrap();
+            let obj_link = LinkData::from_string(&link_obj)?;
+            return self.get_real_chunk_item(obj_link).await;
+        }
+
+        Err(NdnError::NotFound(format!(
+            "chunk not found! {}",
+            chunk_id.to_string()
+        )))
     }
 
     pub async fn put_object(mgr_id: Option<&str>, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
@@ -379,7 +514,7 @@ impl NamedDataMgr {
         user_id: &str,
     ) -> NdnResult<()> {
         self.db
-            .create_path(obj_id, path, app_id, user_id)
+            .create_path(path, obj_id, None, app_id, user_id)
             .map_err(|e| {
                 warn!("create_file: create path failed! {}", e.to_string());
                 e
@@ -416,7 +551,7 @@ impl NamedDataMgr {
         let path_obj = PathObject::new(path.to_string(), new_obj_id.clone());
         let path_obj_str = serde_json::to_string(&path_obj).unwrap();
         self.db
-            .set_path(path, &new_obj_id, path_obj_str, app_id, user_id)
+            .set_path(path, &new_obj_id, None, path_obj_str, app_id, user_id)
             .map_err(|e| {
                 warn!("update_file: update path failed! {}", e.to_string());
                 e
@@ -444,7 +579,7 @@ impl NamedDataMgr {
     }
 
     pub async fn remove_file_impl(&self, path: &str) -> NdnResult<()> {
-        self.db.remove_path(path).map_err(|e| {
+        self.db.remove_path(path, "", "").map_err(|e| {
             warn!("remove_file: remove path failed! {}", e.to_string());
             e
         })?;
@@ -464,27 +599,78 @@ impl NamedDataMgr {
         named_mgr.remove_file_impl(path).await
     }
 
-    pub async fn remove_dir_impl(&self, path: &str) -> NdnResult<()> {
-        self.db.remove_dir_path(path).map_err(|e| {
-            warn!("remove_dir: remove dir path failed! {}", e.to_string());
-            e
-        })?;
-        info!("remove ndn dir path:{}", path);
-        Ok(())
+    // pub async fn remove_dir_impl(&self, path: &str) -> NdnResult<()> {
+    //     self.db.remove_dir_path(path).map_err(|e| {
+    //         warn!("remove_dir: remove dir path failed! {}", e.to_string());
+    //         e
+    //     })?;
+    //     info!("remove ndn dir path:{}", path);
+    //     Ok(())
+    // }
+
+    // pub async fn remove_dir(mgr_id: Option<&str>, path: &str) -> NdnResult<()> {
+    //     let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
+    //     if named_mgr.is_none() {
+    //         return Err(NdnError::NotFound(format!("named data mgr not found")));
+    //     }
+    //     let named_mgr = named_mgr.unwrap();
+    //     let named_mgr = named_mgr.lock().await;
+    //     named_mgr.remove_dir_impl(path).await
+    // }
+
+    //只有chunk完整准备好了，才是存在。写入到一半的chunk不会算存在。
+    //通过get_chunk_state可以得到更准确的chunk状态
+    pub async fn is_chunk_exist(
+        &self,
+        chunk_id: &ChunkId,
+        is_auto_add: Option<bool>,
+    ) -> NdnResult<(bool, u64)> {
+        let chunk_state = self.query_chunkstate_by_id(chunk_id).await?;
+        let (chunk_state, chunk_size,_progress) = chunk_state;
+        match chunk_state {
+            ChunkState::Completed => Ok((true, chunk_size)),
+            ChunkState::Link(link_data) => {
+                if chunk_size == 0 {
+                    let real_chunk_item = self.get_real_chunk_item(link_data).await?;
+                    return Ok((true, real_chunk_item.chunk_size));
+                } else {
+                    return Ok((true, chunk_size));
+                }
+            }
+            _ => Ok((false, 0)),
+        }
     }
 
-    pub async fn remove_dir(mgr_id: Option<&str>, path: &str) -> NdnResult<()> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-        if named_mgr.is_none() {
-            return Err(NdnError::NotFound(format!("named data mgr not found")));
+    pub async fn query_chunkstate_by_id(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkState, u64,String)> {
+        let chunk_item_result = self.db.get_chunk_item(chunk_id);
+        if chunk_item_result.is_ok() {
+            let chunk_item = chunk_item_result.unwrap();
+            return Ok((chunk_item.chunk_state, chunk_item.chunk_size, chunk_item.progress));
         }
-        let named_mgr = named_mgr.unwrap();
-        let named_mgr = named_mgr.lock().await;
-        named_mgr.remove_dir_impl(path).await
+
+        let link_obj_result = self.db.get_object_link(&chunk_id.to_obj_id());
+        if link_obj_result.is_ok() {
+            let link_obj = link_obj_result.unwrap();
+            let obj_link = LinkData::from_string(&link_obj)?;
+            let obj_link2 = obj_link.clone();
+            match obj_link {
+                LinkData::SameAs(link_obj_id) => {
+                    return Ok((ChunkState::Link(obj_link2), 0, "".to_string()));
+                }
+                LinkData::PartOf(link_obj_id, range) => {
+                    return Ok((ChunkState::Link(obj_link2), range.end - range.start, "".to_string()));
+                }
+                LinkData::LocalFile(file_path,range,last_modify_time,qcid) => {
+                    return Ok((ChunkState::Link(obj_link2), range.end - range.start, "".to_string()));
+                }
+            }
+        }
+
+        return Ok((ChunkState::NotExist, 0, "".to_string()));
     }
 
     pub async fn is_chunk_exist_impl(&self, chunk_id: &ChunkId) -> NdnResult<bool> {
-        let (is_exist, chunk_size) = self.local_store.is_chunk_exist(chunk_id, None).await?;
+        let (is_exist, chunk_size) = self.is_chunk_exist(chunk_id, None).await?;
         return Ok(is_exist);
     }
 
@@ -506,7 +692,7 @@ impl NamedDataMgr {
         &self,
         chunk_id: &ChunkId,
     ) -> NdnResult<(ChunkState, u64, String)> {
-        self.local_store.query_chunkstate_by_id(chunk_id).await
+        self.query_chunkstate_by_id(chunk_id).await
     }
 
     pub async fn query_chunk_state(
@@ -522,16 +708,100 @@ impl NamedDataMgr {
         named_mgr.query_chunk_state_impl(chunk_id).await
     }
 
-    pub async fn link_chunk_to_local_impl(&self, chunk_id: &ChunkId, local_file_path: &Path,range:Range<u64>) -> NdnResult<()> {
+    pub async fn link_chunk_to_local_impl(&self, chunk_id: &ChunkId, local_file_path: &Path,range:Range<u64>,last_modify_time:u64,qcid:Option<String>) -> NdnResult<()> {
+        let qcid = qcid.unwrap_or("_".to_string());
         let file_meta = local_file_path.metadata().map_err(|e| {
             warn!("link_chunk_to_local: get file metadata failed! {}", e.to_string());
             NdnError::IoError(e.to_string())
         })?;
         let file_size = file_meta.len();
-        let link_data = LinkData::LocalFile(local_file_path.to_string_lossy().to_string(),range);
+        let link_data = LinkData::LocalFile(local_file_path.to_string_lossy().to_string(),range,last_modify_time,qcid);
         let obj_id = chunk_id.to_obj_id();
-        self.local_store.link(&obj_id, &link_data).await?;
+        self.link(&obj_id, &link_data).await?;
         Ok(())
+    }
+
+    pub async fn open_store_chunk_reader_impl(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        let (chunk_state, chunk_size,_progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        let chunk_real_path;
+        let chunk_range:Range<u64>;
+        match chunk_state {
+            ChunkState::Completed => {
+                chunk_real_path = self.get_chunk_path(chunk_id);
+                chunk_range = Range{start:0,end:chunk_size};
+            }
+            ChunkState::Link(link_data) => {
+                match link_data {
+                    LinkData::SameAs(link_obj_id) => {
+                        let link_chunk_id = ChunkId::from_obj_id(&link_obj_id);
+                        return Box::pin(self.open_store_chunk_reader_impl(&link_chunk_id, offset)).await;
+                    }
+                    LinkData::PartOf(link_obj_id,range) => {
+                        return Err(NdnError::Internal(("not supported".to_string())));
+                    }
+                    LinkData::LocalFile(file_path,range,_last_modify_time,_qcid) => {
+                        chunk_real_path = PathBuf::from(file_path);
+                        chunk_range = range;
+                    }
+                }
+            }
+            _ => {
+                return Err(NdnError::InComplete(format!(
+                    "chunk {} state not support open reader! state:{}",
+                    chunk_id.to_string(),
+                    chunk_state.to_str()
+                )));
+            }
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true) // 设置只读模式
+            .open(&chunk_real_path)
+            .await
+            .map_err(|e| {
+                warn!("open_chunk_reader: open file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+        
+        if chunk_range.start != 0 {
+            file.seek(SeekFrom::Start(chunk_range.start)).await.map_err(|e| {
+                warn!("open_chunk_reader: seek file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+        }
+
+        if offset > 0 {
+            file.seek(SeekFrom::Current(offset as i64)).await.map_err(|e| {
+                warn!("open_chunk_reader: seek file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+        }
+
+        Ok((Box::pin(file), chunk_size))
+    }
+
+    pub async fn open_chunk_reader(
+        mgr_id: Option<&str>,
+        chunk_id: &ChunkId,
+        offset: u64,
+        auto_cache: bool,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
+        if named_mgr.is_none() {
+            return Err(NdnError::NotFound(format!(
+                "named data mgr {} not found",
+                mgr_id.unwrap()
+            )));
+        }
+        let named_mgr = named_mgr.unwrap();
+        let named_mgr = named_mgr.lock().await;
+        named_mgr
+            .open_chunk_reader_impl(chunk_id, offset, auto_cache)
+            .await
     }
 
     pub async fn open_chunk_reader_impl(
@@ -569,43 +839,15 @@ impl NamedDataMgr {
         }
 
         //debug!("get_chunk_reader: CACHE MISS :{}", chunk_id.to_string());
-        if self.local_cache.is_some() {
-            let local_cache = self.local_cache.as_ref().unwrap();
-            let local_reader = local_cache.open_chunk_reader(chunk_id, offset).await;
-            if local_reader.is_ok() {
-                info!(
-                    "get_chunk_reader:return local cache file:{}",
-                    chunk_id.to_string()
-                );
-                return local_reader;
-            }
-            debug!("get_chunk_reader: no cache file:{}", chunk_id.to_string());
-        }
+        // TODO: Add local cache support if needed
+        // if self.local_cache_base_dir.is_some() {
+        //     // Handle local cache
+        // }
 
-      
-        let local_reader = self.local_store.open_chunk_reader(chunk_id, offset).await?;
+        let local_reader = self.open_store_chunk_reader_impl(chunk_id, offset).await?;
         return Ok(local_reader);
     }
 
-    pub async fn open_chunk_reader(
-        mgr_id: Option<&str>,
-        chunk_id: &ChunkId,
-        offset: u64,
-        auto_cache: bool,
-    ) -> NdnResult<(ChunkReader, u64)> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-        if named_mgr.is_none() {
-            return Err(NdnError::NotFound(format!(
-                "named data mgr {} not found",
-                mgr_id.unwrap()
-            )));
-        }
-        let named_mgr = named_mgr.unwrap();
-        let named_mgr = named_mgr.lock().await;
-        named_mgr
-            .open_chunk_reader_impl(chunk_id, offset, auto_cache)
-            .await
-    }
 
     //return chunklist_reader,chunklist_size(total_size)
     pub async fn open_chunklist_reader(
@@ -646,18 +888,152 @@ impl NamedDataMgr {
         Ok((Box::pin(reader), total_size))
     }
 
-    //return chunk_id,progress_info
+    //打开writer并允许writer已经存在
     pub async fn open_chunk_writer_impl(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
         offset: u64,
     ) -> NdnResult<(ChunkWriter, String)> {
-        let (writer, chunk_progress_info) = self.local_store
-            .open_chunk_writer(chunk_id, chunk_size, offset)
-            .await?;
-        Ok((writer, chunk_progress_info))
+        let mut real_chunk_size = chunk_size;
+        let (chunk_state, stored_chunk_size,progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        if !chunk_state.can_open_writer() {
+            return Err(NdnError::Internal(format!(
+                "chunk {} state not support open writer! {}",
+                chunk_id.to_string(),chunk_state.to_str()
+            )));
+        }
+        //let chunk_item = self.db.get_chunk_item(chunk_id).await;
+        let chunk_path = self.get_chunk_path(chunk_id);
+        if chunk_state == ChunkState::Incompleted {
+            let file_meta = fs::metadata(&chunk_path).await.map_err(|e| {
+                warn!("open_chunk_writer: get metadata failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+
+            if offset <= file_meta.len() {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .open(&chunk_path)
+                    .await
+                    .map_err(|e| {
+                        warn!("open_chunk_writer: open file failed! {}", e.to_string());
+                        NdnError::IoError(e.to_string())
+                    })?;
+
+                let std_file = file.into_std().await;
+                let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+                    warn!("open_chunk_writer: lock file failed! {}", e.to_string());
+                    NdnError::IoError(e.to_string())
+                })?;
+                let mut file = tokio::fs::File::from_std(std_file);
+
+                if offset != 0 {
+                    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+                        warn!("open_chunk_writer: seek file failed! {}", e.to_string());
+                        NdnError::IoError(e.to_string())
+                    })?;
+                } else {
+                    file.seek(SeekFrom::End(0)).await.map_err(|e| {
+                        warn!("open_chunk_writer: seek file failed! {}", e.to_string());
+                        NdnError::IoError(e.to_string())
+                    })?;
+                }
+
+                if progress.len() < 2 {
+                    let progress = json!({
+                        "pos":file_meta.len(),
+                    })
+                    .to_string();
+                    return Ok((Box::pin(file), progress));
+                }
+                return Ok((Box::pin(file), progress));
+            } else {
+                warn!(
+                    "open_chunk_writer: offset too large! {}",
+                    chunk_id.to_string()
+                );
+                return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
+            }
+        } else {
+            if offset != 0 {
+                warn!("open_chunk_writer: offset not 0! {}", chunk_id.to_string());
+                return Err(NdnError::Internal("offset not 0".to_string()));
+            }
+            // Create parent directories if they don't exist
+            if let Some(parent) = std::path::Path::new(&chunk_path).parent() {
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    warn!("open_chunk_writer: create dir failed! {}", e.to_string());
+                    NdnError::IoError(e.to_string())
+                })?;
+            }
+
+            let file = File::create(&chunk_path).await.map_err(|e| {
+                warn!("open_chunk_writer: create file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+
+            let std_file = file.into_std().await;
+            let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+                warn!("open_chunk_writer: lock file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+            let file = tokio::fs::File::from_std(std_file);
+
+            //创建chunk_item
+            let chunk_item = ChunkItem::new(&chunk_id, real_chunk_size, None);
+            self.db.set_chunk_item(&chunk_item)?;
+
+            return Ok((Box::pin(file), "".to_string()));
+        }
     }
+
+    //打开writer,不允许writer已经存在
+    pub async fn open_new_chunk_writer_impl(
+        &self,
+        chunk_id: &ChunkId,
+        chunk_size: u64,
+    ) -> NdnResult<ChunkWriter> {
+        let (chunk_state, chunk_size,progress) = self.query_chunkstate_by_id(chunk_id).await?;
+        if !chunk_state.can_open_new_writer() {
+            return Err(NdnError::Internal(format!(
+                "chunk {} state not support open new writer! {}",
+                chunk_id.to_string(),chunk_state.to_str()
+            )));
+        }
+        let chunk_path = self.get_chunk_path(&chunk_id);
+
+        // Create parent directories if they don't exist
+        if let Some(parent) = std::path::Path::new(&chunk_path).parent() {
+            fs::create_dir_all(parent).await.map_err(|e| {
+                warn!(
+                    "open_new_chunk_writer: create dir failed! {}",
+                    e.to_string()
+                );
+                NdnError::IoError(e.to_string())
+            })?;
+        }
+
+        //已独占写模式创建文件
+        let file = File::create(&chunk_path).await.map_err(|e| {
+            warn!("open_chunk_writer: create file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+
+        let std_file = file.into_std().await;
+        let mut file_lock = std_file.try_lock_exclusive().map_err(|e| {
+            warn!("open_new_chunk_writer: lock file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        let file = tokio::fs::File::from_std(std_file);
+
+        let chunk_item = ChunkItem::new(chunk_id, chunk_size, None);
+        self.db.set_chunk_item(&chunk_item)?;
+        return Ok(Box::pin(file));
+    }
+
+    //return chunk_id,progress_info
+
 
     pub async fn open_chunk_writer(
         mgr_id: Option<&str>,
@@ -676,35 +1052,39 @@ impl NamedDataMgr {
             .await
     }
 
+
     pub async fn update_chunk_progress_impl(
         &self,
         chunk_id: &ChunkId,
         progress: String,
     ) -> NdnResult<()> {
-        self.local_store
-            .update_chunk_progress(chunk_id, progress)
-            .await
+        return self
+            .db
+            .update_chunk_progress(chunk_id, progress);
     }
 
-    pub async fn update_chunk_progress(
-        mgr_id: Option<&str>,
-        chunk_id: &ChunkId,
-        progress: String,
-    ) -> NdnResult<()> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-        if named_mgr.is_none() {
-            return Err(NdnError::NotFound(format!("named data mgr not found")));
-        }
-        let named_mgr = named_mgr.unwrap();
-        let named_mgr = named_mgr.lock().await;
-        named_mgr
-            .update_chunk_progress_impl(chunk_id, progress)
-            .await
-    }
 
+    //writer已经写入完成，此时可以进行一次可选的hash校验
     pub async fn complete_chunk_writer_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        self.local_store.complete_chunk_writer(chunk_id).await
+        let mut chunk_item = self.db.get_chunk_item(chunk_id);
+        if chunk_item.is_err() {
+            return Err(NdnError::NotFound(format!(
+                "chunk not found! {}",
+                chunk_id.to_string()
+            )));
+        }
+        let mut chunk_item = chunk_item.unwrap();
+        chunk_item.chunk_state = ChunkState::Completed;
+        chunk_item.progress = "".to_string();
+        info!(
+            "complete_chunk_writer: complete chunk {} success itemsize:{}",
+            chunk_id.to_string(),
+            chunk_item.chunk_size
+        );
+        self.db.set_chunk_item(&chunk_item)?;
+        Ok(())
     }
+
 
     pub async fn complete_chunk_writer(mgr_id: Option<&str>, chunk_id: &ChunkId) -> NdnResult<()> {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
@@ -715,6 +1095,70 @@ impl NamedDataMgr {
         let named_mgr = named_mgr.lock().await;
         named_mgr.complete_chunk_writer_impl(chunk_id).await
     }
+
+    //=====================下面的都是helper函数了======================
+    //针对小于1MB的 chunk,推荐直接返回内存
+    pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
+        let (mut chunk_reader, chunk_size) =
+            self.open_store_chunk_reader_impl(chunk_id, 0).await?;
+        let mut buffer = Vec::with_capacity(chunk_size as usize);
+        chunk_reader.read_to_end(&mut buffer).await.map_err(|e| {
+            warn!("get_chunk_data: read file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        Ok(buffer)
+    }
+
+    pub async fn get_chunk_piece(
+        &self,
+        chunk_id: &ChunkId,
+        offset: u64,
+        piece_size: u32,
+    ) -> NdnResult<Vec<u8>> {
+        let (mut reader, chunk_size) = self.open_store_chunk_reader_impl(chunk_id, 0).await?;
+        let mut buffer = vec![0u8; piece_size as usize];
+        reader.read_exact(&mut buffer).await.map_err(|e| {
+            warn!("get_chunk_piece: read file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        Ok(buffer)
+    }
+
+    //写入一个在内存中的完整的chunk
+    pub async fn put_chunk(
+        &self,
+        chunk_id: &ChunkId,
+        chunk_data: &[u8],
+        need_verify: bool,
+    ) -> NdnResult<()> {
+        if need_verify {
+            let hash_method = chunk_id.chunk_type.to_hash_method()?;
+            let mut chunk_hasher = ChunkHasher::new_with_hash_method(hash_method)?;
+            let hash_bytes = chunk_hasher.calc_from_bytes(&chunk_data);
+            if !chunk_id.equal(&hash_bytes) {
+                warn!(
+                    "put_chunk: chunk_id not equal hash_bytes! {}",
+                    chunk_id.to_string()
+                );
+                return Err(NdnError::InvalidId(format!(
+                    "chunk_id not equal hash_bytes! {}",
+                    chunk_id.to_string()
+                )));
+            }
+        }
+
+        let mut chunk_writer = self
+            .open_new_chunk_writer_impl(chunk_id, chunk_data.len() as u64)
+            .await?;
+        chunk_writer.write_all(chunk_data).await.map_err(|e| {
+            warn!("put_chunk: write file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        self.complete_chunk_writer_impl(chunk_id).await?;
+
+        Ok(())
+    }
+
 
     //下面是一些helper函数
     pub async fn pub_object_to_file(
@@ -756,6 +1200,14 @@ impl NamedDataMgr {
             .put_object_impl(&will_sign_obj_id, &obj_jwt)
             .await?;
         Ok(())
+    }
+
+    pub fn query_local_file_info_by_qcid_impl(&self, qcid: &str) -> Option<LocalFileInfo> {
+        unimplemented!();
+    }
+
+    pub async fn query_local_file_link_data_impl(&self, local_file_path: &Path) -> Option<LocalFileInfo> {
+        unimplemented!();
     }
 
     pub async fn sigh_path_obj_impl(&self, path: &str, path_obj_jwt: &str) -> NdnResult<()> {
@@ -898,6 +1350,7 @@ impl NamedDataMgr {
             .await?;
         Ok(())
     }
+
 
     pub async fn pub_local_file_as_chunk(
         self,

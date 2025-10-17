@@ -2,6 +2,7 @@ use super::chunk::{ChunkId,ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SI
 use crate::hash::DEFAULT_HASH_METHOD;
 use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::str::FromStr;
 use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
@@ -233,16 +234,16 @@ pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
     hasher.update(&buffer);
     let hash_result = hasher.finalize();
 
-    Ok(ChunkId {
-        chunk_type: ChunkType::QCID,
-        hash_result: hash_result.to_vec(),
-    })
+    let result_chunk_id = ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID);
+
+    Ok(result_chunk_id)
 }
 
 pub async fn calc_quick_hash_by_buffer(
     buffer_begin: &[u8],
     buffer_mid: &[u8],
     buffer_end: &[u8],
+    length: u64,
 ) -> NdnResult<ChunkId> {
     let mut hasher = Sha256::new();
     let limit_size = QCID_HASH_PIECE_SIZE as usize;
@@ -260,11 +261,9 @@ pub async fn calc_quick_hash_by_buffer(
     hasher.update(buffer_end);
     let hash_result = hasher.finalize();
 
-    Ok(ChunkId {
-        chunk_type: ChunkType::QCID,
-        hash_result: hash_result.to_vec(),
-    })
+    Ok(ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID))
 }
+
 
 pub async fn calculate_file_chunk_id(
     file_path: &str,
@@ -289,6 +288,15 @@ pub async fn calculate_file_chunk_id(
         let chunk_id = ChunkId::from_hash_result(&hash_result, chunk_type);
         return Ok((chunk_id, file_size));
     }
+}
+
+pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<String> {
+    let mut file_reader = tokio::fs::File::open(file_path).await.map_err(|err| {
+        warn!("caculate_qcid_from_file: open file failed! {}", err.to_string());
+        NdnError::IoError(err.to_string())
+    })?;
+    let qcid = calc_quick_hash(&mut file_reader, None).await?;
+    return Ok(qcid.to_string());
 }
 
 pub async fn copy_chunk<R, W>(
