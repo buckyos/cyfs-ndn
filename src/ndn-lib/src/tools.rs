@@ -14,6 +14,23 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::chunk::caculate_qcid_from_file;
 
+pub enum KnownStandardObject {
+
+}
+
+impl KnownStandardObject {
+
+    pub fn from_obj_data(obj_id: &ObjId, obj_data: &str) -> NdnResult<Self> {
+        unimplemented!();
+    }
+    
+    pub fn get_child_obj_ids(&self) -> Vec<ObjId> {
+        unimplemented!();
+    }
+}
+
+
+
 #[derive(PartialEq)]
 pub enum CheckMode {
     ByQCID,

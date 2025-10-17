@@ -68,6 +68,7 @@ impl NamedDataMgr {
         self.mgr_id.clone()
     }
 
+
     pub async fn set_mgr_by_id(
         named_data_mgr_id: Option<&str>,
         mgr: NamedDataMgr,
@@ -1206,10 +1207,6 @@ impl NamedDataMgr {
         unimplemented!();
     }
 
-    pub async fn query_local_file_link_data_impl(&self, local_file_path: &Path) -> Option<LocalFileInfo> {
-        unimplemented!();
-    }
-
     pub async fn sigh_path_obj_impl(&self, path: &str, path_obj_jwt: &str) -> NdnResult<()> {
         let path_obj_json: serde_json::Value = decode_jwt_claim_without_verify(path_obj_jwt)
             .map_err(|e| {
@@ -1406,6 +1403,91 @@ impl NamedDataMgr {
             self.complete_chunk_writer_impl(&chunk_id).await?;
         }
         Ok(chunk_id)
+    }
+
+    pub async fn gc_worker(db_path: &str) -> NdnResult<()> {
+        let mut conn = Connection::open(&db_path).map_err(|e| {
+            warn!("NamedDataMgrDB: open database failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "DELETE FROM obj_ref_update_queue WHERE ref_count = 0",
+            [],
+        )
+        .map_err(|e| {
+            warn!("NamedDataMgrDB: delete obj ref update queue failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        loop {
+            let tx = conn.transaction().map_err(|e| {
+                warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+            //在obj_ref_update_queue中pop出一条最旧的记录
+            let row = tx.query_one("SELECT obj_id, ref_count FROM obj_ref_update_queue ORDER BY update_time ASC LIMIT 1", [], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+            });
+            if row.is_ok() {
+                let (obj_id_str, ref_count) = row.unwrap();
+                let obj_id = ObjId::new(obj_id_str.as_str());
+                if obj_id.is_err() {
+                    continue;;
+                }
+
+                if ref_count == 0 {
+                    continue;;
+                }
+                let obj_id = obj_id.unwrap();
+                //尝试获取obj_data,如果失败则创建一个占位的空记录
+                let obj_row = tx.query_one("SELECT obj_data,ref_count FROM objects WHERE obj_id = ?1", [obj_id_str.clone()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+                });
+                if obj_row.is_ok() {
+                    let (obj_data, _ref_count) = obj_row.unwrap();
+                    NamedDataMgrDB::update_obj_ref_count(&tx, &obj_id, Some(obj_data.as_str()), ref_count)?;
+                } else {
+                    debug!("NamedDataMgrDB: insert object without obj_data ! {}", obj_id_str.as_str());
+                    tx.execute("INSERT INTO objects (obj_id, obj_type,obj_data, ref_count,create_time,last_access_time) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", 
+                    [obj_id_str.clone(), obj_id.obj_type.clone(), "".to_string(), ref_count.to_string(), buckyos_get_unix_timestamp().to_string(), buckyos_get_unix_timestamp().to_string()]).map_err(|e| {
+                        warn!("NamedDataMgrDB: insert objects failed! {}", e.to_string());
+                        NdnError::DbError(e.to_string())
+                    })?;
+                }
+                //Pop这条记录
+                tx.execute("DELETE FROM obj_ref_update_queue WHERE obj_id = ?1", [obj_id_str]).map_err(|e| {
+                    warn!("NamedDataMgrDB: delete obj ref update queue failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
+
+                tx.commit().map_err(|e| {
+                    warn!("NamedDataMgrDB: commit transaction failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
+            } else {
+                return Ok(());
+            }
+
+        }       
+
+        Ok(())
+    }
+
+    pub fn start_gc_thread(&self) -> NdnResult<()> {
+        let db_path = self.db.db_path.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let worker_result = Self::gc_worker(&db_path).await;
+                if worker_result.is_ok() {
+                    info!("gc_worker success,obj_ref_update_queue is clean!");
+                    //此时可以尝试真正的删除对象了，总是从chunk开始
+                }
+            }
+        });
+        Ok(())
     }
 }
 

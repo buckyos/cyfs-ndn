@@ -1,3 +1,4 @@
+use crate::tools::KnownStandardObject;
 use crate::{
     build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState,
     FileObject, NdnError, NdnResult, PathObject, LinkData, ObjectLink,
@@ -20,6 +21,7 @@ use std::io as std_io;
 use std::io::SeekFrom;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 use std::{path::PathBuf, pin::Pin};
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -43,7 +45,7 @@ impl From<NdnError> for std_io::Error {
     }
 }
 pub struct NamedDataMgrDB {
-    db_path: String,
+    pub db_path: String,
     conn: Mutex<Connection>,
 }
 
@@ -67,7 +69,7 @@ impl NamedDataMgrDB {
         )
         .map_err(|e| {
             warn!(
-                "NamedDataMgrDB: create paths table failed! {}",
+                "NamedDataMgrDB: create PATHS table failed! {}",
                 e.to_string()
             );
             NdnError::DbError(e.to_string())
@@ -81,23 +83,23 @@ impl NamedDataMgrDB {
             [],
         )
         .map_err(|e| {
-            warn!("NamedDataMgrDB: create local file info table failed! {}", e.to_string());
+            warn!("NamedDataMgrDB: create PATH_METAS table failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS local_file_info (
-                local_file_path TEXT PRIMARY KEY,
-                qcid TEXT NOT NULL,
-                last_modify_time INTEGER NOT NULL,
-                content TEXT NOT NULL
-            )",
-            [],
-        )
-        .map_err(|e| {
-            warn!("NamedDataMgrDB: create local file info table failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
+        // conn.execute(
+        //     "CREATE TABLE IF NOT EXISTS local_file_info (
+        //         local_file_path TEXT PRIMARY KEY,
+        //         qcid TEXT NOT NULL,
+        //         last_modify_time INTEGER NOT NULL,
+        //         content TEXT NOT NULL
+        //     )",
+        //     [],
+        // )
+        // .map_err(|e| {
+        //     warn!("NamedDataMgrDB: create local file info table failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
 
         // Create tables from NamedDataDb
         conn.execute(
@@ -105,6 +107,7 @@ impl NamedDataMgrDB {
                 chunk_id TEXT PRIMARY KEY,
                 chunk_size INTEGER NOT NULL, 
                 chunk_state TEXT NOT NULL,
+                ref_count INTEGER NOT NULL,
                 progress TEXT,
                 description TEXT NOT NULL,
                 create_time INTEGER NOT NULL,
@@ -157,7 +160,8 @@ impl NamedDataMgrDB {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS object_links (
                 link_obj_id TEXT PRIMARY KEY,
-                obj_link TEXT NOT NULL
+                obj_link TEXT NOT NULL,
+                create_time INTEGER NOT NULL,
             )",
             [],
         )
@@ -497,13 +501,14 @@ impl NamedDataMgrDB {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO chunk_items 
-            (chunk_id, chunk_size, chunk_state, progress, 
+            (chunk_id, chunk_size, chunk_state, ref_count, progress, 
              description, create_time, update_time)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 chunk_item.chunk_id.to_string(),
                 chunk_item.chunk_size,
                 chunk_item.chunk_state,
+                chunk_item.ref_count,
                 chunk_item.progress,
                 chunk_item.description,
                 chunk_item.create_time,
@@ -531,10 +536,11 @@ impl NamedDataMgrDB {
                     chunk_id: chunk_id.clone(),
                     chunk_size: row.get(1)?,
                     chunk_state: row.get(2)?,
-                    progress: row.get(3)?,
-                    description: row.get(4)?,
-                    create_time: row.get(5)?,
-                    update_time: row.get(6)?,
+                    ref_count: row.get(3)?,
+                    progress: row.get(4)?,
+                    description: row.get(5)?,
+                    create_time: row.get(6)?,
+                    update_time: row.get(7)?,
                 })
             })
             .map_err(|e| {
@@ -555,12 +561,13 @@ impl NamedDataMgrDB {
         for chunk in chunk_list {
             tx.execute(
                 "INSERT OR REPLACE INTO chunk_items 
-                (chunk_id, chunk_size, chunk_state, progress, description, create_time, update_time)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (chunk_id, chunk_size, chunk_state, ref_count, progress, description, create_time, update_time)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     chunk.chunk_id.to_string(),
                     chunk.chunk_size,
                     chunk.chunk_state,
+                    chunk.ref_count,
                     chunk.progress,
                     chunk.description,
                     chunk.create_time,
@@ -647,8 +654,9 @@ impl NamedDataMgrDB {
         // 如果从 null 变成非 null，执行ref_count更新
         if old_obj_data.is_some() {
             let (old_obj_data, old_ref_count) = old_obj_data.unwrap();
-            if old_obj_data.len() < 0 && old_ref_count > 0 {
-                Self::update_obj_ref_count(&tx, obj_id, Some(&old_obj_data), old_ref_count)?;
+            if old_obj_data.len() < 2 && old_ref_count > 0 && obj_str.len() > 0 {
+                debug!("NamedDataMgrDB: update obj ref_count from null to non-null, obj_id: {}", obj_id.to_string());
+                Self::update_obj_ref_count(&tx, obj_id, Some(obj_str), old_ref_count)?;
             }
         }
         
@@ -714,29 +722,45 @@ impl NamedDataMgrDB {
         Ok(())
     }
 
-    fn update_obj_ref_count<'a>(tx: &Transaction<'a>, obj_id: &ObjId, obj_data: Option<&str>, add_ref_count: i32) -> NdnResult<()> {
-        if obj_id.is_container() {
-            let obj_id_str = obj_id.to_string();
-            Self::push_obj_id_to_add_ref_count_queue(tx, obj_id_str.as_str(), add_ref_count)?;
-        } else {
-            tx.execute(
-                "UPDATE objects SET ref_count = ref_count + (?1) WHERE obj_id = ?2",
-                params![add_ref_count, obj_id.to_string()],
-            )
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: update object ref count failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
+    pub fn update_obj_ref_count<'a>(tx: &Transaction<'a>, obj_id: &ObjId, obj_data: Option<&str>, add_ref_count: i32) -> NdnResult<()> {
+        if obj_data.is_some() {
+            if obj_id.is_chunk() {
+                tx.execute(
+                    "UPDATE chunk_items SET ref_count = ref_count + (?1) WHERE chunk_id = ?2",
+                    params![add_ref_count, obj_id.to_string()],
+                )
+                .map_err(|e| {
+                    warn!("NamedDataMgrDB: update chunk ref count failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
+            } else {
+                tx.execute(
+                    "UPDATE objects SET ref_count = ref_count + (?1), last_access_time = ?2 WHERE obj_id = ?3",
+                    params![add_ref_count, buckyos_get_unix_timestamp(), obj_id.to_string()],
+                )
+                .map_err(|e| {
+                    warn!("NamedDataMgrDB: update object ref count failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
 
-            //可识别的标准对象，还需要获取其子对象，并执行update_obj_ref_count
+                let obj_data_str = obj_data.unwrap();
+                let known_standard_object = KnownStandardObject::from_obj_data(obj_id, obj_data_str);
+                if known_standard_object.is_ok() {
+                    let known_standard_object = known_standard_object.unwrap();
+                    let child_obj_ids = known_standard_object.get_child_obj_ids();
+                    for child_obj_id in child_obj_ids {
+                        Self::update_obj_ref_count(tx, &child_obj_id, None, add_ref_count)?;
+                    }
+                }
+            }
+        } else  {
+            Self::push_obj_id_to_add_ref_count_queue(tx, obj_id.to_string().as_str(), add_ref_count)?;
         }
-
+        
         Ok(())
     }
 
-    pub fn start_gc_thread(&self) -> NdnResult<()> {
-       unimplemented!();
-    }
+
     
     // pub async fn remove_object(&self, obj_id: &ObjId) -> NdnResult<()> {
     //     let conn = self.conn.lock().unwrap();
@@ -830,75 +854,123 @@ impl NamedDataMgrDB {
         Ok(())
     }
 
-    pub fn set_local_file_info(&self, local_file_path: &str, local_file_info: &LocalFileInfo) -> NdnResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO local_file_info (local_file_path, qcid, last_modify_time, content)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![local_file_path, local_file_info.qcid.as_str(), local_file_info.last_modify_time, local_file_info.content.as_str()],
-        )
-        .map_err(|e| {
-            warn!("NamedDataMgrDB: add local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-        Ok(())
-    }
+    pub fn query_local_file_info_by_qcid(&self, qcid: &str) -> NdnResult<Option<LocalFileInfo>> {
+        // let mut conn = self.conn.lock().unwrap();
 
-    pub fn remove_local_file_info(&self, local_file_path: &str) -> NdnResult<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM local_file_info WHERE local_file_path = ?1",
-            params![local_file_path],
-        )
-        .map_err(|e| {
-            warn!("NamedDataMgrDB: remove local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-        Ok(())
-    }
-
-    pub fn query_local_file_info(&self, local_file_path: &str) -> NdnResult<Option<LocalFileInfo>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT qcid, last_modify_time, content FROM local_file_info WHERE local_file_path = ?1")
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
-
-        let mut rows = stmt.query(params![local_file_path]).map_err(|e| {
-            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-
-        let row = rows.next().map_err(|e| {
-            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-
-        if row.is_none() {
-            return Ok(None);
-        }
-
-        let row = row.unwrap();
-        let qcid: String = row.get(0).map_err(|e| {
-            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-        let last_modify_time: u64 = row.get(1).map_err(|e| {
-            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-        let content: String = row.get(2).map_err(|e| {
-            warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
-        let local_file_info = LocalFileInfo {
-            qcid,
-            last_modify_time,
-            content,
-        };
+        // let tx = conn.transaction().map_err(|e| {
+        //     warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
         
-        Ok(Some(local_file_info))
+
+        // let same_as_link_data = LinkData::SameAs(ObjId::new(qcid)?);
+        // let same_as_link_data_str = same_as_link_data.to_string();
+        // //从object_links table中查找qcid对应的信息
+        // let mut rows = tx.execute(
+        //     "SELECT obj_id FROM object_links WHERE obj_link = ?1 ORDER BY create_time DESC LIMIT 1",
+        //     params![same_as_link_data_str],
+        // )
+        // .map_err(|e| {
+        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
+
+        // let content_obj_id: String = rows.get(0).map_err(|e| {
+        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
+
+        // let obj_link = stmt.query_row(params![qcid], |row| row.get::<_, String>(0)).map_err(|e| {
+        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+        //     NdnError::DbError(e.to_string())
+        // })?;
+
+        // let link_data = LinkData::from_string(&obj_link)?;
+        // match link_data {
+        //     LinkData::LocalFile(file_path, range, last_modify_time, qcid) => {
+        //         let local_file_info = LocalFileInfo {
+        //             qcid: qcid.to_string(),
+        //             last_modify_time: last_modify_time,
+        //             content: file_path,
+        //         };
+        //         return Ok(Some(local_file_info));
+        //     }
+        //     _ => {
+        //         return Ok(None);
+        //     }
+        // }
+        unimplemented!();
     }
+
+    // pub fn set_local_file_info(&self, local_file_path: &str, local_file_info: &LocalFileInfo) -> NdnResult<()> {
+    //     let conn = self.conn.lock().unwrap();
+    //     conn.execute(
+    //         "INSERT OR REPLACE INTO local_file_info (local_file_path, qcid, last_modify_time, content)
+    //          VALUES (?1, ?2, ?3, ?4)",
+    //         params![local_file_path, local_file_info.qcid.as_str(), local_file_info.last_modify_time, local_file_info.content.as_str()],
+    //     )
+    //     .map_err(|e| {
+    //         warn!("NamedDataMgrDB: add local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+    //     Ok(())
+    // }
+
+    // pub fn remove_local_file_info(&self, local_file_path: &str) -> NdnResult<()> {
+    //     let conn = self.conn.lock().unwrap();
+    //     conn.execute(
+    //         "DELETE FROM local_file_info WHERE local_file_path = ?1",
+    //         params![local_file_path],
+    //     )
+    //     .map_err(|e| {
+    //         warn!("NamedDataMgrDB: remove local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+    //     Ok(())
+    // }
+
+    // pub fn query_local_file_info(&self, local_file_path: &str) -> NdnResult<Option<LocalFileInfo>> {
+    //     let conn = self.conn.lock().unwrap();
+    //     let mut stmt = conn
+    //         .prepare("SELECT qcid, last_modify_time, content FROM local_file_info WHERE local_file_path = ?1")
+    //         .map_err(|e| {
+    //             warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //             NdnError::DbError(e.to_string())
+    //         })?;
+
+    //     let mut rows = stmt.query(params![local_file_path]).map_err(|e| {
+    //         warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+
+    //     let row = rows.next().map_err(|e| {
+    //         warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+
+    //     if row.is_none() {
+    //         return Ok(None);
+    //     }
+
+    //     let row = row.unwrap();
+    //     let qcid: String = row.get(0).map_err(|e| {
+    //         warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+    //     let last_modify_time: u64 = row.get(1).map_err(|e| {
+    //         warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+    //     let content: String = row.get(2).map_err(|e| {
+    //         warn!("NamedDataMgrDB: query local file info failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
+    //     let local_file_info = LocalFileInfo {
+    //         qcid,
+    //         last_modify_time,
+    //         content,
+    //     };
+        
+    //     Ok(Some(local_file_info))
+    // }
 }

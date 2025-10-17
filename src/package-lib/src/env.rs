@@ -481,7 +481,7 @@ impl PackageEnv {
                 info!("chunk {} downloaded, size: {}", chunk_id_str, chunk_size);
             }
 
-            let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader_static(self.config.named_mgr_name.as_deref(),
+            let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader(self.config.named_mgr_name.as_deref(),
                 &chunk_id,0,false).await
                 .map_err(|e| PkgError::LoadError(
                     pkg_id.clone(),
