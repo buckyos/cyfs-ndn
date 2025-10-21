@@ -1,7 +1,6 @@
 use crate::tools::KnownStandardObject;
 use crate::{
-    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState,
-    FileObject, NdnError, NdnResult, PathObject, LinkData, ObjectLink,
+    build_named_object_by_json, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, RelationObject, RELATION_TYPE_SAME
 };
 use buckyos_kit::get_buckyos_named_data_dir;
 use buckyos_kit::{
@@ -31,13 +30,9 @@ use tokio_util::bytes::BytesMut;
 use tokio_util::io::StreamReader;
 
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId};
-use super::def::{ChunkItem, ndn_get_time_now};
+use super::def::{ChunkItem};
 
-pub struct LocalFileInfo {
-    pub qcid: String,
-    pub last_modify_time: u64,
-    pub content:String
-}
+
 
 impl From<NdnError> for std_io::Error {
     fn from(err: NdnError) -> Self {
@@ -107,9 +102,10 @@ impl NamedDataMgrDB {
                 chunk_id TEXT PRIMARY KEY,
                 chunk_size INTEGER NOT NULL, 
                 chunk_state TEXT NOT NULL,
+                local_path TEXT,
+                local_info TEXT,
                 ref_count INTEGER NOT NULL,
                 progress TEXT,
-                description TEXT NOT NULL,
                 create_time INTEGER NOT NULL,
                 update_time INTEGER NOT NULL
             )",
@@ -158,16 +154,19 @@ impl NamedDataMgrDB {
         })?;
 
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS object_links (
-                link_obj_id TEXT PRIMARY KEY,
-                obj_link TEXT NOT NULL,
-                create_time INTEGER NOT NULL,
-            )",
+            "CREATE TABLE IF NOT EXISTS object_relations (
+                obj_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                target TEXT NOT NULL,
+                relation_type INTEGER NOT NULL,
+                relation_object TEXT NOT NULL,
+                create_time INTEGER NOT NULL
+            ) PRIMARY KEY (obj_id)",
             [],
         )
         .map_err(|e| {
             warn!(
-                "NamedDataMgrDB: create table object_links failed! {}",
+                "NamedDataMgrDB: create table object_relations failed! {}",
                 e.to_string()
             );
             NdnError::DbError(e.to_string())
@@ -499,26 +498,55 @@ impl NamedDataMgrDB {
     // Chunk related methods from NamedDataDb
     pub fn set_chunk_item(&self, chunk_item: &ChunkItem) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO chunk_items 
-            (chunk_id, chunk_size, chunk_state, ref_count, progress, 
-             description, create_time, update_time)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                chunk_item.chunk_id.to_string(),
-                chunk_item.chunk_size,
-                chunk_item.chunk_state,
-                chunk_item.ref_count,
-                chunk_item.progress,
-                chunk_item.description,
-                chunk_item.create_time,
-                chunk_item.update_time,
-            ],
-        )
-        .map_err(|e| {
-            warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
+
+        match &chunk_item.chunk_state {
+            ChunkState::LocalLink(ref local_info) => {
+                let local_info_str = serde_json::to_string(local_info).unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_items 
+                    (chunk_id, chunk_size, chunk_state, local_path,local_info, ref_count, progress, 
+                     create_time, update_time)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        chunk_item.chunk_id.to_string(),
+                        chunk_item.chunk_size,
+                        chunk_item.chunk_state,
+                        local_info.path,
+                        local_info_str,
+                        chunk_item.ref_count,
+                        chunk_item.progress,
+                        chunk_item.create_time,
+                        chunk_item.update_time,
+                    ],
+                )
+                .map_err(|e| {
+                    warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
+            }
+            _ => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_items 
+                    (chunk_id, chunk_size, chunk_state, ref_count, progress, 
+                     create_time, update_time)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        chunk_item.chunk_id.to_string(),
+                        chunk_item.chunk_size,
+                        chunk_item.chunk_state,
+                        chunk_item.ref_count,
+                        chunk_item.progress,
+                        chunk_item.create_time,
+                        chunk_item.update_time,
+                    ],
+                )
+                .map_err(|e| {
+                    warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
+                    NdnError::DbError(e.to_string())
+                })?;
+            }
+        }
+        
         Ok(())
     }
 
@@ -532,13 +560,14 @@ impl NamedDataMgrDB {
 
         let chunk = stmt
             .query_row(params![chunk_id.to_string()], |row| {
+                let chunk_state:ChunkState = row.get(2)?;
+
                 Ok(ChunkItem {
                     chunk_id: chunk_id.clone(),
                     chunk_size: row.get(1)?,
                     chunk_state: row.get(2)?,
                     ref_count: row.get(3)?,
                     progress: row.get(4)?,
-                    description: row.get(5)?,
                     create_time: row.get(6)?,
                     update_time: row.get(7)?,
                 })
@@ -551,48 +580,48 @@ impl NamedDataMgrDB {
         Ok(chunk)
     }
 
-    pub fn put_chunk_list(&self, chunk_list: Vec<ChunkItem>) -> NdnResult<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction().map_err(|e| {
-            warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
+    // pub fn put_chunk_list(&self, chunk_list: Vec<ChunkItem>) -> NdnResult<()> {
+    //     let mut conn = self.conn.lock().unwrap();
+    //     let tx = conn.transaction().map_err(|e| {
+    //         warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
 
-        for chunk in chunk_list {
-            tx.execute(
-                "INSERT OR REPLACE INTO chunk_items 
-                (chunk_id, chunk_size, chunk_state, ref_count, progress, description, create_time, update_time)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    chunk.chunk_id.to_string(),
-                    chunk.chunk_size,
-                    chunk.chunk_state,
-                    chunk.ref_count,
-                    chunk.progress,
-                    chunk.description,
-                    chunk.create_time,
-                    chunk.update_time,
-                ],
-            )
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
-        }
+    //     for chunk in chunk_list {
+    //         tx.execute(
+    //             "INSERT OR REPLACE INTO chunk_items 
+    //             (chunk_id, chunk_size, chunk_state, ref_count, progress, description, create_time, update_time)
+    //             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    //             params![
+    //                 chunk.chunk_id.to_string(),
+    //                 chunk.chunk_size,
+    //                 chunk.chunk_state,
+    //                 chunk.ref_count,
+    //                 chunk.progress,
+    //                 chunk.description,
+    //                 chunk.create_time,
+    //                 chunk.update_time,
+    //             ],
+    //         )
+    //         .map_err(|e| {
+    //             warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
+    //             NdnError::DbError(e.to_string())
+    //         })?;
+    //     }
 
-        tx.commit().map_err(|e| {
-            warn!("NamedDataMgrDB: commit failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
-        })?;
+    //     tx.commit().map_err(|e| {
+    //         warn!("NamedDataMgrDB: commit failed! {}", e.to_string());
+    //         NdnError::DbError(e.to_string())
+    //     })?;
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 
     pub fn update_chunk_progress(&self, chunk_id: &ChunkId, progress: String) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE chunk_items SET progress = ?1, chunk_state = 'incompleted', update_time = ?2 WHERE chunk_id = ?3",
-            params![progress, ndn_get_time_now(), chunk_id.to_string()],
+            params![progress, buckyos_get_unix_timestamp(), chunk_id.to_string()],
         ).map_err(|e| {
             warn!("NamedDataMgrDB: update chunk progress failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
@@ -625,7 +654,7 @@ impl NamedDataMgrDB {
 
     // Object related methods from NamedDataDb
     pub fn set_object(&self, obj_id: &ObjId, obj_type: &str, obj_str: &str) -> NdnResult<()> {
-        let now_time = ndn_get_time_now();
+        let now_time = buckyos_get_unix_timestamp();
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| {
@@ -693,7 +722,7 @@ impl NamedDataMgrDB {
         obj_id: &str, 
         add_ref_count: i32
     ) -> NdnResult<()> {
-        let now_time = ndn_get_time_now();
+        let now_time = buckyos_get_unix_timestamp();
         
         // 先执行 upsert
         tx.execute(
@@ -747,9 +776,17 @@ impl NamedDataMgrDB {
                 let known_standard_object = KnownStandardObject::from_obj_data(obj_id, obj_data_str);
                 if known_standard_object.is_ok() {
                     let known_standard_object = known_standard_object.unwrap();
-                    let child_obj_ids = known_standard_object.get_child_obj_ids();
-                    for child_obj_id in child_obj_ids {
-                        Self::update_obj_ref_count(tx, &child_obj_id, None, add_ref_count)?;
+                    let child_objs = known_standard_object.get_child_objs()?;
+                    for (child_obj_id,obj_str) in child_objs {
+                        match obj_str {
+                            Some(obj_str) => {
+                                Self::update_obj_ref_count(tx, &child_obj_id, Some(obj_str.as_str()), add_ref_count)?;
+                            }
+                            None => {
+                                Self::update_obj_ref_count(tx, &child_obj_id, None, add_ref_count)?;
+                            }
+                        }
+
                     }
                 }
             }
@@ -776,131 +813,179 @@ impl NamedDataMgrDB {
     //     Ok(())
     // }
 
-
-
-    // Object link related methods from NamedDataDb
-    pub fn set_object_link(&self, obj_id: &ObjId, obj_link: &LinkData) -> NdnResult<()> {
+    pub fn set_relation_object(&self, relation_object: &RelationObject,obj_ids:Option<(ObjId,String)>) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
+        let mut create_time;
+        if relation_object.iat.is_none() {
+            create_time = buckyos_get_unix_timestamp();
+        } else {
+            create_time = relation_object.iat.unwrap();
+        }
+        let relation_obj_ids: (ObjId,String);
+        if obj_ids.is_none() {;
+            relation_obj_ids = relation_object.gen_obj_id();
+        } else {
+            relation_obj_ids = obj_ids.unwrap();
+        }
         conn.execute(
-            "INSERT OR REPLACE INTO object_links (link_obj_id, obj_link)
-             VALUES (?1, ?2)",
-            params![obj_id.to_string(), obj_link.to_string()],
+            "INSERT OR REPLACE INTO object_relations (obj_id, source, target, relation_type, relation_object, create_time)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![relation_obj_ids.0.to_string(),relation_object.source.to_string(),relation_object.target.to_string(), relation_object.relation, relation_obj_ids.1, create_time],
         )
         .map_err(|e| {
-            warn!("NamedDataMgrDB: insert object link failed! {}", e.to_string());
+            warn!("NamedDataMgrDB: insert relation object failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
         Ok(())
     }
 
-    pub fn query_object_link_ref(&self, ref_obj_id: &ObjId) -> NdnResult<Vec<String>> {
+    pub fn get_relation_by_source(&self, reation_type:&str,source: &ObjId) -> NdnResult<Vec<RelationObject>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT link_obj_id FROM object_links WHERE obj_link LIKE ?1")
+            .prepare("SELECT relation_object FROM object_relations WHERE source = ?1 AND relation_type = ?2")
             .map_err(|e| {
-                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                warn!("NamedDataMgrDB: get_relation_by_source failed! {}", e.to_string());
                 NdnError::DbError(e.to_string())
             })?;
-
-        let ref_obj_id_str = format!("%{}%", ref_obj_id.to_string());
-        let mut rows = stmt.query(params![ref_obj_id_str]).map_err(|e| {
-            warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+        let mut rows = stmt.query(params![source.to_string(), reation_type]).map_err(|e| {
+            warn!("NamedDataMgrDB: get_relation_by_source failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
-
-        let mut link_obj_ids = Vec::new();
+        let mut relation_objects = Vec::new();
         while let Some(row) = rows.next().map_err(|e| {
-            warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+            warn!("NamedDataMgrDB: get_relation_by_source failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })? {
-            let link_obj_id: String = row.get(0).map_err(|e| {
-                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+            let relation_object_str: String = row.get(0).map_err(|e| {
+                warn!("NamedDataMgrDB: get_relation_by_source failed! {}", e.to_string());
                 NdnError::DbError(e.to_string())
             })?;
-            link_obj_ids.push(link_obj_id);
+            let relation_object_json = load_named_object_from_obj_str(&relation_object_str)?;
+            let relation_object = serde_json::from_value(relation_object_json).map_err(|e| {
+                warn!("NamedDataMgrDB: get_relation_by_source failed! {},parser obj_str failed.", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+            relation_objects.push(relation_object);
         }
-
-        Ok(link_obj_ids)
+        if relation_objects.is_empty() {
+            return Err(NdnError::NotFound(format!("No relation object found for source:{} and relation_type:{}", source.to_string(), reation_type)));
+        }
+        Ok(relation_objects)
     }
 
-    pub fn get_object_link(&self, obj_id: &ObjId) -> NdnResult<String> {
+    pub fn get_relation_by_target(&self, reation_type:&str,target: &ObjId) -> NdnResult<Vec<RelationObject>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT obj_link FROM object_links WHERE link_obj_id = ?1")
+            .prepare("SELECT relation_object FROM object_relations WHERE target = ?1 AND relation_type = ?2")
             .map_err(|e| {
-                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+                warn!("NamedDataMgrDB: get_relation_by_target failed! {}", e.to_string());
                 NdnError::DbError(e.to_string())
             })?;
-
-        let obj_link = stmt
-            .query_row(params![obj_id.to_string()], |row| row.get::<_, String>(0))
-            .map_err(|e| {
-                warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+        let mut rows = stmt.query(params![target.to_string(), reation_type]).map_err(|e| {
+            warn!("NamedDataMgrDB: get_relation_by_target failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        let mut relation_objects = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| {
+            warn!("NamedDataMgrDB: get_relation_by_target failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })? {
+            let relation_object_str: String = row.get(0).map_err(|e| {
+                warn!("NamedDataMgrDB: get_relation_by_target failed! {}", e.to_string());
                 NdnError::DbError(e.to_string())
             })?;
-        Ok(obj_link)
+            let relation_object_json = load_named_object_from_obj_str(&relation_object_str)?;
+            let relation_object = serde_json::from_value(relation_object_json).map_err(|e| {
+                warn!("NamedDataMgrDB: get_relation_by_target failed! {},parser obj_str failed.", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+            relation_objects.push(relation_object);
+        }
+        if relation_objects.is_empty() {
+            return Err(NdnError::NotFound(format!("No relation object found for target:{} and relation_type:{}", target.to_string(), reation_type)));
+        }
+        Ok(relation_objects)
     }
 
-    pub fn remove_object_link(&self, obj_id: &ObjId) -> NdnResult<()> {
+    pub fn remove_relation_object_by_obj_id(&self, relation_obj_id: &ObjId) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM object_links WHERE link_obj_id = ?1",
-            params![obj_id.to_string()],
+            "DELETE FROM object_relations WHERE obj_id = ?1",
+            params![relation_obj_id.to_string()],
         )
         .map_err(|e| {
-            warn!("NamedDataMgrDB: remove object link failed! {}", e.to_string());
+            warn!("NamedDataMgrDB: remove relation object failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
         Ok(())
     }
 
-    pub fn query_local_file_info_by_qcid(&self, qcid: &str) -> NdnResult<Option<LocalFileInfo>> {
-        // let mut conn = self.conn.lock().unwrap();
-
-        // let tx = conn.transaction().map_err(|e| {
-        //     warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
-        //     NdnError::DbError(e.to_string())
-        // })?;
-        
-
-        // let same_as_link_data = LinkData::SameAs(ObjId::new(qcid)?);
-        // let same_as_link_data_str = same_as_link_data.to_string();
-        // //从object_links table中查找qcid对应的信息
-        // let mut rows = tx.execute(
-        //     "SELECT obj_id FROM object_links WHERE obj_link = ?1 ORDER BY create_time DESC LIMIT 1",
-        //     params![same_as_link_data_str],
-        // )
-        // .map_err(|e| {
-        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
-        //     NdnError::DbError(e.to_string())
-        // })?;
-
-        // let content_obj_id: String = rows.get(0).map_err(|e| {
-        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
-        //     NdnError::DbError(e.to_string())
-        // })?;
-
-        // let obj_link = stmt.query_row(params![qcid], |row| row.get::<_, String>(0)).map_err(|e| {
-        //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
-        //     NdnError::DbError(e.to_string())
-        // })?;
-
-        // let link_data = LinkData::from_string(&obj_link)?;
-        // match link_data {
-        //     LinkData::LocalFile(file_path, range, last_modify_time, qcid) => {
-        //         let local_file_info = LocalFileInfo {
-        //             qcid: qcid.to_string(),
-        //             last_modify_time: last_modify_time,
-        //             content: file_path,
-        //         };
-        //         return Ok(Some(local_file_info));
-        //     }
-        //     _ => {
-        //         return Ok(None);
-        //     }
-        // }
-        unimplemented!();
+    // Object link related methods from NamedDataDb
+    pub fn set_object_link(&self, obj_id: &ObjId, obj_link: &ObjectLinkData) -> NdnResult<()> {
+        let relation_object = RelationObject::create_by_link_data(obj_id.clone(), obj_link.clone());
+        self.set_relation_object(&relation_object, None)
     }
+
+    pub fn get_same_as_object_by_target(&self, target: &ObjId) -> NdnResult<Vec<ObjId>> {
+        let relation_objects = self.get_relation_by_target(RELATION_TYPE_SAME, target)?;
+        let mut same_as_object_ids = Vec::new();
+        for relation_object in relation_objects {
+            same_as_object_ids.push(relation_object.source);
+        }
+        if same_as_object_ids.is_empty() {
+            return Err(NdnError::NotFound(format!("No same as object found for target:{}", target.to_string())));
+        }
+        Ok(same_as_object_ids)
+    }
+
+
+    //pub fn query_local_file_info_by_qcid(&self, qcid: &str) -> NdnResult<Option<LocalFileInfo>> {
+    // let mut conn = self.conn.lock().unwrap();
+
+    // let tx = conn.transaction().map_err(|e| {
+    //     warn!("NamedDataMgrDB: transaction failed! {}", e.to_string());
+    //     NdnError::DbError(e.to_string())
+    // })?;
+    
+
+    // let same_as_link_data = LinkData::SameAs(ObjId::new(qcid)?);
+    // let same_as_link_data_str = same_as_link_data.to_string();
+    // //从object_links table中查找qcid对应的信息
+    // let mut rows = tx.execute(
+    //     "SELECT obj_id FROM object_links WHERE obj_link = ?1 ORDER BY create_time DESC LIMIT 1",
+    //     params![same_as_link_data_str],
+    // )
+    // .map_err(|e| {
+    //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+    //     NdnError::DbError(e.to_string())
+    // })?;
+
+    // let content_obj_id: String = rows.get(0).map_err(|e| {
+    //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+    //     NdnError::DbError(e.to_string())
+    // })?;
+
+    // let obj_link = stmt.query_row(params![qcid], |row| row.get::<_, String>(0)).map_err(|e| {
+    //     warn!("NamedDataMgrDB: query object link failed! {}", e.to_string());
+    //     NdnError::DbError(e.to_string())
+    // })?;
+
+    // let link_data = LinkData::from_string(&obj_link)?;
+    // match link_data {
+    //     LinkData::LocalFile(file_path, range, last_modify_time, qcid) => {
+    //         let local_file_info = LocalFileInfo {
+    //             qcid: qcid.to_string(),
+    //             last_modify_time: last_modify_time,
+    //             content: file_path,
+    //         };
+    //         return Ok(Some(local_file_info));
+    //     }
+    //     _ => {
+    //         return Ok(None);
+    //     }
+    // }
+    //    unimplemented!();
+    //}
 
     // pub fn set_local_file_info(&self, local_file_path: &str, local_file_info: &LocalFileInfo) -> NdnResult<()> {
     //     let conn = self.conn.lock().unwrap();

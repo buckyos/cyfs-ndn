@@ -330,6 +330,18 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
 }
 
 
+pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
+    if obj_str.find("{").is_some() {
+        let obj_json = serde_json::from_str(obj_str)
+            .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
+        return Ok(obj_json);
+    } else {
+        let claims = name_lib::decode_jwt_claim_without_verify(obj_str)
+            .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
+        return Ok(claims);
+    }
+}
+
 
 pub fn named_obj_str_to_jwt(
     obj_json_str: &String,

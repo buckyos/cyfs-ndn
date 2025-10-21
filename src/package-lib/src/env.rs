@@ -415,12 +415,7 @@ impl PackageEnv {
                     format!("Invalid chunk id: {}", e),
                 ))?;
 
-            let is_chunk_exist = named_mgr.is_chunk_exist_impl(&chunk_id).await
-                .map_err(|e| PkgError::ParseError(
-                    pkg_id.to_owned(),
-                    format!("Chunk not found: {}", e),
-                ))?;
-
+            let is_chunk_exist = named_mgr.have_chunk_impl(&chunk_id).await;
             if !is_chunk_exist {
                 miss_chunk_list.push(chunk_id);
             }

@@ -1,7 +1,7 @@
 use buckyos_kit::{buckyos_get_unix_timestamp,is_default};
 use serde::{Serialize,Deserialize};
 
-use crate::{ChunkId, LinkData};
+use crate::{ChunkId};
 use std::collections::HashMap;
 use crate::{OBJ_TYPE_FILE,OBJ_TYPE_PATH,build_named_object_by_json,ObjId};
 use serde_json::Value;
@@ -39,8 +39,6 @@ pub struct FileObject {
      */
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_list:Option<HashMap<String,Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub links:Option<Vec<LinkData>>,
     #[serde(flatten)]
     pub extra_info: HashMap<String, Value>,
 }
@@ -49,7 +47,7 @@ impl FileObject {
     //content can be chunkid or chunklistid
     pub fn new(name:String,size:u64,content:String)->Self {
         Self {name,size,content,meta:None,mime:None,owner:None,exp:0,
-            create_time:None,chunk_list:None,links:None,extra_info:HashMap::new()}
+            create_time:None,chunk_list:None,extra_info:HashMap::new()}
     }
 
     pub fn gen_obj_id(&self)->(ObjId, String) {

@@ -62,6 +62,13 @@ impl SimpleChunkList {
         (result_id, obj_str)
     }
 
+    pub fn from_json(obj_str: &str) -> NdnResult<Self> {
+        let chunk_list:Vec<ChunkId> = serde_json::from_str(obj_str).map_err(|e| {
+            NdnError::InvalidParam(format!("parse chunk list from json failed: {}", e.to_string()))
+        })?;
+        Self::from_chunk_list(chunk_list)
+    }
+
     //return (chunk_index,chunk_offset)
     pub fn get_chunk_index_by_offset(&self, seek_from: SeekFrom) -> NdnResult<(usize, u64)> {
         unimplemented!()

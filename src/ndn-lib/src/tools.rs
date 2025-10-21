@@ -1,4 +1,4 @@
-use crate::{ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, ObjId, PackedObjItem, PullMode, SimpleChunkList, CHUNK_NORMAL_SIZE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+use crate::{ChunkHasher, DirObject, FileObject, NamedDataMgr, NdnError, NdnResult, ObjId, PackedObjItem, PullMode, SimpleChunkList, CHUNK_NORMAL_SIZE, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
 use std::ops::Range;
 use std::path::Path;
 use std::collections::HashMap;
@@ -15,17 +15,67 @@ use tokio::sync::Mutex;
 use crate::chunk::caculate_qcid_from_file;
 
 pub enum KnownStandardObject {
-
+    Dir(DirObject,String),
+    File(FileObject,String),
+    ChunkList(SimpleChunkList,String),
 }
 
 impl KnownStandardObject {
 
     pub fn from_obj_data(obj_id: &ObjId, obj_data: &str) -> NdnResult<Self> {
-        unimplemented!();
+        //TODO:support obj_data is jwt
+        let obj_type = obj_id.obj_type.as_str();
+        
+        match obj_type {
+            OBJ_TYPE_DIR => {
+                let dir_obj:DirObject = serde_json::from_str(obj_data).map_err(|e| {
+                    NdnError::InvalidParam(format!("parse dir object from json failed: {}", e.to_string()))
+                })?;
+                return Ok(KnownStandardObject::Dir(dir_obj,obj_data.to_string()));
+            },
+            OBJ_TYPE_FILE => {
+                let file_obj:FileObject = serde_json::from_str(obj_data).map_err(|e| {
+                    NdnError::InvalidParam(format!("parse file object from json failed: {}", e.to_string()))
+                })?;
+                return Ok(KnownStandardObject::File(file_obj,obj_data.to_string()));
+            },
+            OBJ_TYPE_CHUNK_LIST_SIMPLE => {
+                let chunk_list = SimpleChunkList::from_json(obj_data)?;
+                return Ok(KnownStandardObject::ChunkList(chunk_list,obj_data.to_string()));
+            },
+            _ => {
+                return Err(NdnError::InvalidParam(format!("Unknown object type: {}", obj_type)));
+            }
+        }
     }
     
-    pub fn get_child_obj_ids(&self) -> Vec<ObjId> {
-        unimplemented!();
+    //应该返回一个迭代器?
+    pub fn get_child_objs(&self) -> NdnResult< Vec<(ObjId,Option<String>)>> {
+        match self {
+            KnownStandardObject::Dir(dir_obj,dir_obj_str) => {
+                let mut child_objs = Vec::new();
+                for (_sub_name,sub_item) in dir_obj.iter() { 
+                    let (obj_id,obj_str) = sub_item.get_obj_id()?;
+                    if obj_str.len() > 0 {
+                        child_objs.push((obj_id, Some(obj_str)));
+                    } else {
+                        child_objs.push((obj_id, None));
+                    }
+                }
+                return Ok(child_objs);
+            },
+            KnownStandardObject::File(file_obj,file_obj_str) => {
+                let content_id = ObjId::new(file_obj.content.as_str())?;
+                return Ok(vec![(content_id, None)]);
+            },
+            KnownStandardObject::ChunkList(chunk_list,chunk_list_str) => {
+                let mut child_objs = Vec::new();
+                for chunk_id in chunk_list.body.iter() {
+                    child_objs.push((chunk_id.to_obj_id(), None));
+                }
+                return Ok(child_objs);
+            }
+        }
     }
 }
 
@@ -64,17 +114,17 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
         }
     }
 
-    if check_mode.is_support_quick_check() {
-        let new_qcid = caculate_qcid_from_file(local_file_path).await?;
-        let local_file_info = ndn_mgr.query_local_file_info_by_qcid_impl(new_qcid.as_str());
-        if local_file_info.is_some() {
-            let local_file_info = local_file_info.unwrap();
-            //TODO:need check path and last modify time?
-            debug!("cacl_file_object:local file is not changed ByQCID, reuse linked local file info");
-            file_obj_result.content = local_file_info.content.clone();
-            return Ok(file_obj_result);
-        } 
-    }
+    // if check_mode.is_support_quick_check() {
+    //     let new_qcid = caculate_qcid_from_file(local_file_path).await?;
+    //     let local_file_info = ndn_mgr.query_local_file_info_by_qcid_impl(new_qcid.as_str());
+    //     if local_file_info.is_some() {
+    //         let local_file_info = local_file_info.unwrap();
+    //         //TODO:need check path and last modify time?
+    //         debug!("cacl_file_object:local file is not changed ByQCID, reuse linked local file info");
+    //         file_obj_result.content = local_file_info.content.clone();
+    //         return Ok(file_obj_result);
+    //     } 
+    // }
 
     let mut file_reader = tokio::fs::File::open(local_file_path).await.map_err(|e| {
         error!("open local_file_path failed, err:{}", e);
@@ -99,7 +149,7 @@ pub async fn cacl_file_object(local_file_path:&Path,fileobj_template:&FileObject
             chunk_size
         );
 
-        let is_exist = ndn_mgr.is_chunk_exist_impl(&chunk_id).await?;
+        let is_exist = ndn_mgr.have_chunk_impl(&chunk_id).await;
         if !is_exist {
             //TODO: link时需要指定Range
             let range = Range{start:read_pos,end:read_pos + chunk_size};

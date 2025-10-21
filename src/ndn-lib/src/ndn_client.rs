@@ -281,8 +281,8 @@ impl NdnClient {
                 info!("push_chunk:remote chunk already exists, skip");
                 return Ok(());
             },
-            ChunkState::Link(link_data) => {
-                info!("push_chunk:remote chunk is a link, skip");
+            ChunkState::LocalLink(_link_data) => {
+                info!("push_chunk:remote chunk is a local link, skip");
                 return Ok(());
             }
             _ => {}
@@ -860,8 +860,8 @@ impl NdnClient {
                 warn!("pull_chunk: chunk {} is disabled at named_mgr",chunk_id.to_string());
                 return Err(NdnError::InvalidState(format!("{} is disable",chunk_id.to_string())));
             },
-            ChunkState::Link(link_data) => {
-                warn!("pull_chunk: chunk {} is a link at named_mgr",chunk_id.to_string());
+            ChunkState::LocalLink(link_data) => {
+                warn!("pull_chunk: chunk {} is a local link at named_mgr",chunk_id.to_string());
             },
             ChunkState::NotExist | ChunkState::New => {
                 //no progess info
