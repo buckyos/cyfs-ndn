@@ -3,14 +3,23 @@ use crate::{ChunkId, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, Ndn
 use buckyos_kit::*;
 use std::io::SeekFrom;
 use std::sync::Arc;
-use tempfile::tempdir;
+use tempfile::{tempdir, TempDir};
+use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn test_basic_chunk_operations() -> NdnResult<()> {
+    std::env::set_var("BUCKY_LOG", "debug");
     init_logging("ndn-lib test", false);
     // Create a temporary directory for testing
     let test_dir = tempdir().unwrap();
+    let test_path = test_dir.path().to_path_buf();
+    
+    // Prevent automatic cleanup by forgetting the TempDir
+    std::mem::forget(test_dir);
+    
+    println!("Test directory preserved at: {}", test_path.display());
+    
     let config = NamedDataMgrConfig {
         local_cache: None,
         mmap_cache_dir: None,
@@ -18,7 +27,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
 
     let chunk_mgr = NamedDataMgr::from_config(
         Some("test".to_string()),
-        test_dir.path().to_path_buf(),
+        test_path.clone(),
         config,
     )
     .await?;

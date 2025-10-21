@@ -93,6 +93,10 @@ impl NdnError {
             _ => NdnError::RemoteError(format!("HTTP error: {} for {}", code, info)),
         }
     }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, NdnError::NotFound(_))
+    }
 }
 
 

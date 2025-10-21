@@ -786,6 +786,7 @@ impl NamedDataMgr {
                     .read(true)
                     .open(&chunk_real_path)
                     .await?;
+                return Ok((Box::pin(file), chunk_item.chunk_size));
             },
             ChunkState::LocalLink(local_chunk_info) => {
                 let chunk_real_path = PathBuf::from(local_chunk_info.path);
@@ -816,7 +817,7 @@ impl NamedDataMgr {
                 )));
             }
         }
-        unimplemented!();
+
     }
 
 
@@ -867,15 +868,28 @@ impl NamedDataMgr {
         offset: u64,
     ) -> NdnResult<(ChunkWriter, String)> {
         let mut real_chunk_size = chunk_size;
-        let chunk_item = self.get_chunk_item_impl(chunk_id).await?;
-        let chunk_state = chunk_item.chunk_state;
-        let progress = chunk_item.progress;
-        if !chunk_state.can_open_writer() {
-            return Err(NdnError::Internal(format!(
-                "chunk {} state not support open writer! {}",
-                chunk_id.to_string(),chunk_state.to_str()
-            )));
+        let mut no_chunk_item = false;
+        let mut chunk_state = ChunkState::NotExist;
+        let mut progress = "".to_string();
+        let chunk_item = self.get_chunk_item_impl(chunk_id).await;
+
+        if chunk_item.is_err() {
+            let chunk_error = chunk_item.err().unwrap();
+            if !chunk_error.is_not_found() {
+                return Err(chunk_error);
+            };
+        } else {
+            let chunk_item = chunk_item.unwrap();
+            chunk_state = chunk_item.chunk_state;
+            progress = chunk_item.progress;
+            if !chunk_state.can_open_writer() {
+                return Err(NdnError::Internal(format!(
+                    "chunk {} state not support open writer! {}",
+                    chunk_id.to_string(),chunk_state.to_str()
+                )));
+            }
         }
+       
         //let chunk_item = self.db.get_chunk_item(chunk_id).await;
         let chunk_path = self.get_chunk_path(chunk_id);
         if chunk_state == ChunkState::Incompleted {
@@ -956,6 +970,7 @@ impl NamedDataMgr {
             //创建chunk_item
             let chunk_item = ChunkItem::new(&chunk_id, real_chunk_size);
             self.db.set_chunk_item(&chunk_item)?;
+            debug!("create chunk item {} to db success", chunk_id.to_string());
 
             return Ok((Box::pin(file), "".to_string()));
         }
@@ -1041,14 +1056,7 @@ impl NamedDataMgr {
 
     //writer已经写入完成，此时可以进行一次可选的hash校验
     pub async fn complete_chunk_writer_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        let mut chunk_item = self.db.get_chunk_item(chunk_id);
-        if chunk_item.is_err() {
-            return Err(NdnError::NotFound(format!(
-                "chunk not found! {}",
-                chunk_id.to_string()
-            )));
-        }
-        let mut chunk_item = chunk_item.unwrap();
+        let mut chunk_item = self.db.get_chunk_item(chunk_id)?;
         chunk_item.chunk_state = ChunkState::Completed;
         chunk_item.progress = "".to_string();
         info!(

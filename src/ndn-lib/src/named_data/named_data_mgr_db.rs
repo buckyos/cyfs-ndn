@@ -46,6 +46,7 @@ pub struct NamedDataMgrDB {
 
 impl NamedDataMgrDB {
     pub fn new(db_path: String) -> NdnResult<Self> {
+        debug!("NamedDataMgrDB: new db path: {}", db_path);
         let conn = Connection::open(&db_path).map_err(|e| {
             warn!("NamedDataMgrDB: open db failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
@@ -104,7 +105,7 @@ impl NamedDataMgrDB {
                 chunk_state TEXT NOT NULL,
                 local_path TEXT,
                 local_info TEXT,
-                ref_count INTEGER NOT NULL,
+                ref_count INTEGER NOT NULL DEFAULT 0,
                 progress TEXT,
                 create_time INTEGER NOT NULL,
                 update_time INTEGER NOT NULL
@@ -160,8 +161,9 @@ impl NamedDataMgrDB {
                 target TEXT NOT NULL,
                 relation_type INTEGER NOT NULL,
                 relation_object TEXT NOT NULL,
-                create_time INTEGER NOT NULL
-            ) PRIMARY KEY (obj_id)",
+                create_time INTEGER NOT NULL,
+                PRIMARY KEY (obj_id)
+            )",
             [],
         )
         .map_err(|e| {
@@ -504,16 +506,15 @@ impl NamedDataMgrDB {
                 let local_info_str = serde_json::to_string(local_info).unwrap();
                 conn.execute(
                     "INSERT OR REPLACE INTO chunk_items 
-                    (chunk_id, chunk_size, chunk_state, local_path,local_info, ref_count, progress, 
+                    (chunk_id, chunk_size, chunk_state, local_path,local_info, progress, 
                      create_time, update_time)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         chunk_item.chunk_id.to_string(),
                         chunk_item.chunk_size,
                         chunk_item.chunk_state,
                         local_info.path,
                         local_info_str,
-                        chunk_item.ref_count,
                         chunk_item.progress,
                         chunk_item.create_time,
                         chunk_item.update_time,
@@ -525,16 +526,16 @@ impl NamedDataMgrDB {
                 })?;
             }
             _ => {
+                //debug!("set_chunk_item: chunk_state: {:?}", chunk_item.chunk_state);
                 conn.execute(
                     "INSERT OR REPLACE INTO chunk_items 
-                    (chunk_id, chunk_size, chunk_state, ref_count, progress, 
+                    (chunk_id, chunk_size, chunk_state, progress, 
                      create_time, update_time)
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         chunk_item.chunk_id.to_string(),
                         chunk_item.chunk_size,
                         chunk_item.chunk_state,
-                        chunk_item.ref_count,
                         chunk_item.progress,
                         chunk_item.create_time,
                         chunk_item.update_time,
@@ -553,28 +554,36 @@ impl NamedDataMgrDB {
     pub fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT * FROM chunk_items WHERE chunk_id = ?1")
+            .prepare("SELECT chunk_size, chunk_state, ref_count, progress, create_time, update_time, local_path, local_info FROM chunk_items WHERE chunk_id = ?1")
             .map_err(|e| {
                 NdnError::DbError(e.to_string())
             })?;
 
         let chunk = stmt
             .query_row(params![chunk_id.to_string()], |row| {
-                let chunk_state:ChunkState = row.get(2)?;
+                let chunk_state: ChunkState = row.get(1)?;
+                debug!("get_chunk_item: chunk_state: {:?}", chunk_state);
 
                 Ok(ChunkItem {
                     chunk_id: chunk_id.clone(),
-                    chunk_size: row.get(1)?,
-                    chunk_state: row.get(2)?,
-                    ref_count: row.get(3)?,
-                    progress: row.get(4)?,
-                    create_time: row.get(6)?,
-                    update_time: row.get(7)?,
+                    chunk_size: row.get(0)?,
+                    chunk_state: chunk_state,
+                    ref_count: row.get(2)?,
+                    progress: row.get(3)?,
+                    create_time: row.get(4)?,
+                    update_time: row.get(5)?,
                 })
             })
             .map_err(|e| {
-                warn!("NamedDataMgrDB: get_chunk failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
+                match e {
+                    rusqlite::Error::QueryReturnedNoRows => {
+                        NdnError::NotFound(format!("chunk not found: {}", chunk_id.to_string()))
+                    }
+                    _ => {
+                        warn!("NamedDataMgrDB: get_chunk failed! {}", e.to_string());
+                        NdnError::DbError(e.to_string())
+                    }
+                }
             })?;
 
         Ok(chunk)
