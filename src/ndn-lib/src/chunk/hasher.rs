@@ -290,13 +290,13 @@ pub async fn calculate_file_chunk_id(
     }
 }
 
-pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<String> {
+pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<ChunkId> {
     let mut file_reader = tokio::fs::File::open(file_path).await.map_err(|err| {
         warn!("caculate_qcid_from_file: open file failed! {}", err.to_string());
         NdnError::IoError(err.to_string())
     })?;
     let qcid = calc_quick_hash(&mut file_reader, None).await?;
-    return Ok(qcid.to_string());
+    return Ok(qcid);
 }
 
 pub async fn copy_chunk<R, W>(

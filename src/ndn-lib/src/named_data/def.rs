@@ -12,10 +12,11 @@ use crate::ObjectLinkData;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkLocalInfo {
-    #[serde(skip_serializing)]
+    #[serde(skip_serializing,default)]
     pub path: String,//文件的本地路径
     pub qcid: String,//创建链接时，文件的qcid
     pub last_modify_time: u64,//创建链接时，文件的最后修改时间
+    #[serde(skip_serializing_if = "Option::is_none",default)]
     pub range: Option<Range<u64>>,//文件的部分，为None表示整个文件
 }
 
@@ -27,6 +28,16 @@ impl Default for ChunkLocalInfo {
             last_modify_time: 0,
             range: None,
         }
+    }
+}
+
+impl ChunkLocalInfo {
+    pub fn create_by_info_str(path:String,info_str:&str) -> NdnResult<Self> {
+        let mut local_info: ChunkLocalInfo = serde_json::from_str(info_str).map_err(|e| {
+            NdnError::InvalidParam(e.to_string())
+        })?;
+        local_info.path = path;
+        Ok(local_info)
     }
 }
 
@@ -94,6 +105,13 @@ impl ChunkState {
             _ => false,
         }
     }
+
+    pub fn is_local_link(&self) -> bool {
+        match self {
+            ChunkState::LocalLink(_) => true,
+            _ => false,
+        }
+    }
 }
 
 impl ToSql for ChunkState {
@@ -151,7 +169,7 @@ impl ChunkItem {
     }
 
     pub fn new_local_file(chunk_id: &ChunkId, chunk_size: u64, 
-        path: &PathBuf, qcid: &str, last_modify_time: u64, range: Option<Range<u64>>) -> Self {
+        path: &PathBuf, qcid: &ChunkId, last_modify_time: u64, range: Option<Range<u64>>) -> Self {
         let local_info = ChunkLocalInfo {
             path: path.to_string_lossy().to_string(),
             qcid: qcid.to_string(),

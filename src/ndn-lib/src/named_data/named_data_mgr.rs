@@ -1,7 +1,7 @@
 use super::def::{ChunkItem, ObjectState, ChunkState};
 use super::named_data_mgr_db::NamedDataMgrDB;
 use crate::{
-    build_named_object_by_json, ChunkHasher, ChunkId, ChunkListReader, ChunkLocalInfo, ChunkReadSeek, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, SimpleChunkList, SimpleChunkListReader, OBJ_TYPE_CHUNK_LIST_SIMPLE
+    build_named_object_by_json, caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkListReader, ChunkLocalInfo, ChunkReadSeek, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, SimpleChunkList, SimpleChunkListReader, OBJ_TYPE_CHUNK_LIST_SIMPLE
 };
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
@@ -23,6 +23,7 @@ use std::io::SeekFrom;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 use std::{path::PathBuf, path::Path,pin::Pin};
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -379,12 +380,12 @@ impl NamedDataMgr {
         self.db
             .set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
     }
-
+    //target obj is the same as obj_id
     pub async fn link_same_object(&self, obj_id: &ObjId, target_obj: &ObjId) -> NdnResult<()> {
         let link_data = ObjectLinkData::SameAs(target_obj.clone());
         self.db.set_object_link(obj_id, &link_data)
     }
-
+    //target obj is a part of obj_id,the part is defined by range
     pub async fn link_part_of(&self, obj_id: &ObjId, target_obj: &ObjId, range: Range<u64>) -> NdnResult<()> {
         let link_data = ObjectLinkData::PartOf(target_obj.clone(), range);
         self.db.set_object_link(obj_id, &link_data)
@@ -396,13 +397,16 @@ impl NamedDataMgr {
             return chunk_item;
         }
 
-
+        debug!("{} chunk_item not found,try to get same as object", chunk_id.to_string());
         let same_objs = self.db.get_same_as_object_by_target(&chunk_id.to_obj_id());
         if same_objs.is_ok() {
             let same_objs = same_objs.unwrap();
-            let result_item = Box::pin(self.get_chunk_item_impl(&ChunkId::from_obj_id(&same_objs[0]))).await;
-            if result_item.is_ok() {
-                return result_item;
+            if same_objs.len() > 0 {
+                debug!("same as object:{}", same_objs[0].to_string());
+                let result_item = Box::pin(self.get_chunk_item_impl(&ChunkId::from_obj_id(&same_objs[0]))).await;
+                if result_item.is_ok() {
+                    return result_item;
+                }
             }
         }
 
@@ -781,7 +785,7 @@ impl NamedDataMgr {
         let chunk_item = self.get_chunk_item_impl(chunk_id).await?;
         match chunk_item.chunk_state {
             ChunkState::Completed => {
-                let chunk_real_path = self.get_chunk_path(chunk_id);
+                let chunk_real_path = self.get_chunk_path(&chunk_item.chunk_id);
                 let mut file = OpenOptions::new()
                     .read(true)
                     .open(&chunk_real_path)
@@ -1083,6 +1087,13 @@ impl NamedDataMgr {
         named_mgr.complete_chunk_writer_impl(chunk_id).await
     }
 
+    pub async fn add_chunk_by_link_to_local_file_impl(&self, chunk_id: &ChunkId, 
+        qcid:&ChunkId,chunk_size:u64,local_file_path: &PathBuf, last_modify_time: u64, range: Option<Range<u64>>) -> NdnResult<()> {
+        let chunk_item = ChunkItem::new_local_file(chunk_id, chunk_size, local_file_path, qcid, last_modify_time, range);
+        return self.db.set_chunk_item(&chunk_item);
+    }
+
+
     //=====================下面的都是helper函数了======================
     //针对小于1MB的 chunk,推荐直接返回内存
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
@@ -1336,10 +1347,9 @@ impl NamedDataMgr {
 
 
     pub async fn pub_local_file_as_chunk(
-        self,
+        &self,
         local_file_path: &PathBuf,
-        user_id: &str,
-        app_id: &str,
+        local_link_only: bool,
     ) -> NdnResult<ChunkId> {
         //TODO：优化，边算边传，支持断点续传
         debug!(
@@ -1369,24 +1379,32 @@ impl NamedDataMgr {
 
         let is_exist = self.have_chunk_impl(&chunk_id).await;
         if !is_exist {
-            let (mut chunk_writer, _) = self
-                .open_chunk_writer_impl(&chunk_id, chunk_size, 0)
-                .await?;
+            if local_link_only {
+                let last_modify_time = tokio::fs::metadata(local_file_path).await.unwrap().modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let range = None;
+                let qcid = caculate_qcid_from_file(local_file_path).await?;
+                self.add_chunk_by_link_to_local_file_impl(&chunk_id, &chunk_id, chunk_size, local_file_path, last_modify_time, range).await?;
+                info!("pub_local_file_as_chunk: chunk_id:{} link to {:?} success,qcid:{}", chunk_id.to_string(),local_file_path, qcid.to_string());
+            } else {
+                let (mut chunk_writer, _) = self
+                    .open_chunk_writer_impl(&chunk_id, chunk_size, 0)
+                    .await?;
 
-            file_reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-            let copy_bytes = tokio::io::copy(&mut file_reader, &mut chunk_writer)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "copy local_file {:?} to named-mgr failed, err:{}",
-                        local_file_path, e
-                    );
-                    NdnError::IoError(format!("copy local_file to named-mgr failed, err:{}", e))
-                })?;
+                file_reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+                let copy_bytes = tokio::io::copy(&mut file_reader, &mut chunk_writer)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "copy local_file {:?} to named-mgr failed, err:{}",
+                            local_file_path, e
+                        );
+                        NdnError::IoError(format!("copy local_file to named-mgr failed, err:{}", e))
+                    })?;
 
-            info!("pub_local_file_as_fileobj:copy local_file {:?} to named-mgr's chunk success,copy_bytes:{}", local_file_path, copy_bytes);
-       
-            self.complete_chunk_writer_impl(&chunk_id).await?;
+                info!("pub_local_file_as_fileobj:copy local_file {:?} to named-mgr's chunk success,copy_bytes:{}", local_file_path, copy_bytes);
+        
+                self.complete_chunk_writer_impl(&chunk_id).await?;
+            }
         }
         Ok(chunk_id)
     }

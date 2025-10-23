@@ -1,6 +1,6 @@
 use crate::tools::KnownStandardObject;
 use crate::{
-    build_named_object_by_json, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkListReader, ChunkReadSeek, ChunkState, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, RelationObject, RELATION_TYPE_SAME
+    build_named_object_by_json, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkListReader, ChunkLocalInfo, ChunkReadSeek, ChunkState, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, RelationObject, RELATION_TYPE_SAME
 };
 use buckyos_kit::get_buckyos_named_data_dir;
 use buckyos_kit::{
@@ -524,6 +524,7 @@ impl NamedDataMgrDB {
                     warn!("NamedDataMgrDB: insert chunk failed! {}", e.to_string());
                     NdnError::DbError(e.to_string())
                 })?;
+                debug!("NamedDataMgrDB: insert local link chunk item success: {},path:{},info:{}", chunk_item.chunk_id.to_string(), local_info.path, local_info_str);
             }
             _ => {
                 //debug!("set_chunk_item: chunk_state: {:?}", chunk_item.chunk_state);
@@ -561,8 +562,16 @@ impl NamedDataMgrDB {
 
         let chunk = stmt
             .query_row(params![chunk_id.to_string()], |row| {
-                let chunk_state: ChunkState = row.get(1)?;
-                debug!("get_chunk_item: chunk_state: {:?}", chunk_state);
+                let mut chunk_state: ChunkState = row.get(1)?;
+                if chunk_state.is_local_link() {
+                    let local_path:String = row.get(6)?;
+                    let local_info_str:String = row.get(7)?;
+                    let local_info = ChunkLocalInfo::create_by_info_str(local_path, local_info_str.as_str()).map_err(|e| {
+                        rusqlite::Error::InvalidColumnName(e.to_string())
+                    })?;
+                    chunk_state = ChunkState::LocalLink(local_info);
+                }
+                debug!("get_chunk_item {} : chunk_state: {:?}", chunk_id.to_string(), chunk_state);
 
                 Ok(ChunkItem {
                     chunk_id: chunk_id.clone(),

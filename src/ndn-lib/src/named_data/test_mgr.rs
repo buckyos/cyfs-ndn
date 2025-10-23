@@ -1,11 +1,20 @@
 use super::*;
 use crate::{ChunkId, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, NdnResult, ObjId};
 use buckyos_kit::*;
-use std::io::SeekFrom;
+use std::io::{SeekFrom, Write};
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use std::path::PathBuf;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+//‘A’ 1024 mix256:80086ab72eeb9e77b07540897e0c8d6d23ec8eef0f8c3a47e1b3f4e93443d9536bed
+//'B' 1024 mix256:80089b6ce55f379e9771551de6939556a7e6b949814ae27c2f5cfd5dbeb378ce7c2a
+fn create_test_data(all_fill:u8, fill_count:u64) -> Vec<u8> {
+    let mut data = Vec::new();
+    for _ in 0..fill_count {
+        data.push(all_fill);
+    }
+    data
+}
 
 #[tokio::test]
 async fn test_basic_chunk_operations() -> NdnResult<()> {
@@ -16,7 +25,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     let test_path = test_dir.path().to_path_buf();
     
     // Prevent automatic cleanup by forgetting the TempDir
-    std::mem::forget(test_dir);
+   // std::mem::forget(test_dir);
     
     println!("Test directory preserved at: {}", test_path.display());
     
@@ -53,17 +62,78 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
         .await
         .unwrap();
     assert_eq!(size, test_data.len() as u64);
-    drop(chunk_mgr);
+
 
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
     assert_eq!(&buffer, test_data);
 
+    let qcid_id = ObjId::new("qcid:1234567890abcdef").unwrap();
+    let chunk_obj_id = chunk_id.to_obj_id();
+    chunk_mgr.link_same_object(&chunk_obj_id, &qcid_id).await.unwrap();
+
+
+    let chunk_id2 = ChunkId::new("qcid:1234567890abcdef").unwrap();
+    let (mut reader2, size2) = chunk_mgr
+        .open_chunk_reader_impl(&chunk_id2, 0, true)
+        .await
+        .unwrap();
+    assert_eq!(size2, test_data.len() as u64);
+
+    // let qcid_id2 = ObjId::new("qcid:1234567890").unwrap();
+    // chunk_mgr.link_part_of(&qcid_id, &qcid_id2, 0..10).await.unwrap();
+    // let chunk_id3 = ChunkId::new("qcid:1234567890").unwrap();
+    // let (mut reader3, size3) = chunk_mgr
+    //     .open_chunk_reader_impl(&chunk_id3, 0, true)
+    //     .await
+    //     .unwrap();
+    // assert_eq!(size3, 10);
+    // let mut buffer3 = Vec::new();
+    // reader3.read_to_end(&mut buffer3).await.unwrap();
+    // assert_eq!(&buffer3, &test_data[0..10]);
+
+    let test_local_file_path = test_path.join("test.data");
+    let test_local_file_data = create_test_data(b'A', 1024);
+    let mut file = std::fs::File::create(test_local_file_path.clone()).unwrap();
+    file.write_all(&test_local_file_data).unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let test_file_chunk_id = chunk_mgr.pub_local_file_as_chunk(&test_local_file_path, false).await.unwrap();
+    info!("test_file_chunk_id:{}", test_file_chunk_id.to_string());
+    let (mut reader3, size3) = chunk_mgr
+        .open_chunk_reader_impl(&test_file_chunk_id, 0, true)
+        .await
+        .unwrap();
+    assert_eq!(size3, test_local_file_data.len() as u64);
+    let mut buffer3 = Vec::new();
+    reader3.read_to_end(&mut buffer3).await.unwrap();
+    assert_eq!(&buffer3, &test_local_file_data);
+
+    let test_local_file_path2 = test_path.join("test2.data");
+    let test_local_file_data2 = create_test_data(b'B', 1024*64);
+    let mut file2 = std::fs::File::create(test_local_file_path2.clone()).unwrap();
+    file2.write_all(&test_local_file_data2).unwrap();
+    file2.flush().unwrap();
+    drop(file2);
+    let test_file_chunk_id2 = chunk_mgr.pub_local_file_as_chunk(&test_local_file_path2, true).await.unwrap();
+    info!("test_file_chunk_id2:{}", test_file_chunk_id2.to_string());
+
+    let (mut reader4, size4) = chunk_mgr
+        .open_chunk_reader_impl(&test_file_chunk_id2, 0, true)
+        .await
+        .unwrap();
+    assert_eq!(size4, test_local_file_data2.len() as u64);
+    let mut buffer4 = Vec::new();
+    reader4.read_to_end(&mut buffer4).await.unwrap();
+    assert_eq!(&buffer4, &test_local_file_data2);
+
+
+    drop(chunk_mgr);
     Ok(())
 }
 
 #[tokio::test]
-async fn test_base_operations() -> NdnResult<()> {
+async fn test_base_object_operations() -> NdnResult<()> {
     // Create a temporary directory for testing
     init_logging("ndn-lib test", false);
     let test_dir = tempdir().unwrap();
