@@ -1,5 +1,6 @@
 use super::*;
-use crate::{ChunkId, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, NdnResult, ObjId};
+use crate::tools::pub_local_file_as_chunk;
+use crate::{ChunkId, ChunkType, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, NdnResult, ObjId, StoreMode};
 use buckyos_kit::*;
 use std::io::{SeekFrom, Write};
 use std::sync::Arc;
@@ -40,24 +41,26 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
         config,
     )
     .await?;
+    NamedDataMgr::set_mgr_by_id(Some("test"),chunk_mgr).await.unwrap();
 
     // Create test data
     let test_data = b"Hello, World!";
     let chunk_id = ChunkId::new("sha256:1234567890abcdef").unwrap();
-
+    let chunk_mgr = NamedDataMgr::get_named_data_mgr_by_id(Some("test")).await.unwrap();
+    let real_chunk_mgr = chunk_mgr.lock().await;
     // Write chunk
-    let (mut writer, _) = chunk_mgr
+    let (mut writer, _) = real_chunk_mgr
         .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
         .await
         .unwrap();
     writer.write_all(test_data).await.unwrap();
-    chunk_mgr
+    real_chunk_mgr
         .complete_chunk_writer_impl(&chunk_id)
         .await
         .unwrap();
 
     // Read and verify chunk
-    let (mut reader, size) = chunk_mgr
+    let (mut reader, size) = real_chunk_mgr
         .open_chunk_reader_impl(&chunk_id, 0, true)
         .await
         .unwrap();
@@ -70,15 +73,16 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
 
     let qcid_id = ObjId::new("qcid:1234567890abcdef").unwrap();
     let chunk_obj_id = chunk_id.to_obj_id();
-    chunk_mgr.link_same_object(&chunk_obj_id, &qcid_id).await.unwrap();
+    real_chunk_mgr.link_same_object(&chunk_obj_id, &qcid_id).await.unwrap();
 
 
     let chunk_id2 = ChunkId::new("qcid:1234567890abcdef").unwrap();
-    let (mut reader2, size2) = chunk_mgr
+    let (mut reader2, size2) = real_chunk_mgr
         .open_chunk_reader_impl(&chunk_id2, 0, true)
         .await
         .unwrap();
     assert_eq!(size2, test_data.len() as u64);
+    drop(real_chunk_mgr);
 
     // let qcid_id2 = ObjId::new("qcid:1234567890").unwrap();
     // chunk_mgr.link_part_of(&qcid_id, &qcid_id2, 0..10).await.unwrap();
@@ -98,12 +102,14 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     file.write_all(&test_local_file_data).unwrap();
     file.flush().unwrap();
     drop(file);
-    let test_file_chunk_id = chunk_mgr.pub_local_file_as_chunk(&test_local_file_path, false).await.unwrap();
+    let test_file_chunk_id = pub_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path, StoreMode::StoreInNamedMgr).await.unwrap();
     info!("test_file_chunk_id:{}", test_file_chunk_id.to_string());
-    let (mut reader3, size3) = chunk_mgr
+    let real_chunk_mgr = chunk_mgr.lock().await;
+    let (mut reader3, size3) = real_chunk_mgr
         .open_chunk_reader_impl(&test_file_chunk_id, 0, true)
         .await
         .unwrap();
+    drop(real_chunk_mgr);
     assert_eq!(size3, test_local_file_data.len() as u64);
     let mut buffer3 = Vec::new();
     reader3.read_to_end(&mut buffer3).await.unwrap();
@@ -115,20 +121,20 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     file2.write_all(&test_local_file_data2).unwrap();
     file2.flush().unwrap();
     drop(file2);
-    let test_file_chunk_id2 = chunk_mgr.pub_local_file_as_chunk(&test_local_file_path2, true).await.unwrap();
+    let test_file_chunk_id2 = pub_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path2, StoreMode::StoreInNamedMgr).await.unwrap();
     info!("test_file_chunk_id2:{}", test_file_chunk_id2.to_string());
 
-    let (mut reader4, size4) = chunk_mgr
+    let real_chunk_mgr = chunk_mgr.lock().await;
+    let (mut reader4, size4) = real_chunk_mgr
         .open_chunk_reader_impl(&test_file_chunk_id2, 0, true)
         .await
         .unwrap();
+    drop(real_chunk_mgr);
     assert_eq!(size4, test_local_file_data2.len() as u64);
     let mut buffer4 = Vec::new();
     reader4.read_to_end(&mut buffer4).await.unwrap();
     assert_eq!(&buffer4, &test_local_file_data2);
 
-
-    drop(chunk_mgr);
     Ok(())
 }
 

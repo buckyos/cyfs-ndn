@@ -168,16 +168,9 @@ impl ChunkItem {
         result
     }
 
-    pub fn new_local_file(chunk_id: &ChunkId, chunk_size: u64, 
-        path: &PathBuf, qcid: &ChunkId, last_modify_time: u64, range: Option<Range<u64>>) -> Self {
-        let local_info = ChunkLocalInfo {
-            path: path.to_string_lossy().to_string(),
-            qcid: qcid.to_string(),
-            last_modify_time,
-            range,
-        };
+    pub fn new_local_file(chunk_id: &ChunkId, chunk_size: u64, chunk_local_info: &ChunkLocalInfo) -> Self {
         let mut result = Self::new(chunk_id, chunk_size);
-        result.chunk_state = ChunkState::LocalLink(local_info.clone());
+        result.chunk_state = ChunkState::LocalLink(chunk_local_info.clone());
         result
     }
 }

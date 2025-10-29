@@ -21,57 +21,65 @@ use futures::Future;
 use futures::future::BoxFuture;
 use rand::RngCore;
 
-use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, verify_named_object_from_str, CYFSHttpRespHeaders, ChunkState, ChunkWriter, DirObject, FileObject, HashMethod, PathObject, ProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
-pub enum PullAction {
-    PullFileOK(u64),
-    PullChunkOK(u64),
+use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, verify_named_object_from_str, CYFSHttpRespHeaders, ChunkState, ChunkWriter, DirObject, FileObject, HashMethod, PathObject, ChunkProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+pub enum NdnAction {
+    FileOK(u64),
+    ChunkOK(u64),
+    DirOK(PathBuf),
     Skip(u64),
 }
 // PullProgressCallback(inner_path, action), return true if continue, false if stop
-pub type PullProgressCallback = Box<dyn FnMut(String, PullAction) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'static>> + Send>;
+pub type NdnProgressCallback = Box<dyn FnMut(String, NdnAction) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'static>> + Send>;
 
 
 #[derive(Clone,Debug,PartialEq)]
-pub enum PullMode {
+pub enum StoreMode {
     //local file path and range, store in local file or named mgr?
     LocalFile(PathBuf,Range<u64>,bool),
     StoreInNamedMgr,
+    NoStore,
 }
 
-impl Default for PullMode {
+impl Default for StoreMode {
     fn default() -> Self {
         Self::StoreInNamedMgr
     }
 }
 
-impl PullMode {
-    pub fn is_pull_to_local(&self) -> bool {
+impl StoreMode {
+    pub fn new_local() -> Self {
+        return Self::LocalFile(PathBuf::new(), 0..0, false);
+    }
+
+    pub fn is_store_to_local(&self) -> bool {
         match self {
-            PullMode::LocalFile(_,_,_) => true,
-            PullMode::StoreInNamedMgr => false,
+            StoreMode::LocalFile(_,_,_) => true,
+            StoreMode::StoreInNamedMgr => false,
+            StoreMode::NoStore => false,
         }
     }
 
-    pub fn gen_sub_pull_mode(&self,sub_item_name:&String)->Self {
+    pub fn gen_sub_store_mode(&self,sub_item_name:&String)->Self {
         match self {
-            PullMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
-                PullMode::LocalFile(local_path.clone().join(sub_item_name), 
+            StoreMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
+                StoreMode::LocalFile(local_path.clone().join(sub_item_name), 
                 0..0, *need_pull_to_named_mgr)
             }
             _ => self.clone(),
         }
     }
 
-    pub fn need_pull_to_named_mgr(&self) -> bool {
+    pub fn need_store_to_named_mgr(&self) -> bool {
         match self {
-            PullMode::LocalFile(_,_,need_pull_to_named_mgr) => *need_pull_to_named_mgr,
-            PullMode::StoreInNamedMgr => true,
+            StoreMode::LocalFile(_,_,need_pull_to_named_mgr) => *need_pull_to_named_mgr,
+            StoreMode::StoreInNamedMgr => true,
+            StoreMode::NoStore => false,
         }
     }
 
     pub async fn open_local_writer(&self) -> NdnResult<ChunkWriter> {
         match self {
-            PullMode::LocalFile(local_file_path,range,_) => {
+            StoreMode::LocalFile(local_file_path,range,_) => {
                 if let Some(parent) = local_file_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| NdnError::IoError(format!("Failed to create directory: {}", e)))?;
@@ -90,7 +98,10 @@ impl PullMode {
                 }
                 return Ok(Box::pin(local_file));
             }
-            PullMode::StoreInNamedMgr => {
+            StoreMode::StoreInNamedMgr => {
+                return Err(NdnError::InvalidState("not a local file".to_string()));
+            }
+            StoreMode::NoStore => {
                 return Err(NdnError::InvalidState("not a local file".to_string()));
             }
         }
@@ -481,7 +492,7 @@ impl NdnClient {
 
     }
 
-    pub async fn pull_chunk(&self, chunk_id:ChunkId,pull_mode:PullMode)->NdnResult<u64> {
+    pub async fn pull_chunk(&self, chunk_id:ChunkId,pull_mode:StoreMode)->NdnResult<u64> {
         let chunk_url = self.gen_chunk_url(&chunk_id,None);
         info!("will pull chunk {} by url:{}",chunk_id.to_string(),chunk_url);
         self.pull_chunk_by_url(chunk_url,chunk_id,pull_mode).await
@@ -656,11 +667,11 @@ impl NdnClient {
     // }
 
 
-    pub async fn pull_file(&self,file_obj:FileObject,pull_mode:PullMode,mut progress_callback: Option<Arc<Mutex<PullProgressCallback>>>) -> NdnResult<()>{
+    pub async fn pull_file(&self,file_obj:FileObject,pull_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<()>{
         let content_obj_id = ObjId::new(file_obj.content.as_str())?;
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::new(file_obj.content.as_str())?;
-            self.pull_chunk(chunk_id, PullMode::default()).await?;
+            self.pull_chunk(chunk_id, StoreMode::default()).await?;
             //TODO: add link to local file?
             return Ok(());
         } else {
@@ -679,7 +690,7 @@ impl NdnClient {
     }
     
     pub async fn pull_dir(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject,
-        pull_mode:PullMode, progress_callback: Option<Arc<Mutex<PullProgressCallback>>>) -> NdnResult<()>{
+        pull_mode:StoreMode, progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<()>{
         //TODO: ndn_mgr需要有一个可信的，容器对象都存在的标签，来快速检查
         for (sub_name,sub_item) in dir_obj.iter() {
             let sub_item_type = sub_item.get_obj_type();
@@ -689,7 +700,7 @@ impl NdnClient {
                     let sub_item_obj = self.get_obj_by_id(sub_item_obj_id).await?;
                     let sub_dir: DirObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
-                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
+                    let sub_pull_mode = pull_mode.gen_sub_store_mode(sub_name);
                     
                     Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone(),progress_callback.clone())).await?;
                 }
@@ -703,11 +714,11 @@ impl NdnClient {
                     let sub_file_size = sub_file.size;
                     NamedDataMgr::put_object(ndn_mgr_id, &sub_item_obj_id, &sub_item_obj_str).await?;
                     
-                    let sub_pull_mode = pull_mode.gen_sub_pull_mode(sub_name);
+                    let sub_pull_mode = pull_mode.gen_sub_store_mode(sub_name);
                     self.pull_file(sub_file,pull_mode.clone(),progress_callback.clone()).await?;
                     if let Some(progress_callback) = progress_callback.clone() {
                         let mut progress_callback = progress_callback.lock().await;
-                        let is_continue = progress_callback(sub_name.clone(), PullAction::PullFileOK(sub_file_size)).await?;
+                        let is_continue = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_file_size)).await?;
                         if !is_continue {
                             info!("pull_dir: stopped by progress callback");
                             return Ok(());
@@ -735,7 +746,7 @@ impl NdnClient {
             .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
         let file_obj_size = file_obj.size;
 
-        self.pull_file(file_obj.clone(), PullMode::LocalFile(local_path.clone(), 0..file_obj_size, false), None).await?;
+        self.pull_file(file_obj.clone(), StoreMode::LocalFile(local_path.clone(), 0..file_obj_size, false), None).await?;
 
         let local_file_obj_path = local_path.with_extension("fileobj");
             //dump file_obj to local_file_obj_path
@@ -802,7 +813,7 @@ impl NdnClient {
         Ok(file_chunk_id != content_chunk_id)
     }
 
-    pub async fn pull_chunklist(&self, chunk_list_id:&ObjId,pull_mode:PullMode,mut progress_callback: Option<Arc<Mutex<PullProgressCallback>>>)->NdnResult<u64>{
+    pub async fn pull_chunklist(&self, chunk_list_id:&ObjId,pull_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>)->NdnResult<u64>{
         //在chunklist下载中，允许使用多源
         let chunk_list_obj_data = self.get_obj_by_id(chunk_list_id.clone()).await?;
         let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
@@ -814,11 +825,11 @@ impl NdnClient {
                 return Err(NdnError::Internal(format!("Failed to get chunk size: {}", chunk_id.to_string())));
             }
             let chunk_size = chunk_size.unwrap();
-            let chunk_pull_mode:PullMode;
+            let chunk_pull_mode:StoreMode;
             let the_pull_mode = pull_mode.clone();
             match the_pull_mode {
-                PullMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
-                    chunk_pull_mode = PullMode::LocalFile(local_path.clone(), 
+                StoreMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
+                    chunk_pull_mode = StoreMode::LocalFile(local_path.clone(), 
                         range.start + offset..range.start + offset + chunk_size, need_pull_to_named_mgr);
                 }
                 _ => {
@@ -835,7 +846,7 @@ impl NdnClient {
 
     //TODO: support muilt remote source,when open remote reader failed, try next source
     //return download size
-    pub async fn pull_chunk_by_url(&self, chunk_url:String,chunk_id:ChunkId,pull_mode:PullMode)->NdnResult<u64> {
+    pub async fn pull_chunk_by_url(&self, chunk_url:String,chunk_id:ChunkId,pull_mode:StoreMode)->NdnResult<u64> {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await;
         if named_mgr.is_none() {
             return Err(NdnError::Internal("no named data mgr".to_string()));
@@ -913,7 +924,7 @@ impl NdnClient {
         
         //copy chunk from remote to named_mgr and local file
         if remote_reader.is_none() {
-            if !pull_mode.is_pull_to_local() {
+            if !pull_mode.is_store_to_local() {
                 info!("pull_chunk OK. chunk already exists at named_mgr.");
                 return Ok(0);
             } else {
@@ -929,7 +940,7 @@ impl NdnClient {
             }
         } else {
             let mut remote_reader = remote_reader.unwrap();
-            if pull_mode.need_pull_to_named_mgr() {
+            if pull_mode.need_store_to_named_mgr() {
                 // open chunk writer with progress info
                 let real_named_mgr = named_mgr.lock().await;
                 let (mut chunk_writer,progress_info) = real_named_mgr.open_chunk_writer_impl(&chunk_id,chunk_size,download_pos).await?;
@@ -968,7 +979,7 @@ impl NdnClient {
                 let copy_result = copy_chunk(chunk_id.clone(), &mut remote_reader, &mut chunk_writer, real_hash_state, progress_callback).await?;
                 named_mgr.lock().await.complete_chunk_writer_impl(&chunk_id).await?;
                 info!("pull_chunk OK, copy chunk from remote => named_mgr success");
-                if pull_mode.is_pull_to_local() {
+                if pull_mode.is_store_to_local() {
                     let mut real_named_mgr = named_mgr.lock().await;
                     let (mut local_reader,_) = real_named_mgr.open_chunk_reader_impl(&chunk_id,0,true).await?;
                     drop(real_named_mgr);

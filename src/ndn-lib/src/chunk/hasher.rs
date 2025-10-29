@@ -1,6 +1,6 @@
 use super::chunk::{ChunkId,ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SIZE, QCID_HASH_PIECE_SIZE};
 use crate::hash::DEFAULT_HASH_METHOD;
-use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult};
+use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult, MIN_QCID_FILE_SIZE};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::str::FromStr;
@@ -8,7 +8,7 @@ use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
 
 // 添加类型别名来简化 copy_chunk 的签名
-pub type ProgressCallback = Option<Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>>;
+pub type ChunkProgressCallback = Option<Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>>;
 
 pub struct ChunkHasher {
     pub hash_method: HashMethod,
@@ -208,7 +208,7 @@ pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
         length
     };
 
-    if length < QCID_HASH_PIECE_SIZE * 3 {
+    if length < MIN_QCID_FILE_SIZE {
         return Err(NdnError::Internal(format!(
             "quick hash error: item size is too small"
         )));
@@ -304,7 +304,7 @@ pub async fn copy_chunk<R, W>(
     mut chunk_reader: R,
     mut chunk_writer: W,
     mut hasher: Option<ChunkHasher>,
-    mut progress_callback: ProgressCallback,
+    mut progress_callback: ChunkProgressCallback,
 ) -> NdnResult<u64>
 where
     R: AsyncRead + Unpin,

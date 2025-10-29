@@ -46,7 +46,7 @@ impl DirObject {
     }
 
     //gen_obj_id会消耗self,防止构造id后潜在的修改
-    pub fn gen_obj_id(self) -> NdnResult<(ObjId, String)> {
+    pub fn gen_obj_id(&self) -> NdnResult<(ObjId, String)> {
         let mut real_extra_info:HashMap<String, Value> = HashMap::new(); 
         for (key, value) in &self.extra_info {
             real_extra_info.insert(key.clone(), value.clone());
