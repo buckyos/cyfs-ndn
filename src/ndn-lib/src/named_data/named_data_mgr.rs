@@ -1148,10 +1148,32 @@ impl NamedDataMgr {
         Ok(buffer)
     }
 
-    pub async fn put_chunk_by_reader(&self, chunk_id: &ChunkId, chunk_size: u64, mut reader: &mut ChunkReader) -> NdnResult<()> {
+    pub async fn put_chunk_by_reader_impl(&self, chunk_id: &ChunkId, chunk_size: u64, mut reader: &mut ChunkReader) -> NdnResult<()> {
         let mut chunk_writer = self.open_new_chunk_writer_impl(chunk_id, chunk_size).await?;
         tokio::io::copy(reader,&mut chunk_writer).await?;
         self.complete_chunk_writer_impl(chunk_id).await?;
+        Ok(())
+    }
+
+    pub async fn put_chunk_by_reader(
+        mgr_id: Option<&str>,
+        chunk_id: &ChunkId,
+        chunk_size: u64,
+        mut reader: &mut ChunkReader,
+    ) -> NdnResult<()> {
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
+        if named_mgr.is_none() {
+            return Err(NdnError::NotFound(format!("named data mgr not found")));
+        }
+        let named_mgr = named_mgr.unwrap();
+        let real_named_mgr = named_mgr.lock().await;
+        let mut chunk_writer = real_named_mgr.open_new_chunk_writer_impl(chunk_id, chunk_size).await?;
+        drop(real_named_mgr);
+
+        tokio::io::copy(reader,&mut chunk_writer).await?;
+        
+        let real_named_mgr = named_mgr.lock().await;
+        real_named_mgr.complete_chunk_writer_impl(chunk_id).await?;
         Ok(())
     }
 

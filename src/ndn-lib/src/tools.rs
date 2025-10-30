@@ -157,7 +157,7 @@ pub async fn store_content_to_ndn_mgr_impl(ndn_mgr:&NamedDataMgr,
                         NdnError::IoError(format!("Failed to open file: {}", e))
                     })?;
                     let mut reader: Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>> = Box::pin(reader);
-                    return ndn_mgr.put_chunk_by_reader(&chunk_id, chunk_size, &mut reader).await;
+                    return ndn_mgr.put_chunk_by_reader_impl(&chunk_id, chunk_size, &mut reader).await;
                 },
                 ContentToStore::Object(obj_id,obj_str) => {
                     return ndn_mgr.put_object_impl(&obj_id,&obj_str).await;
@@ -183,7 +183,7 @@ pub async fn store_content_to_ndn_mgr(ndn_mgr_id:Option<&str>,
 //use Link Mode to cacl dir object
 pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
     local_file_path:&Path,fileobj_template:&FileObject,use_chunklist:bool,
-    check_mode:&CheckMode,store_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<FileObject> {
+    check_mode:&CheckMode,store_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<(FileObject,ObjId,String)> {
     let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(ndn_mgr_id).await;
     if named_mgr.is_none() {
         return Err(NdnError::NotFound(format!("named data mgr not found")));
@@ -220,13 +220,19 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
             let qcid_obj_id = qcid.to_obj_id();
             let real_named_mgr = named_mgr.lock().await;
             let source_obj = real_named_mgr.query_source_object_by_target(&qcid_obj_id).await?;
+            drop(real_named_mgr);
             if source_obj.is_some() {
+
                 let source_obj = source_obj.unwrap();
+                info!("qcid already exists! file {} : {}=>{}", local_file_path.display(), source_obj.to_string(), qcid_obj_id.to_string());
                 //store_content_to_ndn_mgr(&real_named_mgr,&source_obj,store_mode.clone()).await?;
                 file_obj_result.content = source_obj.to_string();
                 file_obj_result.size = file_size as u64;
                 file_obj_result.create_time = Some(file_last_modify_time);
-                return Ok(file_obj_result);
+                let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
+                let content = ContentToStore::from_obj(file_obj_id.clone(),file_obj_str.clone());
+                store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
+                return Ok((file_obj_result,file_obj_id,file_obj_str));
             } else {
                 qcid_string = qcid.to_string();
                 new_qcid = Some(qcid);
@@ -282,18 +288,27 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
         store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode.clone()).await?;
     } 
 
+    if new_qcid.is_some() {
+        let real_named_mgr = named_mgr.lock().await;
+        let content_obj_id = ObjId::new(file_obj_result.content.as_str())?;
+        let new_qcid_obj_id = new_qcid.unwrap().to_obj_id();
+        real_named_mgr.link_same_object(&content_obj_id, &new_qcid_obj_id).await?;
+        info!("cacl {} file: link qcid to content: {}=>{}", local_file_path.display(), content_obj_id.to_string(), new_qcid_obj_id.to_string());
+    }
+
     file_obj_result.size = file_size;
     file_obj_result.create_time = None;
+    file_obj_result.name = local_file_path.file_name().unwrap().to_string_lossy().to_string();
     let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
-    let content = ContentToStore::from_obj(file_obj_id,file_obj_str);
+    let content = ContentToStore::from_obj(file_obj_id.clone(),file_obj_str.clone());
     store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
-    Ok(file_obj_result)
+    Ok((file_obj_result,file_obj_id,file_obj_str))
 }
 
 //use Link Mode to cacl dir object
 pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     source_dir:&Path,file_obj_template:&FileObject,
-    check_mode:&CheckMode,store_mode:StoreMode,progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<DirObject> {
+    check_mode:&CheckMode,store_mode:StoreMode,progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<(DirObject,ObjId,String)> {
     //遍历source_dir下的所有文件和子目录
     let mut read_dir = fs::read_dir(source_dir).await?;
     let mut will_process_file = Vec::new();
@@ -302,10 +317,10 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
         let sub_path = entry.path();
         if sub_path.is_dir() {
             //println!("dir: {}", sub_path.display());
-            let sub_dir_obj = Box::pin(cacl_dir_object(ndn_mgr_id,&sub_path,file_obj_template,check_mode,store_mode.clone(),progress_callback.clone())).await?;
+            let (sub_dir_obj,sub_dir_obj_id,sub_dir_str) = Box::pin(cacl_dir_object(ndn_mgr_id,&sub_path,file_obj_template,check_mode,store_mode.clone(),progress_callback.clone())).await?;
             let sub_total_size = sub_dir_obj.total_size;
             let sub_dir_obj_str = serde_json::to_string(&sub_dir_obj).unwrap();
-            let (sub_dir_obj_id, _) = sub_dir_obj.gen_obj_id()?;
+            //let (sub_dir_obj_id, _) = sub_dir_obj.gen_obj_id()?;
             
             this_dir_obj.add_directory(sub_path.file_name().unwrap().to_string_lossy().to_string(), 
                 sub_dir_obj_id, sub_total_size);
@@ -317,18 +332,16 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     
     for file in will_process_file {
         //println!("file: {}", file.display());
-        let file_object = cacl_file_object(ndn_mgr_id,&file,file_obj_template,true,check_mode,store_mode.clone(),progress_callback.clone()).await?;
-        let file_object_str = serde_json::to_string(&file_object).unwrap();
+        let (file_object,file_object_id,file_object_str) = cacl_file_object(ndn_mgr_id,&file,file_obj_template,true,check_mode,store_mode.clone(),progress_callback.clone()).await?;
         let file_object_json = serde_json::to_value(&file_object).unwrap();
-        let (file_object_id, _) = file_object.gen_obj_id();
-       
+
         this_dir_obj.add_file(file.file_name().unwrap().to_string_lossy().to_string(), file_object_json, file_object.size);
     }
 
     let (dir_obj_id, dir_obj_str) = this_dir_obj.gen_obj_id()?;
-    let content = ContentToStore::from_obj(dir_obj_id,dir_obj_str);
+    let content = ContentToStore::from_obj(dir_obj_id.clone(),dir_obj_str.clone());
     store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
-    return Ok(this_dir_obj);
+    return Ok((this_dir_obj,dir_obj_id,dir_obj_str));
 }
 
 pub async fn restore_file_object(file_object:ObjId,ndn_mgr_id:Option<&str>,target_file:&Path) -> NdnResult<()> {
@@ -394,7 +407,7 @@ pub async fn restore_dir_object(dir_object:ObjId,ndn_mgr_id:Option<&str>,target_
 }
 
 
-pub async fn pub_local_file_as_chunk(
+pub async fn put_local_file_as_chunk(
     mgr_id: Option<&str>,
     chunk_type: ChunkType,
     local_file_path: &PathBuf,
@@ -480,97 +493,19 @@ pub async fn pub_local_file_as_fileobj(
     mgr_id: Option<&str>,
     local_file_path: &PathBuf,
     ndn_path: &str,
-    ndn_content_path: &str,
     fileobj_template: &mut FileObject,
     user_id: &str,
-    app_id: &str,
-    use_chunklist: bool,
-) -> NdnResult<()> {
+    app_id: &str
+) -> NdnResult<(FileObject,ObjId,String)> {
     let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
     if named_mgr.is_none() {
         return Err(NdnError::NotFound(format!("named data mgr not found")));
     }
     let named_mgr = named_mgr.unwrap();
-    //TODO：优化，边算边传，支持断点续传
-    debug!(
-        "start pub local_file_as_fileobj, local_file_path:{}",
-        local_file_path.display()
-    );
-    let file_size = tokio::fs::metadata(local_file_path).await.unwrap().len();
-    let mut is_use_chunklist = false;
-    let mut chunk_size = CHUNK_NORMAL_SIZE as u64;
-
-    if file_size > CHUNK_NORMAL_SIZE as u64 {
-        if use_chunklist {
-            is_use_chunklist = true;
-        } else {
-            chunk_size = file_size;
-        }
-    }
-
-    let mut file_reader = tokio::fs::File::open(local_file_path).await.map_err(|e| {
-        error!("open local_file_path failed, err:{}", e);
-        NdnError::IoError(format!("open local_file_path failed, err:{}", e))
-    })?;
-    debug!("open local_file_path success");
-    let mut read_pos = 0;
-
-    let mut chunk_hasher = ChunkHasher::new(None).unwrap();
-    let chunk_type = chunk_hasher.hash_method.clone();
-    file_reader.seek(SeekFrom::Start(read_pos)).await;
-    let (chunk_raw_id, chunk_size) = chunk_hasher
-        .calc_from_reader_with_length(&mut file_reader, chunk_size)
-        .await
-        .unwrap();
-
-    let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(chunk_size, &chunk_raw_id, chunk_type)?;
-    info!(
-        "pub_local_file_as_fileobj:calc chunk_id success,chunk_id:{},chunk_size:{}",
-        chunk_id.to_string(),
-        chunk_size
-    );
+    let (file_object,file_object_id,file_object_str) = cacl_file_object(mgr_id,local_file_path,fileobj_template,true,&CheckMode::ByFullHash,StoreMode::StoreInNamedMgr,None).await?;
     let real_named_mgr = named_mgr.lock().await;
-    let is_exist = real_named_mgr.have_chunk_impl(&chunk_id).await;
-    if !is_exist {
-        let (mut chunk_writer, _) = real_named_mgr
-            .open_chunk_writer_impl(&chunk_id, chunk_size, 0)
-            .await?;
-        drop(real_named_mgr);
-        file_reader.seek(std::io::SeekFrom::Start(0)).await.unwrap();
-        let copy_bytes = tokio::io::copy(&mut file_reader, &mut chunk_writer)
-            .await
-            .map_err(|e| {
-                error!(
-                    "copy local_file {:?} to named-mgr failed, err:{}",
-                    local_file_path, e
-                );
-                NdnError::IoError(format!("copy local_file to named-mgr failed, err:{}", e))
-            })?;
-
-        info!("pub_local_file_as_fileobj:copy local_file {:?} to named-mgr's chunk success,copy_bytes:{}", local_file_path, copy_bytes);
-        let real_named_mgr = named_mgr.lock().await;
-        real_named_mgr.complete_chunk_writer_impl(&chunk_id).await?;
-    } else {
-        drop(real_named_mgr);
-    }
-
-    fileobj_template.content = chunk_id.to_string();
-    fileobj_template.size = chunk_size;
-    fileobj_template.create_time = Some(buckyos_get_unix_timestamp());
-
-    let (file_obj_id, file_obj_str) = fileobj_template.gen_obj_id();
-    let chunk_obj_id = chunk_id.to_obj_id();
-    let real_named_mgr = named_mgr.lock().await;
-    real_named_mgr
-        .put_object_impl(&file_obj_id, file_obj_str.as_str())
-        .await?;
-    real_named_mgr
-        .set_file_impl(ndn_path, &file_obj_id, app_id, user_id)
-        .await?;
-    real_named_mgr
-        .set_file_impl(ndn_content_path, &chunk_obj_id, app_id, user_id)
-        .await?;
-    Ok(())
+    real_named_mgr.create_file_impl(ndn_path, &file_object_id, app_id, user_id).await?;
+    return Ok((file_object,file_object_id,file_object_str));
 }
 
 
@@ -722,10 +657,9 @@ mod test {
 
         let source_dir = Path::new("/Users/liuzhicong/Downloads/");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let dir_objectA = cacl_dir_object(Some("testA"),source_dir,&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+        let (dir_objectA,dir_object_id,dir_object_str) = cacl_dir_object(Some("testA"),source_dir,&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
         let dir_object_str = serde_json::to_string_pretty(&dir_objectA).unwrap();
         println!("dir_object_str: {}", dir_object_str);
-        let (dir_object_id, dir_obj_str_for_gen_obj_id) = dir_objectA.gen_obj_id().unwrap();
         println!("dir_object_id: {}", dir_object_id.to_string());
 
         //let ndn_clientB = NdnClient::new(named_mgrB.clone());
@@ -745,6 +679,8 @@ mod test {
             config,
         )
         .await.unwrap();
+
+        let test_dir = tempdir().unwrap();
         let config2 = NamedDataMgrConfig::default();
         NamedDataMgr::set_mgr_by_id(Some("test"),named_mgr).await.unwrap();
         let named_mgr = NamedDataMgr::from_config(
@@ -756,20 +692,19 @@ mod test {
         NamedDataMgr::set_mgr_by_id(Some("test2"),named_mgr).await.unwrap();
         info!("---start calc dir object in store to named mgr mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let dir_object = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
-        //let dir_object_str = serde_json::to_string_pretty(&dir_object).unwrap();
-        //println!("dir_object_str: {}", dir_object_str);
-        let (dir_object_id, dir_obj_str_for_gen_obj_id) = dir_object.gen_obj_id().unwrap();
+        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+        let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
+        println!("dir_object_store_str: {}", dir_object_store_str);
+        println!("dir_object_str: {}", dir_object_str);
         println!("dir_object_id: {}", dir_object_id.to_string());
-        println!("dir_obj_str_for_gen_obj_id: {}", dir_obj_str_for_gen_obj_id);
+
 
         info!("---start calc dir object in local file mode");
-        let dir_object = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),None).await.unwrap();
-        //let dir_object_str = serde_json::to_string_pretty(&dir_object).unwrap();
-        //println!("dir_object_str: {}", dir_object_str);
-        let (dir_object_id2, dir_obj_str_for_gen_obj_id) = dir_object.gen_obj_id().unwrap();
+        let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),None).await.unwrap();
+        let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
+        println!("dir_object_store_str: {}", dir_object_store_str);
         println!("dir_object_id: {}", dir_object_id.to_string());
-        println!("dir_obj_str_for_gen_obj_id: {}", dir_obj_str_for_gen_obj_id);
+        println!("dir_object_str: {}", dir_object_str);
         assert_eq!(dir_object_id, dir_object_id2);
 
         info!("---end");

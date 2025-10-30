@@ -10,9 +10,9 @@ use std::path::Path;
 pub struct DirObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    pub total_size: u64,//包含所有子文件夹
+    pub total_size: u64,//包含所有子文件夹和当前文件夹下文件的总大小
     pub file_count: u64,
-    pub file_size: u64,//不包含子文件内文件
+    pub file_size: u64,//不包含子文件，只计算当前文件夹下文件的总大小
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
 
@@ -23,7 +23,7 @@ pub struct DirObject {
     #[serde(flatten)]
     pub extra_info: HashMap<String, Value>,
     #[serde(flatten)]
-    pub object_map: SimpleObjectMap,
+    pub object_map: SimpleObjectMap, // 保存真正的sub items
 }
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {

@@ -28,8 +28,23 @@ pub enum NdnAction {
     DirOK(PathBuf),
     Skip(u64),
 }
+
+pub enum ProgressCallbackResult {
+    Continue,//default, continue to the next item
+    Skip,//skip the current item
+    Stop,//stop the process
+}
+
+impl ProgressCallbackResult {
+    pub fn is_continue(&self) -> bool {
+        match self {
+            ProgressCallbackResult::Continue => true,
+            _ => false,
+        }
+    }
+}
 // PullProgressCallback(inner_path, action), return true if continue, false if stop
-pub type NdnProgressCallback = Box<dyn FnMut(String, NdnAction) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'static>> + Send>;
+pub type NdnProgressCallback = Box<dyn FnMut(String, NdnAction) -> Pin<Box<dyn Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>> + Send>;
 
 
 #[derive(Clone,Debug,PartialEq)]
@@ -685,9 +700,9 @@ impl NdnClient {
     }
 
     //准备dir_object,并列出所有需要下载的chunk
-    pub async fn prepare_dir_object(&self,dir_obj:&ObjId,last_dir_obj:Option<ObjId>) -> NdnResult<()>{
-        unimplemented!()
-    }
+    // pub async fn prepare_dir_object(&self,dir_obj:&ObjId,last_dir_obj:Option<ObjId>) -> NdnResult<()>{
+    //     unimplemented!()
+    // }
     
     pub async fn pull_dir(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject,
         pull_mode:StoreMode, progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<()>{
@@ -718,8 +733,8 @@ impl NdnClient {
                     self.pull_file(sub_file,pull_mode.clone(),progress_callback.clone()).await?;
                     if let Some(progress_callback) = progress_callback.clone() {
                         let mut progress_callback = progress_callback.lock().await;
-                        let is_continue = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_file_size)).await?;
-                        if !is_continue {
+                        let callback_result = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_file_size)).await?;
+                        if !callback_result.is_continue() {
                             info!("pull_dir: stopped by progress callback");
                             return Ok(());
                         }

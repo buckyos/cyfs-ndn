@@ -1,5 +1,5 @@
 use super::*;
-use crate::tools::pub_local_file_as_chunk;
+use crate::tools::put_local_file_as_chunk;
 use crate::{ChunkId, ChunkType, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, NdnResult, ObjId, StoreMode};
 use buckyos_kit::*;
 use std::io::{SeekFrom, Write};
@@ -102,7 +102,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     file.write_all(&test_local_file_data).unwrap();
     file.flush().unwrap();
     drop(file);
-    let test_file_chunk_id = pub_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path, StoreMode::StoreInNamedMgr).await.unwrap();
+    let test_file_chunk_id = put_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path, StoreMode::StoreInNamedMgr).await.unwrap();
     info!("test_file_chunk_id:{}", test_file_chunk_id.to_string());
     let real_chunk_mgr = chunk_mgr.lock().await;
     let (mut reader3, size3) = real_chunk_mgr
@@ -121,7 +121,7 @@ async fn test_basic_chunk_operations() -> NdnResult<()> {
     file2.write_all(&test_local_file_data2).unwrap();
     file2.flush().unwrap();
     drop(file2);
-    let test_file_chunk_id2 = pub_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path2, StoreMode::StoreInNamedMgr).await.unwrap();
+    let test_file_chunk_id2 = put_local_file_as_chunk(Some("test"),ChunkType::Sha256,&test_local_file_path2, StoreMode::StoreInNamedMgr).await.unwrap();
     info!("test_file_chunk_id2:{}", test_file_chunk_id2.to_string());
 
     let real_chunk_mgr = chunk_mgr.lock().await;

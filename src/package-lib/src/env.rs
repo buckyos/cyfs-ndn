@@ -463,7 +463,7 @@ impl PackageEnv {
                     pkg_id.clone(),
                     format!("Invalid chunk id: {}", e),
                 ))?;
-            if !NamedDataMgr::have_chunk(&chunk_id,self.config.named_mgr_name.as_deref()).await {
+            if !NamedDataMgr::have_chunk(self.config.named_mgr_name.as_deref(),&chunk_id).await {
                 info!("{}'s chunk {} not found, downloading...", pkg_id, chunk_id_str);
                 //TODO:ndn client要支持 1个zone内地址(none) ，2个zone外地址（发布者+传播者) 的多源模式
                 let zone_ndn_url = "http://127.0.0.1/ndn/";
