@@ -339,7 +339,9 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     }
 
     let (dir_obj_id, dir_obj_str) = this_dir_obj.gen_obj_id()?;
-    let content = ContentToStore::from_obj(dir_obj_id.clone(),dir_obj_str.clone());
+    let dir_obj_store_str = serde_json::to_string(&this_dir_obj).unwrap();
+    //store dir object to ndn mgr
+    let content = ContentToStore::from_obj(dir_obj_id.clone(),dir_obj_store_str);
     store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
     return Ok((this_dir_obj,dir_obj_id,dir_obj_str));
 }
@@ -672,10 +674,11 @@ mod test {
         init_logging("ndn-lib-test", false);
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig::default();
-    
+        
+        let target_dir = Path::new("/Users/liuzhicong/OneDriveBackup/");
         let named_mgr = NamedDataMgr::from_config(
             Some("test".to_string()),
-            test_dir.path().to_path_buf(),
+            target_dir.to_path_buf(),
             config,
         )
         .await.unwrap();
@@ -692,7 +695,7 @@ mod test {
         NamedDataMgr::set_mgr_by_id(Some("test2"),named_mgr).await.unwrap();
         info!("---start calc dir object in store to named mgr mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/OneDrive/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_store_str: {}", dir_object_store_str);
         println!("dir_object_str: {}", dir_object_str);

@@ -196,9 +196,10 @@ impl NamedDataMgr {
         let hex_str = hex::encode(chunk_id.hash_result.clone());
         let dir1 = &hex_str[0..2];
         let dir2 = &hex_str[2..4];
-        let file_name = &hex_str[4..];
+        let file_name = format!("{}.{}",&hex_str[4..],chunk_id.chunk_type.to_string().as_str());
+        //let file_name = &hex_str[4..] + chunk_id.chunk_type.to_string().as_str();
 
-        self.base_dir.join(dir1).join(dir2).join(file_name).join(chunk_id.chunk_type.to_string())
+        self.base_dir.join(dir1).join(dir2).join(file_name)
 
     }
 
