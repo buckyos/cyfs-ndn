@@ -10,6 +10,7 @@ use tokio::fs;
 
 use std::io::SeekFrom;
 use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncReadExt;
 use crate::chunk::ChunkId;
 use crate::packed_obj_pipline::{PackedObjPiplineWriter, PackedObjPiplineReader, ChunkChannelSourceWriter};
 use std::sync::Arc;
@@ -153,10 +154,19 @@ pub async fn store_content_to_ndn_mgr_impl(ndn_mgr:&NamedDataMgr,
                         return Ok(());
                     }
 
-                    let reader = tokio::fs::File::open(chunk_local_info.path).await.map_err(|e| {
+                    let mut reader = tokio::fs::File::open(chunk_local_info.path).await.map_err(|e| {
                         NdnError::IoError(format!("Failed to open file: {}", e))
                     })?;
-                    let mut reader: Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>> = Box::pin(reader);
+                    //limit the reader from chunk_local_info.range
+                    let mut reader: Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>> = if let Some(range) = chunk_local_info.range {
+                        let start = range.start;
+                        let len = range.end - range.start;
+                        // position to start, then wrap with take to cap reads to len bytes
+                        reader.seek(SeekFrom::Start(start)).await?;
+                        Box::pin(reader.take(len))
+                    } else {
+                        Box::pin(reader)
+                    };
                     return ndn_mgr.put_chunk_by_reader_impl(&chunk_id, chunk_size, &mut reader).await;
                 },
                 ContentToStore::Object(obj_id,obj_str) => {
@@ -622,6 +632,20 @@ mod test {
     use buckyos_kit::*;
     use tempfile::tempdir;
     use crate::{NamedDataMgrConfig, NdnClient};
+
+    #[tokio::test]
+    async fn test_file_name() {
+        let hexstr = "80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5";
+        let len = hexstr.len();
+        let dir1 = &hexstr[len-4..len-2];
+        let dir2 = &hexstr[len-2..len];
+        let file_name = format!("{}.{}",&hexstr,ChunkType::Mix256.to_string().as_str());
+        println!("dir1: {}", dir1);
+        assert_eq!(dir1, "75");
+        println!("dir2: {}", dir2);
+        assert_eq!(dir2, "d5");
+        println!("file_name: {}", file_name);
+    }
     /*
     构造测试
     # 针对一个目录，基于named_mgrA,使用link模式计算dir object idA该过程可以中断重试(用qcid快速跳过已经计算过的fileobject)
@@ -675,7 +699,7 @@ mod test {
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig::default();
         
-        let target_dir = Path::new("/Users/liuzhicong/OneDriveBackup/");
+        let target_dir = Path::new("/Users/liuzhicong/test_backup/");
         let named_mgr = NamedDataMgr::from_config(
             Some("test".to_string()),
             target_dir.to_path_buf(),
@@ -695,7 +719,7 @@ mod test {
         NamedDataMgr::set_mgr_by_id(Some("test2"),named_mgr).await.unwrap();
         info!("---start calc dir object in store to named mgr mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/OneDrive/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_store_str: {}", dir_object_store_str);
         println!("dir_object_str: {}", dir_object_str);

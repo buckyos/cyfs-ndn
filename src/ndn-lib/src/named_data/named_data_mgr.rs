@@ -194,9 +194,10 @@ impl NamedDataMgr {
     fn get_chunk_path(&self, chunk_id: &ChunkId) -> PathBuf {
         //根据ChunkId的HashResult,产生一个三层的目录结构
         let hex_str = hex::encode(chunk_id.hash_result.clone());
-        let dir1 = &hex_str[0..2];
-        let dir2 = &hex_str[2..4];
-        let file_name = format!("{}.{}",&hex_str[4..],chunk_id.chunk_type.to_string().as_str());
+        let len = hex_str.len();
+        let dir1 = &hex_str[len-4..len-2];
+        let dir2 = &hex_str[len-2..len];
+        let file_name = format!("{}.{}",&hex_str,chunk_id.chunk_type.to_string().as_str());
         //let file_name = &hex_str[4..] + chunk_id.chunk_type.to_string().as_str();
 
         self.base_dir.join(dir1).join(dir2).join(file_name)
@@ -1151,7 +1152,12 @@ impl NamedDataMgr {
 
     pub async fn put_chunk_by_reader_impl(&self, chunk_id: &ChunkId, chunk_size: u64, mut reader: &mut ChunkReader) -> NdnResult<()> {
         let mut chunk_writer = self.open_new_chunk_writer_impl(chunk_id, chunk_size).await?;
-        tokio::io::copy(reader,&mut chunk_writer).await?;
+        // ensure we only copy exactly chunk_size bytes
+        let mut limited = reader.take(chunk_size);
+        let copy_bytes = tokio::io::copy(&mut limited,&mut chunk_writer).await?;
+        if copy_bytes != chunk_size {
+            return Err(NdnError::IoError(format!("copy chunk failed! expected:{} actual:{}", chunk_size, copy_bytes)));
+        }
         self.complete_chunk_writer_impl(chunk_id).await?;
         Ok(())
     }
@@ -1171,7 +1177,12 @@ impl NamedDataMgr {
         let mut chunk_writer = real_named_mgr.open_new_chunk_writer_impl(chunk_id, chunk_size).await?;
         drop(real_named_mgr);
 
-        tokio::io::copy(reader,&mut chunk_writer).await?;
+        // ensure we only copy exactly chunk_size bytes
+        let mut limited = reader.take(chunk_size);
+        let copy_bytes = tokio::io::copy(&mut limited,&mut chunk_writer).await?;
+        if copy_bytes != chunk_size {
+            return Err(NdnError::IoError(format!("copy chunk failed! expected:{} actual:{}", chunk_size, copy_bytes)));
+        }
         
         let real_named_mgr = named_mgr.lock().await;
         real_named_mgr.complete_chunk_writer_impl(chunk_id).await?;
