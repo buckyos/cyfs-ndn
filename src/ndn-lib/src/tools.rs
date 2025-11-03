@@ -24,7 +24,6 @@ pub enum KnownStandardObject {
 }
 
 impl KnownStandardObject {
-
     pub fn from_obj_data(obj_id: &ObjId, obj_data: &str) -> NdnResult<Self> {
         //TODO:support obj_data is jwt
         let obj_type = obj_id.obj_type.as_str();
@@ -141,9 +140,7 @@ pub async fn store_content_to_ndn_mgr_impl(ndn_mgr:&NamedDataMgr,
                     return ndn_mgr.add_chunk_by_link_to_local_file_impl(&chunk_id, chunk_size, &chunk_local_info).await;
                 },
                 ContentToStore::Object(obj_id,obj_str) => {
-                    if is_store_in_named_mgr {
-                        return ndn_mgr.put_object_impl(&obj_id,&obj_str).await;
-                    } 
+                    return ndn_mgr.put_object_impl(&obj_id,&obj_str).await;
                 }
              }
         },
@@ -235,11 +232,35 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
             let source_obj = real_named_mgr.query_source_object_by_target(&qcid_obj_id).await?;
             drop(real_named_mgr);
             if source_obj.is_some() {
-
                 let source_obj = source_obj.unwrap();
                 info!("qcid already exists! file {} : {}=>{}", local_file_path.display(), source_obj.to_string(), qcid_obj_id.to_string());
                 //store_content_to_ndn_mgr(&real_named_mgr,&source_obj,store_mode.clone()).await?;
                 file_obj_result.content = source_obj.to_string();
+                if progress_callback.is_some() {
+                    if source_obj.obj_type.as_str() == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+                        let chunk_list_body = NamedDataMgr::get_object(ndn_mgr_id,&source_obj,None).await?;
+                        let chunk_list = SimpleChunkList::from_json_value(chunk_list_body)?;
+                        let mut start_pos = 0;
+                        for chunk_id in chunk_list.body.iter() {
+                            let chunk_size = chunk_id.get_length().unwrap();
+                            let inner_path = format!("{}/{}:{}",local_file_path.to_path_buf().to_string_lossy().to_string(),start_pos,start_pos + chunk_size);
+                            start_pos += chunk_size;
+                            let callback_result = call_ndn_callback(&progress_callback,
+                                inner_path,
+                                NdnAction::ChunkOK(chunk_id.clone(),chunk_size)).await?;
+                            if !callback_result.is_continue() { 
+                                return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+                            }
+                        }
+                    } else {
+                        let callback_result = call_ndn_callback(&progress_callback,
+                            local_file_path.to_path_buf().to_string_lossy().to_string(),
+                            NdnAction::ChunkOK(ChunkId::from_obj_id(&source_obj),file_size)).await?;
+                        if !callback_result.is_continue() { 
+                            return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+                        }
+                    }
+                }
                 let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
                 let content = ContentToStore::from_obj(file_obj_id.clone(),file_obj_str.clone());
                 store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
@@ -286,7 +307,12 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
                 range,
             };
             let content = ContentToStore::from_local_file(chunk_id.clone(),chunk_size,chunk_local_info);
-            let callback_result = call_ndn_callback(&progress_callback,chunk_index.to_string(),NdnAction::ChunkOK(chunk_id.clone(),chunk_size)).await?;
+            let inner_path = if is_use_chunklist {
+                format!("{}/{}:{}",local_file_path.to_path_buf().to_string_lossy().to_string(),read_pos,read_pos + chunk_size)
+            } else {
+                local_file_path.to_path_buf().to_string_lossy().to_string()
+            };
+            let callback_result = call_ndn_callback(&progress_callback,inner_path,NdnAction::ChunkOK(chunk_id.clone(),chunk_size)).await?;
             if !callback_result.is_continue() { 
                 return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
             }
@@ -743,7 +769,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cacl_dir_object() {
-        std::env::set_var("BUCKY_LOG", "warn");
+        //std::env::set_var("BUCKY_LOG", "warn");
         init_logging("ndn-lib-test", false);
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig::default();
@@ -769,7 +795,7 @@ mod test {
 
         let progress_callback: Option<Arc<Mutex<NdnProgressCallback>>> = Some(Arc::new(Mutex::new(Box::new(|inner_path:String,action:NdnAction| {
             Box::pin(async move {
-                info!("progress_callback: inner_path:{} action:{:?}", inner_path, action);
+                info!("ndn_callback: {} {}", inner_path, action.to_string());
                 Ok(ProgressCallbackResult::Continue)
             }) as Pin<Box<dyn std::future::Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>>
         }))));

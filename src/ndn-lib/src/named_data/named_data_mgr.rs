@@ -357,7 +357,7 @@ impl NamedDataMgr {
         
         if obj_body.is_some() {
             let obj_body = obj_body.unwrap();
-            let obj_body = obj_body.to_json_value().map_err(|e| {
+            let obj_body = obj_body.to_json_value().map_err(|e| {                
                 warn!("get_object: decode obj body failed! {}", e.to_string());
                 NdnError::DecodeError(e.to_string())
             })?;

@@ -19,6 +19,8 @@ mod tools;
 
 //mod example;
 
+use std::path::PathBuf;
+
 pub use object::*;
 pub use chunk::*;
 pub use link_obj::*;
@@ -40,6 +42,12 @@ pub use tools::*;
 
 use reqwest::StatusCode;
 use thiserror::Error;
+use std::pin::Pin;
+use std::future::Future;
+use std::ops::Range;
+use tokio::fs::OpenOptions;
+use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, AsyncReadExt, AsyncSeekExt};
+use tokio::io::{SeekFrom, BufReader, BufWriter};
 
 #[macro_use]
 extern crate log;
@@ -138,3 +146,128 @@ pub const OBJ_TYPE_PKG: &str = "pkg"; // package
 // pub use http::*;
 pub const RELATION_TYPE_SAME: &str = "same";
 pub const RELATION_TYPE_PART_OF: &str = "part_of";
+
+#[derive(Debug,Clone)]
+pub enum NdnAction {
+    PreFile,
+    FileOK(ObjId,u64),
+    ChunkOK(ChunkId,u64),
+    PreDir,
+    DirOK(ObjId,u64),
+    Skip(u64),
+}
+
+impl ToString for NdnAction {
+    fn to_string(&self) -> String {
+        match self {
+            NdnAction::PreFile => "PreFile".to_string(),
+            NdnAction::FileOK(obj_id,size) => format!("FileOK {} ({})",obj_id.to_string(),size),
+            NdnAction::ChunkOK(chunk_id,size) => format!("ChunkOK {} ({})",chunk_id.to_string(),size),
+            NdnAction::PreDir => "PreDir".to_string(),
+            NdnAction::DirOK(obj_id,size) => format!("DirOK {} ({})",obj_id.to_string(),size),
+            NdnAction::Skip(size) => format!("Skip:{}",size),
+        }
+    }
+}
+
+pub enum ProgressCallbackResult {
+    Continue,//default, continue to the next item
+    Skip,//skip the current item
+    Stop,//stop the process
+}
+
+impl ProgressCallbackResult {
+    pub fn is_continue(&self) -> bool {
+        match self {
+            ProgressCallbackResult::Continue => true,
+            ProgressCallbackResult::Skip => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_skip(&self) -> bool {
+        match self {
+            ProgressCallbackResult::Skip => true,
+            _ => false,
+        }
+    }
+}
+// PullProgressCallback(inner_path, action), return true if continue, false if stop
+pub type NdnProgressCallback = Box<dyn FnMut(String, NdnAction) -> Pin<Box<dyn Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>> + Send>;
+
+
+#[derive(Clone,Debug,PartialEq)]
+pub enum StoreMode {
+    //local file path and range, store in local file or named mgr?
+    LocalFile(PathBuf,Range<u64>,bool),
+    StoreInNamedMgr,
+    NoStore,
+}
+
+impl Default for StoreMode {
+    fn default() -> Self {
+        Self::StoreInNamedMgr
+    }
+}
+
+impl StoreMode {
+    pub fn new_local() -> Self {
+        return Self::LocalFile(PathBuf::new(), 0..0, false);
+    }
+
+    pub fn is_store_to_local(&self) -> bool {
+        match self {
+            StoreMode::LocalFile(_,_,_) => true,
+            StoreMode::StoreInNamedMgr => false,
+            StoreMode::NoStore => false,
+        }
+    }
+
+    pub fn gen_sub_store_mode(&self,sub_item_name:&String)->Self {
+        match self {
+            StoreMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
+                StoreMode::LocalFile(local_path.clone().join(sub_item_name), 
+                0..0, *need_pull_to_named_mgr)
+            }
+            _ => self.clone(),
+        }
+    }
+
+    pub fn need_store_to_named_mgr(&self) -> bool {
+        match self {
+            StoreMode::LocalFile(_,_,need_pull_to_named_mgr) => *need_pull_to_named_mgr,
+            StoreMode::StoreInNamedMgr => true,
+            StoreMode::NoStore => false,
+        }
+    }
+
+    pub async fn open_local_writer(&self) -> NdnResult<ChunkWriter> {
+        match self {
+            StoreMode::LocalFile(local_file_path,range,_) => {
+                if let Some(parent) = local_file_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| NdnError::IoError(format!("Failed to create directory: {}", e)))?;
+                }
+
+                let mut local_file = OpenOptions::new()
+                    .write(true)
+                    .open(&local_file_path)
+                    .await
+                    .map_err(|e| {
+                        warn!("open_chunk_writer: open file failed! {}", e.to_string());
+                        NdnError::IoError(e.to_string())
+                    })?;
+                if range.start != 0 {
+                    local_file.seek(SeekFrom::Start(range.start)).await?;
+                }
+                return Ok(Box::pin(local_file));
+            }
+            StoreMode::StoreInNamedMgr => {
+                return Err(NdnError::InvalidState("not a local file".to_string()));
+            }
+            StoreMode::NoStore => {
+                return Err(NdnError::InvalidState("not a local file".to_string()));
+            }
+        }
+    }
+}
