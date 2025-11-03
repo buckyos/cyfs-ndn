@@ -43,6 +43,13 @@ pub struct FileObject {
     pub extra_info: HashMap<String, Value>,
 }
 
+impl Default for FileObject {
+    fn default() -> Self {
+        Self {name:String::new(),size:0,content:String::new(),meta:None,mime:None,owner:None,exp:0,
+            create_time:None,chunk_list:None,extra_info:HashMap::new()}
+    }
+}
+
 impl FileObject {
     //content can be chunkid or chunklistid
     pub fn new(name:String,size:u64,content:String)->Self {

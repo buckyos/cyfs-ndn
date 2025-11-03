@@ -22,10 +22,13 @@ use futures::future::BoxFuture;
 use rand::RngCore;
 
 use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, verify_named_object_from_str, CYFSHttpRespHeaders, ChunkState, ChunkWriter, DirObject, FileObject, HashMethod, PathObject, ChunkProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+#[derive(Debug,Clone)]
 pub enum NdnAction {
-    FileOK(u64),
-    ChunkOK(u64),
-    DirOK(PathBuf),
+    PreFile,
+    FileOK(ObjId,u64),
+    ChunkOK(ChunkId,u64),
+    PreDir,
+    DirOK(ObjId,u64),
     Skip(u64),
 }
 
@@ -39,6 +42,14 @@ impl ProgressCallbackResult {
     pub fn is_continue(&self) -> bool {
         match self {
             ProgressCallbackResult::Continue => true,
+            ProgressCallbackResult::Skip => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_skip(&self) -> bool {
+        match self {
+            ProgressCallbackResult::Skip => true,
             _ => false,
         }
     }
@@ -733,7 +744,7 @@ impl NdnClient {
                     self.pull_file(sub_file,pull_mode.clone(),progress_callback.clone()).await?;
                     if let Some(progress_callback) = progress_callback.clone() {
                         let mut progress_callback = progress_callback.lock().await;
-                        let callback_result = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_file_size)).await?;
+                        let callback_result = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_item_obj_id.clone(),sub_file_size)).await?;
                         if !callback_result.is_continue() {
                             info!("pull_dir: stopped by progress callback");
                             return Ok(());

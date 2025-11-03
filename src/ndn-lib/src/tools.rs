@@ -1,4 +1,4 @@
-use crate::{ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NdnError, NdnProgressCallback, NdnResult, ObjId, PackedObjItem, SimpleChunkList, StoreMode, CHUNK_NORMAL_SIZE, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+use crate::{CHUNK_NORMAL_SIZE, ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NdnAction, NdnError, NdnProgressCallback, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, PackedObjItem, ProgressCallbackResult, SimpleChunkList, StoreMode};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -222,6 +222,9 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
         }
     }
 
+    file_obj_result.size = file_size;
+    file_obj_result.create_time = Some(file_last_modify_time);;
+    file_obj_result.name = local_file_path.file_name().unwrap().to_string_lossy().to_string();
     //
     if check_mode.is_support_quick_check() {    
         let qcid = caculate_qcid_from_file(local_file_path).await;
@@ -237,8 +240,6 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
                 info!("qcid already exists! file {} : {}=>{}", local_file_path.display(), source_obj.to_string(), qcid_obj_id.to_string());
                 //store_content_to_ndn_mgr(&real_named_mgr,&source_obj,store_mode.clone()).await?;
                 file_obj_result.content = source_obj.to_string();
-                file_obj_result.size = file_size as u64;
-                file_obj_result.create_time = Some(file_last_modify_time);
                 let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
                 let content = ContentToStore::from_obj(file_obj_id.clone(),file_obj_str.clone());
                 store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
@@ -256,6 +257,7 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
     })?;
     
     let mut read_pos = 0;
+    let mut chunk_index = 0;
     while read_pos < file_size {
         let mut chunk_hasher = ChunkHasher::new(None).unwrap();
         let chunk_type = chunk_hasher.hash_method.clone();
@@ -272,6 +274,7 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
             if is_use_chunklist {
                 chunk_list.append_chunk(chunk_id.clone())?;
                 range = Some(read_pos..read_pos + chunk_size);
+                chunk_index += 1;
             } else {
                 file_obj_result.content = chunk_id.to_string();
             }
@@ -283,6 +286,10 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
                 range,
             };
             let content = ContentToStore::from_local_file(chunk_id.clone(),chunk_size,chunk_local_info);
+            let callback_result = call_ndn_callback(&progress_callback,chunk_index.to_string(),NdnAction::ChunkOK(chunk_id.clone(),chunk_size)).await?;
+            if !callback_result.is_continue() { 
+                return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+            }
             store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode.clone()).await?;
         }    
         read_pos += chunk_size;
@@ -293,7 +300,7 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
         let sub_item_count = chunk_list.body.len();
         let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
         file_obj_result.content = chunk_list_id.to_string();
-        //store chunk list to ndn mgr
+
         let content = ContentToStore::from_obj(chunk_list_id,chunk_list_str);
         store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode.clone()).await?;
     } 
@@ -306,14 +313,20 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
         info!("cacl {} file: link qcid to content: {}=>{}", local_file_path.display(), content_obj_id.to_string(), new_qcid_obj_id.to_string());
     }
 
-    file_obj_result.size = file_size;
-    file_obj_result.create_time = None;
-    file_obj_result.name = local_file_path.file_name().unwrap().to_string_lossy().to_string();
     let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
     let content = ContentToStore::from_obj(file_obj_id.clone(),file_obj_str.clone());
     store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
     Ok((file_obj_result,file_obj_id,file_obj_str))
 }
+
+
+async fn call_ndn_callback(progress_callback: &Option<Arc<Mutex<NdnProgressCallback>>>,inner_path:String,action:NdnAction) -> NdnResult<ProgressCallbackResult> {
+    if let Some(callback) = progress_callback {
+        let mut callback = callback.lock().await;
+        return callback(inner_path,action).await;
+    }
+    Ok(ProgressCallbackResult::Continue)
+} 
 
 //use Link Mode to cacl dir object
 pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
@@ -327,11 +340,29 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
         let sub_path = entry.path();
         if sub_path.is_dir() {
             //println!("dir: {}", sub_path.display());
+            let callback_result = call_ndn_callback(&progress_callback,sub_path.to_string_lossy().to_string(),NdnAction::PreDir).await?;
+            if !callback_result.is_continue() { 
+                return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+            }
+
+            if callback_result.is_skip() {
+                debug!("user skip sub dir: {}", sub_path.display());
+                continue;
+            }
+
             let (sub_dir_obj,sub_dir_obj_id,sub_dir_str) = Box::pin(cacl_dir_object(ndn_mgr_id,&sub_path,file_obj_template,check_mode,store_mode.clone(),progress_callback.clone())).await?;
             let sub_total_size = sub_dir_obj.total_size;
+            let callback_result = call_ndn_callback(&progress_callback,sub_path.to_string_lossy().to_string(),NdnAction::DirOK(sub_dir_obj_id.clone(),sub_total_size)).await?;
+            
+            if !callback_result.is_continue() { 
+                return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+            }
+            if callback_result.is_skip() {
+                debug!("user skip sub dir: {}", sub_path.display());
+                continue;
+            }
             let sub_dir_obj_str = serde_json::to_string(&sub_dir_obj).unwrap();
             //let (sub_dir_obj_id, _) = sub_dir_obj.gen_obj_id()?;
-            
             this_dir_obj.add_directory(sub_path.file_name().unwrap().to_string_lossy().to_string(), 
                 sub_dir_obj_id, sub_total_size);
         } else {
@@ -342,9 +373,25 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     
     for file in will_process_file {
         //println!("file: {}", file.display());
+        let callback_result = call_ndn_callback(&progress_callback,file.to_string_lossy().to_string(),NdnAction::PreFile).await?;
+        if !callback_result.is_continue() {
+            break;
+        }
+        if callback_result.is_skip() {
+            debug!("user skip file: {}", file.display());
+            continue;
+        }
         let (file_object,file_object_id,file_object_str) = cacl_file_object(ndn_mgr_id,&file,file_obj_template,true,check_mode,store_mode.clone(),progress_callback.clone()).await?;
         let file_object_json = serde_json::to_value(&file_object).unwrap();
-
+        
+        let callback_result = call_ndn_callback(&progress_callback,file.to_string_lossy().to_string(),NdnAction::FileOK(file_object_id.clone(),file_object.size)).await?;
+        if !callback_result.is_continue() {
+            return Err(NdnError::InvalidState(format!("break by user, callback result is not continue")));
+        }
+        if callback_result.is_skip() {
+            debug!("user skip file: {}", file.display());
+            continue;
+        }
         this_dir_obj.add_file(file.file_name().unwrap().to_string_lossy().to_string(), file_object_json, file_object.size);
     }
 
@@ -355,6 +402,8 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     store_content_to_ndn_mgr(ndn_mgr_id,content,store_mode).await?;
     return Ok((this_dir_obj,dir_obj_id,dir_obj_str));
 }
+
+
 
 pub async fn restore_file_object(file_object:ObjId,ndn_mgr_id:Option<&str>,target_file:&Path) -> NdnResult<()> {
     let file_obj_json = NamedDataMgr::get_object(ndn_mgr_id,&file_object,None).await?;
@@ -694,7 +743,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cacl_dir_object() {
-        //std::env::set_var("BUCKY_LOG", "debug");
+        std::env::set_var("BUCKY_LOG", "warn");
         init_logging("ndn-lib-test", false);
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig::default();
@@ -717,9 +766,19 @@ mod test {
         )
         .await.unwrap();
         NamedDataMgr::set_mgr_by_id(Some("test2"),named_mgr).await.unwrap();
+
+        let progress_callback: Option<Arc<Mutex<NdnProgressCallback>>> = Some(Arc::new(Mutex::new(Box::new(|inner_path:String,action:NdnAction| {
+            Box::pin(async move {
+                info!("progress_callback: inner_path:{} action:{:?}", inner_path, action);
+                Ok(ProgressCallbackResult::Continue)
+            }) as Pin<Box<dyn std::future::Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>>
+        }))));
+
         info!("---start calc dir object in store to named mgr mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
+        //let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,progress_callback.clone()).await.unwrap();
         let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+     
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_store_str: {}", dir_object_store_str);
         println!("dir_object_str: {}", dir_object_str);
@@ -727,11 +786,15 @@ mod test {
 
 
         info!("---start calc dir object in local file mode");
-        let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),None).await.unwrap();
+        let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
+        let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),progress_callback.clone()).await.unwrap();
+        //let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),None).await.unwrap();
+ 
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_store_str: {}", dir_object_store_str);
-        println!("dir_object_id: {}", dir_object_id.to_string());
-        println!("dir_object_str: {}", dir_object_str);
+        println!("dir_object_id2: {}", dir_object_id2.to_string());
+        println!("dir_object_str2: {}", dir_object_str2);
+        assert_eq!(dir_object_str, dir_object_str2);
         assert_eq!(dir_object_id, dir_object_id2);
 
         info!("---end");
