@@ -133,6 +133,14 @@ impl NamedDataMgr {
         .await
     }
 
+    pub async fn is_named_data_mgr_exist(
+        named_data_mgr_id: Option<&str>,
+    ) -> bool {
+        let named_mgr_key = named_data_mgr_id.unwrap_or("default").to_string();
+        let mut named_data_mgr_map = NAMED_DATA_MGR_MAP.lock().await;
+        named_data_mgr_map.contains_key(&named_mgr_key)
+    }
+
     pub async fn get_named_data_mgr_by_id(
         named_data_mgr_id: Option<&str>,
     ) -> Option<Arc<tokio::sync::Mutex<Self>>> {
@@ -202,6 +210,10 @@ impl NamedDataMgr {
 
         self.base_dir.join(dir1).join(dir2).join(file_name)
 
+    }
+
+    pub fn get_base_dir(&self) -> PathBuf {
+        self.base_dir.clone()
     }
 
     fn get_cache_mmap_path(&self, chunk_id: &ChunkId) -> Option<String> {
