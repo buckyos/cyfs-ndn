@@ -915,6 +915,9 @@ impl NamedDataMgr {
         } else {
             let chunk_item = chunk_item.unwrap();
             chunk_state = chunk_item.chunk_state;
+            if chunk_state == ChunkState::Completed {
+                return Err(NdnError::AlreadyExists(format!("chunk {} already completed", chunk_id.to_string())));
+            }
             progress = chunk_item.progress;
             if !chunk_state.can_open_writer() {
                 return Err(NdnError::Internal(format!(
