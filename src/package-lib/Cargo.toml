@@ -7,35 +7,35 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-log = "*"
-thiserror = "*"
-tokio = { version = "*", features = ["full"] }
-reqwest = { version = "*", features = ["json", "stream"] }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
 fs_extra = "*"
-futures-util = "*"
-futures = "*"
+futures-util = { workspace = true }
+futures = { workspace = true }
 regex = "*"
 async-recursion = "*"
 version-compare = "*"
 semver = "*"
 toml = "*"
-chrono = "*"
-serde = { version = "1.0", features = ["derive"] }
+chrono = { workspace = true }
+serde = { workspace = true }
 serde_derive = "*"
-serde_json = "*"
+serde_json = { workspace = true }
 simplelog = "*"
 dirs = "*"
-async-trait = "*"
-tempfile = "*"
+async-trait = { workspace = true }
+tempfile = { workspace = true }
 time = "*"
 warp = "*"
 sha2 = "*"
-rusqlite = "*"
+rusqlite = { workspace = true }
 async-fd-lock = "*"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tokio-tar = "*"
 ndn-lib = { path = "../ndn-lib" }
-name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" }
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
+name-lib = { workspace = true }
+buckyos-kit = { workspace = true }
 [dev-dependencies]
-tempfile = "*"
+tempfile = { workspace = true }

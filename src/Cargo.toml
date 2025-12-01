@@ -6,3 +6,19 @@ members = [
     "./ndn-lib",
 ]
 
+[workspace.dependencies]
+log = "*"
+thiserror = "*"
+tokio = { version = "*", features = ["full"] }
+reqwest = { version = "*", features = ["json", "rustls-tls", "stream"] }
+futures = "*"
+futures-util = "*"
+chrono = "*"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "*"
+async-trait = "*"
+tempfile = "*"
+rusqlite = { version = "*", features = ["bundled", "backup"] }
+buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "beta1" }
+name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "beta1"}
+name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "beta1"}
