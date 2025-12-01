@@ -515,6 +515,7 @@ pub async fn put_local_file_as_chunk(
         NdnError::IoError(format!("open local_file_path failed, err:{}", e))
     })?;
     debug!("open local_file_path success");
+    //TODO: support other hash type
     let mut chunk_hasher = ChunkHasher::new(None).unwrap();
     let chunk_type = chunk_hasher.hash_method.clone();
 
