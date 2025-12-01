@@ -21,6 +21,7 @@ pub struct PackageMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>, //pkg的分类,app,pkg,agent等
     pub author: String,
+    pub owner:DID,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_id: Option<String>, //有些pkg不需要下载
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -35,7 +36,7 @@ pub struct PackageMeta {
 
 impl PackageMeta {
 
-    pub fn new(pkg_name: &str, version: &str, author: &str, tag: Option<&str>) -> Self {
+    pub fn new(pkg_name: &str, version: &str, author: &str, owner: &DID, tag: Option<&str>) -> Self {
         let now = buckyos_kit::buckyos_get_unix_timestamp();
         let exp = now + 3600 * 24 * 30;
         Self {
@@ -44,6 +45,7 @@ impl PackageMeta {
             author: author.to_string(),
             tag: tag.map(|s| s.to_string()),
             category: None,
+            owner: owner.clone(),
             chunk_id: None,
             chunk_url: None,
             chunk_size: None,
