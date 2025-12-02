@@ -276,7 +276,7 @@ impl PackageId {
     }
 
     pub fn unique_name_to_did(unique_name: &str) -> DID {
-        let parts = unique_name.split('-').collect::<Vec<&str>>();
+        let parts = unique_name.split('_').collect::<Vec<&str>>();
         if parts.len() == 2 {
             //did:bns:module_name.author
             let did_str = format!("did:bns:{}.{}", parts[1], parts[0]);
@@ -302,7 +302,7 @@ impl PackageId {
             let author = parts[1];
             let module_name = parts[0];
             return Ok(PackageId {
-                name: format!("{}-{}", author, module_name),
+                name: format!("{}_{}", author, module_name),
                 version_exp: None,
                 objid: None,
             });
@@ -388,11 +388,14 @@ mod tests {
 
     #[test]
     fn test_parse() {
-        let pkg_id = "buckyos-filebrowser";
+        let pkg_id = "buckyos-dev_filebrowser";
         let result = PackageId::parse(pkg_id).unwrap();
-        assert_eq!(&result.name, "buckyos-filebrowser");
+        assert_eq!(&result.name, "buckyos-dev_filebrowser");
         let pkg_id2 = result.to_string();
         assert_eq!(pkg_id, pkg_id2);
+        let did = result.to_did();
+        assert_eq!(did.method, "bns");
+        assert_eq!(did.id, "filebrowser.buckyos-dev");
 
         let pkg_id = "a#0.1.0:stable";
         let result = PackageId::parse(pkg_id).unwrap();
@@ -402,23 +405,23 @@ mod tests {
         let pkg_id2 = result.to_string();
         assert_eq!(pkg_id, pkg_id2);
 
-        let pkg_id = "nightly-linux-amd64.buckyos-filebrowser#0.4.0";
+        let pkg_id = "nightly-linux-amd64.buckyos_filebrowser#0.4.0";
         let result = PackageId::parse(pkg_id).unwrap();
-        assert_eq!(&result.name, "nightly-linux-amd64.buckyos-filebrowser");
+        assert_eq!(&result.name, "nightly-linux-amd64.buckyos_filebrowser");
         assert_eq!(result.version_exp.as_ref().unwrap().to_string(), "0.4.0".to_string());
         assert_eq!(result.version_exp.as_ref().unwrap().tag,None);
         let app_name = result.get_unique_name();
-        assert_eq!(app_name, "buckyos-filebrowser".to_string());
+        assert_eq!(app_name, "buckyos_filebrowser".to_string());
 
         let did1= result.to_did();
-        let did = PackageId::unique_name_to_did("buckyos-filebrowser");
+        let did = PackageId::unique_name_to_did("buckyos_filebrowser");
         let host_name = did.to_host_name();
         assert_eq!(host_name, "filebrowser.buckyos.bns.did");
         assert_eq!(did1, did);
         assert_eq!(did.method, "bns");
         assert_eq!(did.id, "filebrowser.buckyos");
         let pkg_id = PackageId::from_did(&did).unwrap();
-        assert_eq!(pkg_id.name, "buckyos-filebrowser");
+        assert_eq!(pkg_id.name, "buckyos_filebrowser");
         assert_eq!(pkg_id.version_exp, None);
         assert_eq!(pkg_id.objid, None);
 

@@ -778,12 +778,13 @@ impl PackageEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use name_lib::DID;
     use serde_json::json;
     use tempfile::tempdir;
     use buckyos_kit::*;
 
     async fn setup_test_env() -> (PackageEnv, tempfile::TempDir) {
-        std::env::set_var("BUCKY_LOG", "debug");
+        unsafe { std::env::set_var("BUCKY_LOG", "debug"); }
         init_logging("test_package_lib", false);
         let temp_dir = tempdir().unwrap();
         let env = PackageEnv::new(temp_dir.path().to_path_buf());
@@ -802,6 +803,7 @@ mod tests {
         
         // 创建meta文件
         let meta = PackageMeta {
+            owner: DID::from_str("did:bns:buckyos.ai").unwrap(),
             pkg_name: pkg_name.to_string(),
             description:json!({}),
             version: version.to_string(),
