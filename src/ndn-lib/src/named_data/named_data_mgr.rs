@@ -1,7 +1,7 @@
 use super::def::{ChunkItem, ObjectState, ChunkState};
 use super::named_data_mgr_db::NamedDataMgrDB;
 use crate::{
-    build_named_object_by_json, caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkListReader, ChunkLocalInfo, ChunkReadSeek, ChunkType, FileObject, NdnError, NdnResult, ObjectLinkData, PathObject, SimpleChunkList, SimpleChunkListReader, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE
+    ChunkHasher, ChunkId, ChunkListReader, ChunkLocalInfo, ChunkReadSeek, ChunkType, FileObject, LimitReader, NdnError, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, ObjectLinkData, PathObject, SimpleChunkList, SimpleChunkListReader, StoreMode, build_named_object_by_json, caculate_qcid_from_file
 };
 use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId, CHUNK_NORMAL_SIZE};
 use buckyos_kit::get_buckyos_named_data_dir;
@@ -755,7 +755,7 @@ impl NamedDataMgr {
             })?;
         }
 
-        Ok((Box::pin(file), chunk_size))
+        Ok((Box::pin(LimitReader::from_reader(Box::pin(file), chunk_range.end - chunk_range.start - offset)), chunk_size))
     }
 
     pub async fn open_chunk_reader(
@@ -813,14 +813,20 @@ impl NamedDataMgr {
         }
 
         let chunk_item = self.get_chunk_item_impl(chunk_id).await?;
-        match chunk_item.chunk_state {
+        let file = match chunk_item.chunk_state {
             ChunkState::Completed => {
                 let chunk_real_path = self.get_chunk_path(&chunk_item.chunk_id);
                 let mut file = OpenOptions::new()
                     .read(true)
                     .open(&chunk_real_path)
                     .await?;
-                return Ok((Box::pin(file), chunk_item.chunk_size));
+                if offset > 0 {
+                    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+                        warn!("open_chunk_reader: seek chunk file failed! {}", e.to_string());
+                        NdnError::IoError(e.to_string())
+                    })?;
+                }
+                file
             },
             ChunkState::LocalLink(local_chunk_info) => {
                 let chunk_real_path = PathBuf::from(local_chunk_info.path);
@@ -841,7 +847,7 @@ impl NamedDataMgr {
                         NdnError::IoError(e.to_string())
                     })?;
                 }
-                return Ok((Box::pin(file), chunk_item.chunk_size));
+                file
             },
             _ => {
                 return Err(NdnError::Internal(format!(
@@ -850,8 +856,9 @@ impl NamedDataMgr {
                     chunk_item.chunk_state.to_str()
                 )));
             }
-        }
+        };
 
+        Ok((Box::pin(LimitReader::from_reader(Box::pin(file), chunk_item.chunk_size - offset)), chunk_item.chunk_size))
     }
 
 

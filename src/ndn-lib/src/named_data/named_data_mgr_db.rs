@@ -29,7 +29,7 @@ use tokio::{
 use tokio_util::bytes::BytesMut;
 use tokio_util::io::StreamReader;
 
-use crate::{ChunkList, ChunkReader, ChunkWriter, ObjId};
+use crate::{ChunkList, ObjId};
 use super::def::{ChunkItem};
 
 
