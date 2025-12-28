@@ -375,8 +375,8 @@ impl MetaIndexDb {
         
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(pkg_name.to_string()),
-            Box::new(min_version),
-            Box::new(max_version)
+            Box::new(min_version as i64),
+            Box::new(max_version as i64)
         ];
         
         if let Some(tag_value) = tag {
@@ -470,7 +470,7 @@ impl MetaIndexDb {
                 // 插入新记录
                 tx.execute(
                     "INSERT INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    params![meta_node.pkg_name, meta_node.author, meta_node.version, version_int, metaobjid, meta_node.tag, current_time],
+                    params![meta_node.pkg_name, meta_node.author, meta_node.version, version_int as i64, metaobjid, meta_node.tag, current_time],
                 ).map_err(|e| PkgError::SqlError(e.to_string()))?;
             }
         }
@@ -510,7 +510,7 @@ impl MetaIndexDb {
             // 插入新记录
             conn.execute(
                 "INSERT INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![pkgname, author, version, version_int, metaobjid, tag, current_time],
+                params![pkgname, author, version, version_int as i64, metaobjid, tag, current_time],
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
 
@@ -592,7 +592,7 @@ impl MetaIndexDb {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, u64>(3)?,
+                row.get::<_, i64>(3)? as u64,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?
@@ -603,7 +603,7 @@ impl MetaIndexDb {
             let (pkg_name, author, version, version_int, metaobjid, tag, update_time) = version_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![pkg_name, author, version, version_int, metaobjid, tag, update_time]
+                params![pkg_name, author, version, version_int as i64, metaobjid, tag, update_time]
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
         

@@ -268,7 +268,8 @@ chunklist的构造一定是非均质的，可以参考git的命令模式
 基本协议的逻辑，都是服务端只要做基本的bind操作，就基本能实现自动控制
 
 ### pull chunk
-
+- 核心协议，所有的已发布（公共内容）都应该用非加密但可验证的pull chunk协议来提高性能
+- 基于NDN的理论，也可以更好的在路由层，针对这个协议进行优化。实现更好的去中心化CDN网络。
 
 ### push chunk
 push chunk是client直接向server upload chunk, server会根据一些通用逻辑（非应用逻辑）进行默认处理
@@ -340,6 +341,9 @@ push chunk是client直接向server upload chunk, server会根据一些通用逻�
 #### ChunkList
 
 ## 内容购买
+
+兼容http 402
+
 从协议上，request中要包含最近购买的ticket id,以方便服务器进行验证
 从协议上，是cyfs:// server的提供方，可以根据request的身份，决定是否要返回内容。如果是因为没有授权导致的，cyfs://扩展协议要求给出更具体的理由
 1. 用户需要购买才能访问资源（给出购买链接，如果不给出则使用USDB上的默认合约进行购买）
@@ -353,4 +357,31 @@ USDB合约返回购买查看权的的方法：直接购买 + 进入特定用户�
 - 版权的拥有方可以调整内容查看权的实现方式，调整之前的购买总是有效的
 - 用户购买查看权（有时间限制，或永久）
 - 用户购买进入用户组的权利
+
+
+
+
+## 协议参考
+
+### get_object_by_url 加密为主
+
+get_object_by_url(any://$clientid/listenerid/$objid/)
+
+### pull_chunk_by_url （明文优先）
+
+### push_chunk 加密和明文并存
+
+### pull_chunk_list_by_url （明文优先）
+
+### 支持打包格式的协议
+- object set pack (pipline)，加密
+类似git pack，可以在pack里平摊的append NamedObject和chunk.  append完成后，可以构造一个压缩包，以chunk模式发送
+也可以stream化，一头append,另一头可以pop出单个的object/chunk。协议设计上，stream化后是双向的，接收端可以控制chunk的发送速度（需要ack一下chunk是否存在再发送）
+
+
+### 关键的URL
+
+### 所有扩展的http header
+
+## 标准对象参考
 

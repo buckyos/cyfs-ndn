@@ -10,7 +10,7 @@ members = [
 log = "*"
 thiserror = "*"
 tokio = { version = "*", features = ["full"] }
-reqwest = { version = "*", features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "*", features = ["json", "stream","rustls-tls-native-roots"] }
 futures = "*"
 futures-util = "*"
 chrono = "*"

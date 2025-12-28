@@ -60,9 +60,9 @@ impl ObjectMapSqliteStorageChunkIterator {
         })?;
 
         let params = if self.last_key.is_some() {
-            params![self.last_key.as_ref(), self.chunk_size as u64]
+            params![self.last_key.as_ref(), self.chunk_size as i64]
         } else {
-            params![self.chunk_size as u64, 0u64]
+            params![self.chunk_size as i64, 0i64]
         };
 
         let rows = stmt
@@ -271,7 +271,7 @@ impl ObjectMapInnerStorage for ObjectMapSqliteStorage {
         let ret = match index {
             Some(i) => conn.execute(
                 "INSERT OR REPLACE INTO object_map (key, value, mtree_index) VALUES (?1, ?2, ?3)",
-                params![key, value.to_base32(), i],
+                params![key, value.to_base32(), i as i64],
             ),
             None => conn.execute(
                 "INSERT OR REPLACE INTO object_map (key, value, mtree_index) VALUES (?1, ?2, NULL)",
@@ -296,7 +296,7 @@ impl ObjectMapInnerStorage for ObjectMapSqliteStorage {
             .query_row(
                 "SELECT value, mtree_index FROM object_map WHERE key=?1",
                 params![key],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.map(|i| i as u64))),
             )
             .optional()
             .map_err(|e| {
@@ -408,7 +408,7 @@ impl ObjectMapInnerStorage for ObjectMapSqliteStorage {
             })?;
 
         let iter = stmt
-            .query_map(params![page_size as u64, offset as u64], |r| r.get(0))
+            .query_map(params![page_size as i64, offset as i64], |r| r.get(0))
             .map_err(|e| {
                 let msg = format!("Failed to query object_map: {}", e);
                 error!("{}", msg);
@@ -437,7 +437,7 @@ impl ObjectMapInnerStorage for ObjectMapSqliteStorage {
         let conn = lock.as_ref().unwrap();
 
         let total_count: usize = conn
-            .query_row("SELECT COUNT(*) FROM object_map", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM object_map", [], |r| Ok(r.get::<_, i64>(0)? as usize))
             .map_err(|e| {
                 let msg = format!("Failed to count object_map: {}", e);
                 error!("{}", msg);
@@ -456,7 +456,7 @@ impl ObjectMapInnerStorage for ObjectMapSqliteStorage {
 
         conn.execute(
             "UPDATE object_map SET mtree_index=?1 WHERE key=?2",
-            params![index, key],
+            params![index as i64, key],
         )
         .map_err(|e| {
             let msg = format!("Failed to update mtree_index: {}, {}", key, e);

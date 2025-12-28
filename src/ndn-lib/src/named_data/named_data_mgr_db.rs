@@ -511,13 +511,13 @@ impl NamedDataMgrDB {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                     params![
                         chunk_item.chunk_id.to_string(),
-                        chunk_item.chunk_size,
+                        chunk_item.chunk_size as i64,
                         chunk_item.chunk_state,
                         local_info.path,
                         local_info_str,
                         chunk_item.progress,
-                        chunk_item.create_time,
-                        chunk_item.update_time,
+                        chunk_item.create_time as i64,
+                        chunk_item.update_time as i64,
                     ],
                 )
                 .map_err(|e| {
@@ -535,11 +535,11 @@ impl NamedDataMgrDB {
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         chunk_item.chunk_id.to_string(),
-                        chunk_item.chunk_size,
+                        chunk_item.chunk_size as i64,
                         chunk_item.chunk_state,
                         chunk_item.progress,
-                        chunk_item.create_time,
-                        chunk_item.update_time,
+                        chunk_item.create_time as i64,
+                        chunk_item.update_time as i64,
                     ],
                 )
                 .map_err(|e| {
@@ -575,12 +575,12 @@ impl NamedDataMgrDB {
 
                 Ok(ChunkItem {
                     chunk_id: chunk_id.clone(),
-                    chunk_size: row.get(0)?,
+                    chunk_size: row.get::<_, i64>(0)? as u64,
                     chunk_state: chunk_state,
                     ref_count: row.get(2)?,
                     progress: row.get(3)?,
-                    create_time: row.get(4)?,
-                    update_time: row.get(5)?,
+                    create_time: row.get::<_, i64>(4)? as u64,
+                    update_time: row.get::<_, i64>(5)? as u64,
                 })
             })
             .map_err(|e| {
@@ -639,7 +639,7 @@ impl NamedDataMgrDB {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE chunk_items SET progress = ?1, chunk_state = 'incompleted', update_time = ?2 WHERE chunk_id = ?3",
-            params![progress, buckyos_get_unix_timestamp(), chunk_id.to_string()],
+            params![progress, buckyos_get_unix_timestamp() as i64, chunk_id.to_string()],
         ).map_err(|e| {
             warn!("NamedDataMgrDB: update chunk progress failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
@@ -691,7 +691,7 @@ impl NamedDataMgrDB {
         tx.execute(
             "INSERT OR REPLACE INTO objects (obj_id, obj_type, obj_data, ref_count, create_time, last_access_time)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![obj_id.to_string(), obj_type, obj_str, 0, now_time, now_time],
+            params![obj_id.to_string(), obj_type, obj_str, 0, now_time as i64, now_time as i64],
         )
         .map_err(|e| {
             warn!("NamedDataMgrDB: insert object failed! {}", e.to_string());
@@ -749,7 +749,7 @@ impl NamedDataMgrDB {
              ON CONFLICT(obj_id) DO UPDATE SET
                  ref_count = ref_count + excluded.ref_count,
                  update_time = ?3",
-            params![obj_id, add_ref_count, now_time],
+            params![obj_id, add_ref_count, now_time as i64],
         )
         .map_err(|e| {
             warn!("NamedDataMgrDB: push obj id to add ref count queue failed! {}", e.to_string());
@@ -783,7 +783,7 @@ impl NamedDataMgrDB {
             } else {
                 tx.execute(
                     "UPDATE objects SET ref_count = ref_count + (?1), last_access_time = ?2 WHERE obj_id = ?3",
-                    params![add_ref_count, buckyos_get_unix_timestamp(), obj_id.to_string()],
+                    params![add_ref_count, buckyos_get_unix_timestamp() as i64, obj_id.to_string()],
                 )
                 .map_err(|e| {
                     warn!("NamedDataMgrDB: update object ref count failed! {}", e.to_string());
@@ -848,7 +848,7 @@ impl NamedDataMgrDB {
         conn.execute(
             "INSERT OR REPLACE INTO object_relations (obj_id, source, target, relation_type, relation_object, create_time)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![relation_obj_ids.0.to_string(),relation_object.source.to_string(),relation_object.target.to_string(), relation_object.relation, relation_obj_ids.1, create_time],
+            params![relation_obj_ids.0.to_string(),relation_object.source.to_string(),relation_object.target.to_string(), relation_object.relation, relation_obj_ids.1, create_time as i64],
         )
         .map_err(|e| {
             warn!("NamedDataMgrDB: insert relation object failed! {}", e.to_string());

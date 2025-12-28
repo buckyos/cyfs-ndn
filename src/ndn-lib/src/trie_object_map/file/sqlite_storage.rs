@@ -60,9 +60,9 @@ where
         })?;
 
         let params = if self.last_key.is_some() {
-            params![self.last_key.as_ref(), self.chunk_size as u64]
+            params![self.last_key.as_ref(), self.chunk_size as i64]
         } else {
-            params![self.chunk_size as u64, 0u64]
+            params![self.chunk_size as i64, 0i64]
         };
 
         let rows = stmt
