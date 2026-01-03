@@ -4,6 +4,24 @@ use buckyos_kit::buckyos_get_unix_timestamp;
 use serde::{Serialize,Deserialize};
 use crate::{build_named_object_by_json, ChunkId, NdnError, NdnResult, ObjId, OBJ_TYPE_RELATION, RELATION_TYPE_PART_OF, RELATION_TYPE_SAME};
 
+/*
+
+实现去中心的“内容评论”(强实体关系)
+
+ - 内容的评论，本质上是基于一个特定的Content Object二次创作的NameObject
+ - 该NamedObject的传播，也立足于“Onwer、收录者、传播者“的三元结构
+ - 当创作一个评论时，自己时评论的Owner，原内容的Owner/收录者 都可以是该评论的收录者
+ - 如何获得一个内容的所有评论？ 基于内容的“Onwer、收录者、传播者“，分别查询是否有基于该内容的评论，从这些渠道获得评论object后先去重，再进行本地展示
+ - 当得到一个评论列表后，又可以基于评论列表里所有评论的作者，进一步获得更多的评论
+ - 本地LLM可以很大的对海量的不同来源的评论进行筛选
+
+ 本文件中的RelationObject，是一种弱实体关系
+ 允许在两个对象的作者都不知情的情况下，被关联在一起
+ 创建RelationObject的作者，通常是一种纯粹的观察（洞察）视角
+
+  通过一个cyfs:// url来引用obj,可以同时包含目标对象的 语义路径 + 引用时的objid
+  这种引用方式，可以允许被引用的objid发生变化,而语义路径不变（比如可以简单的筛选针对一个软件所有版本的评论和针对特定版本的评论）
+*/
 
 // #[derive(Debug, Clone,Eq, PartialEq)]
 // pub enum LinkData {

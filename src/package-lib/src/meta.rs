@@ -5,29 +5,41 @@ use serde_json::{Value,json};
 use name_lib::*;
 use buckyos_kit::buckyos_get_unix_timestamp;
 use crate::{PkgResult, PkgError,PackageId};
+
+fn is_zero(value:&u64)->bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PackageMeta {
     pub pkg_name: String,
     pub version: String,
-    pub description: Value,
-    pub pub_time: u64,
-    #[serde(default)]
-    pub exp:u64,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub deps: HashMap<String, String>,     //key = pkg_name,value = version_req_str,like ">1.0.0-alpha"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub category: Option<String>, //pkg的分类,app,pkg,agent等
+    pub meta: Value,//description
+
     pub author: String,
     pub owner:DID,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_id: Option<String>, //有些pkg不需要下载
+    pub category: Option<String>, //pkg的分类,app,pkg,agent等
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+
+    #[serde(default)]
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    //key = pkg_name,value = version_req_str,like ">1.0.0-alpha"
+    pub deps: HashMap<String, String>,     
+
+    pub create_time: u64,
+    #[serde(default)]
+    pub exp:u64,
+
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default)]
+    pub size:u64,//如果content是null,则为0
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>, //有些pkg不需要下载
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunk_url: Option<String>, //发布时的URL,可以不写
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_size: Option<u64>, //有些pkg不需要下载
 
     #[serde(flatten)]
     pub extra_info: HashMap<String, Value>,
@@ -46,14 +58,15 @@ impl PackageMeta {
             tag: tag.map(|s| s.to_string()),
             category: None,
             owner: owner.clone(),
-            chunk_id: None,
+
+            content: None,
+            size: 0,
             chunk_url: None,
-            chunk_size: None,
-            pub_time: now,
+            create_time: now,
             exp: exp,
             deps: HashMap::new(),
             extra_info: HashMap::new(),
-            description: json!({}),
+            meta: json!({}),
         }
     }
     pub fn from_str(meta_str: &str) -> PkgResult<Self> {

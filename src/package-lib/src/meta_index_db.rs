@@ -653,7 +653,7 @@ mod tests {
         let meta_db = MetaIndexDb::new(db_path,false)?;
         let test_pkg_meta = PackageMeta {
             pkg_name: "test-pkg".to_string(),
-            description: json!({}),
+            meta: json!({}),
             exp: 0,
             extra_info: HashMap::new(),
             version: "1.0.1".to_string(),
@@ -665,7 +665,7 @@ mod tests {
             chunk_size: Some(100),
             chunk_url: Some("http://test.com/chunk1".to_string()),
             deps: HashMap::new(),
-            pub_time: 0,
+            create_time: 0,
         };
 
         let test_pkg_meta_str = serde_json::to_string(&test_pkg_meta).unwrap();
@@ -728,10 +728,10 @@ mod tests {
             chunk_size: Some(100),
             chunk_url: Some("http://test.com/chunk1".to_string()),
             deps: HashMap::new(),
-            pub_time: 0,
+            create_time: 0,
             exp: 0,
             extra_info: HashMap::new(),
-            description: json!({}),
+            meta: json!({}),
         };  
         let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();

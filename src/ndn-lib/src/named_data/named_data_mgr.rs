@@ -1356,7 +1356,7 @@ impl NamedDataMgr {
             })?;
 
             //在obj_ref_update_queue中pop出一条最旧的记录
-            let row = tx.query_one("SELECT obj_id, ref_count FROM obj_ref_update_queue ORDER BY update_time ASC LIMIT 1", [], |row| {
+            let row = tx.query_row("SELECT obj_id, ref_count FROM obj_ref_update_queue ORDER BY update_time ASC LIMIT 1", [], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
             });
             if row.is_ok() {
@@ -1371,7 +1371,7 @@ impl NamedDataMgr {
                 }
                 let obj_id = obj_id.unwrap();
                 //尝试获取obj_data,如果失败则创建一个占位的空记录
-                let obj_row = tx.query_one("SELECT obj_data,ref_count FROM objects WHERE obj_id = ?1", [obj_id_str.clone()], |row| {
+                let obj_row = tx.query_row("SELECT obj_data,ref_count FROM objects WHERE obj_id = ?1", [obj_id_str.clone()], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
                 });
                 if obj_row.is_ok() {
