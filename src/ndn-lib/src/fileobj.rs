@@ -1,71 +1,58 @@
-use buckyos_kit::{buckyos_get_unix_timestamp,is_default};
-use serde::{Serialize,Deserialize};
-
-use crate::{ChunkId};
+use buckyos_kit::buckyos_get_unix_timestamp;
+use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 use std::collections::HashMap;
-use crate::{OBJ_TYPE_FILE,OBJ_TYPE_PATH,build_named_object_by_json,ObjId};
-use serde_json::Value;
-
-//针对任何FileObject(NamedObject)的传播，都有网络性的3个核心橘色
-//1.版权所有:
-// author:String,作者，可以为空，为空时作者等于owner
-// owner:DID,所有者，为空则是copyleft(属于所有人)
-// author和owner都为空时，别认为是一个匿名且无版权的对象
-//2. 收录者:DID
-// 不保存在Object内的，称作外部收录者。针对不同的context,可以有不同的获得收录者的逻辑
-//   - DirObject就是一种标准的收录Context
-//   - pkg-source 是一种基于sqlite数据库的Context
-// 系统提供多种形式，允许收录者证明“自己收录了该作品”，原则上收录者收录作品，不需要得到作品作者的认可
-// 包存在Object内的，有Owner签名的，被称作“作者认可的收录者”，这种是双向收录，
-// 单向收录和双向收录在涉及到利益分成时有所区别
-// 有的大牌收录者，可能只会传播双向收录的Object
-//3. 传播者:DID
-// 传播者的DID一定不在Object内
-// 传播者通常是基于Context得到的（比如Alice给Bob分享一个文件，Alice就是传播者
-// 有的场景，也允许传播者构造签名证明其传播过这个文件。但通常这个签名只需要传播者的设备私钥就能构造。
-
+use crate::{build_named_object_by_json, BaseContentObject, ObjId, OBJ_TYPE_FILE, OBJ_TYPE_PATH};
 
 
 //TODO：NDN如何提供一种通用机制，检查FileObject在本地是 完全存在的 ？ 在这里的逻辑是FileObject的Content(存在)
 // 思路：Object如果引用了另一个Object,要区分这个引用是强引用(依赖）还是弱引用，
-#[derive(Serialize,Deserialize,Clone)]
+#[derive(Serialize,Deserialize,Clone,Debug, PartialEq)]
 pub struct FileObject {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name:String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta:Option<serde_json::Value>,//description
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner:Option<String>,
+    #[serde(flatten)]
+    pub content_obj:BaseContentObject,
 
     pub size:u64,
     pub content:String,//chunkid or chunklistid
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime:Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub create_time:Option<u64>,
-    #[serde(skip_serializing_if = "is_default")]
-    pub exp:u64,
-
     #[serde(flatten)]
-    pub extra_info: HashMap<String, Value>,
+    pub meta:HashMap<String,serde_json::Value>,
 }
 
 impl Default for FileObject {
     fn default() -> Self {
-        Self {name:String::new(),size:0,content:String::new(),meta:None,mime:None,owner:None,exp:0,
-            create_time:None,extra_info:HashMap::new()}
+        Self {
+            content_obj: BaseContentObject::default(),
+            size: 0,
+            content: String::new(),
+            meta: HashMap::new(),
+        }
+    }
+}
+
+impl Deref for FileObject {
+    type Target = BaseContentObject;
+    fn deref(&self) -> &Self::Target {
+        &self.content_obj
+    }
+}
+
+impl DerefMut for FileObject {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content_obj
     }
 }
 
 impl FileObject {
     //content can be chunkid or chunklistid
     pub fn new(name:String,size:u64,content:String)->Self {
-        Self {name,size,content,meta:None,mime:None,owner:None,exp:0,
-            create_time:None,extra_info:HashMap::new()}
+        Self {
+            content_obj: BaseContentObject::new(name),
+            size,
+            content,
+            meta: HashMap::new(),
+        }
     }
 
     pub fn gen_obj_id(&self)->(ObjId, String) {

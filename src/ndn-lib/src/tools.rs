@@ -220,8 +220,13 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
     }
 
     file_obj_result.size = file_size;
-    file_obj_result.create_time = Some(file_last_modify_time);;
-    file_obj_result.name = local_file_path.file_name().unwrap().to_string_lossy().to_string();
+    file_obj_result.content_obj.create_time = file_last_modify_time;
+    file_obj_result.content_obj.last_update_time = file_last_modify_time;
+    file_obj_result.content_obj.name = local_file_path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     //
     if check_mode.is_support_quick_check() {    
         let qcid = caculate_qcid_from_file(local_file_path).await;
@@ -362,6 +367,21 @@ pub async fn cacl_dir_object(ndn_mgr_id:Option<&str>,
     let mut read_dir = fs::read_dir(source_dir).await?;
     let mut will_process_file = Vec::new();
     let mut this_dir_obj = DirObject::new(None);
+
+    // Fill BaseContentObject fields for determinism (otherwise BaseContentObject::default() uses "now",
+    // which makes DirObject id/str unstable across runs).
+    if let Ok(meta) = tokio::fs::metadata(source_dir).await {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                let ts = dur.as_secs();
+                this_dir_obj.content_obj.create_time = ts;
+                this_dir_obj.content_obj.last_update_time = ts;
+            }
+        }
+    }
+    if let Some(name) = source_dir.file_name() {
+        this_dir_obj.content_obj.name = name.to_string_lossy().to_string();
+    }
     while let Some(entry) = read_dir.next_entry().await? {
         let sub_path = entry.path();
         if sub_path.is_dir() {
@@ -757,7 +777,11 @@ mod test {
         )
         .await.unwrap();
 
-        let source_dir = Path::new("/Users/liuzhicong/Downloads/");
+        let source_dir_tmp = tempdir().unwrap();
+        let source_dir = source_dir_tmp.path();
+        std::fs::write(source_dir.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(source_dir.join("sub")).unwrap();
+        std::fs::write(source_dir.join("sub").join("b.txt"), b"world").unwrap();
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
         let (dir_objectA,dir_object_id,dir_object_str) = cacl_dir_object(Some("testA"),source_dir,&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
         let dir_object_str = serde_json::to_string_pretty(&dir_objectA).unwrap();
@@ -775,7 +799,8 @@ mod test {
         let test_dir = tempdir().unwrap();
         let config = NamedDataMgrConfig::default();
         
-        let target_dir = Path::new("/Users/liuzhicong/test_backup/");
+        let target_dir_tmp = tempdir().unwrap();
+        let target_dir = target_dir_tmp.path();
         let named_mgr = NamedDataMgr::from_config(
             Some("test".to_string()),
             target_dir.to_path_buf(),
@@ -803,8 +828,13 @@ mod test {
 
         info!("---start calc dir object in store to named mgr mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
+        let source_dir_tmp = tempdir().unwrap();
+        let source_dir = source_dir_tmp.path();
+        std::fs::write(source_dir.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(source_dir.join("sub")).unwrap();
+        std::fs::write(source_dir.join("sub").join("b.txt"), b"world").unwrap();
         //let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,progress_callback.clone()).await.unwrap();
-        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
+        let (dir_object,dir_object_id,dir_object_str) = cacl_dir_object(Some("test"),source_dir,&file_obj_template,&CheckMode::ByQCID,StoreMode::StoreInNamedMgr,None).await.unwrap();
      
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();
         println!("dir_object_store_str: {}", dir_object_store_str);
@@ -814,7 +844,7 @@ mod test {
 
         info!("---start calc dir object in local file mode");
         let file_obj_template = FileObject::new("".to_string(), 0, "".to_string());
-        let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),progress_callback.clone()).await.unwrap();
+        let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),source_dir,&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),progress_callback.clone()).await.unwrap();
         //let (dir_object,dir_object_id2,dir_object_str2) = cacl_dir_object(Some("test2"),&Path::new("/Users/liuzhicong/Downloads/"),&file_obj_template,&CheckMode::ByQCID,StoreMode::new_local(),None).await.unwrap();
  
         let dir_object_store_str = serde_json::to_string_pretty(&dir_object).unwrap();

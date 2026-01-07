@@ -2,7 +2,8 @@
 
 mod chunk;
 mod object;
-mod link_obj;
+mod relation_obj;
+mod action_obj;
 mod named_data;
 mod cyfs_http;
 mod ndn_client;
@@ -16,14 +17,15 @@ mod object_array;
 mod coll;
 mod packed_obj_pipline;
 mod tools;
-
+mod base_content;
 //mod example;
 
 use std::path::PathBuf;
 
 pub use object::*;
 pub use chunk::*;
-pub use link_obj::*;
+pub use base_content::*;
+pub use relation_obj::*;
 pub use named_data::*;
 pub use cyfs_http::*;
 pub use ndn_client::*;
@@ -124,7 +126,9 @@ impl From<std::io::Error> for NdnError {
 pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
 pub const OBJ_TYPE_PATH: &str = "cypath";
+pub const OBJ_TYPE_INCLUSION_PROOF: &str = "cyinc"; // curator -> creator: content inclusion proof (recommend JWT signed by curator)
 pub const OBJ_TYPE_RELATION: &str = "cyrel";
+pub const OBJ_TYPE_ACTION: &str = "cyact";
 pub const OBJ_TYPE_PACK: &str = "cypack"; // object set
 
 pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
@@ -142,8 +146,7 @@ pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list
 pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
 
 pub const OBJ_TYPE_PKG: &str = "pkg"; // package
-// mod http;
-// pub use http::*;
+
 pub const RELATION_TYPE_SAME: &str = "same";
 pub const RELATION_TYPE_PART_OF: &str = "part_of";
 

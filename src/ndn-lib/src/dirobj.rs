@@ -2,70 +2,83 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use crate::object::ObjId;
-use crate::{build_named_object_by_json, FileObject, NdnError, NdnResult, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+use crate::{BaseContentObject, FileObject, NdnError, NdnResult, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
 use crate::object_map::{SimpleObjectMap, SimpleMapItem};
-use std::path::Path;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirObject {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+
+    #[serde(flatten)]
+    pub content_obj:BaseContentObject,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    #[serde(flatten)]
+    pub meta:HashMap<String,serde_json::Value>,
+   
     pub total_size: u64,//包含所有子文件夹和当前文件夹下文件的总大小
     pub file_count: u64,
     pub file_size: u64,//不包含子文件，只计算当前文件夹下文件的总大小
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner: Option<String>,
 
-
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default")]
-    pub exp: u64,
-    #[serde(flatten)]
-    pub extra_info: HashMap<String, Value>,
     #[serde(flatten)]
     pub object_map: SimpleObjectMap, // 保存真正的sub items
 }
 
-fn is_default<T: Default + PartialEq>(t: &T) -> bool {
-                                                               t == &T::default()
+
+impl Deref for DirObject {
+    type Target = BaseContentObject;
+    fn deref(&self) -> &Self::Target {
+        &self.content_obj
+    }
 }
+
+impl DerefMut for DirObject {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content_obj
+    }
+}
+
 
 impl DirObject {
     pub fn new(name: Option<String>) -> Self {
-        
+        let content_obj = match name {
+            Some(name) => BaseContentObject::new(name),
+            None => BaseContentObject::default(),
+        };
         Self {
-            name,
+            content_obj,
+            meta: HashMap::new(),
             total_size: 0,
             file_count: 0,
             file_size: 0,
-            owner: None,
-            exp: 0,
-            extra_info: HashMap::new(),
             object_map: SimpleObjectMap::new(),
         }
     }
 
     //gen_obj_id会消耗self,防止构造id后潜在的修改
     pub fn gen_obj_id(&self) -> NdnResult<(ObjId, String)> {
-        let mut real_extra_info:HashMap<String, Value> = HashMap::new(); 
-        for (key, value) in &self.extra_info {
-            real_extra_info.insert(key.clone(), value.clone());
-        }
-        if self.name.is_some() {
-            real_extra_info.insert("name".to_string(), Value::String(self.name.clone().unwrap()));
-        }
-        real_extra_info.insert("total_size".to_string(), Value::Number(self.total_size.into()));
-        real_extra_info.insert("file_count".to_string(), Value::Number(self.file_count.into()));
-        real_extra_info.insert("file_size".to_string(), Value::Number(self.file_size.into()));
-        if self.owner.is_some() {
-            real_extra_info.insert("owner".to_string(), Value::String(self.owner.clone().unwrap()));
-        }
+        // 性能优化：避免先序列化整个 DirObject（会包含很大的 body），再 remove("body")。
+        // 这里仅序列化 content_obj（flatten 的基础字段）并补齐目录统计字段，然后让
+        // SimpleObjectMap::gen_obj_id_with_real_obj 负责把 body(子项) 转成 ObjId 映射并写回。
+        let mut this_obj = serde_json::to_value(&self.content_obj)
+            .map_err(|e| NdnError::InvalidData(format!("serialize BaseContentObject failed: {}", e)))?;
+        let obj = this_obj
+            .as_object_mut()
+            .ok_or_else(|| NdnError::InvalidData("BaseContentObject must serialize to JSON object".to_string()))?;
+        obj.insert(
+            "total_size".to_string(),
+            Value::Number(serde_json::Number::from(self.total_size)),
+        );
+        obj.insert(
+            "file_count".to_string(),
+            Value::Number(serde_json::Number::from(self.file_count)),
+        );
+        obj.insert(
+            "file_size".to_string(),
+            Value::Number(serde_json::Number::from(self.file_size)),
+        );
 
-        if self.exp > 0 {
-            real_extra_info.insert("exp".to_string(), Value::Number(self.exp.into()));
-        }
-
-        SimpleObjectMap::gen_obj_id_with_extra_info(OBJ_TYPE_DIR,&self.object_map.body, &real_extra_info)
+        self.object_map.gen_obj_id_with_real_obj(OBJ_TYPE_DIR, &mut this_obj)
     }
 
     // 委托方法到 SimpleObjectMap
@@ -77,11 +90,11 @@ impl DirObject {
         self.object_map.is_empty()
     }
 
-    pub fn get(&self, key: &str) -> Option<&super::SimpleMapItem> {
+    pub fn get(&self, key: &str) -> Option<&SimpleMapItem> {
         self.object_map.get(key)
     }
 
-    pub fn remove(&mut self, key: &str) -> Option<super::SimpleMapItem> {
+    pub fn remove(&mut self, key: &str) -> Option<SimpleMapItem> {
         self.object_map.remove(key)
     }
 
@@ -97,7 +110,7 @@ impl DirObject {
         self.object_map.values()
     }
 
-    pub fn iter(&self) -> std::collections::hash_map::Iter<'_,String, super::SimpleMapItem> {
+    pub fn iter(&self) -> std::collections::hash_map::Iter<'_,String, SimpleMapItem> {
         self.object_map.iter()
     }
 
@@ -117,7 +130,7 @@ impl DirObject {
         }
 
         self.total_size += dir_size;
-        self.object_map.insert(name, super::SimpleMapItem::ObjId(dir_obj_id));
+        self.object_map.insert(name, SimpleMapItem::ObjId(dir_obj_id));
         Ok(())
     }
 
@@ -183,25 +196,21 @@ mod tests {
         let file4 = FileObject::new("file4".to_string(), 2048, "sha256:1234567890ABCD".to_string());
         let file4_obj = serde_json::to_value(file4).unwrap();
         dir_sub.add_file("file4".to_string(), file4_obj, 1024).unwrap();
-        
-        let file6 = FileObject::new("file6".to_string(), 2048, "sha256:1234567890ABCD".to_string());
+
         let sub_total_size = dir_sub.total_size;
         let (sub_obj_id, json_str) = dir_sub.gen_obj_id().unwrap();
         println!("sub_dir_id: {}", sub_obj_id.to_string());
-        assert!(sub_obj_id.to_string() == "cydir:71ebdfa188af679d3853288e750d9995151f5850b8c9d7dfde3d1a8ed8a58ae7");
+        assert_eq!(sub_obj_id.obj_type, OBJ_TYPE_DIR);
 
         dir_root.add_directory("sub".to_string(), sub_obj_id, sub_total_size).unwrap();
 
-        let json_str = serde_json::to_string(&dir_root).unwrap();
+        let json_str = serde_json::to_string_pretty(&dir_root).unwrap();
         println!("json_str_for_dir_root: {}", json_str);
 
-        dir_root.extra_info.insert("test".to_string(), Value::String("test extra info \nsecond line".to_string()));
-
         let (obj_id, json_str) = dir_root.gen_obj_id().unwrap();
-        println!("root_dir_id: {}", obj_id.to_string());
-        println!("json_str_for_root_gen_obj_id: {}", json_str);
-        assert!(obj_id.to_string() == "cydir:118fc282dfb2fc0181e670020cf57730c6aab56b7b5a8b30d858ce0a76690e1c");
-
+        println!("dir_root_obj_id: {}", obj_id.to_string());
+        println!("json_str_for_dir_root_gen_obj_id: {}", json_str);
+        assert_eq!(obj_id.obj_type, OBJ_TYPE_DIR);
     }
 
 }

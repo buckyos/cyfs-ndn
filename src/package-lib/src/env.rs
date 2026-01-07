@@ -399,9 +399,10 @@ impl PackageEnv {
 
         let (meta_obj_id,pkg_meta) = meta_info.unwrap();
         // 检查chunk是否存在
-        if let Some(chunk_id) = pkg_meta.content {
+        if !pkg_meta.content.is_empty() {
             // TODO: 实现chunk存在性检查
-            info!("check chunk {} exist", chunk_id.to_string());
+            let chunk_id_str = pkg_meta.content.clone();
+            info!("check chunk {} exist", chunk_id_str);
             let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(named_mgr_id).await;
             if named_mgr.is_none() {
                 return Err(PkgError::FileNotFoundError(
@@ -410,7 +411,7 @@ impl PackageEnv {
             }
             let named_mgr = named_mgr.unwrap();
             let named_mgr = named_mgr.lock().await;
-            let chunk_id = ChunkId::new(&chunk_id)
+            let chunk_id = ChunkId::new(&chunk_id_str)
                 .map_err(|e| PkgError::ParseError(
                     pkg_id.to_owned(),
                     format!("Invalid chunk id: {}", e),
@@ -458,37 +459,44 @@ impl PackageEnv {
     async fn install_pkg_impl(&mut self, meta_obj_id: &str,pkg_meta: &PackageMeta,force_install: bool) -> PkgResult<()> {
         let pkg_id = pkg_meta.get_package_id().to_string();
         //检查chunk是否存在
-        if let Some(ref chunk_id_str) = pkg_meta.content {
-            let chunk_id = ChunkId::new(&chunk_id_str)
-                .map_err(|e| PkgError::ParseError(
-                    pkg_id.clone(),
-                    format!("Invalid chunk id: {}", e),
-                ))?;
-            if !NamedDataMgr::have_chunk(self.config.named_mgr_name.as_deref(),&chunk_id).await {
-                info!("{}'s chunk {} not found, downloading...", pkg_id, chunk_id_str);
-                //TODO:ndn client要支持 1个zone内地址(none) ，2个zone外地址（发布者+传播者) 的多源模式
-                let zone_ndn_url = "http://127.0.0.1/ndn/";
-                let ndn_client = NdnClient::new(zone_ndn_url.to_string(),None,self.config.named_mgr_name.clone());
-                let chunk_size = ndn_client.pull_chunk(chunk_id.clone(),StoreMode::StoreInNamedMgr).await
-                    .map_err(|e| PkgError::DownloadError(
-                        pkg_id.clone(),
-                        format!("Failed to download chunk: {}", e),
-                    ))?;
-                info!("chunk {} downloaded, size: {}", chunk_id_str, chunk_size);
-            }
+        if !pkg_meta.content.is_empty() {
 
-            let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader(self.config.named_mgr_name.as_deref(),
-                &chunk_id,0,false).await
-                .map_err(|e| PkgError::LoadError(
-                    pkg_id.clone(),
-                    format!("Failed to open chunk reader: {}", e),
-                ))?;
-            let meta_obj_id = ObjId::new(meta_obj_id).map_err(|e| PkgError::ParseError(
-                pkg_id.clone(),
-                format!("Invalid meta obj id: {}", e),
-            ))?;
-            self.do_install_pkg_from_data(&pkg_meta,&meta_obj_id,chunk_reader,force_install).await?;
-            info!("{} extract chunk to pkg_env OK.", pkg_id);
+            //1) ndn_client.pull_file
+            //2) open local file reader
+            //3) install
+
+            // let chunk_id_str = pkg_meta.content.as_str();
+            // let chunk_id = ChunkId::new(chunk_id_str)
+            //     .map_err(|e| PkgError::ParseError(
+            //         pkg_id.clone(),
+            //         format!("Invalid chunk id: {}", e),
+            //     ))?;
+            // if !NamedDataMgr::have_chunk(self.config.named_mgr_name.as_deref(),&chunk_id).await {
+            //     info!("{}'s chunk {} not found, downloading...", pkg_id, chunk_id_str);
+            //     //TODO:ndn client要支持 1个zone内地址(none) ，2个zone外地址（发布者+传播者) 的多源模式
+            //     let zone_ndn_url = "http://127.0.0.1/ndn/";
+            //     let ndn_client = NdnClient::new(zone_ndn_url.to_string(),None,self.config.named_mgr_name.clone());
+            //     let chunk_size = ndn_client.pull_chunk(chunk_id.clone(),StoreMode::StoreInNamedMgr).await
+            //         .map_err(|e| PkgError::DownloadError(
+            //             pkg_id.clone(),
+            //             format!("Failed to download chunk: {}", e),
+            //         ))?;
+            //     info!("chunk {} downloaded, size: {}", chunk_id_str, chunk_size);
+            // }
+
+            // let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader(self.config.named_mgr_name.as_deref(),
+            //     &chunk_id,0,false).await
+            //     .map_err(|e| PkgError::LoadError(
+            //         pkg_id.clone(),
+            //         format!("Failed to open chunk reader: {}", e),
+            //     ))?;
+
+            // let meta_obj_id = ObjId::new(meta_obj_id).map_err(|e| PkgError::ParseError(
+            //     pkg_id.clone(),
+            //     format!("Invalid meta obj id: {}", e),
+            // ))?;
+            // self.do_install_pkg_from_data(&pkg_meta,&meta_obj_id,content_reader,force_install).await?;
+            // info!("{} extract chunk to pkg_env OK.", pkg_id);
         }
 
         Ok(())
@@ -531,13 +539,14 @@ impl PackageEnv {
         meta_db.add_pkg_meta(&meta_obj_id.to_string(), &pkg_meta_str, &pkg_meta.author, None)?;
         
         // 设置包版本
-        meta_db.set_pkg_version(&pkg_meta.pkg_name, &pkg_meta.author, &pkg_meta.version, &meta_obj_id.to_string(), pkg_meta.tag.as_deref())?;
+        meta_db.set_pkg_version(&pkg_meta.name, &pkg_meta.author, &pkg_meta.version, &meta_obj_id.to_string(), pkg_meta.version_tag.as_deref())?;
 
-        info!("install_pkg_from_local_file: pkg {} installed successfully from {}", pkg_meta.pkg_name, local_file.display());
+        info!("install_pkg_from_local_file: pkg {} installed successfully from {}", pkg_meta.name, local_file.display());
 
         Ok(())
     }
 
+    // cd my_env && buckycli pkg_install $pkg_id
     //安装pkg，安装成功后该pkg可以加载成功,返回安装成功的pkg的meta_obj_id
     //安装操作会锁定env，直到安装完成（不会出现两个安装操作同时进行）
     //安装过程会根据env是否支持符号链接，尝试建立有好的符号链接
@@ -567,7 +576,7 @@ impl PackageEnv {
             self.cacl_pkg_deps_metas(&pkg_meta,&mut deps).await?;
 
             for (dep_meta_obj_id, dep_pkg_meta) in deps.iter() {
-                info!("install dep pkg {}#{}", dep_pkg_meta.pkg_name, dep_pkg_meta.version);
+                info!("install dep pkg {}#{}", dep_pkg_meta.name, dep_pkg_meta.version);
                 
                 let install_result = self.install_pkg_impl(dep_meta_obj_id.as_str(), &dep_pkg_meta, force_install).await;
                 match install_result {
@@ -611,12 +620,12 @@ impl PackageEnv {
         //将chunk (这是一个tar.gz文件)解压安装到真实目录 pkgs/pkg_nameA/$meta_obj_id
         //注意处理前缀: 如果包名与当前env前缀相同，那么符号链接里只包含无前缀部分
         //如果是最新版本，建立符号链接 ./pkg_nameA -> pkgs/pkg_nameA/$meta_obj_id/
-        info!("extract pkg {} from chunk",pkg_meta.pkg_name.as_str());
+        info!("extract pkg {} from chunk",pkg_meta.name.as_str());
 
         let buf_reader = BufReader::new(chunk_reader);
         let gz_decoder = GzipDecoder::new(buf_reader);
         let mut archive = Archive::new(gz_decoder);
-        let synlink_target = format!("./pkgs/{}/{}", pkg_meta.pkg_name, meta_obj_id.to_string());
+        let synlink_target = format!("./pkgs/{}/{}", pkg_meta.name, meta_obj_id.to_string());
         if self.config.enable_link {
             let target_dir = self.work_dir.join(synlink_target.clone());
             if target_dir.exists() {
@@ -634,10 +643,10 @@ impl PackageEnv {
         
         let pkg_id = pkg_meta.get_package_id();
         let link_pkg_name;
-        if pkg_meta.pkg_name.starts_with(self.get_prefix().as_str()) {
-            link_pkg_name = pkg_meta.pkg_name.split(".").last().unwrap().to_string();
+        if pkg_meta.name.starts_with(self.get_prefix().as_str()) {
+            link_pkg_name = pkg_meta.name.split(".").last().unwrap().to_string();
         } else {
-            link_pkg_name = pkg_meta.pkg_name.clone();
+            link_pkg_name = pkg_meta.name.clone();
         }
         
         let friendly_path = if self.is_latest_version(&pkg_id)? {
@@ -668,7 +677,7 @@ impl PackageEnv {
             }
             tokio::fs::create_dir_all(&friendly_path).await?;
             archive.unpack(&friendly_path).await?;     
-            info!("extract pkg {} to friendly path {} OK.", pkg_meta.pkg_name.as_str(), friendly_path.display());
+            info!("extract pkg {} to friendly path {} OK.", pkg_meta.name.as_str(), friendly_path.display());
         }
         
         Ok(())
@@ -750,7 +759,7 @@ impl PackageEnv {
 
 
     fn get_pkg_strict_dir(&self, meta_obj_id: &str,pkg_meta: &PackageMeta) -> PkgResult<PathBuf> {
-        let pkg_name = pkg_meta.pkg_name.clone();
+        let pkg_name = pkg_meta.name.clone();
         let real_obj_id = ObjId::new(meta_obj_id)
             .map_err(|e| PkgError::ParseError(meta_obj_id.to_string(),e.to_string()))?;
         //pkgs/pkg_nameA/$meta_obj_id
@@ -825,22 +834,12 @@ mod tests {
         tokio_fs::create_dir_all(&pkg_dir).await.unwrap();
         
         // 创建meta文件
-        let meta = PackageMeta {
-            owner: DID::from_str("did:bns:buckyos.ai").unwrap(),
-            pkg_name: pkg_name.to_string(),
-            meta:json!({}),
-            version: version.to_string(),
-            tag: Some("test".to_string()),
-            category: Some("test".to_string()),
-            author: "test".to_string(),
-            chunk_id: Some("test_chunk".to_string()),
-            chunk_size: Some(100),
-            chunk_url: Some("http://test.com".to_string()),
-            deps: HashMap::new(),
-            create_time: 0,
-            exp: 0,
-            extra_info:HashMap::new()
-        };
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut meta = PackageMeta::new(pkg_name, version, "test", &owner, Some("test"));
+        //meta.category = Some("test".to_string());
+        //meta.chunk_url = Some("http://test.com".to_string());
+        meta._base.size = 100;
+        meta._base.content = "test_chunk".to_string();
         
         let meta_path = pkg_dir.join(".pkg.meta");
         tokio_fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).await.unwrap();
@@ -923,9 +922,8 @@ mod tests {
         
         // 测试获取meta信息
         let (meta_obj_id,meta) = env.get_pkg_meta("test-pkg#1.0.0").await.unwrap();
-        assert_eq!(meta.pkg_name, "test-pkg");
+        assert_eq!(meta.name, "test-pkg");
         assert_eq!(meta.version, "1.0.0".to_string());
-        assert_eq!(meta.category, Some("test".to_string()));
         
         // 测试不存在的包
         assert!(env.get_pkg_meta("not-exist#1.0.0").await.is_err());

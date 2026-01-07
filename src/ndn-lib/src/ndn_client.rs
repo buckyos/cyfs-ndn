@@ -115,7 +115,7 @@ impl NdnClient {
 
         // if resp_headers.obj_id.is_none() {
         //     let msg = format!("no obj id in resp_headers, inner_path: {}", inner_path);
-        //     warn!("{}",msg);
+        //     warn!("{}",msg);z
         //     return Err(NdnError::InvalidId(msg));
         // }
 

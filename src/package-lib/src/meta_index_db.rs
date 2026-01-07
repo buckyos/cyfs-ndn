@@ -651,22 +651,10 @@ mod tests {
         let db_path = temp_dir.path().join("test_meta.db");
         
         let meta_db = MetaIndexDb::new(db_path,false)?;
-        let test_pkg_meta = PackageMeta {
-            pkg_name: "test-pkg".to_string(),
-            meta: json!({}),
-            exp: 0,
-            extra_info: HashMap::new(),
-            version: "1.0.1".to_string(),
-            author: "author1".to_string(),
-            owner: DID::from_str("did:bns:buckyos.ai").unwrap(),
-            tag: Some("stable".to_string()),
-            category: Some("app".to_string()),
-            chunk_id: Some("chunk1".to_string()),
-            chunk_size: Some(100),
-            chunk_url: Some("http://test.com/chunk1".to_string()),
-            deps: HashMap::new(),
-            create_time: 0,
-        };
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut test_pkg_meta = PackageMeta::new("test-pkg", "1.0.1", "author1", &owner, Some("stable"));
+        test_pkg_meta._base.size = 100;
+        test_pkg_meta._base.content = "chunk1".to_string();
 
         let test_pkg_meta_str = serde_json::to_string(&test_pkg_meta).unwrap();
         
@@ -717,24 +705,11 @@ mod tests {
         info!("db_path:{}", db_path.to_string_lossy());
         
         let meta_db = MetaIndexDb::new(db_path,false)?;
-        let mut test_pkg_meta1 = PackageMeta {
-            pkg_name: "test-pkg".to_string(),
-            version: "1.0.0".to_string(),
-            author: "author1".to_string(),
-            owner: DID::from_str("did:bns:buckyos.ai").unwrap(),
-            tag: Some("stable".to_string()),
-            category: Some("app".to_string()),
-            chunk_id: Some("chunk1".to_string()),
-            chunk_size: Some(100),
-            chunk_url: Some("http://test.com/chunk1".to_string()),
-            deps: HashMap::new(),
-            create_time: 0,
-            exp: 0,
-            extra_info: HashMap::new(),
-            meta: json!({}),
-        };  
-        let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut test_pkg_meta1 = PackageMeta::new("test-pkg", "1.0.0", "author1", &owner, Some("stable"));
+        test_pkg_meta1._base.size = 100;
+        test_pkg_meta1._base.content = "chunk1".to_string();
+        let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
         meta_db.add_pkg_meta("meta1", &test_pkg_meta_str1, "author1", Some("pk1".to_string()))?;
 
         let mut test_pkg_meta2 = PackageMeta::new("test-pkg","1.1.0","author1",&owner,None);
