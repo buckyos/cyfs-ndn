@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::collections::HashMap;
 use crate::{build_named_object_by_json, BaseContentObject, ObjId, OBJ_TYPE_FILE, OBJ_TYPE_PATH};
-
+use buckyos_kit::is_zero;
 
 //TODO：NDN如何提供一种通用机制，检查FileObject在本地是 完全存在的 ？ 在这里的逻辑是FileObject的Content(存在)
 // 思路：Object如果引用了另一个Object,要区分这个引用是强引用(依赖）还是弱引用，
@@ -11,8 +11,11 @@ use crate::{build_named_object_by_json, BaseContentObject, ObjId, OBJ_TYPE_FILE,
 pub struct FileObject {
     #[serde(flatten)]
     pub content_obj:BaseContentObject,
-
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default)]
     pub size:u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
     pub content:String,//chunkid or chunklistid
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]

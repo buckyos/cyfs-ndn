@@ -21,6 +21,9 @@ pub struct ActionObject {
     pub action: String,
     pub target: ObjId,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub base_on:Option<ObjId>,//the action is based on another action 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
     pub iat: u64,
     pub exp: u64,
