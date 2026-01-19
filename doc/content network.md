@@ -149,4 +149,18 @@ buckyos的内容发布体系并没有中心化的审核机制，原理上任何�
 谁的名字是才是真名？
 
 
+## 引用内容进行创作
+
+最常见的是论文里的引用，这里引用并不是二创，而是支持新内容的一些相关内容
+
+### 基于算子的引用
+已知数据的url是 cyfs://objurlA,cyfs://objurlB
+算子的id是 cacl_obj_1
+
+那么，可以定义一个result_url，指向 cacl_obj_1(cyfs://objurlA,cyfs://objurlB)
+
+可以直接open_reader(result_url). 
+
+
+这是Content Network的lazy eval, 用于减少中间缓存，并说明数据的深层次关系.
 
