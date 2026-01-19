@@ -34,7 +34,36 @@
 
     列出待选用的`API`，按功能分组，相似功能的`API`分成一组，构造测试用例时尽量从相同组中随机选择以更全面的覆盖
 
-    TODO：
+    - URL 生成
+        - `NdnClient`：`gen_chunk_url`、`gen_obj_url`
+    - NamedDataMgr 管理
+        - `NamedDataMgr`：`set_mgr_by_id`、`get_named_data_mgr_by_path`、`get_named_data_mgr_by_id`、`is_named_data_mgr_exist`、`get_mgr_id`、`get_base_dir`
+    - 对象读取（本地优先，必要时回源）
+        - `NdnClient`：`get_obj_by_id`、`get_obj_by_url`
+        - `NamedDataMgr`：`get_object/get_object_impl`、`get_real_object_impl`、`query_object_by_id`、`is_object_exist`
+    - 对象写入
+        - `NamedDataMgr`：`put_object/put_object_impl`、
+    - 对象关联
+      `link_same_object`、`link_part_of`、`query_source_object_by_target`
+    - 对象挂载路径管理
+        - `NamedDataMgr`：`get_obj_id_by_path_impl/get_obj_id_by_path`、`select_obj_id_by_path_impl/select_obj_id_by_path`、`get_cache_path_obj`、`update_cache_path_obj`、`create_file_impl/create_file`、`set_file_impl/set_file`、`remove_file_impl/remove_file`、`get_chunk_reader_by_path_impl/get_chunk_reader_by_path`
+    - Chunk 状态查询与上传
+        - `NdnClient`：`query_chunk_state`、`push_chunk`
+        - `NamedDataMgr`：`have_chunk/have_chunk_impl`、`query_chunk_state/query_chunk_state_impl`、`check_chunk_exist_impl`（未实现）
+    - Chunk 下载/读取
+        - `NdnClient`：`pull_chunk`、`pull_chunk_by_url`、`open_chunk_reader_by_url`
+        - `NamedDataMgr`：`open_store_chunk_reader_impl`、`open_chunk_reader_impl/open_chunk_reader`、`open_chunklist_reader`、`get_chunk_data`、`get_chunk_piece`
+    - Chunk 写入/导入
+        - `NdnClient`：`pull_chunk`（落本地/本地存储）作为拉取入口
+        - `NamedDataMgr`：`open_chunk_writer_impl/open_chunk_writer`、`open_new_chunk_writer_impl`、`update_chunk_progress_impl`、`complete_chunk_writer_impl/complete_chunk_writer`、`complete_chunk_writer_and_rename_impl`（未实现）、`put_chunk_by_reader_impl/put_chunk_by_reader`、`put_chunk`、`add_chunk_by_link_to_local_file_impl`
+    - 文件/目录下载
+        - `NdnClient`：`pull_file`、`pull_chunklist`、`pull_dir`、`download_fileobj`（落盘 `FileObject`）
+    - 发布（挂载到对象路径）/签名
+        - `NamedDataMgr`：`pub_object`、`sign_obj`、`sigh_path_obj_impl/sigh_path_obj`
+    - 辅助校验/同步
+        - `NdnClient`：`remote_is_better`
+    - GC
+        - `NamedDataMgr`：`gc_worker`、`gc_objects`、`start_gc_thread`
 
 4. 错误码
 
