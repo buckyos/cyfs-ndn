@@ -1440,7 +1440,7 @@ impl NamedDataMgr {
             
             // 如果没有找到要删除的记录，退出循环
             if chunk_ids_to_delete.is_empty() {
-                return Ok(());
+                break;
             }
             
             // 在新的事务中删除找到的chunk记录
