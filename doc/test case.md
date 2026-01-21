@@ -7,7 +7,6 @@
 用例设计从几个维度分类，先设计`一般性用例`，这些用例应该在不同维度下分别实现，不同维度下的特别用例单独列出。在不同维度下的不同取值设计交叉覆盖。`一般性用例`在部分维度下只能取限定值会明确标识，无标识用例在各维度下可以取任意值。
 
 1. 存储数据类型
-
     - Chunk
 
         非结构化数据
@@ -33,7 +32,6 @@
 3. `API`选用
 
     列出待选用的`API`，按功能分组，相似功能的`API`分成一组，构造测试用例时尽量从相同组中随机选择以更全面的覆盖
-
     - URL 生成
         - `NdnClient`：`gen_chunk_url`、`gen_obj_url`
     - NamedDataMgr 管理
@@ -75,64 +73,67 @@
 
 ## 用例落地细化（执行指引）
 
-- 覆盖矩阵与优先级  
-  - 最小组合：`数据类型 × 拓扑 × 权限`，其中 API 组在组合内随机选 1~2 个代表接口；必测组合：`Chunk/Object` × `单节点` × `默认权限`、`File/Dir` × `单节点` × `默认权限`、`Chunk/Object` × `同 Zone 多节点` × `默认权限`。选测组合：跨 Zone、权限受限（读/写/读写）、Link 模式。  
-  - 优先级建议：存取 > GC > 路径挂载/发布 > 下载/同步 > Link 模式。  
-  - 抽样规则：在选测组合中至少覆盖每类拓扑 1 例、每类权限 1 例，API 组内随机选择不同接口轮换。
-- API 选用与断言  
-  - 读写：`put_object/put_object_impl` + `get_object/get_object_impl` 成功返回，数据 HASH/ID 一致；读不存在返回 NotFound。  
-  - 路径管理：`create_file`/`set_file` 后用 `get_obj_id_by_path` 校验路径指向；删除用 `remove_file` 校验路径失效。  
-  - 下载/读取：`pull_chunk/pull_chunk_by_url/open_chunk_reader_by_url` 返回的内容与源一致；`pull_file/pull_dir` 落盘文件校验大小/HASH。  
-  - GC：`start_gc_thread` 定时 15s 调度，`gc_objects`/`gc_worker` 可手动触发；`last_access_time < now-86400` 被清理。发布到 `NDN-Path` 的对象应被保活。  
-  - 未实现/不测：`check_chunk_exist_impl`、`complete_chunk_writer_and_rename_impl` 标记为 TODO/跳过。  
-  - 错误码：使用 `NdnError`（`NotFound`、`InvalidId`、`InvalidLink`、`AlreadyExists`、`VerifyError`、`IoError`、`DbError`、`InComplete`、`RemoteError`、`DecodeError`、`OffsetTooLarge`、`InvalidObjType`、`InvalidData`、`InvalidParam`）。前置条件：参数合法、ObjId 可解析、必要文件/目录存在、网络请求成功。
-- 错误码与“其他错误”  
-  - 常见：`NotFound`（对象/Chunk 不存在）、`InvalidId`（ObjId/DID/PathObj 签名不符）、`InvalidLink`（O-link/R-link 解析失败）、`VerifyError`（数据校验失败）、`IoError`（本地读写失败）、`DbError`、`InComplete`（Chunk 未完成）、`RemoteError`（远端 HTTP 失败）、`DecodeError`（JSON/JWT 解析失败）、`InvalidParam`。  
-  - 其他错误：网络超时视为 `RemoteError`；内部异常使用 `Internal`。  
-- 权限用例配置  
-  - 当前 `NamedDataMgr`/`NdnClient` 内部未实现 ACL，只有 PathObj 使用 `resolve_auth_key` 验签 DID（`ndn_client.rs`）。默认视为开放访问；权限用例需依赖外部 Gateway/服务端策略。  
-  - cyfs-gateway（`cyfs-gateway` 仓库）权限入口：CLI 需要 admin 密码，配置文件支持 include/远程同步（`doc/cyfs-gateway cli product design.md`）；转发/访问控制通过 process_chain rule（`doc/概念设计/ProcessChain.md`）实现，规则命令支持 `policy accept/drop/return` 和 `match`/`forward` 等，可用于基于 Host/IP/标签的访问控制。  
-  - 针对 NDN 的规则示例（写在 `rootfs/etc/user_gateway.yaml` 并 `cyfs reload --all` 或重启 web3-gateway）：  
-    ```yaml
-    servers:
-      node_gateway:
-        hook_point:
-          main:
-            blocks:
-              ndn_acl:
-                id: ndn_acl
-                priority: -5
-                block: |
-                  # 禁止来自 bob.web3.buckyos.io 的写入请求
-                  match ${REQ_HEADER.host} "bob\\.web3\\.buckyos\\.io" && match ${REQ.method} "POST" && reject "deny bob write";
-                  # 只允许指定 DID 的访问
-                  match ${REQ_HEADER.did} "did:dev:ALLOWED.*" || reject "deny unauth did";
-                  accept;
-    ```  
-    配置步骤：编辑 `user_gateway.yaml`（覆盖自动生成配置）、`cyfs reload --all` 或重启 web3-gateway（`sudo python3 /opt/web3-gateway/start.py`）；断言方法：访问被拒绝的 Host/DID 返回 403/拒绝日志，允许的请求成功命中后续 block。
-- GC 语义澄清  
-  - 代码保留 1 天：`last_access_time < now - 60*60*24` 删除；调度周期 15s。  
-  - 发布到 `NDN-Path`、以及被保活对象引用的对象应跳过删除。  
-  - 标注/引用：`update_obj_ref_count` 遇到非 Chunk 对象会递归子对象（通过 `KnownStandardObject::get_child_objs`）更新 ref_count；`obj_ref_update_queue` 延迟消费，`gc_worker` 批量写入并清零队列后才进入 `gc_objects` 的删除窗口。
-- 数据篡改/ID 不匹配构造方式  
-  - 构造合法对象后手工修改 `obj_data` 或 chunk 内容，再用原 ObjId 读，预期校验失败；或伪造 ObjId 访问，预期返回 NotFound/IntegrityError。  
-  - 断言：Chunk 校验失败返回 `VerifyError`（来自 `chunk::hasher`）；ObjId/PathObj 不符返回 `InvalidId`；不存在返回 `NotFound`；日志关键词包含具体错误信息。
-- 多节点/跨 Zone 前置  
-  - 需要准备：SN/Gateway 配置、Zone/DID/Device ID、路由/域名、证书/鉴权信息。  
-  - 单节点/本地：`get_named_data_mgr_by_path` 自动创建 `ndn_mgr.json` 和 DB；`set_mgr_by_id` 注册实例。  
-  - 多节点（参照 buckyos-devkit 标准分布式测试环境）：3 个 Zone：A=`test.buckyos.io`，B=`bob.web3.buckyos.io`，SN=`sn.buckyos.io/web3.buckyos.io`；拓扑 DEV→VM_SN→（NAT1→VM_NODE_A2 10.0.1.2，NAT2→VM_NODE_B1 10.0.2.2），NODE_A1 在宿主机，需在 `etc/resolv.conf` 指向 SN。  
-  - 部署步骤概览：安装 multipass → 配置 bridge（`dev_vm_config.json`）→ `main.py create` 创建 VM → 构建 buckyos → `main.py install --all` → `main.py active_sn`/`active --all` 启动 SN/节点，确认 DNS 解析与节点启动 (`buckycli sys_config --get boot/config`)。  
-  - Gateway/SN 启动与配置示例：SN 使用 `main.py active_sn` 生成配置并 `main.py start_sn` 启动；节点侧 web3-gateway 安装包包含 `rootfs/etc/cyfs_gateway.yaml`（include boot/user/post/node），启动命令 `sudo python3 /opt/web3-gateway/start.py`（或服务方式），需保证 `boot_gateway.yaml` 中 `node_rtcp` 绑定 2980、`zone_gateway_http`/`node_gateway_http` 绑定 80/3180，必要时在 `user_gateway.yaml` 覆盖自定义规则后执行 `cyfs reload --all`。  
-- Link 模式场景  
-  - 覆盖：本地文件缺失（应报错）、本地文件被修改（mtime 变化应拒绝或重新计算）、Link→Store 转换优先 Store、断点续传、外部文件冲突处理。  
-  - 预期：缺失/修改导致读失败或重新计算（通常 `IoError`/`VerifyError`）；Link 覆盖为 Store 后优先使用 Store；断点续传依赖 ChunkWriter 进度；冲突时返回 `AlreadyExists`/`InvalidParam`。  
-- 下载/同步判定  
-  - `remote_is_better`：判断远端是否较新；`download_fileobj`：有更新则落盘文件与 fileobj；`pull_file/pull_dir`：按模式（智能同步/完全同步）覆盖冲突策略。  
-  - “智能同步”：同步删除缺失项，保留新增文件；本地文件若 mtime 更新更晚则重命名保留（参考 `named_mgr.md` 描述）。  
-  - “完全同步”：等同同步前清空目标目录再复制。  
-  - 判定：校验最终文件集合、冲突文件重命名存在与否、日志含模式标识。
+- 输出`Debug`级别日志
+- 覆盖矩阵与优先级
+    - 最小组合：`数据类型 × 拓扑 × 权限`，其中 API 组在组合内随机选 1~2 个代表接口；必测组合：`Chunk/Object` × `单节点` × `默认权限`、`File/Dir` × `单节点` × `默认权限`、`Chunk/Object` × `同 Zone 多节点` × `默认权限`。选测组合：跨 Zone、权限受限（读/写/读写）、Link 模式。
+    - 优先级建议：存取 > GC > 路径挂载/发布 > 下载/同步 > Link 模式。
+    - 抽样规则：在选测组合中至少覆盖每类拓扑 1 例、每类权限 1 例，API 组内随机选择不同接口轮换。
+- API 选用与断言
+    - 读写：`put_object/put_object_impl` + `get_object/get_object_impl` 成功返回，数据 HASH/ID 一致；读不存在返回 NotFound。
+    - 路径管理：`create_file`/`set_file` 后用 `get_obj_id_by_path` 校验路径指向；删除用 `remove_file` 校验路径失效。
+    - 下载/读取：`pull_chunk/pull_chunk_by_url/open_chunk_reader_by_url` 返回的内容与源一致；`pull_file/pull_dir` 落盘文件校验大小/HASH。
+    - GC：`start_gc_thread` 定时 15s 调度，`gc_objects`/`gc_worker` 可手动触发；`last_access_time < now-86400` 被清理。发布到 `NDN-Path` 的对象应被保活。
+    - 未实现/不测：`check_chunk_exist_impl`、`complete_chunk_writer_and_rename_impl` 标记为 TODO/跳过。
+    - 错误码：使用 `NdnError`（`NotFound`、`InvalidId`、`InvalidLink`、`AlreadyExists`、`VerifyError`、`IoError`、`DbError`、`InComplete`、`RemoteError`、`DecodeError`、`OffsetTooLarge`、`InvalidObjType`、`InvalidData`、`InvalidParam`）。前置条件：参数合法、ObjId 可解析、必要文件/目录存在、网络请求成功。
+- 错误码与“其他错误”
+    - 常见：`NotFound`（对象/Chunk 不存在）、`InvalidId`（ObjId/DID/PathObj 签名不符）、`InvalidLink`（O-link/R-link 解析失败）、`VerifyError`（数据校验失败）、`IoError`（本地读写失败）、`DbError`、`InComplete`（Chunk 未完成）、`RemoteError`（远端 HTTP 失败）、`DecodeError`（JSON/JWT 解析失败）、`InvalidParam`。
+    - 其他错误：网络超时视为 `RemoteError`；内部异常使用 `Internal`。
+- 权限用例配置
+    - 当前 `NamedDataMgr`/`NdnClient` 内部未实现 ACL，只有 PathObj 使用 `resolve_auth_key` 验签 DID（`ndn_client.rs`）。默认视为开放访问；权限用例需依赖外部 Gateway/服务端策略。
+    - cyfs-gateway（`cyfs-gateway` 仓库）权限入口：CLI 需要 admin 密码，配置文件支持 include/远程同步（`doc/cyfs-gateway cli product design.md`）；转发/访问控制通过 process_chain rule（`doc/概念设计/ProcessChain.md`）实现，规则命令支持 `policy accept/drop/return` 和 `match`/`forward` 等，可用于基于 Host/IP/标签的访问控制。
+    - 针对 NDN 的规则示例（写在 `rootfs/etc/user_gateway.yaml` 并 `cyfs reload --all` 或重启 web3-gateway）：
+        ```yaml
+        servers:
+            node_gateway:
+                hook_point:
+                    main:
+                        blocks:
+                            ndn_acl:
+                                id: ndn_acl
+                                priority: -5
+                                block: |
+                                    # 禁止来自 bob.web3.buckyos.io 的写入请求
+                                    match ${REQ_HEADER.host} "bob\\.web3\\.buckyos\\.io" && match ${REQ.method} "POST" && reject "deny bob write";
+                                    # 只允许指定 DID 的访问
+                                    match ${REQ_HEADER.did} "did:dev:ALLOWED.*" || reject "deny unauth did";
+                                    accept;
+        ```
+        配置步骤：编辑 `user_gateway.yaml`（覆盖自动生成配置）、`cyfs reload --all` 或重启 web3-gateway（`sudo python3 /opt/web3-gateway/start.py`）；断言方法：访问被拒绝的 Host/DID 返回 403/拒绝日志，允许的请求成功命中后续 block。
+- GC 语义澄清
+    - 代码保留 1 天：`last_access_time < now - 60*60*24` 删除；调度周期 15s。
+    - 发布到 `NDN-Path`、以及被保活对象引用的对象应跳过删除。
+    - 标注/引用：`update_obj_ref_count` 遇到非 Chunk 对象会递归子对象（通过 `KnownStandardObject::get_child_objs`）更新 ref_count；`obj_ref_update_queue` 延迟消费，`gc_worker` 批量写入并清零队列后才进入 `gc_objects` 的删除窗口。
+- 数据篡改/ID 不匹配构造方式
+    - 构造合法对象后手工修改 `obj_data` 或 chunk 内容，再用原 ObjId 读，预期校验失败；或伪造 ObjId 访问，预期返回 NotFound/IntegrityError。
+    - 断言：Chunk 校验失败返回 `VerifyError`（来自 `chunk::hasher`）；ObjId/PathObj 不符返回 `InvalidId`；不存在返回 `NotFound`；日志关键词包含具体错误信息。
+- 多节点/跨 Zone 前置
+    - 需要准备：SN/Gateway 配置、Zone/DID/Device ID、路由/域名、证书/鉴权信息。
+    - 单节点/本地：`get_named_data_mgr_by_path` 自动创建 `ndn_mgr.json` 和 DB；`set_mgr_by_id` 注册实例。
+    - 多节点（参照 buckyos-devkit 标准分布式测试环境）：3 个 Zone：A=`test.buckyos.io`，B=`bob.web3.buckyos.io`，SN=`sn.buckyos.io/web3.buckyos.io`；拓扑 DEV→VM_SN→（NAT1→VM_NODE_A2 10.0.1.2，NAT2→VM_NODE_B1 10.0.2.2），NODE_A1 在宿主机，需在 `etc/resolv.conf` 指向 SN。
+    - 部署步骤概览：安装 multipass → 配置 bridge（`dev_vm_config.json`）→ `main.py create` 创建 VM → 构建 buckyos → `main.py install --all` → `main.py active_sn`/`active --all` 启动 SN/节点，确认 DNS 解析与节点启动 (`buckycli sys_config --get boot/config`)。
+    - Gateway/SN 启动与配置示例：SN 使用 `main.py active_sn` 生成配置并 `main.py start_sn` 启动；节点侧 web3-gateway 安装包包含 `rootfs/etc/cyfs_gateway.yaml`（include boot/user/post/node），启动命令 `sudo python3 /opt/web3-gateway/start.py`（或服务方式），需保证 `boot_gateway.yaml` 中 `node_rtcp` 绑定 2980、`zone_gateway_http`/`node_gateway_http` 绑定 80/3180，必要时在 `user_gateway.yaml` 覆盖自定义规则后执行 `cyfs reload --all`。
+- Link 模式场景
+    - 覆盖：本地文件缺失（应报错）、本地文件被修改（mtime 变化应拒绝或重新计算）、Link→Store 转换优先 Store、断点续传、外部文件冲突处理。
+    - 预期：缺失/修改导致读失败或重新计算（通常 `IoError`/`VerifyError`）；Link 覆盖为 Store 后优先使用 Store；断点续传依赖 ChunkWriter 进度；冲突时返回 `AlreadyExists`/`InvalidParam`。
+- 下载/同步判定
+    - `remote_is_better`：判断远端是否较新；`download_fileobj`：有更新则落盘文件与 fileobj；`pull_file/pull_dir`：按模式（智能同步/完全同步）覆盖冲突策略。
+    - “智能同步”：同步删除缺失项，保留新增文件；本地文件若 mtime 更新更晚则重命名保留（参考 `named_mgr.md` 描述）。
+    - “完全同步”：等同同步前清空目标目录再复制。
+    - 判定：校验最终文件集合、冲突文件重命名存在与否、日志含模式标识。
 
 ## 一般性用例
+
+无特殊说明，具体环境下类似的用例设计，具体细节和本节一样，不必赘述
 
 1. 存取
     - 存入并成功读取数据
