@@ -58,3 +58,4 @@ tempfile = { workspace = true }
 [dev-dependencies]
 
 rand = "*"
+env_logger = "*"
