@@ -3,12 +3,15 @@ use buckyos_kit::get_relative_path;
 use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify, DID};
 use name_client::resolve_auth_key;
 use tokio::io::{AsyncRead,AsyncWrite,AsyncWriteExt,AsyncReadExt,AsyncSeekExt};
+use tokio::sync::Mutex;
 use url::Url;
 use log::*;
 use reqwest::{Body, Client, StatusCode};
 use std::io::SeekFrom;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs::OpenOptions;
 use tokio_util::io::StreamReader;
 use futures_util::StreamExt;
 use std::pin::Pin;
@@ -18,7 +21,7 @@ use futures::Future;
 use futures::future::BoxFuture;
 use rand::RngCore;
 
-use crate::{build_named_object_by_json, build_obj_id, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object, CYFSHttpRespHeaders, ChunkState, DirObject, FileObject, HashMethod, PathObject, ProgressCallback, SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
+use crate::*;
 
 
 pub enum ChunkWorkState {
@@ -99,16 +102,6 @@ impl NdnClient {
         format!("{}/{}",real_base_url,obj_id.to_base32())
     }
 
-    fn verify_obj_id(obj_id:&ObjId,obj_str:&str)->NdnResult<serde_json::Value> {
-        let obj_json = serde_json::from_str(obj_str)
-            .map_err(|e|NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
-        let cacl_obj_id = build_obj_id(obj_id.obj_type.as_str(), obj_str);
-        if cacl_obj_id != *obj_id {
-            return Err(NdnError::InvalidId(format!("obj_id not match, known:{} remote:{}",obj_id.to_string(),obj_str)));
-        }
-        Ok(obj_json)
-    }
-
     fn verify_inner_path_to_obj(resp_headers:&CYFSHttpRespHeaders,inner_path:&str)->NdnResult<()> {
         // //use crate::::{PathObjectMapItemProof, PathObjectMapProofVerifier, PathObjectMapProofVerifyResult};
         // use crate::hash::HashMethod;
@@ -122,7 +115,7 @@ impl NdnClient {
 
         // if resp_headers.obj_id.is_none() {
         //     let msg = format!("no obj id in resp_headers, inner_path: {}", inner_path);
-        //     warn!("{}",msg);
+        //     warn!("{}",msg);z
         //     return Err(NdnError::InvalidId(msg));
         // }
 
@@ -200,6 +193,7 @@ impl NdnClient {
         }
     }       
 
+    //zone内设备之间互相push chunk
     pub async fn push_chunk(&self,chunk_id:ChunkId,target_url:Option<String>)->NdnResult<()> {
         let chunk_url;
         if target_url.is_some() {
@@ -214,8 +208,8 @@ impl NdnClient {
                 info!("push_chunk:remote chunk already exists, skip");
                 return Ok(());
             },
-            ChunkState::Link(link_data) => {
-                info!("push_chunk:remote chunk is a link, skip");
+            ChunkState::LocalLink(_link_data) => {
+                info!("push_chunk:remote chunk is a local link, skip");
                 return Ok(());
             }
             _ => {}
@@ -224,7 +218,7 @@ impl NdnClient {
         let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
             .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
         let real_named_mgr = named_mgr.lock().await;
-        let (mut chunk_reader,len) = real_named_mgr.open_chunk_reader_impl(&chunk_id,SeekFrom::Start(already_uploaded_size),false).await?;
+        let (mut chunk_reader,len) = real_named_mgr.open_chunk_reader_impl(&chunk_id,already_uploaded_size,false).await?;
         debug!("push_chunk:local chunk_reader open success");
         drop(real_named_mgr);
 
@@ -258,12 +252,15 @@ impl NdnClient {
             .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
         let real_named_mgr = named_mgr.lock().await;
         let obj_data = real_named_mgr.get_object_impl(&obj_id, None).await;
+        drop(real_named_mgr);
         if obj_data.is_ok() {
             return obj_data;
         } else {
             info!("get_obj_by_id: get obj by id failed:{}, try to get obj from remote",obj_id.to_string());
             let obj_url = self.gen_obj_url(&obj_id, None);
-            let (_,obj_data) = self.get_obj_by_url(&obj_url, Some(obj_id)).await?;
+            let (_,obj_data) = self.get_obj_by_url(&obj_url, Some(obj_id.clone())).await?;
+            let obj_data_str = serde_json::to_string(&obj_data).unwrap();
+            NamedDataMgr::put_object(self.default_ndn_mgr_id.as_deref(), &obj_id, &obj_data_str).await?;
             return Ok(obj_data);
         }
     }
@@ -316,7 +313,7 @@ impl NdnClient {
                     }
                 }
             }
-            let real_obj = NdnClient::verify_obj_id(&known_obj_id,&obj_str)?;
+            let real_obj = verify_named_object_from_str(&known_obj_id,&obj_str)?;
             return Ok((known_obj_id,real_obj));
         }
         
@@ -324,7 +321,7 @@ impl NdnClient {
             //URL is a Object Link (CYFS O-Link)
             let obj_id = obj_id_from_url.unwrap();
             if obj_inner_path.is_none() {
-                let real_obj = NdnClient::verify_obj_id(&obj_id,&obj_str)?;
+                let real_obj = verify_named_object_from_str(&obj_id,&obj_str)?;
                 return Ok((obj_id,real_obj));
             } else {
                 if cyfs_resp_headers.obj_id.is_none() || cyfs_resp_headers.root_obj_id.is_none() {
@@ -335,7 +332,7 @@ impl NdnClient {
                 if root_obj_id != obj_id {
                     return Err(NdnError::InvalidId(format!("root obj id not match, known:{} remote:{}",root_obj_id.to_string(),obj_id.to_string())));
                 }
-                let real_obj = NdnClient::verify_obj_id(&real_obj_id,&obj_str)?;
+                let real_obj = verify_named_object_from_str(&real_obj_id,&obj_str)?;
                 let verify_result = NdnClient::verify_inner_path_to_obj(&cyfs_resp_headers,obj_inner_path.unwrap().as_str())?;
                 return Ok((real_obj_id,real_obj));
             }
@@ -346,7 +343,7 @@ impl NdnClient {
             }
             
             let obj_id = cyfs_resp_headers.obj_id.clone().unwrap();
-            let real_target_obj = NdnClient::verify_obj_id(&obj_id,&obj_str)?;
+            let real_target_obj = verify_named_object_from_str(&obj_id,&obj_str)?;
             //let real_path = 
 
             if url.starts_with("http://127.0.0.1/") || url.starts_with("https://")  || self.force_trust_remote {
@@ -411,10 +408,10 @@ impl NdnClient {
 
     }
 
-    pub async fn pull_chunk(&self, chunk_id:ChunkId,mgr_id:Option<&str>)->NdnResult<u64> {
+    pub async fn pull_chunk(&self, chunk_id:ChunkId,pull_mode:StoreMode)->NdnResult<u64> {
         let chunk_url = self.gen_chunk_url(&chunk_id,None);
         info!("will pull chunk {} by url:{}",chunk_id.to_string(),chunk_url);
-        self.pull_chunk_by_url(chunk_url,chunk_id,mgr_id).await
+        self.pull_chunk_by_url(chunk_url,chunk_id,pull_mode).await
     }
 
     //helper function 
@@ -547,154 +544,133 @@ impl NdnClient {
         }        
     }
 
+    // download chunk被pull_chunk替代
     //返回成功下载的chunk_id和chunk_size,下载成功后named mgr种chunk存在于cache中
-    pub async fn download_chunk_to_local(&self,chunk_url:&str,chunk_id:ChunkId,local_path:&PathBuf,offset:u64,no_verify:Option<bool>) -> NdnResult<(ChunkId,u64)> {
-        // 首先从URL下载chunk到本地缓存
-        let chunk_size = self.pull_chunk_by_url(chunk_url.to_string(), chunk_id.clone(), self.default_ndn_mgr_id.as_deref()).await?;
+    // pub async fn download_chunk(&self,chunk_url:&str,chunk_id:ChunkId,
+    //     local_path:&PathBuf,offset:u64,no_verify:Option<bool>) -> NdnResult<(ChunkId,u64)> {
+    //     // 首先从URL下载chunk到本地缓存
+    //     let chunk_size = self.pull_chunk_by_url(chunk_url.to_string(), chunk_id.clone(), PullMode::default()).await?;
  
-        // 确保目标目录存在
-        if let Some(parent) = local_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| NdnError::IoError(format!("Failed to create directory: {}", e)))?;
-        }
+    //     // 确保目标目录存在
+    //     if let Some(parent) = local_path.parent() {
+    //         std::fs::create_dir_all(parent)
+    //             .map_err(|e| NdnError::IoError(format!("Failed to create directory: {}", e)))?;
+    //     }
         
-        // 打开本地文件用于写入
-        let mut file = tokio::fs::File::create(local_path)
-            .await
-            .map_err(|e| NdnError::IoError(format!("Failed to create file: {}", e)))?;
+    //     // 打开本地文件用于写入
+    //     let mut file = tokio::fs::File::create(local_path)
+    //         .await
+    //         .map_err(|e| NdnError::IoError(format!("Failed to create file: {}", e)))?;
 
-        file.seek(SeekFrom::Start(offset)).await
-            .map_err(|e| NdnError::IoError(format!("Failed to seek file: {}", e)))?;
+    //     file.seek(SeekFrom::Start(offset)).await
+    //         .map_err(|e| NdnError::IoError(format!("Failed to seek file: {}", e)))?;
         
-        // 从named-data-mgr中获取chunk reader，因为pull_chunk已经将chunk写入named-data-mgr
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
-            .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
-        let real_named_mgr = named_mgr.lock().await;
-        let (mut chunk_reader, chunk_size) = real_named_mgr.open_chunk_reader_impl(&chunk_id, SeekFrom::Start(0), true).await
-            .map_err(|e| NdnError::Internal(format!("Failed to get chunk reader: {}", e)))?;    
-        // 复制数据到本地文件（TODO：要验证 chunkid)
-        drop(real_named_mgr);
-        let hasher = ChunkHasher::new_with_hash_method(chunk_id.chunk_type.to_hash_method()?)?;
-        copy_chunk(chunk_id.clone(), chunk_reader, &mut file, Some(hasher), None)
-            .await
-            .map_err(|e| NdnError::IoError(format!("Failed to copy data to file: {}", e)))?;
+    //     // 从named-data-mgr中获取chunk reader，因为pull_chunk已经将chunk写入named-data-mgr
+    //     let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await
+    //         .ok_or_else(|| NdnError::Internal("No named data manager available".to_string()))?;
+    //     let real_named_mgr = named_mgr.lock().await;
+    //     let (mut chunk_reader, chunk_size) = real_named_mgr.open_chunk_reader_impl(&chunk_id, 0, true).await
+    //         .map_err(|e| NdnError::Internal(format!("Failed to get chunk reader: {}", e)))?;    
+    //     // 复制数据到本地文件（TODO：要验证 chunkid)
+    //     drop(real_named_mgr);
+    //     let hasher = ChunkHasher::new_with_hash_method(chunk_id.chunk_type.to_hash_method()?)?;
+    //     copy_chunk(chunk_id.clone(), chunk_reader, &mut file, Some(hasher), None)
+    //         .await
+    //         .map_err(|e| NdnError::IoError(format!("Failed to copy data to file: {}", e)))?;
         
-        // 返回chunk_id和大小
-        Ok((chunk_id, chunk_size))
-    }
-
-    //使用这种模式是发布方承诺用 R-Link发布FileObject,用O-Link发布chunk的模式
-    //返回下载成功的FileObj和obj_id，下载成功后named mgr中chunk存在于cache中
-    pub async fn download_fileobj_to_local(&self,fileobj_url:&str,local_path:&PathBuf,no_verify:Option<bool>) -> NdnResult<(ObjId,FileObject)> {
-        let (obj_id, file_obj_json) = self.get_obj_by_url(fileobj_url, None).await?;
-        
-        // 解析FileObject
-        let file_obj: FileObject = serde_json::from_value(file_obj_json)
-            .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
-
-        let content_obj_id = ObjId::new(file_obj.content.as_str())?;
-        if content_obj_id.is_chunk() {
-            // 2. 得到fileobj的content chunkid
-            let content_chunk_id = ChunkId::new(file_obj.content.as_str())
-            .map_err(|e| NdnError::Internal(format!("Failed to parse content chunk id: {}", e)))?;
-
-            // 构建content chunk的URL
-            let content_chunk_url = self.gen_chunk_url(&content_chunk_id, None);
-            info!("download_fileobj_to_local: content_chunk_url {}",content_chunk_url);
-
-            // 3. 使用download_chunk_to_local将chunk下载到本地指定文件
-            let (_, chunk_size) = self.download_chunk_to_local(&content_chunk_url, content_chunk_id, local_path, 0, no_verify).await?;
-
-            // 验证下载的文件大小与FileObject中声明的大小是否一致
-            if chunk_size != file_obj.size {
-            return Err(NdnError::Internal(format!(
-                "Downloaded file size ({}) doesn't match expected size ({})",
-                chunk_size, file_obj.size
-            )));
-            }
-
-            let local_file_obj_path = local_path.with_extension("fileobj");
-            //dump file_obj to local_file_obj_path
-            tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
-            .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
-
-            return Ok((obj_id, file_obj));
-        } else {
-            if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
-                let chunk_list_obj_data = self.get_obj_by_id(content_obj_id.clone()).await?;
-                let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
-                    .map_err(|e| NdnError::Internal(format!("Failed to parse SimpleChunkList: {}", e)))?;
-                let mut offset = 0;
-                for chunk_id in chunk_list {
-                    let chunk_url = self.gen_chunk_url(&chunk_id, None);
-                    let (_, chunk_size) = self.download_chunk_to_local(&chunk_url, chunk_id, local_path, offset, no_verify).await?;
-                    offset += chunk_size;
-                }
-
-                let local_file_obj_path = local_path.with_extension("fileobj");
-                //dump file_obj to local_file_obj_path
-                tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj).unwrap()).await
-                .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
-
-                
-                return Ok((obj_id, file_obj));
-            } else {
-                return Err(NdnError::Internal(format!("Unsupported content obj type: {}", content_obj_id.obj_type)));
-            }
-            
-        }
-    }
+    //     // 返回chunk_id和大小
+    //     Ok((chunk_id, chunk_size))
+    // }
 
 
-    pub async fn pull_file_imp(&self,file_obj:FileObject) -> NdnResult<()>{
+    pub async fn pull_file(&self,file_obj:FileObject,pull_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<()>{
         let content_obj_id = ObjId::new(file_obj.content.as_str())?;
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::new(file_obj.content.as_str())?;
-            self.pull_chunk(chunk_id, None).await?;
+            self.pull_chunk(chunk_id, StoreMode::default()).await?;
+            //TODO: add link to local file?
             return Ok(());
         } else {
             if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
-                let chunk_list_obj_data = self.get_obj_by_id(content_obj_id.clone()).await?;
-                let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
-                    .map_err(|e| NdnError::Internal(format!("Failed to parse SimpleChunkList: {}", e)))?;
-                let mut offset = 0;
-                for chunk_id in chunk_list {
-                    self.pull_chunk(chunk_id, None).await?;
-                }
+                self.pull_chunklist(&content_obj_id, pull_mode,progress_callback).await?;
                 return Ok(());
             } else {
                 return Err(NdnError::Internal(format!("Unsupported content obj type: {}", content_obj_id.obj_type)));
             }
         }
     }
+
+    //准备dir_object,并列出所有需要下载的chunk
+    // pub async fn prepare_dir_object(&self,dir_obj:&ObjId,last_dir_obj:Option<ObjId>) -> NdnResult<()>{
+    //     unimplemented!()
+    // }
     
-    pub async fn pull_dir_imp(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject) -> NdnResult<()>{
+    pub async fn pull_dir(&self,ndn_mgr_id:Option<&str>,dir_obj:DirObject,
+        pull_mode:StoreMode, progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> NdnResult<()>{
         //TODO: ndn_mgr需要有一个可信的，容器对象都存在的标签，来快速检查
         for (sub_name,sub_item) in dir_obj.iter() {
             let sub_item_type = sub_item.get_obj_type();
             match sub_item_type.as_str() {
                 OBJ_TYPE_DIR => {
-                    let sub_item_obj = sub_item.get_obj()?;
+                    let (sub_item_obj_id,_) = sub_item.get_obj_id()?;
+                    let sub_item_obj = self.get_obj_by_id(sub_item_obj_id).await?;
                     let sub_dir: DirObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse DirObject: {}", e)))?;
-                    Box::pin(self.pull_dir_imp(ndn_mgr_id,sub_dir)).await?;
+                    let sub_pull_mode = pull_mode.gen_sub_store_mode(sub_name);
+                    
+                    Box::pin(self.pull_dir(ndn_mgr_id,sub_dir,pull_mode.clone(),progress_callback.clone())).await?;
                 }
                 OBJ_TYPE_FILE => {
                     // placeholder for file handling
                     let sub_item_obj = sub_item.get_obj()?;
+                    let (sub_item_obj_id, sub_item_obj_str) = sub_item.get_obj_id()?;
+                
                     let sub_file: FileObject = serde_json::from_value(sub_item_obj)
                         .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
-                    self.pull_file_imp(sub_file).await?;
+                    let sub_file_size = sub_file.size;
+                    NamedDataMgr::put_object(ndn_mgr_id, &sub_item_obj_id, &sub_item_obj_str).await?;
+                    
+                    let sub_pull_mode = pull_mode.gen_sub_store_mode(sub_name);
+                    self.pull_file(sub_file,pull_mode.clone(),progress_callback.clone()).await?;
+                    if let Some(progress_callback) = progress_callback.clone() {
+                        let mut progress_callback = progress_callback.lock().await;
+                        let callback_result = progress_callback(sub_name.clone(), NdnAction::FileOK(sub_item_obj_id.clone(),sub_file_size)).await?;
+                        if !callback_result.is_continue() {
+                            info!("pull_dir: stopped by progress callback");
+                            return Ok(());
+                        }
+                    }
+                    
                 }
                 _ => {
                     warn!("pull_dir: unknown sub item type:{}",sub_item_type);
                     continue;
                 }
             }
+
         }
         Ok(())
     }
 
+    //使用这种模式是发布方承诺用 R-Link发布FileObject,用O-Link发布chunk的模式
+    //返回下载成功的FileObj和obj_id，下载成功后named mgr中chunk存在于cache中
+    pub async fn download_fileobj(&self,fileobj_url:&str,local_path:&PathBuf,no_verify:Option<bool>) -> NdnResult<(ObjId,FileObject)> {
+        let (obj_id, file_obj_json) = self.get_obj_by_url(fileobj_url, None).await?;
+        
+        // 解析FileObject
+        let file_obj: FileObject = serde_json::from_value(file_obj_json.clone())
+            .map_err(|e| NdnError::Internal(format!("Failed to parse FileObject: {}", e)))?;
+        let file_obj_size = file_obj.size;
+
+        self.pull_file(file_obj.clone(), StoreMode::LocalFile(local_path.clone(), 0..file_obj_size, false), None).await?;
+
+        let local_file_obj_path = local_path.with_extension("fileobj");
+            //dump file_obj to local_file_obj_path
+        tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj_json).unwrap()).await
+            .map_err(|e| NdnError::IoError(format!("Failed to write fileobj to local file: {}", e)))?;
+
+        Ok((obj_id, file_obj))
+    }
     pub async fn remote_is_better(&self,url:&str,local_path:&PathBuf) -> NdnResult<bool> {
         // 1. 通过url下载fileojbect对象
         // 2. 计算本地文件的hash 
@@ -753,8 +729,41 @@ impl NdnClient {
         Ok(file_chunk_id != content_chunk_id)
     }
 
-    pub async fn pull_chunk_by_url(&self, chunk_url:String,chunk_id:ChunkId,mgr_id:Option<&str>)->NdnResult<u64> {
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
+    pub async fn pull_chunklist(&self, chunk_list_id:&ObjId,pull_mode:StoreMode,mut progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>)->NdnResult<u64>{
+        //在chunklist下载中，允许使用多源
+        let chunk_list_obj_data = self.get_obj_by_id(chunk_list_id.clone()).await?;
+        let chunk_list:Vec<ChunkId> = serde_json::from_value(chunk_list_obj_data)
+            .map_err(|e| NdnError::Internal(format!("Failed to parse SimpleChunkList: {}", e)))?;
+        let mut offset = 0;
+        for chunk_id in chunk_list {
+            let chunk_size = chunk_id.get_length();
+            if chunk_size.is_none() {
+                return Err(NdnError::Internal(format!("Failed to get chunk size: {}", chunk_id.to_string())));
+            }
+            let chunk_size = chunk_size.unwrap();
+            let chunk_pull_mode:StoreMode;
+            let the_pull_mode = pull_mode.clone();
+            match the_pull_mode {
+                StoreMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
+                    chunk_pull_mode = StoreMode::LocalFile(local_path.clone(), 
+                        range.start + offset..range.start + offset + chunk_size, need_pull_to_named_mgr);
+                }
+                _ => {
+                    chunk_pull_mode = the_pull_mode;
+                }
+            }
+            let copy_size = self.pull_chunk( chunk_id, chunk_pull_mode).await?;
+            offset += chunk_size;
+        }
+
+        info!("pull_chunklist {} OK, total size:{}",chunk_list_id.to_string(),offset);
+        return Ok(offset);
+    }
+
+    //TODO: support muilt remote source,when open remote reader failed, try next source
+    //return download size
+    pub async fn pull_chunk_by_url(&self, chunk_url:String,chunk_id:ChunkId,pull_mode:StoreMode)->NdnResult<u64> {
+        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref()).await;
         if named_mgr.is_none() {
             return Err(NdnError::Internal("no named data mgr".to_string()));
         }
@@ -765,16 +774,23 @@ impl NdnClient {
         // query chunk state from named_mgr (if chunk is completed, return already exists)
         let (chunk_state,_chunk_size,progress) = real_named_mgr.query_chunk_state_impl(&chunk_id).await?;
         drop(real_named_mgr);
-
+        
+        //open remote reader
         let mut real_hash_state = None;
         let mut download_pos = 0;
-        let mut reader = None;
+        let mut remote_reader = None;
         match chunk_state {
-            ChunkState::Completed => {
-                warn!("pull_chunk: chunk {} already exists at named_mgr:{:?}",chunk_id.to_string(),&mgr_id);
-                return Ok(0);
+            ChunkState::Completed  => {
+                info!("pull_chunk: chunk {} already exists at named_mgr",chunk_id.to_string());
             },
-            ChunkState::NotExist => {
+            ChunkState::Disabled => {
+                warn!("pull_chunk: chunk {} is disabled at named_mgr",chunk_id.to_string());
+                return Err(NdnError::InvalidState(format!("{} is disable",chunk_id.to_string())));
+            },
+            ChunkState::LocalLink(link_data) => {
+                warn!("pull_chunk: chunk {} is a local link at named_mgr",chunk_id.to_string());
+            },
+            ChunkState::NotExist | ChunkState::New => {
                 //no progess info
                 let open_result = self.open_chunk_reader_by_url(chunk_url.as_str(),Some(chunk_id.clone()),None).await;
                 if open_result.is_err() {
@@ -783,9 +799,9 @@ impl NdnClient {
                 }
                 let (mut _reader,resp_headers) = open_result.unwrap();
                 chunk_size = resp_headers.obj_size.unwrap();
-                reader = Some(_reader);
+                remote_reader = Some(_reader);
             },
-            _ => {
+            ChunkState::Incompleted => {
                 chunk_size = _chunk_size;
                 // use progress info to open reader send request with range to remote
                 if progress.len() > 2 {
@@ -816,52 +832,93 @@ impl NdnClient {
                     return Err(NdnError::NotFound(chunk_id.to_string()));
                 }
                 let (mut _reader,resp_headers) = open_result.unwrap();
-                reader = Some(_reader);
+                remote_reader = Some(_reader);
                 info!("pull_chunk: open chunk reader success,chunk_id:{},chunk_size:{},download_pos:{}",
                     chunk_id.to_string(),chunk_size,download_pos);
             },
         }
-        // open chunk writer with progress info
-        let real_named_mgr = named_mgr.lock().await;
-        let (mut chunk_writer,progress_info) = real_named_mgr.open_chunk_writer_impl(&chunk_id,chunk_size,download_pos).await?;
-        drop(real_named_mgr);
-        let named_mgr2 = named_mgr.clone();
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
-        let progress_callback = {
-            Some(Box::new(move |chunk_id: ChunkId, pos: u64, hasher: &Option<ChunkHasher>| {
-                let this_chunk_id = chunk_id.clone();
-                let mut json_progress_str = String::new();
-                if let Some(hasher) = hasher {
-                    let state = hasher.save_state();
-                    if state.is_err() {
-                        warn!("pull_chunk: save state failed:{}",state.err().unwrap().to_string());                  
-                    } else {
-                        let state = state.unwrap();
-                        json_progress_str = serde_json::to_string(&state).unwrap(); 
-                    }
-                }
-                let counter = counter.clone();
-                let named_mgr2 = named_mgr2.clone();
-                
-                Box::pin(async move {
-                    let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count % 16 == 0 {
-                        if !json_progress_str.is_empty() {
-                            let mut real_named_mgr = named_mgr2.lock().await;
-                            real_named_mgr.update_chunk_progress_impl(&this_chunk_id,json_progress_str).await?;
+        
+        //copy chunk from remote to named_mgr and local file
+        if remote_reader.is_none() {
+            if !pull_mode.is_store_to_local() {
+                info!("pull_chunk OK. chunk already exists at named_mgr.");
+                return Ok(0);
+            } else {
+                //local to local
+                let mut real_named_mgr = named_mgr.lock().await;
+                let (mut local_reader,_) = real_named_mgr.open_chunk_reader_impl(&chunk_id,0,true).await?;
+                drop(real_named_mgr);
+                let mut local_writer = pull_mode.open_local_writer().await?;
+                debug!("pull_chunk: copy chunk from ndn_mgr => local_file ...");
+                tokio::io::copy(&mut remote_reader.unwrap(), &mut local_writer).await?;
+                info!("pull_chunk OK, copy chunk from ndn_mgr => local_file success");
+                return Ok(chunk_size);
+            }
+        } else {
+            let mut remote_reader = remote_reader.unwrap();
+            if pull_mode.need_store_to_named_mgr() {
+                // open chunk writer with progress info
+                let real_named_mgr = named_mgr.lock().await;
+                let (mut chunk_writer,progress_info) = real_named_mgr.open_chunk_writer_impl(&chunk_id,chunk_size,download_pos).await?;
+                drop(real_named_mgr);
+                let named_mgr2 = named_mgr.clone();
+                let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+                let progress_callback = {
+                    Some(Box::new(move |chunk_id: ChunkId, pos: u64, hasher: &Option<ChunkHasher>| {
+                        let this_chunk_id = chunk_id.clone();
+                        let mut json_progress_str = String::new();
+                        if let Some(hasher) = hasher {
+                            let state = hasher.save_state();
+                            if state.is_err() {
+                                warn!("pull_chunk: save state failed:{}",state.err().unwrap().to_string());                  
+                            } else {
+                                let state = state.unwrap();
+                                json_progress_str = serde_json::to_string(&state).unwrap(); 
+                            }
                         }
-                    }
-                    Ok(())
-                }) as Pin<Box<dyn Future<Output = NdnResult<()>> + Send>>
-            }) as Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>)
-        };
+                        let counter = counter.clone();
+                        let named_mgr2 = named_mgr2.clone();
+                        
+                        Box::pin(async move {
+                            let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if count % 16 == 0 {
+                                if !json_progress_str.is_empty() {
+                                    let mut real_named_mgr = named_mgr2.lock().await;
+                                    real_named_mgr.update_chunk_progress_impl(&this_chunk_id,json_progress_str).await?;
+                                }
+                            }
+                            Ok(())
+                        }) as Pin<Box<dyn Future<Output = NdnResult<()>> + Send>>
+                    }) as Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>)
+                };
 
-        let reader = reader.unwrap();
-        let copy_result = copy_chunk(chunk_id.clone(), reader, chunk_writer, real_hash_state, progress_callback).await?;
-        named_mgr.lock().await.complete_chunk_writer_impl(&chunk_id).await?;
-        return Ok(copy_result);
+                let copy_result = copy_chunk(chunk_id.clone(), &mut remote_reader, &mut chunk_writer, real_hash_state, progress_callback).await?;
+                named_mgr.lock().await.complete_chunk_writer_impl(&chunk_id).await?;
+                info!("pull_chunk OK, copy chunk from remote => named_mgr success");
+                if pull_mode.is_store_to_local() {
+                    let mut real_named_mgr = named_mgr.lock().await;
+                    let (mut local_reader,_) = real_named_mgr.open_chunk_reader_impl(&chunk_id,0,true).await?;
+                    drop(real_named_mgr);
+                    let mut local_writer = pull_mode.open_local_writer().await?;
+                    debug!("pull_chunk: copy chunk from ndn_mgr => local_file ...");
+                    
+                    tokio::io::copy(&mut remote_reader, &mut local_writer).await?;
+                    info!("pull_chunk OK, copy chunk from ndn_mgr => local_file success");
+                    return Ok(chunk_size);
+                } else {
+                    return Ok(copy_result);
+                }
+            } else {
+                let mut local_writer = pull_mode.open_local_writer().await?;
+                debug!("pull_chunk: copy chunk from remote => local_file ...");
+                copy_chunk(chunk_id.clone(), &mut remote_reader, &mut local_writer, None, None).await?;
+                info!("pull_chunk OK, copy chunk from remote => local_file success");
+                return Ok(chunk_size);
+            }
+        }
     }
 
+    
     
     //async fn open_chunk_writer_by_url(&self,chunk_url:String,open_mode:ChunkWriterOpenMode)->NdnResult<(ChunkWriter,Option<ChunkHasher>)> {
     //    unimplemented!()

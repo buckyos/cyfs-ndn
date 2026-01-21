@@ -1,0 +1,601 @@
+{
+  "total_size": 1268095537,
+  "file_count": 74,
+  "file_size": 1261121897,
+  "body": {
+    "sqlite-tools-osx-x64-3490100": "cydir:0db931deec2d6842e42a8699e1824f4f187212057752f4f684c2ad78fb35e246",
+    "P020250114657396557396.xlsx": {
+      "body": {
+        "content": "mix256:d6d107077300b2473eaf967b3bba9bd0525c41f059defabc6bfff3873cb1ae796a61a2",
+        "name": "P020250114657396557396.xlsx",
+        "size": 125142
+      },
+      "obj_type": "cyfile"
+    },
+    "meta.db": {
+      "body": {
+        "content": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5",
+        "name": "meta.db",
+        "size": 155648
+      },
+      "obj_type": "cyfile"
+    },
+    "测试数据.zip": {
+      "body": {
+        "content": "mix256:8d63dac8891c9725b8ab235a62118a659e64f794d6ef550d2e7f3457643cf62d104e",
+        "name": "测试数据.zip",
+        "size": 12685
+      },
+      "obj_type": "cyfile"
+    },
+    ".localized": {
+      "body": {
+        "content": "",
+        "name": ".localized",
+        "size": 0
+      },
+      "obj_type": "cyfile"
+    },
+    "zone UI.drawio": {
+      "body": {
+        "content": "mix256:eca71285396efa41a1dfc5af795933aad4814202f085f9842cddae81d8a3892b37c518",
+        "name": "zone UI.drawio",
+        "size": 300012
+      },
+      "obj_type": "cyfile"
+    },
+    "image.png": {
+      "body": {
+        "content": "mix256:c083109a27cd3da353633cd232083263245facf1e51234974a222bf5586a2d8705b474",
+        "name": "image.png",
+        "size": 262592
+      },
+      "obj_type": "cyfile"
+    },
+    "Coll Token.docx": {
+      "body": {
+        "content": "mix256:dd7d36eaee8ae36d5fea215403913755679074bf94135b5b6138c491e78b5041110e",
+        "name": "Coll Token.docx",
+        "size": 16093
+      },
+      "obj_type": "cyfile"
+    },
+    "VeraCrypt_1.26.20.dmg": {
+      "body": {
+        "content": "mix256:9cbcb1070685b55f0ca1ad47020301de1b1f1008c8142864c4a1f5e48eb69a914a34f9af",
+        "name": "VeraCrypt_1.26.20.dmg",
+        "size": 15490588
+      },
+      "obj_type": "cyfile"
+    },
+    "go1.25.0.linux-amd64 (1).tar.gz": {
+      "body": {
+        "content": "clist:cda7b91c026cfce59f0cde88a0e8b3bf970bd752918e51bfde2f6501d155a9b49c91fcf3",
+        "create_time": 1755329130,
+        "size": 59659213
+      },
+      "obj_type": "cyfile"
+    },
+    "libsciter.dylib": {
+      "body": {
+        "content": "clist:80d1d30b5946d8b47b0d8ab01170e05f115ae84218b3977ac840877508284c7667e18998",
+        "name": "libsciter.dylib",
+        "size": 24438912
+      },
+      "obj_type": "cyfile"
+    },
+    "W3 - Signed Side Letter for Token Warrant with BRV(1).pdf": {
+      "body": {
+        "content": "mix256:ce9c0e592c104b8ef7dcd320b232000261821523340bb12c6facf8681c4d5e0e757ab1",
+        "name": "W3 - Signed Side Letter for Token Warrant with BRV(1).pdf",
+        "size": 233038
+      },
+      "obj_type": "cyfile"
+    },
+    "Fog Works Zhicong Employment Offer Letter (Signed) (1).pdf": {
+      "body": {
+        "content": "mix256:9bcc069f7ec08a8d5e1d40fceb2006c8f45fc643b700e2dad34eb57827c2c85316aef0",
+        "name": "Fog Works Zhicong Employment Offer Letter (Signed) (1).pdf",
+        "size": 108059
+      },
+      "obj_type": "cyfile"
+    },
+    "node_daemon_434100.log": {
+      "body": {
+        "content": "mix256:b7d94d2c8bb998ef8fbb67d6712c5c22a82a1be7cfc6c684a363889716826d91ecd279",
+        "name": "node_daemon_434100.log",
+        "size": 1273015
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos copy.tar": {
+      "body": {
+        "content": "clist:f58a9324eee76fa7a052e885a381db80382cc64afe8adcf412b5b910c80bd097c18a369a",
+        "create_time": 1753080394,
+        "size": 75810165
+      },
+      "obj_type": "cyfile"
+    },
+    "xB51-P02-GR.zip": {
+      "body": {
+        "content": "mix256:ddc0cf039f234a43ad5d5e80b0a64b5c6e57255cdb1207cf6238a55d6f9b576a6e35d8a8",
+        "name": "xB51-P02-GR.zip",
+        "size": 7594077
+      },
+      "obj_type": "cyfile"
+    },
+    "macfuse-4.10.1.dmg": {
+      "body": {
+        "content": "mix256:f5ba8b03a523fcc910534ce7d8c616c5eef2e5026ee36440510df4bdd9477c44744ae6bf",
+        "name": "macfuse-4.10.1.dmg",
+        "size": 6479221
+      },
+      "obj_type": "cyfile"
+    },
+    "c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.db": {
+      "body": {
+        "content": "mix256:80a00370dd45bf3a622d0b0861aaf45ab4476f3e19dd18e877e15357a63821bdb6eeb3",
+        "name": "c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.db",
+        "size": 53248
+      },
+      "obj_type": "cyfile"
+    },
+    "ChatGPT_Atlas.dmg": {
+      "body": {
+        "content": "clist:ead8fb6d8e14d442bebdda1111f2fe836e06164ae54bc54b63d913e66fdc124a40782744",
+        "name": "ChatGPT_Atlas.dmg",
+        "size": 230616170
+      },
+      "obj_type": "cyfile"
+    },
+    "go1.25.0.linux-amd64.tar.gz": {
+      "body": {
+        "content": "clist:cda7b91c026cfce59f0cde88a0e8b3bf970bd752918e51bfde2f6501d155a9b49c91fcf3",
+        "name": "go1.25.0.linux-amd64.tar.gz",
+        "size": 59659213
+      },
+      "obj_type": "cyfile"
+    },
+    "meta_index.db": {
+      "body": {
+        "content": "mix256:80e00c8ef01bd1dc5855c10c5b3eecc8215fd117e91889ba1625556026a6d0481b8edc",
+        "name": "meta_index.db",
+        "size": 208896
+      },
+      "obj_type": "cyfile"
+    },
+    "Gemini_Generated_Image_qyp42pqyp42pqyp4.png": {
+      "body": {
+        "content": "mix256:a5b84d7764a364a7da93d230d7648f3dd706fb79fc1289da68191de3e24c548c98beda",
+        "name": "Gemini_Generated_Image_qyp42pqyp42pqyp4.png",
+        "size": 1268773
+      },
+      "obj_type": "cyfile"
+    },
+    "mutex.md": {
+      "body": {
+        "content": "mix256:e51dd72e6256218e9f44ecd15f19540f02a9a50eeeb10ac7550e7991f34f218f20ee",
+        "name": "mutex.md",
+        "size": 3813
+      },
+      "obj_type": "cyfile"
+    },
+    "bucky.ai.tar": {
+      "body": {
+        "content": "mix256:80508113395bb7fbd43dbc8719772ae746a152ea9e93cf1444b2f14bf9c477ee93e4",
+        "name": "bucky.ai.tar",
+        "size": 10240
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos - Plan.tsv": {
+      "body": {
+        "content": "mix256:8b2122f98f977c7471a5bdbe944940aba074a349eb6b4bcb879afa8c5859adb1c3e6",
+        "name": "buckyos - Plan.tsv",
+        "size": 4235
+      },
+      "obj_type": "cyfile"
+    },
+    "1095-B.pdf": {
+      "body": {
+        "content": "mix256:e18d17169ec91655598585eda2af1608b499a02ba8ac8b1fbf1c2a32d76b61001328c5",
+        "name": "1095-B.pdf",
+        "size": 378593
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos.tar": {
+      "body": {
+        "content": "clist:f58a9324eee76fa7a052e885a381db80382cc64afe8adcf412b5b910c80bd097c18a369a",
+        "name": "buckyos.tar",
+        "size": 75810165
+      },
+      "obj_type": "cyfile"
+    },
+    "platinum-90-hmo-250-30-pcp-child-dental-alt (1).pdf": {
+      "body": {
+        "content": "mix256:9de3ce01322dbd638fc3a362d38595176217e4182688655fc6cd8b041ec59cd9c66b0560",
+        "create_time": 1744242473,
+        "size": 3387805
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos.-.Plan (1).csv": {
+      "body": {
+        "content": "mix256:8b2122f98f977c7471a5bdbe944940aba074a349eb6b4bcb879afa8c5859adb1c3e6",
+        "name": "buckyos.-.Plan (1).csv",
+        "size": 4235
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos-aarch64-0.4.1+build250818.deb": {
+      "body": {
+        "content": "clist:fab3c44ba3d4207d20bf45f9d419e374d3c1390f21e3e8450256598a0a7ffd8f3dc5c791",
+        "name": "buckyos-aarch64-0.4.1+build250818.deb",
+        "size": 158407162
+      },
+      "obj_type": "cyfile"
+    },
+    "SEI14-RAID-Tutorial-.docx": {
+      "body": {
+        "content": "mix256:80f5ce0215650b213f687f5800bb708b45af12bde09b1c53f70cc135e7e2665581f9b2ca",
+        "name": "SEI14-RAID-Tutorial-.docx",
+        "size": 5487232
+      },
+      "obj_type": "cyfile"
+    },
+    "c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.sha256": {
+      "body": {
+        "content": "mix256:80a003603b157a8ba3d755a7a81151abfc00d76caad0845f470f75871c4d5e652726af",
+        "name": "c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.sha256",
+        "size": 53248
+      },
+      "obj_type": "cyfile"
+    },
+    "0701 PI project周例会纪要.docx": {
+      "body": {
+        "content": "mix256:f49a018e43c7b218dbf424bb0e65380de339067b0051a03f774ccec1ca43f9ad3bdf7c",
+        "name": "0701 PI project周例会纪要.docx",
+        "size": 19828
+      },
+      "obj_type": "cyfile"
+    },
+    "default_meta_index.db": {
+      "body": {
+        "content": "mix256:80800806b4fa46e8a4e2097a0722f809c7f8a50c57d424a226e298d3a0a268626e5420",
+        "name": "default_meta_index.db",
+        "size": 131072
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos-aarch64-0.4.1+build250817.deb": {
+      "body": {
+        "content": "clist:b0e3c74b72855f0879c8a2edc0658ac54e33d5959dc865c284e344541ba2799b9fc4fa4a",
+        "name": "buckyos-aarch64-0.4.1+build250817.deb",
+        "size": 158462384
+      },
+      "obj_type": "cyfile"
+    },
+    "W3 - Signed Series Seed Preferred Stock Investment Agreement with Additional Investors.pdf": {
+      "body": {
+        "content": "mix256:edc224a3e06d8c77f5dd01387c0be505c72e5c607e0b91187b7e4ee5755a607a2e71f7",
+        "name": "W3 - Signed Series Seed Preferred Stock Investment Agreement with Additional Investors.pdf",
+        "size": 598381
+      },
+      "obj_type": "cyfile"
+    },
+    "Battle.net-Setup.zip": {
+      "body": {
+        "content": "mix256:d6e4c301d99a5b8965fed6807e5cbe3f1eefcfb4970bf78d8faa93bc0168883086451274",
+        "name": "Battle.net-Setup.zip",
+        "size": 3207766
+      },
+      "obj_type": "cyfile"
+    },
+    "20251015013022-刘智聪的快速会议-转写智能优化版-1.txt": {
+      "body": {
+        "content": "mix256:d6b7021cd57823032f1748b5e3a359ddaacd7e946d923e36316aceb35a8114b09e4f6c",
+        "name": "20251015013022-刘智聪的快速会议-转写智能优化版-1.txt",
+        "size": 39894
+      },
+      "obj_type": "cyfile"
+    },
+    "codes.txt": {
+      "body": {
+        "content": "mix256:ca023628935a01c39f098326a42dfe68098b2d607b99dbdef947723f7822b95e0808",
+        "name": "codes.txt",
+        "size": 330
+      },
+      "obj_type": "cyfile"
+    },
+    "W2_2024.pdf": {
+      "body": {
+        "content": "mix256:e3bd079554a38d06f810d759573b5e8c9911821082c8ec36b1d6c4de5be237adb8c8b9",
+        "name": "W2_2024.pdf",
+        "size": 122595
+      },
+      "obj_type": "cyfile"
+    },
+    ".buckycli_buckyos.ai": "cydir:57cb9d36c2fc41aafc9d414241e48cfcf5d745593eb35cd1586e9063f369be18",
+    "VNC-Connect-Installer-2.3.0-MacOSX-universal.app.zip": {
+      "body": {
+        "content": "mix256:d1b78b01c3bbc7ab1f53f994edd8aff606baea24f7d104780fcfeb99efc1568fb30b6a23",
+        "name": "VNC-Connect-Installer-2.3.0-MacOSX-universal.app.zip",
+        "size": 2284497
+      },
+      "obj_type": "cyfile"
+    },
+    ".DS_Store": {
+      "body": {
+        "content": "mix256:8440a04dd206a78d4befd902689f474200eaea4a3ed905f39c0b0efeba9cab5211cf",
+        "name": ".DS_Store",
+        "size": 8196
+      },
+      "obj_type": "cyfile"
+    },
+    "image (1).png": {
+      "body": {
+        "content": "mix256:f24d0d86d3a3f2885b61f172ecb9cfc399ad2970efb8621aa6178b728f37cf1372d9",
+        "name": "image (1).png",
+        "size": 9970
+      },
+      "obj_type": "cyfile"
+    },
+    "GitHubDesktop-x64.zip": {
+      "body": {
+        "content": "clist:bcd2f857fc082ce8a63e3cfbcf1f155a49692a892b6b87a1c8bed16e520ad09fe2a0f279",
+        "name": "GitHubDesktop-x64.zip",
+        "size": 184428860
+      },
+      "obj_type": "cyfile"
+    },
+    "openwrt-24.10.1-armsr-armv8-generic-ext4-combined-efi.img.gz": {
+      "body": {
+        "content": "mix256:a6b7cf06a06f925f514c8edcfd97824dd0925692590638ab32a74c200d74bd2919337af6",
+        "name": "openwrt-24.10.1-armsr-armv8-generic-ext4-combined-efi.img.gz",
+        "size": 13884326
+      },
+      "obj_type": "cyfile"
+    },
+    "Gemini_Generated_Image_82cpz282cpz282cp.png": {
+      "body": {
+        "content": "mix256:e3934b0cbca2e9e015f2c8ef28a67700542b406a4673b62a2df1399c575b6023c12cf6",
+        "name": "Gemini_Generated_Image_82cpz282cpz282cp.png",
+        "size": 1231331
+      },
+      "obj_type": "cyfile"
+    },
+    "Transfers_20251026.xlsx": {
+      "body": {
+        "content": "mix256:aca0013d1083a4a97339bde17c34da43b2737465729eb10c969b1a3b349e5b8bba5365",
+        "name": "Transfers_20251026.xlsx",
+        "size": 20524
+      },
+      "obj_type": "cyfile"
+    },
+    "invite.ics": {
+      "body": {
+        "content": "mix256:a81e847dc94b3a5e5207bd659bfdef45a56efe12e331ffe4a9c2973e946bf400a0cb",
+        "name": "invite.ics",
+        "size": 3880
+      },
+      "obj_type": "cyfile"
+    },
+    "0701 PI project周例会纪要2.docx": {
+      "body": {
+        "content": "mix256:edbb01fa8b507305c95d1c0d1efa89388bf4d6d56c5b6e655f0e91e61de97573674752",
+        "name": "0701 PI project周例会纪要2.docx",
+        "size": 24045
+      },
+      "obj_type": "cyfile"
+    },
+    "platinum-90-hmo-250-30-pcp-child-dental-alt.pdf": {
+      "body": {
+        "content": "mix256:9de3ce01322dbd638fc3a362d38595176217e4182688655fc6cd8b041ec59cd9c66b0560",
+        "name": "platinum-90-hmo-250-30-pcp-child-dental-alt.pdf",
+        "size": 3387805
+      },
+      "obj_type": "cyfile"
+    },
+    "sn_db.sqlite3": {
+      "body": {
+        "content": "mix256:80e004a6c2cbcd51fbdc205582c90786fb6d969abb838a56db1c585ca5809085c97815",
+        "name": "sn_db.sqlite3",
+        "size": 77824
+      },
+      "obj_type": "cyfile"
+    },
+    "腾讯云-华凯（广州）通信-震有合同 (1).rar": {
+      "body": {
+        "content": "mix256:c6e381010d4d15fa991f9e0dc76c6ded88238e6722dd6755ce022bff3c50baff22d6c5fb",
+        "name": "腾讯云-华凯（广州）通信-震有合同 (1).rar",
+        "size": 2126278
+      },
+      "obj_type": "cyfile"
+    },
+    "IMG_20250303_172513.jpg": {
+      "body": {
+        "content": "mix256:e4a59f020107ceb7368f51e28e98d6652701fb8ec1b0f8536014482bccd82ca76017ec99",
+        "name": "IMG_20250303_172513.jpg",
+        "size": 4707044
+      },
+      "obj_type": "cyfile"
+    },
+    "platinum-90-hmo-0-10-pcp-child-dental-alt.pdf": {
+      "body": {
+        "content": "mix256:b9edcf01968796fc8d98fba5c05f5ba64e5c49586cd14703def30cf1bb804c39c2e49187",
+        "name": "platinum-90-hmo-0-10-pcp-child-dental-alt.pdf",
+        "size": 3405497
+      },
+      "obj_type": "cyfile"
+    },
+    "cyfs_gateway_158252.log": {
+      "body": {
+        "content": "mix256:82f64cbb5e563fbed0ff4a0da492e7ca1f1cf51e2c1e6a742868cbb31429a17716d477",
+        "name": "cyfs_gateway_158252.log",
+        "size": 1260290
+      },
+      "obj_type": "cyfile"
+    },
+    "SpotHero _ Get Everywhere Easier _ Reserve Parking and Save.pdf": {
+      "body": {
+        "content": "mix256:cfd1e5016380fcc2c238becc3e1058402d1b76b89a36613947db4bb5d5d01f86352c0045",
+        "name": "SpotHero _ Get Everywhere Easier _ Reserve Parking and Save.pdf",
+        "size": 3762383
+      },
+      "obj_type": "cyfile"
+    },
+    "IMG_20250303_163416.jpg": {
+      "body": {
+        "content": "mix256:c1adc401f49162398c13611e0793f42aad8ffdde915cfd1279bd5ee19955eff2116d1335",
+        "name": "IMG_20250303_163416.jpg",
+        "size": 3217089
+      },
+      "obj_type": "cyfile"
+    },
+    "imToken-v2.apk": {
+      "body": {
+        "content": "clist:b3d09f22cd5d6d9e9645cc77131fe654bb51f402cf9e32383fb3cfbe97fe2fb18d1ae215",
+        "name": "imToken-v2.apk",
+        "size": 71821363
+      },
+      "obj_type": "cyfile"
+    },
+    "红楼梦.txt": {
+      "body": {
+        "content": "mix256:e9fe99015eca888fb54188d644df70fa555dd3c9cbdd3a8d7b3034fb59f7a81e16f05dc7",
+        "name": "红楼梦.txt",
+        "size": 2522985
+      },
+      "obj_type": "cyfile"
+    },
+    "PlayCover_3.1.0.dmg": {
+      "body": {
+        "content": "mix256:cbc5d3025c3a291827f4802f665daf5c33a6bfe6ef0df2c6dff3f9e554db6514176196e7",
+        "name": "PlayCover_3.1.0.dmg",
+        "size": 5563083
+      },
+      "obj_type": "cyfile"
+    },
+    "Transfers_20251026.csv": {
+      "body": {
+        "content": "mix256:c359b33b42afa1db1513bcd94053c8791d6a929221d0b3a10280cd736294243e18a0",
+        "name": "Transfers_20251026.csv",
+        "size": 11459
+      },
+      "obj_type": "cyfile"
+    },
+    "sqlite-tools-osx-x64-3490100.zip": {
+      "body": {
+        "content": "mix256:8e9fe2016157747edc48434758d8955be24fb4f1181e2733e7e041c390441b79a291f8e9",
+        "name": "sqlite-tools-osx-x64-3490100.zip",
+        "size": 3706766
+      },
+      "obj_type": "cyfile"
+    },
+    "gold-80-hmo-0-35-pcp-child-dental-alt.pdf": {
+      "body": {
+        "content": "mix256:d7b0ce016d38ff4da75ea31e4333a3d6e225c10944a0f71663d3721ed71d2f251f5728c0",
+        "name": "gold-80-hmo-0-35-pcp-child-dental-alt.pdf",
+        "size": 3381335
+      },
+      "obj_type": "cyfile"
+    },
+    "e9b3d84c8db05800cd5c05c814017aa4.jpg": {
+      "body": {
+        "content": "mix256:d5dc152c012b80488dc77f53885416c841bb24bf0d1e9ab2b4c3453ab81ac51f0e8cc3",
+        "name": "e9b3d84c8db05800cd5c05c814017aa4.jpg",
+        "size": 355925
+      },
+      "obj_type": "cyfile"
+    },
+    "渠道付款统计.xlsx": {
+      "body": {
+        "content": "mix256:bcbb6c9adcd280d847ac226f6835b179e4d6fa4e162c20715e7d9054c06dcd87fc5796",
+        "name": "渠道付款统计.xlsx",
+        "size": 1777084
+      },
+      "obj_type": "cyfile"
+    },
+    "rustdesk-1.4.3-aarch64.dmg": {
+      "body": {
+        "content": "clist:83b0b90b43fb4cdb3c87bed1a48db1b13a6c59848ebd83d69bd056ca10becab0fa548ddb",
+        "name": "rustdesk-1.4.3-aarch64.dmg",
+        "size": 24008707
+      },
+      "obj_type": "cyfile"
+    },
+    "7z2500-mac.tar.xz": {
+      "body": {
+        "content": "mix256:dca472fc7bf340ce41b1ef08eb468e2900152a61ca83dc227d925ac73f49c1ea1f59a2",
+        "name": "7z2500-mac.tar.xz",
+        "size": 1872476
+      },
+      "obj_type": "cyfile"
+    },
+    "scheduler_6121.log": {
+      "body": {
+        "content": "mix256:a281c0074d6792d92a5b76e6182b972205c6c6339b42e9bc9d4ef4f4b41b19a7f7e33a6c",
+        "name": "scheduler_6121.log",
+        "size": 15728802
+      },
+      "obj_type": "cyfile"
+    },
+    "mpt_filesystem_example.rs": {
+      "body": {
+        "content": "mix256:d20f7fb4ee628775fddba5524005ba6ee5d58b942e00543d63357d6f9af02ddebb66",
+        "name": "mpt_filesystem_example.rs",
+        "size": 2002
+      },
+      "obj_type": "cyfile"
+    },
+    "test.db": {
+      "body": {
+        "content": "mix256:80e015c7489d07e8b5622bec83d514913976584d4d8f82baf624dd6df250dc2a9b3cc0",
+        "name": "test.db",
+        "size": 356352
+      },
+      "obj_type": "cyfile"
+    },
+    "Pantum P2200-P2500-P2600-S2000 Series Mac Driver V1_11_14 Codesign.dmg": {
+      "body": {
+        "content": "mix256:d6febb023810c64e6d25c1263d9119df1f242eecf54b19a13bee1aaecf38829b0d4c2bf7",
+        "name": "Pantum P2200-P2500-P2600-S2000 Series Mac Driver V1_11_14 Codesign.dmg",
+        "size": 5177174
+      },
+      "obj_type": "cyfile"
+    },
+    "VNC-Viewer-7.13.1-MacOSX-universal.dmg": {
+      "body": {
+        "content": "mix256:f182d70359177c10479e7d773a2df82d58a4f73b056d1c354b85b11b1040218b3c10419c",
+        "name": "VNC-Viewer-7.13.1-MacOSX-universal.dmg",
+        "size": 7717233
+      },
+      "obj_type": "cyfile"
+    },
+    "meta_index.db_": {
+      "body": {
+        "content": "mix256:0474234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+        "name": "meta_index.db_",
+        "size": 4
+      },
+      "obj_type": "cyfile"
+    },
+    "buckyos.-.Plan.csv": {
+      "body": {
+        "content": "mix256:8b2122f98f977c7471a5bdbe944940aba074a349eb6b4bcb879afa8c5859adb1c3e6",
+        "name": "buckyos.-.Plan.csv",
+        "size": 4235
+      },
+      "obj_type": "cyfile"
+    },
+    "gold-80-hmo-0-35-pcp-child-dental-alt (1).pdf": {
+      "body": {
+        "content": "mix256:d7b0ce016d38ff4da75ea31e4333a3d6e225c10944a0f71663d3721ed71d2f251f5728c0",
+        "create_time": 1744242330,
+        "size": 3381335
+      },
+      "obj_type": "cyfile"
+    }
+  }
+}

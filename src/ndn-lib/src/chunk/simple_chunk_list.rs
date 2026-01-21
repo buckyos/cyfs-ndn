@@ -62,6 +62,20 @@ impl SimpleChunkList {
         (result_id, obj_str)
     }
 
+    pub fn from_json(obj_str: &str) -> NdnResult<Self> {
+        let chunk_list:Vec<ChunkId> = serde_json::from_str(obj_str).map_err(|e| {
+            NdnError::InvalidParam(format!("parse chunk list from json failed: {}", e.to_string()))
+        })?;
+        Self::from_chunk_list(chunk_list)
+    }
+
+    pub fn from_json_value(obj_value: serde_json::Value) -> NdnResult<Self> {
+        let chunk_list:Vec<ChunkId> = serde_json::from_value(obj_value).map_err(|e| {
+            NdnError::InvalidParam(format!("parse chunk list from json failed: {}", e.to_string()))
+        })?;
+        Self::from_chunk_list(chunk_list)
+    }
+
     //return (chunk_index,chunk_offset)
     pub fn get_chunk_index_by_offset(&self, seek_from: SeekFrom) -> NdnResult<(usize, u64)> {
         unimplemented!()
@@ -134,7 +148,7 @@ impl SimpleChunkListReader {
     ) -> std::io::Result<ChunkReader> {
         let mut mgr = named_data_mgr.lock().await;
         let (reader, _) = mgr
-            .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(offset), auto_cache)
+            .open_chunk_reader_impl(&chunk_id, offset, auto_cache)
             .await
             .map_err(|e| {
                 warn!(

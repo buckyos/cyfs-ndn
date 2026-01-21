@@ -375,8 +375,8 @@ impl MetaIndexDb {
         
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(pkg_name.to_string()),
-            Box::new(min_version),
-            Box::new(max_version)
+            Box::new(min_version as i64),
+            Box::new(max_version as i64)
         ];
         
         if let Some(tag_value) = tag {
@@ -470,7 +470,7 @@ impl MetaIndexDb {
                 // 插入新记录
                 tx.execute(
                     "INSERT INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    params![meta_node.pkg_name, meta_node.author, meta_node.version, version_int, metaobjid, meta_node.tag, current_time],
+                    params![meta_node.pkg_name, meta_node.author, meta_node.version, version_int as i64, metaobjid, meta_node.tag, current_time],
                 ).map_err(|e| PkgError::SqlError(e.to_string()))?;
             }
         }
@@ -510,7 +510,7 @@ impl MetaIndexDb {
             // 插入新记录
             conn.execute(
                 "INSERT INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![pkgname, author, version, version_int, metaobjid, tag, current_time],
+                params![pkgname, author, version, version_int as i64, metaobjid, tag, current_time],
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
 
@@ -592,7 +592,7 @@ impl MetaIndexDb {
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, u64>(3)?,
+                row.get::<_, i64>(3)? as u64,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, i64>(6)?
@@ -603,7 +603,7 @@ impl MetaIndexDb {
             let (pkg_name, author, version, version_int, metaobjid, tag, update_time) = version_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![pkg_name, author, version, version_int, metaobjid, tag, update_time]
+                params![pkg_name, author, version, version_int as i64, metaobjid, tag, update_time]
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
         
@@ -639,6 +639,7 @@ impl MetaIndexDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use name_lib::DID;
     use tempfile::tempdir;
     use std::cmp::Ordering;
     use serde_json::json;
@@ -650,21 +651,10 @@ mod tests {
         let db_path = temp_dir.path().join("test_meta.db");
         
         let meta_db = MetaIndexDb::new(db_path,false)?;
-        let test_pkg_meta = PackageMeta {
-            pkg_name: "test-pkg".to_string(),
-            description: json!({}),
-            exp: 0,
-            extra_info: HashMap::new(),
-            version: "1.0.1".to_string(),
-            author: "author1".to_string(),
-            tag: Some("stable".to_string()),
-            category: Some("app".to_string()),
-            chunk_id: Some("chunk1".to_string()),
-            chunk_size: Some(100),
-            chunk_url: Some("http://test.com/chunk1".to_string()),
-            deps: HashMap::new(),
-            pub_time: 0,
-        };
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut test_pkg_meta = PackageMeta::new("test-pkg", "1.0.1", "author1", &owner, Some("stable"));
+        test_pkg_meta._base.size = 100;
+        test_pkg_meta._base.content = "chunk1".to_string();
 
         let test_pkg_meta_str = serde_json::to_string(&test_pkg_meta).unwrap();
         
@@ -708,52 +698,41 @@ mod tests {
 
     #[test]
     fn test_version_db_operations() -> PkgResult<()> {
-        std::env::set_var("BUCKY_LOG", "debug");
+        unsafe { std::env::set_var("BUCKY_LOG", "debug"); }
         buckyos_kit::init_logging("package-lib test", false);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_versions.db");
         info!("db_path:{}", db_path.to_string_lossy());
         
         let meta_db = MetaIndexDb::new(db_path,false)?;
-        let mut test_pkg_meta1 = PackageMeta {
-            pkg_name: "test-pkg".to_string(),
-            version: "1.0.0".to_string(),
-            author: "author1".to_string(),
-            tag: Some("stable".to_string()),
-            category: Some("app".to_string()),
-            chunk_id: Some("chunk1".to_string()),
-            chunk_size: Some(100),
-            chunk_url: Some("http://test.com/chunk1".to_string()),
-            deps: HashMap::new(),
-            pub_time: 0,
-            exp: 0,
-            extra_info: HashMap::new(),
-            description: json!({}),
-        };  
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut test_pkg_meta1 = PackageMeta::new("test-pkg", "1.0.0", "author1", &owner, Some("stable"));
+        test_pkg_meta1._base.size = 100;
+        test_pkg_meta1._base.content = "chunk1".to_string();
         let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
         meta_db.add_pkg_meta("meta1", &test_pkg_meta_str1, "author1", Some("pk1".to_string()))?;
 
-        let mut test_pkg_meta2 = PackageMeta::new("test-pkg","1.1.0","author1",None);
+        let mut test_pkg_meta2 = PackageMeta::new("test-pkg","1.1.0","author1",&owner,None);
         let test_pkg_meta_str2 = serde_json::to_string(&test_pkg_meta2).unwrap();
         meta_db.add_pkg_meta("meta2", &test_pkg_meta_str2, "author1", Some("pk1".to_string()))?;
 
-        let mut test_pkg_meta3 = PackageMeta::new("test-pkg","1.2.0","author1",None);
+        let mut test_pkg_meta3 = PackageMeta::new("test-pkg","1.2.0","author1",&owner,None);
         let test_pkg_meta_str3 = serde_json::to_string(&test_pkg_meta3).unwrap();
         meta_db.add_pkg_meta("meta3", &test_pkg_meta_str3, "author1", Some("pk1".to_string()))?;
         
-        let mut test_pkg_meta4 = PackageMeta::new("test-pkg","2.0.0","author1",None);
+        let mut test_pkg_meta4 = PackageMeta::new("test-pkg","2.0.0","author1",&owner,None);
         let test_pkg_meta_str4 = serde_json::to_string(&test_pkg_meta4).unwrap();
         meta_db.add_pkg_meta("meta4", &test_pkg_meta_str4, "author1", Some("pk1".to_string()))?;
         
-        let mut test_pkg_meta5 = PackageMeta::new("test-pkg","0.9.0","author1",None);
+        let mut test_pkg_meta5 = PackageMeta::new("test-pkg","0.9.0","author1",&owner,None);
         let test_pkg_meta_str5 = serde_json::to_string(&test_pkg_meta5).unwrap();
         meta_db.add_pkg_meta("meta5", &test_pkg_meta_str5, "author1", Some("pk1".to_string()))?;
 
-        let mut test_pkg_meta6 = PackageMeta::new("test-pkg2","0.4.0","author1",None);
+        let mut test_pkg_meta6 = PackageMeta::new("test-pkg2","0.4.0","author1",&owner,None);
         let test_pkg_meta_str6 = serde_json::to_string(&test_pkg_meta6).unwrap();
         meta_db.add_pkg_meta("meta6", &test_pkg_meta_str6, "author1", Some("pk1".to_string()))?;
 
-        let mut test_pkg_meta7 = PackageMeta::new("test-pkg2","0.4.0+build250724","author1",None);
+        let mut test_pkg_meta7 = PackageMeta::new("test-pkg2","0.4.0+build250724","author1",&owner,None);
         let test_pkg_meta_str7 = serde_json::to_string(&test_pkg_meta7).unwrap();
         meta_db.add_pkg_meta("meta7", &test_pkg_meta_str7, "author1", Some("pk1".to_string()))?;
 

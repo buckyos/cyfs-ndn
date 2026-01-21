@@ -69,11 +69,11 @@ async fn gen_fix_size_chunk_list_from_file(file_path: &Path, chunk_size: usize) 
         assert_eq!(length as usize, size, "Chunk length mismatch");
 
         // Write the chunk data to chunk manager
-        let (mut writer, _) = NamedDataMgr::open_chunk_writer(None, &mix_chunk_id, size as u64, 0)
+        let (mut writer, _) = chunk_mgr.lock().await.open_chunk_writer_impl(&mix_chunk_id, size as u64, 0)
             .await
             .unwrap();
         writer.write_all(&chunk_data[..size]).await.unwrap();
-        NamedDataMgr::complete_chunk_writer(None, &mix_chunk_id)
+        chunk_mgr.lock().await.complete_chunk_writer_impl( &mix_chunk_id)
             .await
             .unwrap();
 
@@ -166,11 +166,7 @@ async fn test_chunk_list_main() {
         tokio::fs::create_dir_all(&test_dir).await.unwrap();
     }
 
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+    let config = NamedDataMgrConfig::default();
 
     let chunk_mgr = NamedDataMgr::from_config(
         Some("test_chunk_list".to_string()),

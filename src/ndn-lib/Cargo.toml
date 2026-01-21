@@ -4,22 +4,22 @@ version = "0.4.0"
 edition = "2021"
 
 [dependencies]
-log = "*"
-thiserror = "*" 
+log = { workspace = true }
+thiserror = { workspace = true } 
 anyhow = "*"
 base58 = "*"
-serde = { version = "*", features = ["derive"] }
-serde_json = "*" 
-async-trait = "*"
-tokio = { version = "*", features = ["full"] }
+serde = { workspace = true }
+serde_json = { workspace = true } 
+async-trait = { workspace = true }
+tokio = { workspace = true }
 tokio-util = "*"
-reqwest = {version = "*", features = ["json", "rustls-tls","stream"]}
+reqwest = { workspace = true }
 surf = "*"  
 tide = "*" 
 http-types = '*'
-rusqlite = { version = "*", features = ["bundled", "backup"] }
-futures = "*"  
-futures-util = "*"
+rusqlite = { workspace = true }
+futures = { workspace = true }  
+futures-util = { workspace = true }
 hex = "*"
 url = "*"
 memmap = "*"
@@ -50,11 +50,12 @@ pin-project = "*"
 ouroboros = "*"
 fs2 = "*"
 
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit" }
-name-lib ={ git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" }
-name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" }
-tempfile = "*"
+buckyos-kit = { workspace = true }
+name-lib = { workspace = true }
+name-client = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 
 rand = "*"
+env_logger = "*"

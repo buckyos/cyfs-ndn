@@ -1,55 +1,61 @@
-use buckyos_kit::{buckyos_get_unix_timestamp,is_default};
-use serde::{Serialize,Deserialize};
-
-use crate::{ChunkId, LinkData};
+use buckyos_kit::buckyos_get_unix_timestamp;
+use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 use std::collections::HashMap;
-use crate::{OBJ_TYPE_FILE,OBJ_TYPE_PATH,build_named_object_by_json,ObjId};
-use serde_json::Value;
+use crate::{build_named_object_by_json, BaseContentObject, ObjId, OBJ_TYPE_FILE, OBJ_TYPE_PATH};
+use buckyos_kit::is_zero;
 
 //TODO：NDN如何提供一种通用机制，检查FileObject在本地是 完全存在的 ？ 在这里的逻辑是FileObject的Content(存在)
 // 思路：Object如果引用了另一个Object,要区分这个引用是强引用(依赖）还是弱引用，
-#[derive(Serialize,Deserialize,Clone)]
+#[derive(Serialize,Deserialize,Clone,Debug, PartialEq)]
 pub struct FileObject {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub name:String,
-    pub size:u64,
-    pub content:String,//chunkid or chunklistid
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default")]
-    pub exp:u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub meta:Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime:Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner:Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub create_time:Option<u64>,
-    /*
-    chunklist是附加的chunklist列表，可以用嵌入或引用的方法保存多个
-    chunk_list:
-    {
-        "default":[
-            "chunk_id1",
-            "chunk_id2",
-            "chunk_id3"
-        ],
-        "fixsha512":"chunklistid2"
-    }
-     */
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_list:Option<HashMap<String,Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub links:Option<Vec<LinkData>>,
     #[serde(flatten)]
-    pub extra_info: HashMap<String, Value>,
+    pub content_obj:BaseContentObject,
+    #[serde(skip_serializing_if = "is_zero")]
+    #[serde(default)]
+    pub size:u64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default)]
+    pub content:String,//chunkid or chunklistid
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    #[serde(flatten)]
+    pub meta:HashMap<String,serde_json::Value>,
+}
+
+impl Default for FileObject {
+    fn default() -> Self {
+        Self {
+            content_obj: BaseContentObject::default(),
+            size: 0,
+            content: String::new(),
+            meta: HashMap::new(),
+        }
+    }
+}
+
+impl Deref for FileObject {
+    type Target = BaseContentObject;
+    fn deref(&self) -> &Self::Target {
+        &self.content_obj
+    }
+}
+
+impl DerefMut for FileObject {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.content_obj
+    }
 }
 
 impl FileObject {
     //content can be chunkid or chunklistid
     pub fn new(name:String,size:u64,content:String)->Self {
-        Self {name,size,content,meta:None,mime:None,owner:None,exp:0,
-            create_time:None,chunk_list:None,links:None,extra_info:HashMap::new()}
+        Self {
+            content_obj: BaseContentObject::new(name),
+            size,
+            content,
+            meta: HashMap::new(),
+        }
     }
 
     pub fn gen_obj_id(&self)->(ObjId, String) {

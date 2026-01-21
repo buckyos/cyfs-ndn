@@ -1,436 +1,341 @@
-use super::*;
-use crate::{ChunkId, FileObject, NamedDataMgr, NamedDataMgrConfig, NdnError, NdnResult, ObjId};
-use buckyos_kit::*;
-use std::io::SeekFrom;
-use std::sync::Arc;
-use tempfile::tempdir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use super::NamedDataMgr;
+use crate::{
+    build_named_object_by_json, ChunkHasher, ChunkReader, NdnError, NdnResult, ObjectState,
+};
+use buckyos_kit::buckyos_get_unix_timestamp;
+use rusqlite::Connection;
+use serde_json::json;
+use std::io::Cursor;
+use std::sync::Once;
+use tempfile::TempDir;
+use tokio::io::AsyncReadExt;
+
+static INIT_LOGGER: Once = Once::new();
+
+fn init_logging() {
+    INIT_LOGGER.call_once(|| {
+        let _ = env_logger::builder().is_test(true).try_init();
+    });
+}
+
+async fn create_mgr() -> NdnResult<(TempDir, NamedDataMgr)> {
+    init_logging();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mgr_root = temp_dir.path().join("named_data_mgr");
+    let mgr = NamedDataMgr::get_named_data_mgr_by_path(mgr_root).await?;
+    Ok((temp_dir, mgr))
+}
 
 #[tokio::test]
-async fn test_basic_chunk_operations() -> NdnResult<()> {
-    // Create a temporary directory for testing
-    let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+async fn test_named_data_mgr_put_get_object() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "unit-test",
+        "count": 1
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
 
-    let chunk_mgr = NamedDataMgr::from_config(
-        Some("test".to_string()),
-        test_dir.path().to_path_buf(),
-        config,
-    )
-    .await?;
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+    let got = mgr.get_object_impl(&obj_id, None).await.unwrap();
+    assert_eq!(got, obj_value);
+}
 
-    // Create test data
-    let test_data = b"Hello, World!";
-    let chunk_id = ChunkId::new("sha256:1234567890abcdef").unwrap();
+#[tokio::test]
+async fn test_named_data_mgr_object_exist_and_invalid_type() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "exist-check"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
 
-    // Write chunk
-    let (mut writer, _) = chunk_mgr
-        .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
+    let exists_before = mgr.is_object_exist(&obj_id).await.unwrap();
+    assert!(!exists_before);
+
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+    let exists_after = mgr.is_object_exist(&obj_id).await.unwrap();
+    assert!(exists_after);
+
+    let chunk_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(b"invalid-type");
+    let err = mgr
+        .get_object_impl(&chunk_id.to_obj_id(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, NdnError::InvalidObjType(_)));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_get_missing_object() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "missing"
+    });
+    let (obj_id, _obj_str) = build_named_object_by_json("jobj", &obj_value);
+
+    let err = mgr.get_object_impl(&obj_id, None).await.unwrap_err();
+    assert!(matches!(err, NdnError::NotFound(_)));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_path_management() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "path-target"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+
+    let path = "/ndn/path-test";
+    mgr.create_file_impl(path, &obj_id, "app", "user")
         .await
         .unwrap();
-    writer.write_all(test_data).await.unwrap();
-    chunk_mgr
-        .complete_chunk_writer_impl(&chunk_id)
+
+    let (stored_obj_id, _path_obj_jwt) = mgr.get_obj_id_by_path_impl(path).await.unwrap();
+    assert_eq!(stored_obj_id.to_string(), obj_id.to_string());
+
+    let new_obj_value = json!({
+        "name": "path-target-v2"
+    });
+    let (new_obj_id, new_obj_str) = build_named_object_by_json("jobj", &new_obj_value);
+    mgr.put_object_impl(&new_obj_id, &new_obj_str).await.unwrap();
+    mgr.set_file_impl(path, &new_obj_id, "app", "user")
         .await
         .unwrap();
 
-    // Read and verify chunk
-    let (mut reader, size) = chunk_mgr
-        .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(0), true)
+    let (updated_obj_id, _path_obj_jwt) = mgr.get_obj_id_by_path_impl(path).await.unwrap();
+    assert_eq!(updated_obj_id.to_string(), new_obj_id.to_string());
+
+    mgr.remove_file_impl(path).await.unwrap();
+    assert!(mgr.get_obj_id_by_path_impl(path).await.is_err());
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_select_obj_id_by_path_longest_match() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let root_value = json!({
+        "name": "root-path"
+    });
+    let (root_id, root_str) = build_named_object_by_json("jobj", &root_value);
+    mgr.put_object_impl(&root_id, &root_str).await.unwrap();
+
+    let child_value = json!({
+        "name": "child-path"
+    });
+    let (child_id, child_str) = build_named_object_by_json("jobj", &child_value);
+    mgr.put_object_impl(&child_id, &child_str).await.unwrap();
+
+    mgr.create_file_impl("/a", &root_id, "app", "user")
         .await
         .unwrap();
-    assert_eq!(size, test_data.len() as u64);
-    drop(chunk_mgr);
+    mgr.create_file_impl("/a/b", &child_id, "app", "user")
+        .await
+        .unwrap();
+
+    let (obj_id, _path_obj, relative_path) =
+        mgr.select_obj_id_by_path_impl("/a/b/c").await.unwrap();
+    assert_eq!(obj_id.to_string(), child_id.to_string());
+    assert_eq!(relative_path, Some("c".to_string()));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_put_get_chunk() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let chunk_data = b"named-data-chunk";
+    let chunk_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(chunk_data);
+
+    mgr.put_chunk(&chunk_id, chunk_data, true).await.unwrap();
+    let got = mgr.get_chunk_data(&chunk_id).await.unwrap();
+    assert_eq!(got, chunk_data);
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_get_object_inner_path() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "inner-path",
+        "info": {
+            "count": 7,
+            "labels": ["a", "b"]
+        }
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+    let got = mgr
+        .get_object_impl(&obj_id, Some("info.count".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(got, json!(7));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_link_same_object() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "link-target"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+
+    let alias_value = json!({
+        "name": "link-alias"
+    });
+    let (alias_id, _alias_str) = build_named_object_by_json("jobj", &alias_value);
+
+    mgr.link_same_object(&alias_id, &obj_id).await.unwrap();
+    let got = mgr.get_object_impl(&alias_id, None).await.unwrap();
+    assert_eq!(got, obj_value);
+
+    let source = mgr.query_source_object_by_target(&obj_id).await.unwrap();
+    assert_eq!(source.unwrap().to_string(), alias_id.to_string());
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_link_part_of_invalid() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "part-target"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+
+    let alias_value = json!({
+        "name": "part-alias"
+    });
+    let (alias_id, _alias_str) = build_named_object_by_json("jobj", &alias_value);
+
+    mgr.link_part_of(&alias_id, &obj_id, 0..2).await.unwrap();
+    let err = mgr.get_object_impl(&alias_id, None).await.unwrap_err();
+    assert!(matches!(err, NdnError::InvalidLink(_)));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_query_object_by_id_link_state() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let obj_value = json!({
+        "name": "query-link"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+
+    let alias_value = json!({
+        "name": "query-alias"
+    });
+    let (alias_id, _alias_str) = build_named_object_by_json("jobj", &alias_value);
+    mgr.link_same_object(&alias_id, &obj_id).await.unwrap();
+
+    let state = mgr.query_object_by_id(&alias_id).await.unwrap();
+    assert!(matches!(state, ObjectState::Link(_)));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_put_chunk_invalid_id() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let chunk_data = b"named-data-chunk";
+    let wrong_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(b"other-data");
+
+    let err = mgr.put_chunk(&wrong_id, chunk_data, true).await.unwrap_err();
+    assert!(matches!(err, NdnError::InvalidId(_)));
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_put_chunk_by_reader_impl() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let chunk_data = b"named-data-reader";
+    let chunk_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(chunk_data);
+
+    let mut reader: ChunkReader = Box::pin(Cursor::new(chunk_data.to_vec()));
+    mgr.put_chunk_by_reader_impl(&chunk_id, chunk_data.len() as u64, &mut reader)
+        .await
+        .unwrap();
+
+    let got = mgr.get_chunk_data(&chunk_id).await.unwrap();
+    assert_eq!(got, chunk_data);
+}
+
+#[tokio::test]
+async fn test_named_data_mgr_chunk_reader_by_path() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
+    let chunk_data = b"path-chunk-data";
+    let chunk_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(chunk_data);
+
+    mgr.put_chunk(&chunk_id, chunk_data, true).await.unwrap();
+    let chunk_obj_id = chunk_id.to_obj_id();
+    let path = "/ndn/chunk-path";
+    mgr.create_file_impl(path, &chunk_obj_id, "app", "user")
+        .await
+        .unwrap();
+
+    let (mut reader, chunk_size, read_chunk_id) =
+        mgr.get_chunk_reader_by_path_impl(path, "user", "app", 0)
+            .await
+            .unwrap();
+    assert_eq!(chunk_size, chunk_data.len() as u64);
+    assert_eq!(read_chunk_id.to_string(), chunk_id.to_string());
 
     let mut buffer = Vec::new();
     reader.read_to_end(&mut buffer).await.unwrap();
-    assert_eq!(&buffer, test_data);
-
-    Ok(())
+    assert_eq!(buffer, chunk_data);
 }
 
 #[tokio::test]
-async fn test_base_operations() -> NdnResult<()> {
-    // Create a temporary directory for testing
-    init_logging("ndn-lib test", false);
-    let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
+async fn test_named_data_mgr_gc_objects() {
+    let (_temp_dir, mgr) = create_mgr().await.unwrap();
 
-    let named_mgr = NamedDataMgr::from_config(
-        Some("test".to_string()),
-        test_dir.path().to_path_buf(),
-        config,
+    let chunk_data = b"gc-chunk";
+    let chunk_id = ChunkHasher::new(None)
+        .unwrap()
+        .calc_chunk_id_from_bytes(chunk_data);
+    mgr.put_chunk(&chunk_id, chunk_data, true).await.unwrap();
+
+    let obj_value = json!({
+        "name": "gc-object"
+    });
+    let (obj_id, obj_str) = build_named_object_by_json("jobj", &obj_value);
+    mgr.put_object_impl(&obj_id, &obj_str).await.unwrap();
+
+    let db_path = mgr.db().db_path.clone();
+    let conn = Connection::open(&db_path).unwrap();
+    let old_time = buckyos_get_unix_timestamp() as i64 - 60 * 60 * 24 - 10;
+    conn.execute(
+        "UPDATE chunk_items SET update_time = ?1, ref_count = 0 WHERE chunk_id = ?2",
+        (old_time, chunk_id.to_string()),
     )
-    .await?;
-
-    // Create test data
-    let test_data = b"Hello, Path Test!";
-    let chunk_id = ChunkId::new("sha256:1234567890abcdef").unwrap();
-    let test_path = "/test/file.txt".to_string();
-
-    // Write chunk
-    let (mut writer, _) = named_mgr
-        .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
-        .await?;
-    writer.write_all(test_data).await.unwrap();
-    named_mgr
-        .complete_chunk_writer_impl(&chunk_id)
-        .await
-        .unwrap();
-
-    // Bind chunk to path
-    named_mgr
-        .create_file_impl(
-            test_path.as_str(),
-            &chunk_id.to_obj_id(),
-            "test_app",
-            "test_user",
-        )
-        .await?;
-
-    // Read through path and verify
-    let (mut reader, size, retrieved_chunk_id) = named_mgr
-        .get_chunk_reader_by_path_impl(
-            test_path.as_str(),
-            "test_user",
-            "test_app",
-            SeekFrom::Start(0),
-        )
-        .await?;
-
-    assert_eq!(size, test_data.len() as u64);
-    assert_eq!(retrieved_chunk_id, chunk_id);
-
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.unwrap();
-    assert_eq!(&buffer, test_data);
-
-    //test fileobj
-    let path2 = "/test/file2.txt".to_string();
-    let file_obj = FileObject::new(path2.clone(), test_data.len() as u64, chunk_id.to_string());
-    let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
-    info!("file_obj_id:{}", file_obj_id.to_string());
-    //file-obj is soft linke to chunk-obj
-    named_mgr
-        .put_object_impl(&file_obj_id, &file_obj_str)
-        .await?;
-
-    let obj_content = named_mgr
-        .get_object_impl(&file_obj_id, Some("/content".to_string()))
-        .await?;
-    info!("obj_content:{}", obj_content);
-    assert_eq!(obj_content.as_str().unwrap(), chunk_id.to_string().as_str());
-
-    let (the_chunk_id, path_obj_jwt, inner_obj_path) = named_mgr
-        .select_obj_id_by_path_impl(test_path.as_str())
-        .await?;
-    info!("chunk_id:{}", chunk_id.to_string());
-    info!("inner_obj_path:{}", inner_obj_path.unwrap());
-    let obj_id_of_chunk = chunk_id.to_obj_id();
-    assert_eq!(the_chunk_id, obj_id_of_chunk);
-
-    // Test remove file
-    named_mgr.remove_file_impl(&test_path).await.unwrap();
-
-    // Verify path is removed
-    let result = named_mgr
-        .get_chunk_reader_by_path_impl(
-            test_path.as_str(),
-            "test_user",
-            "test_app",
-            SeekFrom::Start(0),
-        )
-        .await;
-    assert!(result.is_err());
-
-    Ok(())
-}
-
-//test get_chunk_mgr_by_id，然后再创建并写入一个chunk，再读取
-#[tokio::test]
-async fn test_get_chunk_mgr_by_id() -> NdnResult<()> {
-    // Get ChunkMgr by id
-    let random_mgr_id = rand::random::<u64>();
-    //println!("random_mgr_id: {}", random_mgr_id);
-    let chunk_mgr_id = format!("test_{}", random_mgr_id);
-    let mgr_id = Some(chunk_mgr_id.as_str());
-    let chunk_mgr = NamedDataMgr::get_named_data_mgr_by_id(mgr_id).await;
-    assert!(chunk_mgr.is_some());
-    let chunk_mgr = chunk_mgr.unwrap();
-
-    // Create test data
-    let test_data = b"Hello, ChunkMgr Test!";
-    let chunk_id = ChunkId::new("sha256:abcdef1234567890AB").unwrap();
-
-    // Write chunk
-    {
-        let mut chunk_mgr = chunk_mgr.lock().await;
-        let (mut writer, _) = chunk_mgr
-            .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
-            .await
-            .unwrap();
-        writer.write_all(test_data).await.unwrap();
-        chunk_mgr
-            .complete_chunk_writer_impl(&chunk_id)
-            .await
-            .unwrap();
-    }
-
-    // Read chunk and verify
-    {
-        let chunk_mgr = chunk_mgr.lock().await;
-        let (mut reader, size) = chunk_mgr
-            .open_chunk_reader_impl(&chunk_id, SeekFrom::Start(0), true)
-            .await?;
-        assert_eq!(size, test_data.len() as u64);
-        drop(chunk_mgr);
-
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await.unwrap();
-        assert_eq!(&buffer, test_data);
-    }
-
-    Ok(())
-}
-
-#[test]
-fn test_path_normalization() {
-    let test_cases = vec![
-        ("//a//b//c", "/a/b/c"),
-        ("./a/b/c", "a/b/c"),
-        ("/a/b/c", "/a/b/c"),
-        ("a/b/c", "a/b/c"),
-    ];
-
-    for (input, expected) in test_cases {
-        let result = NamedDataMgrDB::normalize_path(input);
-        assert_eq!(result, expected, "Failed to normalize path: {}", input);
-    }
-}
-
-#[tokio::test]
-async fn test_find_longest_matching_path_edge_cases() -> NdnResult<()> {
-    // Create a temporary directory for testing
-    init_logging("ndn-lib test", false);
-    let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
-
-    let chunk_mgr = NamedDataMgr::from_config(
-        Some("test".to_string()),
-        test_dir.path().to_path_buf(),
-        config,
+    .unwrap();
+    conn.execute(
+        "UPDATE objects SET last_access_time = ?1, ref_count = 0 WHERE obj_id = ?2",
+        (old_time, obj_id.to_string()),
     )
-    .await?;
+    .unwrap();
 
-    // Create test data and paths
-    let test_data1 = b"Test data for path 1";
-    let test_data2 = b"Test data for path 2";
-    let test_data3 = b"Test data for path 3";
+    drop(conn);
+    NamedDataMgr::gc_objects(&db_path).await.unwrap();
 
-    let chunk_id1 = ChunkId::new("sha256:1111111111111111").unwrap();
-    let chunk_id2 = ChunkId::new("sha256:2222222222222222").unwrap();
-    let chunk_id3 = ChunkId::new("sha256:3333333333333333").unwrap();
-
-    let base_path = "/test/path";
-    let sub_path1 = "/test/path/file1.txt";
-    let sub_path2 = "/test/path/subdir";
-    let sub_path3 = "/test/path/subdir/file2.txt";
-
-    // Write chunks
-    let (mut writer1, _) = chunk_mgr
-        .open_chunk_writer_impl(&chunk_id1, test_data1.len() as u64, 0)
-        .await?;
-    writer1.write_all(test_data1).await.unwrap();
-    chunk_mgr
-        .complete_chunk_writer_impl(&chunk_id1)
-        .await
-        .unwrap();
-
-    let (mut writer2, _) = chunk_mgr
-        .open_chunk_writer_impl(&chunk_id2, test_data2.len() as u64, 0)
-        .await?;
-    writer2.write_all(test_data2).await.unwrap();
-    chunk_mgr
-        .complete_chunk_writer_impl(&chunk_id2)
-        .await
-        .unwrap();
-
-    let (mut writer3, _) = chunk_mgr
-        .open_chunk_writer_impl(&chunk_id3, test_data3.len() as u64, 0)
-        .await?;
-    writer3.write_all(test_data3).await.unwrap();
-    chunk_mgr
-        .complete_chunk_writer_impl(&chunk_id3)
-        .await
-        .unwrap();
-
-    // Bind chunks to paths
-    chunk_mgr
-        .create_file_impl(base_path, &chunk_id1.to_obj_id(), "test_app", "test_user")
-        .await?;
-
-    //chunk_mgr.sigh_path_obj(base_path path_obj_jwt).await?;
-    info!("Created base path: {}", base_path);
-
-    chunk_mgr
-        .create_file_impl(sub_path1, &chunk_id2.to_obj_id(), "test_app", "test_user")
-        .await?;
-    info!("Created sub path 1: {}", sub_path1);
-
-    chunk_mgr
-        .create_file_impl(sub_path2, &chunk_id3.to_obj_id(), "test_app", "test_user")
-        .await?;
-    info!("Created sub path 2: {}", sub_path2);
-
-    // Test find_longest_matching_path
-
-    // Test case 1: Exact match
-    info!("Test case 1: Exact match with {}", sub_path1);
-    let (result_path, obj_id, path_obj_jwt, relative_path) =
-        chunk_mgr.db().find_longest_matching_path(sub_path1)?;
-    info!(
-        "Result: path={}, obj_id={}, relative_path={:?}",
-        result_path,
-        obj_id.to_string(),
-        relative_path
-    );
-    assert_eq!(result_path, sub_path1);
-    assert_eq!(obj_id, chunk_id2.to_obj_id());
-    assert_eq!(relative_path, Some("".to_string()));
-
-    // Test case 2: Match with a parent path
-    let test_path = "/test/path/subdir/file2.txt";
-    info!("Test case 2: Match with parent path. Testing {}", test_path);
-    let (result_path, obj_id, path_obj_jwt, relative_path) =
-        chunk_mgr.db().find_longest_matching_path(test_path)?;
-    info!(
-        "Result: path={}, obj_id={}, relative_path={:?}",
-        result_path,
-        obj_id.to_string(),
-        relative_path
-    );
-    assert_eq!(result_path, sub_path2);
-    assert_eq!(obj_id, chunk_id3.to_obj_id());
-    assert_eq!(relative_path, Some("/file2.txt".to_string()));
-
-    // Test case 3: Match with the base path
-    let test_path = "/test/path/unknown/file.txt";
-    info!("Test case 3: Match with base path. Testing {}", test_path);
-    let (result_path, obj_id, path_obj_jwt, relative_path) =
-        chunk_mgr.db().find_longest_matching_path(test_path)?;
-    info!(
-        "Result: path={}, obj_id={}, relative_path={:?}",
-        result_path,
-        obj_id.to_string(),
-        relative_path
-    );
-    assert_eq!(result_path, base_path);
-    assert_eq!(obj_id, chunk_id1.to_obj_id());
-    assert_eq!(relative_path, Some("/unknown/file.txt".to_string()));
-
-    // Test case 4: No match (should return error)
-    let test_path = "/other/path/file.txt";
-    info!("Test case 4: No match. Testing {}", test_path);
-    let result = chunk_mgr.db().find_longest_matching_path(test_path);
-    match result {
-        Ok(_) => {
-            panic!("Expected error for path with no match, but got success");
-        }
-        Err(e) => {
-            info!("Got expected error for non-matching path: {}", e);
-            // Verify it's the expected error type
-            match e {
-                NdnError::DbError(_) => {
-                    // This is the expected error type
-                    info!("Error type is correct: DbError");
-                }
-                _ => {
-                    panic!("Expected DbError, but got different error type: {:?}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_concurrent_path_access() -> NdnResult<()> {
-    init_logging("ndn-lib test", false);
-    let test_dir = tempdir().unwrap();
-    let config = NamedDataMgrConfig {
-        local_store: test_dir.path().to_str().unwrap().to_string(),
-        local_cache: None,
-        mmap_cache_dir: None,
-    };
-
-    let named_mgr = Arc::new(tokio::sync::Mutex::new(
-        NamedDataMgr::from_config(
-            Some("test".to_string()),
-            test_dir.path().to_path_buf(),
-            config,
+    let conn = Connection::open(&db_path).unwrap();
+    let chunk_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM chunk_items WHERE chunk_id = ?1",
+            [chunk_id.to_string()],
+            |row| row.get(0),
         )
-        .await?,
-    ));
-
-    let test_data = b"Test data for concurrent access";
-    let chunk_id = ChunkId::new("sha256:1234").unwrap();
-    let test_path = "/test/concurrent/path.txt";
-
-    let (mut writer, _) = named_mgr
-        .lock()
-        .await
-        .open_chunk_writer_impl(&chunk_id, test_data.len() as u64, 0)
-        .await?;
-    writer.write_all(test_data).await.unwrap();
-    named_mgr
-        .lock()
-        .await
-        .complete_chunk_writer_impl(&chunk_id)
-        .await
+        .unwrap();
+    let obj_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM objects WHERE obj_id = ?1",
+            [obj_id.to_string()],
+            |row| row.get(0),
+        )
         .unwrap();
 
-    named_mgr
-        .lock()
-        .await
-        .create_file_impl(test_path, &chunk_id.to_obj_id(), "test_app", "test_user")
-        .await?;
-
-    // 创建多个任务并发访问
-    let mut handles = vec![];
-    for i in 0..10 {
-        let named_mgr_clone = named_mgr.clone();
-        let chunk_id2 = chunk_id.clone();
-        let handle = tokio::spawn(async move {
-            let result = named_mgr_clone
-                .lock()
-                .await
-                .db()
-                .find_longest_matching_path(test_path);
-            assert!(result.is_ok());
-            let (result_path, obj_id, _, _) = result.unwrap();
-            assert_eq!(result_path, test_path);
-            assert_eq!(obj_id, chunk_id2.to_obj_id());
-        });
-        handles.push(handle);
-    }
-
-    // 等待所有任务完成
-    for handle in handles {
-        handle.await.unwrap();
-    }
-
-    Ok(())
+    assert_eq!(chunk_left, 0);
+    assert_eq!(obj_left, 0);
 }

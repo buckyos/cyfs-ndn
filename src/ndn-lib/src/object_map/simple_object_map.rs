@@ -4,6 +4,16 @@ use crate::{build_named_object_by_json, build_named_object_by_jwt, object::ObjId
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize, Serializer, Deserializer};
 
+/*注意,SimpleObjectMap是一个"虚“对象，不应该直接使用。而是被嵌入到一个ReallyObject中使用
+struct ReallyObject {
+    pub other_filed:Value,
+    ...
+    #[serde(flatten)]
+    pub children: SimpleObjectMap,
+}
+
+*/
+
 #[derive(Debug, Clone)]
 pub enum SimpleMapItem {
     //obj type,obj value
@@ -30,6 +40,20 @@ impl SimpleMapItem {
                 let result = decode_jwt_claim_without_verify(obj_value.as_str())
                     .map_err(|e| NdnError::InvalidParam(format!("decode jwt failed:{}", e.to_string())))?;
                 return Ok(result);
+            }
+        }
+    }
+
+    pub fn get_obj_id(&self) -> NdnResult<(ObjId,String)> {
+        match self {
+            SimpleMapItem::ObjId(obj_id) => Ok((obj_id.clone(),"".to_string())),
+            SimpleMapItem::Object(obj_type, obj_value) => {
+                let (obj_id, obj_str) = build_named_object_by_json(obj_type, obj_value);
+                Ok((obj_id, obj_str))
+            },
+            SimpleMapItem::ObjectJwt(obj_type, obj_value) => {
+                let (obj_id, obj_str) = build_named_object_by_jwt(obj_type, obj_value)?;
+                Ok((obj_id, obj_str))
             }
         }
     }
@@ -109,22 +133,22 @@ impl<'a> Deserialize<'a> for SimpleMapItem {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SimpleObjectMap {
-    #[serde(flatten)]
-    pub extra_info: HashMap<String, Value>,
+    // #[serde(flatten)]
+    // pub extra_info: HashMap<String, Value>,
     pub body: HashMap<String, SimpleMapItem>,
 }
 
 impl SimpleObjectMap {
     pub fn new() -> Self {
         Self {
-            extra_info: HashMap::new(),
+            //extra_info: HashMap::new(),
             body: HashMap::new(),
         }
     }
 
-    pub fn gen_obj_id_with_extra_info(map_type:&str, body:&HashMap<String, SimpleMapItem>, extra_info:&HashMap<String, Value>) -> NdnResult<(ObjId, String)> {
+    pub fn gen_obj_id_with_real_obj(&self,result_obj_type:&str, real_obj:&mut Value) -> NdnResult<(ObjId, String)> {
         let mut real_map = HashMap::new();
-        for (key, value) in body {
+        for (key, value) in self.body.iter() {
             match value {
                 SimpleMapItem::Object(obj_type,obj_value) => {
                     let (sub_obj_id, _json_str) = build_named_object_by_json(obj_type, obj_value);
@@ -139,23 +163,18 @@ impl SimpleObjectMap {
                 }
             }
         }
-
-        let mut real_obj = serde_json::Map::new();
-        for (key, value) in extra_info {
-            real_obj.insert(key.clone(), value.clone());
-        }
         
         let body = serde_json::to_value(real_map).expect("Failed to serialize SimpleObjectMap");
-        real_obj.insert("body".to_string(), body);
+        real_obj.as_object_mut().unwrap().insert("body".to_string(), body);
         let real_obj = serde_json::to_value(real_obj).expect("Failed to serialize SimpleObjectMap");
-        let (id, json_str) = build_named_object_by_json(map_type, &real_obj);
+        let (id, json_str) = build_named_object_by_json(result_obj_type, &real_obj);
         Ok((id, json_str))
     }
     
     //gen_obj_id会消耗self,防止构造id后潜在的修改
-    pub fn gen_obj_id(self) -> NdnResult<(ObjId, String)> {
-        Self::gen_obj_id_with_extra_info(OBJ_TYPE_OBJMAP_SIMPLE, &self.body, &self.extra_info)
-    }
+    // pub fn gen_obj_id(self) -> NdnResult<(ObjId, String)> {
+    //     Self::gen_obj_id_with_extra_info(OBJ_TYPE_OBJMAP_SIMPLE, &self.body, &self.extra_info)
+    // }
 
     pub fn len(&self) -> usize {
         self.body.len()
@@ -235,8 +254,6 @@ mod test {
         let file3_jwt = named_obj_to_jwt(&file3_obj, &private_key, None).unwrap();
         
         let test_map1 = json!({
-            "total_size": 302323,
-            "item_count": 3,
             "body": {
                 "file1": file1_obj_id,
                 "file2": {
@@ -250,20 +267,18 @@ mod test {
             }
         });
 
+        let mut real_obj =  json!({
+            "total_size": 302323,
+            "item_count": 3,
+        });
+
         let simple_map1 = serde_json::from_value::<SimpleObjectMap>(test_map1.clone()).unwrap();
        
         assert_eq!(simple_map1.len(), 3);
-        assert_eq!(simple_map1.extra_info["total_size"], 302323);
-        assert_eq!(simple_map1.extra_info["item_count"], 3);
 
-        let simple_map1_obj_str = serde_json::to_string(&simple_map1).unwrap();
-        println!("simple_map1_obj_id_str: {}", simple_map1_obj_str);
-        let simple_map1_val = serde_json::from_str::<Value>(&simple_map1_obj_str).unwrap();
-        assert_eq!(simple_map1_val, test_map1);
-
-        let (simple_map1_obj_id, simple_map1_json_str) = simple_map1.gen_obj_id().unwrap();
+        let (simple_map1_obj_id, simple_map1_obj_str) = simple_map1.gen_obj_id_with_real_obj(OBJ_TYPE_OBJMAP_SIMPLE,  &mut real_obj).unwrap();
         println!("simple_map1_obj_id: {}", simple_map1_obj_id.to_string());
-        println!("simple_map1_json_str: {}", simple_map1_json_str);
+        println!("simple_map1_obj_str: {}", simple_map1_obj_str);
 
     }
 }

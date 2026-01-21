@@ -1,13 +1,14 @@
 use super::chunk::{ChunkId,ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SIZE, QCID_HASH_PIECE_SIZE};
 use crate::hash::DEFAULT_HASH_METHOD;
-use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult};
+use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult, MIN_QCID_FILE_SIZE};
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use std::str::FromStr;
 use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
 
 // 添加类型别名来简化 copy_chunk 的签名
-pub type ProgressCallback = Option<Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>>;
+pub type ChunkProgressCallback = Option<Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>>;
 
 pub struct ChunkHasher {
     pub hash_method: HashMethod,
@@ -207,7 +208,7 @@ pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
         length
     };
 
-    if length < QCID_HASH_PIECE_SIZE * 3 {
+    if length < MIN_QCID_FILE_SIZE {
         return Err(NdnError::Internal(format!(
             "quick hash error: item size is too small"
         )));
@@ -233,16 +234,16 @@ pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
     hasher.update(&buffer);
     let hash_result = hasher.finalize();
 
-    Ok(ChunkId {
-        chunk_type: ChunkType::QCID,
-        hash_result: hash_result.to_vec(),
-    })
+    let result_chunk_id = ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID);
+
+    Ok(result_chunk_id)
 }
 
 pub async fn calc_quick_hash_by_buffer(
     buffer_begin: &[u8],
     buffer_mid: &[u8],
     buffer_end: &[u8],
+    length: u64,
 ) -> NdnResult<ChunkId> {
     let mut hasher = Sha256::new();
     let limit_size = QCID_HASH_PIECE_SIZE as usize;
@@ -260,11 +261,9 @@ pub async fn calc_quick_hash_by_buffer(
     hasher.update(buffer_end);
     let hash_result = hasher.finalize();
 
-    Ok(ChunkId {
-        chunk_type: ChunkType::QCID,
-        hash_result: hash_result.to_vec(),
-    })
+    Ok(ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID))
 }
+
 
 pub async fn calculate_file_chunk_id(
     file_path: &str,
@@ -291,12 +290,21 @@ pub async fn calculate_file_chunk_id(
     }
 }
 
+pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<ChunkId> {
+    let mut file_reader = tokio::fs::File::open(file_path).await.map_err(|err| {
+        warn!("caculate_qcid_from_file: open file failed! {}", err.to_string());
+        NdnError::IoError(err.to_string())
+    })?;
+    let qcid = calc_quick_hash(&mut file_reader, None).await?;
+    return Ok(qcid);
+}
+
 pub async fn copy_chunk<R, W>(
     chunk_id: ChunkId,
     mut chunk_reader: R,
     mut chunk_writer: W,
     mut hasher: Option<ChunkHasher>,
-    mut progress_callback: ProgressCallback,
+    mut progress_callback: ChunkProgressCallback,
 ) -> NdnResult<u64>
 where
     R: AsyncRead + Unpin,
