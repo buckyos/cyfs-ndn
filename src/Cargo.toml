@@ -7,18 +7,19 @@ members = [
 ]
 
 [workspace.dependencies]
-log = "*"
+log = "0.4"
+# Pin to 1.x to avoid pulling both thiserror v1 and v2.
 thiserror = "*"
-tokio = { version = "*", features = ["full"] }
-reqwest = { version = "*", features = ["json", "stream","rustls-tls-native-roots"] }
-futures = "*"
-futures-util = "*"
-chrono = "*"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "*"
-async-trait = "*"
-tempfile = "*"
-rusqlite = { version = "*", features = ["bundled", "backup"] }
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "beta1" }
-name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "beta1"}
-name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "beta1"}
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-native-roots"] }
+futures = "0.3"
+futures-util = "0.3"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tempfile = "3"
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "main" }
+name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "main"}
+name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "main"}

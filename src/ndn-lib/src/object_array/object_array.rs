@@ -15,7 +15,6 @@ use crate::{
 };
 use crate::{get_obj_hash, NdnError, NdnResult};
 use core::hash;
-use http_types::cache;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 use std::io::SeekFrom;

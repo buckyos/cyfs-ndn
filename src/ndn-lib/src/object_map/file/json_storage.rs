@@ -2,7 +2,6 @@ use super::super::storage::{
     ObjectMapInnerStorage, ObjectMapInnerStorageStat, ObjectMapStorageType,
 };
 use crate::{NdnError, NdnResult, ObjId};
-use http_types::content;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

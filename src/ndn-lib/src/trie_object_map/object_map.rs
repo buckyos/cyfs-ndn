@@ -14,7 +14,6 @@ use crate::{build_named_object_by_json, PathObject, OBJ_TYPE_TRIE_SIMPLE};
 use crate::{Base32Codec, NdnError, NdnResult, OBJ_TYPE_TRIE};
 use bincode::de;
 use crypto_common::Key;
-use log::kv::value;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
