@@ -394,12 +394,13 @@ impl NamedDataMgr {
     pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
         self.db.set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
     }
-    //target obj is the same as obj_id
+    
+    //target obj is same as source obj_id  (obj_id alraedy exist)
     pub async fn link_same_object(&self, obj_id: &ObjId, target_obj: &ObjId) -> NdnResult<()> {
         let link_data = ObjectLinkData::SameAs(target_obj.clone());
         self.db.set_object_link(obj_id, &link_data)
     }
-    //target obj is a part of obj_id,the part is defined by range
+    //target obj is a part of obj_id,the part is defined by range (obj_id alraedy exist)
     pub async fn link_part_of(&self, obj_id: &ObjId, target_obj: &ObjId, range: Range<u64>) -> NdnResult<()> {
         let link_data = ObjectLinkData::PartOf(target_obj.clone(), range);
         self.db.set_object_link(obj_id, &link_data)
