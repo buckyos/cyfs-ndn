@@ -1,242 +1,419 @@
-# 概述
+# NamedMgr Test Cases (Planned)
 
-本文档描述`NDN`系统的测试用例设计。其中有一些自定义的名词，在文档后面有相关注解。
+本文档基于 `doc/named_mgr.md` 的设计说明，重新规划 NamedMgr 相关测试用例，覆盖路径元数据、读写语义、对象/Chunk 管理、Link 语义、placement 回退、GC/erase 等核心行为。重点补齐可执行细节、可观测点与边界/异常场景。
 
-# 用例设计
+## 1. 测试范围
 
-用例设计从几个维度分类，先设计`一般性用例`，这些用例应该在不同维度下分别实现，不同维度下的特别用例单独列出。在不同维度下的不同取值设计交叉覆盖。`一般性用例`在部分维度下只能取限定值会明确标识，无标识用例在各维度下可以取任意值。
+- fs-meta-db 的路径元数据管理与读写接口
+- NamedDataMgr / named_store 的对象与 chunk 存储语义
+- NamedMgr 的单写、多读与 commit/working 语义
+- Link 模型（SameAs / PartOf / ExternalFile）与 qcid 检测
+- placement layout 版本回退
+- erase 与 GC 软清理语义
+- path 与 inner_path 解析与挂载互斥
 
-1. 存储数据类型
-    - Chunk
+## 2. 测试环境与前置
 
-        非结构化数据
+- 单机 SQLite 版 fs-meta-db
+- 至少 2 个 store target（用于 placement 回退场景）
+- 可模拟的外部文件路径（ExternalFile）
+- 可控的 qcid 计算/校验接口
+- 具备多 session 并发能力（用于单写冲突测试）
+- 可控制 placement target 可用性（mock 或配置开关）
+- 可观测接口：`stat`/`stat_by_objid`、chunk state、lease 信息
 
-    - Object
+## 3. 术语与约定
 
-        结构化数据，`JSON`格式
+- committed: 已提交对象版本，可并发读
+- working: 写入中的 file_buffer 状态
+- PATH_BUSY / LEASE_CONFLICT: 单写冲突错误
+- NEED_PULL / NOT_PULLED: 对象未 materialize
+- NOT_AVAILABLE: 数据缺失或无法读取（link invalid/placement miss 等）
+- LINK_INVALID_OR_CHANGED: ExternalFile 快速校验失败
 
-    - File
+## 4. 用例模板（统一格式）
 
-        内置的特殊`Object`，表达一个文件；构建测试用例时应该从磁盘文件构造`FileObj`
+每条用例尽量补齐以下字段，确保可落地和可断言：
 
-    - Dir
+- 优先级: P0/P1/P2
+- 前置: 初始对象/路径/环境状态
+- 输入: API 参数（path/objid/offset/range 等）
+- 步骤: 调用序列
+- 观察点: `stat`/`stat_by_objid` 字段、lease/info、chunk state
+- 期望: 返回值/错误码 + 状态 + 副作用
 
-        内置的特殊`Object`，表达一个目录，构建测试用例时应该从磁盘文件系统构造`DirObj`
+## 5. 观察点清单（建议）
 
-2. 节点拓扑结构
-    - 单节点
-    - 多节点
-      用例应该覆盖读写节点相同或不同
-        - 同`Zone`节点
-        - 不同`Zone`节点
-3. `API`选用
+- `stat(path)`：committed/working/materialized、working_closed、objid、lease_id/ttl
+- `stat_by_objid(objid)`：materialized 状态、pull 信息
+- chunk state：ABSENT/WRITING/COMPLETE
+- placement rollback：记录使用 epoch、miss 次数（如有）
 
-    列出待选用的`API`，按功能分组，相似功能的`API`分成一组，构造测试用例时尽量从相同组中随机选择以更全面的覆盖
-    - URL 生成
-        - `NdnClient`：`gen_chunk_url`、`gen_obj_url`
-    - NamedDataMgr 管理
-        - `NamedDataMgr`：`set_mgr_by_id`、`get_named_data_mgr_by_path`、`get_named_data_mgr_by_id`、`is_named_data_mgr_exist`、`get_mgr_id`、`get_base_dir`
-    - 对象读取（本地优先，必要时回源）
-        - `NdnClient`：`get_obj_by_id`、`get_obj_by_url`
-        - `NamedDataMgr`：`get_object/get_object_impl`、`get_real_object_impl`、`query_object_by_id`、`is_object_exist`
-    - 对象写入
-        - `NamedDataMgr`：`put_object/put_object_impl`、
-    - 对象关联
-      `link_same_object`、`link_part_of`、`query_source_object_by_target`
-    - 对象挂载路径管理
-        - `NamedDataMgr`：`get_obj_id_by_path_impl/get_obj_id_by_path`、`select_obj_id_by_path_impl/select_obj_id_by_path`、`get_cache_path_obj`、`update_cache_path_obj`、`create_file_impl/create_file`、`set_file_impl/set_file`、`remove_file_impl/remove_file`、`get_chunk_reader_by_path_impl/get_chunk_reader_by_path`
-    - Chunk 状态查询与上传
-        - `NdnClient`：`query_chunk_state`、`push_chunk`
-        - `NamedDataMgr`：`have_chunk/have_chunk_impl`、`query_chunk_state/query_chunk_state_impl`、`check_chunk_exist_impl`（未实现）
-    - Chunk 下载/读取
-        - `NdnClient`：`pull_chunk`、`pull_chunk_by_url`、`open_chunk_reader_by_url`
-        - `NamedDataMgr`：`open_store_chunk_reader_impl`、`open_chunk_reader_impl/open_chunk_reader`、`open_chunklist_reader`、`get_chunk_data`、`get_chunk_piece`
-    - Chunk 写入/导入
-        - `NdnClient`：`pull_chunk`（落本地/本地存储）作为拉取入口
-        - `NamedDataMgr`：`open_chunk_writer_impl/open_chunk_writer`、`open_new_chunk_writer_impl`、`update_chunk_progress_impl`、`complete_chunk_writer_impl/complete_chunk_writer`、`complete_chunk_writer_and_rename_impl`（未实现）、`put_chunk_by_reader_impl/put_chunk_by_reader`、`put_chunk`、`add_chunk_by_link_to_local_file_impl`
-    - 文件/目录下载
-        - `NdnClient`：`pull_file`、`pull_chunklist`、`pull_dir`、`download_fileobj`（落盘 `FileObject`）
-    - 发布（挂载到对象路径）/签名
-        - `NamedDataMgr`：`pub_object`、`sign_obj`、`sigh_path_obj_impl/sigh_path_obj`
-    - 辅助校验/同步
-        - `NdnClient`：`remote_is_better`
-    - GC
-        - `NamedDataMgr`：`gc_worker`、`gc_objects`、`start_gc_thread`
+## 6. 测试用例
 
-4. 错误码
+### A. 路径元数据与命名空间
 
-5. 权限
-   开放权限的节点执行相关操作时成功，否则失败
-    - 对某些节点开放读权限
-    - 对某些节点开放写权限
-    - 对某些节点开放读写权限
+**TC-A01 路径绑定到 FileObject**
 
-## 用例落地细化（执行指引）
+- 优先级: P0
+- 前置: 生成 FileObjectId
+- 输入: `add_file(path, objid)`
+- 步骤: 调用 `add_file` 后 `stat(path)`
+- 观察点: `stat(path)` 的 objid/committed/materialized
+- 期望: path -> objid 绑定成功；`stat(path)` 显示绑定对象元信息；未 pull 则 `stat` 标记未 materialize
 
-- 输出`Debug`级别日志
-- 覆盖矩阵与优先级
-    - 最小组合：`数据类型 × 拓扑 × 权限`，其中 API 组在组合内随机选 1~2 个代表接口；必测组合：`Chunk/Object` × `单节点` × `默认权限`、`File/Dir` × `单节点` × `默认权限`、`Chunk/Object` × `同 Zone 多节点` × `默认权限`。选测组合：跨 Zone、权限受限（读/写/读写）、Link 模式。
-    - 优先级建议：存取 > GC > 路径挂载/发布 > 下载/同步 > Link 模式。
-    - 抽样规则：在选测组合中至少覆盖每类拓扑 1 例、每类权限 1 例，API 组内随机选择不同接口轮换。
-- API 选用与断言
-    - 读写：`put_object/put_object_impl` + `get_object/get_object_impl` 成功返回，数据 HASH/ID 一致；读不存在返回 NotFound。
-    - 路径管理：`create_file`/`set_file` 后用 `get_obj_id_by_path` 校验路径指向；删除用 `remove_file` 校验路径失效。
-    - 下载/读取：`pull_chunk/pull_chunk_by_url/open_chunk_reader_by_url` 返回的内容与源一致；`pull_file/pull_dir` 落盘文件校验大小/HASH。
-    - GC：`start_gc_thread` 定时 15s 调度，`gc_objects`/`gc_worker` 可手动触发；`last_access_time < now-86400` 被清理。发布到 `NDN-Path` 的对象应被保活。
-    - 未实现/不测：`check_chunk_exist_impl`、`complete_chunk_writer_and_rename_impl` 标记为 TODO/跳过。
-    - 错误码：使用 `NdnError`（`NotFound`、`InvalidId`、`InvalidLink`、`AlreadyExists`、`VerifyError`、`IoError`、`DbError`、`InComplete`、`RemoteError`、`DecodeError`、`OffsetTooLarge`、`InvalidObjType`、`InvalidData`、`InvalidParam`）。前置条件：参数合法、ObjId 可解析、必要文件/目录存在、网络请求成功。
-- 错误码与“其他错误”
-    - 常见：`NotFound`（对象/Chunk 不存在）、`InvalidId`（ObjId/DID/PathObj 签名不符）、`InvalidLink`（O-link/R-link 解析失败）、`VerifyError`（数据校验失败）、`IoError`（本地读写失败）、`DbError`、`InComplete`（Chunk 未完成）、`RemoteError`（远端 HTTP 失败）、`DecodeError`（JSON/JWT 解析失败）、`InvalidParam`。
-    - 其他错误：网络超时视为 `RemoteError`；内部异常使用 `Internal`。
-- 权限用例配置
-    - 当前 `NamedDataMgr`/`NdnClient` 内部未实现 ACL，只有 PathObj 使用 `resolve_auth_key` 验签 DID（`ndn_client.rs`）。默认视为开放访问；权限用例需依赖外部 Gateway/服务端策略。
-    - cyfs-gateway（`cyfs-gateway` 仓库）权限入口：CLI 需要 admin 密码，配置文件支持 include/远程同步（`doc/cyfs-gateway cli product design.md`）；转发/访问控制通过 process_chain rule（`doc/概念设计/ProcessChain.md`）实现，规则命令支持 `policy accept/drop/return` 和 `match`/`forward` 等，可用于基于 Host/IP/标签的访问控制。
-    - 针对 NDN 的规则示例（写在 `rootfs/etc/user_gateway.yaml` 并 `cyfs reload --all` 或重启 web3-gateway）：
-        ```yaml
-        servers:
-            node_gateway:
-                hook_point:
-                    main:
-                        blocks:
-                            ndn_acl:
-                                id: ndn_acl
-                                priority: -5
-                                block: |
-                                    # 禁止来自 bob.web3.buckyos.io 的写入请求
-                                    match ${REQ_HEADER.host} "bob\\.web3\\.buckyos\\.io" && match ${REQ.method} "POST" && reject "deny bob write";
-                                    # 只允许指定 DID 的访问
-                                    match ${REQ_HEADER.did} "did:dev:ALLOWED.*" || reject "deny unauth did";
-                                    accept;
-        ```
-        配置步骤：编辑 `user_gateway.yaml`（覆盖自动生成配置）、`cyfs reload --all` 或重启 web3-gateway（`sudo python3 /opt/web3-gateway/start.py`）；断言方法：访问被拒绝的 Host/DID 返回 403/拒绝日志，允许的请求成功命中后续 block。
-- GC 语义澄清
-    - 代码保留 1 天：`last_access_time < now - 60*60*24` 删除；调度周期 15s。
-    - 发布到 `NDN-Path`、以及被保活对象引用的对象应跳过删除。
-    - 标注/引用：`update_obj_ref_count` 遇到非 Chunk 对象会递归子对象（通过 `KnownStandardObject::get_child_objs`）更新 ref_count；`obj_ref_update_queue` 延迟消费，`gc_worker` 批量写入并清零队列后才进入 `gc_objects` 的删除窗口。
-- 数据篡改/ID 不匹配构造方式
-    - 构造合法对象后手工修改 `obj_data` 或 chunk 内容，再用原 ObjId 读，预期校验失败；或伪造 ObjId 访问，预期返回 NotFound/IntegrityError。
-    - 断言：Chunk 校验失败返回 `VerifyError`（来自 `chunk::hasher`）；ObjId/PathObj 不符返回 `InvalidId`；不存在返回 `NotFound`；日志关键词包含具体错误信息。
-- 多节点/跨 Zone 前置
-    - 需要准备：SN/Gateway 配置、Zone/DID/Device ID、路由/域名、证书/鉴权信息。
-    - 单节点/本地：`get_named_data_mgr_by_path` 自动创建 `ndn_mgr.json` 和 DB；`set_mgr_by_id` 注册实例。
-    - 多节点（参照 buckyos-devkit 标准分布式测试环境）：3 个 Zone：A=`test.buckyos.io`，B=`bob.web3.buckyos.io`，SN=`sn.buckyos.io/web3.buckyos.io`；拓扑 DEV→VM_SN→（NAT1→VM_NODE_A2 10.0.1.2，NAT2→VM_NODE_B1 10.0.2.2），NODE_A1 在宿主机，需在 `etc/resolv.conf` 指向 SN。
-    - 部署步骤概览：安装 multipass → 配置 bridge（`dev_vm_config.json`）→ `main.py create` 创建 VM → 构建 buckyos → `main.py install --all` → `main.py active_sn`/`active --all` 启动 SN/节点，确认 DNS 解析与节点启动 (`buckycli sys_config --get boot/config`)。
-    - Gateway/SN 启动与配置示例：SN 使用 `main.py active_sn` 生成配置并 `main.py start_sn` 启动；节点侧 web3-gateway 安装包包含 `rootfs/etc/cyfs_gateway.yaml`（include boot/user/post/node），启动命令 `sudo python3 /opt/web3-gateway/start.py`（或服务方式），需保证 `boot_gateway.yaml` 中 `node_rtcp` 绑定 2980、`zone_gateway_http`/`node_gateway_http` 绑定 80/3180，必要时在 `user_gateway.yaml` 覆盖自定义规则后执行 `cyfs reload --all`。
-- Link 模式场景
-    - 覆盖：本地文件缺失（应报错）、本地文件被修改（mtime 变化应拒绝或重新计算）、Link→Store 转换优先 Store、断点续传、外部文件冲突处理。
-    - 预期：缺失/修改导致读失败或重新计算（通常 `IoError`/`VerifyError`）；Link 覆盖为 Store 后优先使用 Store；断点续传依赖 ChunkWriter 进度；冲突时返回 `AlreadyExists`/`InvalidParam`。
-- 下载/同步判定
-    - `remote_is_better`：判断远端是否较新；`download_fileobj`：有更新则落盘文件与 fileobj；`pull_file/pull_dir`：按模式（智能同步/完全同步）覆盖冲突策略。
-    - “智能同步”：同步删除缺失项，保留新增文件；本地文件若 mtime 更新更晚则重命名保留（参考 `named_mgr.md` 描述）。
-    - “完全同步”：等同同步前清空目标目录再复制。
-    - 判定：校验最终文件集合、冲突文件重命名存在与否、日志含模式标识。
+**TC-A02 路径绑定到 DirObject**
 
-## 一般性用例
+- 优先级: P0
+- 前置: 生成 DirObjectId
+- 输入: `add_dir(path, dir_objid)`
+- 步骤: `add_dir` 后 `list(path, ...)`
+- 观察点: `list` 返回子项；`stat(path)` objid/type
+- 期望: 绑定成功；`list` 返回 DirObject 子项
 
-无特殊说明，具体环境下类似的用例设计，具体细节和本节一样，不必赘述
+**TC-A03 move 仅变更路径指针**
 
-1. 存取
-    - 存入并成功读取数据
-    - 读取不存在的数据
-    - 读取数据校验失败
-        - 数据和 ID 不匹配
-        - 数据被篡改
-        - 其他
-    - 鉴权失败
-    - 其他错误
-2. GC
-    - 存入`NDN`节点的数据，会默认保留 1 天，超时后被清理
-    - 发布到一个`NDN-Path`的数据，会被一直持有
-    - 被多于一个保活对象(新对象、发布对象)引用或间接引用的对象会被持有到引用它的对象生命周期结束
+- 优先级: P1
+- 前置: path1 已绑定 objid
+- 输入: `move_path(path1, path2)`
+- 期望: path1 解绑；path2 绑定同一 objid；对象内容未复制
 
-## 单`Device`
+**TC-A04 copy 复制路径指针**
 
-1. 基于`NamedDataMgr`接口的本地纯`ndn-lib`单元测试
-    - 存取
-    - GC
-2. 基于`NDNClient`接口向本地`NDN`节点远程测试
-    - 存取
-    - GC
+- 优先级: P1
+- 前置: path1 已绑定 objid
+- 输入: `copy_path(path1, path2)`
+- 期望: path1 与 path2 同时指向同一 objid
 
-## 多设备
+**TC-A05 delete 不触发业务数据删除**
 
-1. 基于`NDNClient`接口从本地`NDN`节点向同`Zone`其他`NDN`节点远程测试
-    - 存取
-    - GC
-2. 基于`NDNClient`接口从本地`NDN`节点向其他`Zone`其他`NDN`节点远程测试
-    - 存取
-    - GC
+- 优先级: P0
+- 前置: path 已绑定 objid 并已 pull
+- 输入: `delete(path)`
+- 观察点: `stat_by_objid` materialized；`open_reader_by_id`
+- 期望: path 解绑；对象与 chunk 仍可通过 objid 访问
 
-# 名词解释
+**TC-A06 move 到已存在目标路径**
 
-1. DID
+- 优先级: P1
+- 前置: path1/path2 均已绑定
+- 输入: `move_path(path1, path2)`
+- 期望: 返回错误；原绑定不变
 
-    一个实体(自然人、组织等)的唯一分布式账号
+**TC-A07 非法路径/根路径**
 
-2. Device
+- 优先级: P1
+- 前置: 非法路径或 `/`
+- 输入: `add_file`/`add_dir`
+- 期望: 返回参数错误；无绑定产生
 
-    一个部署`BuckyOS`的分布式节点实例，它通常属于一个`DID`
+**TC-A08 list 分页边界**
 
-3. Zone
+- 优先级: P1
+- 前置: path 绑定 DirObject，子项数 > page_size
+- 输入: `list(path, pos, page_size)`
+- 步骤: pos=0/page_size=n，再 pos=n
+- 期望: 分页不重叠/不遗漏；越界返回空
 
-    `DID`相同的一组`Device`组成一个`Zone`
+### B. 单写与工作态
 
-4. Gateway
+**TC-B01 单写租约冲突**
 
-    类似于`HTTP`协议的`Nginx`，支持`Device`之间的连通
+- 优先级: P0
+- 前置: session1 对 path `create_file`
+- 输入: session2 对同一 path `create_file`
+- 期望: session2 返回 PATH_BUSY/LEASE_CONFLICT；`stat(path)` 显示 working
 
-5. SN
+**TC-B02 working 状态读拒绝**
 
-    即`SuperNode`，保存`Device`的连通信息(物理地址，域名，注册`SN`等)，用辅助`NAT`穿透、转发等方式辅助`Gateway`实现`Device`之间的连通
+- 优先级: P0
+- 前置: session1 进入 working（create_file）
+- 输入: session2 对该 path `open_reader`
+- 期望: 返回 PATH_BUSY
 
-6. Object
+**TC-B03 working 同 session 特例读取**
 
-    任何格式化数据都可以构成一个`Object`，它们通常由一个`JSON`文本描述，这个`JSON`文本按照确定的顺序编码成字符串，并对它计算`HASH`获得其`ObjId`
+- 优先级: P1
+- 前置: session1 working
+- 输入: session1 `open_reader`
+- 期望: 若支持特例则可读；否则明确返回 PATH_BUSY
 
-7. NDN
+**TC-B04 close_file 后写入禁止**
 
-    即`Named Data Network`，以`ObjId`命名数据，并按照一定的规则组织、存储、发布，发布后的数据可以被其他节点获取。`NDN`里的节点本身也是一个`Named Data`，节点要获取`NDN`里的数据，通常需要数据存放的节点名字和数据本身的名字
+- 优先级: P0
+- 前置: create_file 后 append 数据
+- 输入: `close_file(fb)` 后继续 append
+- 期望: 写入被拒绝；`stat` 显示 working-closed
 
-8. NamedDataMgr
+**TC-B05 cacl_name 提交成功**
 
-    `ndn-lib`实现的一个本地组件，负责组织本地命名数据，并提供本地读写功能
+- 优先级: P0
+- 前置: working-closed 状态
+- 输入: `cacl_name(path)`
+- 期望: path 进入 committed；`open_reader(path)` 可读
 
-9. NdnClient
+**TC-B06 working 未关闭时 cacl_name 失败**
 
-    类似于`HTTP`的访问客户端，负责通过`HTTP`链接访问(读/写)`NDN`网络中的数据；这个`HTTP`链接跟传统`HTTP`链接一样有一个域名段和`Path`段：https://{domain}/{path}
+- 优先级: P0
+- 前置: working 未 close
+- 输入: `cacl_name(path)`
+- 期望: 返回错误；不产生 committed 版本
 
-10. NDN-Path
+**TC-B07 close_file 后 open_reader 行为**
 
-    `NDN`节点服务启动时通常会在`Gateway`注册，类似`Nginx`一样对外提供服务，注册时候会有一个在本节点范围内的唯一服务名称，在访问`NDN`网络中命名数据的`HTTP`链接中会以这个服务名为`Path`段的第一段，剩余的`Path`部分标识要访问的对象：
-    https://{domain}/{ndn-serive-name}/{object-name}
+- 优先级: P1
+- 前置: working-closed，但未 cacl_name
+- 输入: `open_reader(path)`
+- 期望: 返回 PATH_BUSY 或明确错误码；不得读到半成品数据
 
-11. O-link
+**TC-B08 lease 过期/会话崩溃清理**
 
-    访问`NDN`节点中的数据时，可以直接通过`ObjId`进行，对应的`HTTP`链接称为`O-link`：
-    https://{domain}/{ndn-service-name}/{obj-id}
+- 优先级: P0
+- 前置: session1 create_file 后模拟崩溃/ttl 过期
+- 输入: session2 `create_file` / `open_reader`
+- 期望: 单写租约被释放；working 软状态被清理
 
-    因为`ObjId`是一组确定数据的`HASH`，所以`O-link`指向的数据是确定的
+### C. 读取语义与 pull/materialization
 
-12. R-link
+**TC-C01 committed 可并发读**
 
-    `NDN`节点可以像文件系统组织文件一样，把各个`Object`挂载到一个用户指定的`Path`下，用户可以通过这个`Path`替代`ObjId`访问数据，这种`HTTP`链接成为`R-link`：
-    https://{domain}/{ndn-service-name}/{obj-path}
+- 优先级: P0
+- 前置: path committed
+- 输入: 多 session 并发 `open_reader`
+- 期望: 读成功且一致
 
-    这种链接更易读，但因为用户可以更新`{obj-path}`上挂载的`Object`，所以这种链接指向的数据是可以被更新的
+**TC-C02 未 pull 返回 NEED_PULL**
 
-13. inner-path
+- 优先级: P0
+- 前置: path 绑定 objid，但对象未 materialize
+- 输入: `open_reader(path)`
+- 期望: 返回 NEED_PULL/NOT_AVAILABLE
 
-    如果一个对象的`JSON`字段中包含有数据块(`Chunk`/`ChunkList`)，那么可以通过父对象和这个字段在`JSON`数据里的路径（这个路径称为`inner-path`）访问这个数据块：
+**TC-C03 pull 后可读**
 
-    `O-link`: https://{domain}/{ndn-service-name}/{obj-id}/{field-name}
-    `R-link`: https://{domain}/{ndn-service-name}/{obj-path}/{field-name}
+- 优先级: P0
+- 前置: 同 TC-C02
+- 输入: `pull(path, remote)` -> 完成后 `open_reader`
+- 期望: read 成功；`stat` 显示 materialized
 
-    **简单对象类型的子对象不能通过这种方式访问**
+**TC-C04 open_reader_by_id 绕过 path**
 
-14. NDN Router
+- 优先级: P1
+- 前置: objid 存在
+- 输入: `open_reader_by_id(objid)`
+- 期望: 可直接读取对象内容
 
-    实现在`Gateway`里，解析`O-link`/`R-link`找到目标对象的标识，并路由到正确的`NDN`服务
+**TC-C05 pull_by_objid 与 path 一致性**
 
-15. 权限
+- 优先级: P1
+- 前置: path->objid 绑定，未 materialize
+- 输入: `pull_by_objid(objid)` 后 `open_reader(path)`
+- 期望: read 成功；状态一致
 
-    可以为`NDN`节点管理的数据配置合适的权限，为其他用户提供服务
+**TC-C06 open_reader_by_id 未 materialize**
+
+- 优先级: P1
+- 前置: objid 存在但未 materialize
+- 输入: `open_reader_by_id(objid)`
+- 期望: 返回 NEED_PULL/NOT_PULLED
+
+### D. chunk 写入与一致性
+
+**TC-D01 chunk 原子写入**
+
+- 优先级: P0
+- 前置: 准备 chunk 数据
+- 输入: 写入 `chunk.tmp` -> 校验 sha256 -> rename -> COMPLETE
+- 期望: 中途失败不会出现 incomplete 可读数据
+
+**TC-D02 写入校验失败**
+
+- 优先级: P1
+- 前置: 模拟 sha256 不匹配
+- 输入: 执行写入流程
+- 期望: 写入失败，chunk 不进入 COMPLETE
+
+**TC-D03 range 越界读取**
+
+- 优先级: P1
+- 前置: 已 COMPLETE chunk
+- 输入: `GetChunkReader(chunk, offset/range)` 越界
+- 期望: 返回范围错误，不读取数据
+
+### E. Link 语义
+
+**TC-E01 SameAs 链路读取**
+
+- 优先级: P1
+- 前置: ChunkA SameAs ChunkB，ChunkB 已 COMPLETE
+- 输入: `GetChunkReader(ChunkA)`
+- 期望: 读取 ChunkB 内容
+
+**TC-E02 PartOf 范围读取**
+
+- 优先级: P1
+- 前置: ChunkA PartOf ChunkB，范围合法
+- 输入: `GetChunkReader(ChunkA, offset)`
+- 期望: 返回 ChunkB 对应 slice
+
+**TC-E03 ExternalFile qcid 正常**
+
+- 优先级: P0
+- 前置: ExternalFile link + 正确 qcid
+- 输入: `GetChunkReader(chunk)`
+- 期望: 读取外部文件 range 成功
+
+**TC-E04 ExternalFile qcid 变化**
+
+- 优先级: P0
+- 前置: ExternalFile link，外部文件已变更
+- 输入: `GetChunkReader(chunk)`
+- 期望: 返回 LINK_INVALID_OR_CHANGED
+
+**TC-E05 Writer 忽略 link**
+
+- 优先级: P1
+- 前置: chunk 存在 link
+- 输入: `GetChunkWriter(chunkid)`
+- 期望: 只允许内部存储写入，不基于 link 写外部数据
+
+**TC-E06 Link 环检测**
+
+- 优先级: P1
+- 前置: SameAs 或 PartOf 形成环
+- 输入: `GetChunkReader`
+- 期望: 返回错误，避免无限递归
+
+**TC-E07 ExternalFile 路径无效**
+
+- 优先级: P1
+- 前置: ExternalFile link 指向不存在文件
+- 输入: `GetChunkReader`
+- 期望: 返回 NOT_AVAILABLE 或明确错误码
+
+**TC-E08 qcid 仅用于 ExternalFile**
+
+- 优先级: P2
+- 前置: SameAs/PartOf link
+- 输入: `GetChunkReader`
+- 期望: 不做 qcid 校验，读取正常
+
+### F. path 与 inner_path
+
+**TC-F01 inner_path 解析成功**
+
+- 优先级: P0
+- 前置: `/movies/dir1` 绑定 DirObject
+- 输入: `open_reader("/movies/dir1/actions/MI6/content/4")`
+- 期望: 逐层解析 inner_path 并读取目标 chunk
+
+**TC-F02 挂载互斥**
+
+- 优先级: P0
+- 前置: `/movies/dir1/actions/Gongfu` 已绑定 fileobject
+- 输入: 尝试将 `/movies/dir1` 绑定到包含 `actions/*` 的 DirObject
+- 期望: 绑定失败（挂载点互斥）
+
+**TC-F03 inner_path 中段类型冲突**
+
+- 优先级: P1
+- 前置: inner_path 中段指向非 DirObject 字段
+- 输入: `open_reader(path/inner_path)`
+- 期望: 返回路径解析错误
+
+**TC-F04 inner_path 越界**
+
+- 优先级: P1
+- 前置: chunklist 长度有限
+- 输入: `open_reader(path/.../content/out_of_range)`
+- 期望: 返回范围错误
+
+**TC-F05 子 path 与 DirObject 冲突（反向）**
+
+- 优先级: P1
+- 前置: `/movies/dir1` 绑定 DirObject，且包含 `actions/*`
+- 输入: `add_file("/movies/dir1/actions/Gongfu", objid)`
+- 期望: 绑定失败（挂载点互斥）
+
+### G. placement layout 与回退
+
+**TC-G01 current 版本写入**
+
+- 优先级: P0
+- 前置: layout_epoch = current
+- 输入: 写入对象
+- 期望: target 按 current 选择
+
+**TC-G02 读回退到 epoch-1**
+
+- 优先级: P1
+- 前置: current 计算 miss，epoch-1 有数据
+- 输入: 读取对象
+- 期望: 回退到 epoch-1 成功；记录回退次数
+
+**TC-G03 读回退到 epoch-2**
+
+- 优先级: P1
+- 前置: current 与 epoch-1 miss，epoch-2 有数据
+- 输入: 读取对象
+- 期望: 回退到 epoch-2 成功；不再继续回退
+
+**TC-G04 回退全部失败**
+
+- 优先级: P1
+- 前置: current/epoch-1/epoch-2 均 miss
+- 输入: 读取对象
+- 期望: 返回 NOT_AVAILABLE 或明确错误码
+
+### H. snapshot/copy
+
+**TC-H01 snapshot 正常**
+
+- 优先级: P1
+- 前置: src committed
+- 输入: `snapshot(src, target)`
+- 期望: target 指向同一 committed 版本
+
+**TC-H02 snapshot 遇到 working**
+
+- 优先级: P1
+- 前置: src working
+- 输入: `snapshot(src, target)`
+- 期望: 返回 PATH_BUSY
+
+**TC-H03 copy_path 与 snapshot 差异**
+
+- 优先级: P2
+- 前置: src committed
+- 输入: `copy_path(src, target)` vs `snapshot(src, target)`
+- 期望: 语义一致性与元数据差异可被观察（如需要）
+
+### I. erase 与 GC
+
+**TC-I01 erase_obj_by_id**
+
+- 优先级: P0
+- 前置: objid 已 materialize
+- 输入: `erase_obj_by_id(objid)` 后 `open_reader_by_id`
+- 期望: 返回 NEED_PULL/NOT_PULLED；path 绑定保持不变
+
+**TC-I02 soft GC 清理**
+
+- 优先级: P0
+- 前置: 存在 `chunk.tmp`、过期 lease、失败 pull 残留
+- 输入: 触发软清理
+- 期望: 临时/软状态被清理，committed 数据不受影响
+
+**TC-I03 业务数据删除需显式接口**
+
+- 优先级: P0
+- 前置: 已有 committed 对象
+- 输入: 执行 delete(path) 或软清理
+- 期望: 业务数据不被删除；仅显式 erase 可触发本地驱逐
+
+**TC-I04 erase 后 stat_by_objid 状态**
+
+- 优先级: P1
+- 前置: objid 已 materialize
+- 输入: `erase_obj_by_id` 后 `stat_by_objid`
+- 期望: 状态显示未 materialize；path 绑定不变
