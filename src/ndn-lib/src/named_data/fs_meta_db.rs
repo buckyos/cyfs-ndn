@@ -2,6 +2,7 @@ use crate::{NdnError, NdnResult, ObjId};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use log::*;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde_json::Value;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,98 @@ pub struct PathStat {
     pub ctime: i64,
     pub mtime: i64,
     pub working: Option<WorkingEntry>,
+    pub materialize_state: ObjMaterializeState,
+    pub materialize_time: i64,
+    pub materialize_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjMaterializeState {
+    NotPulled = 0,
+    Pulling = 1,
+    Ready = 2,
+    Failed = 3,
+}
+
+impl ObjMaterializeState {
+    fn from_i64(value: i64) -> NdnResult<Self> {
+        match value {
+            0 => Ok(Self::NotPulled),
+            1 => Ok(Self::Pulling),
+            2 => Ok(Self::Ready),
+            3 => Ok(Self::Failed),
+            _ => Err(NdnError::InvalidData(format!(
+                "invalid materialize state: {}",
+                value
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjStat {
+    pub obj_id: ObjId,
+    pub materialize_state: ObjMaterializeState,
+    pub materialize_time: i64,
+    pub materialize_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListEntry {
+    pub name: String,
+    pub path: String,
+    pub obj_id: ObjId,
+    pub obj_type: PathObjType,
+    pub state: PathState,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListResult {
+    pub entries: Vec<ListEntry>,
+    pub next_pos: u32,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PullContext {
+    pub remote: String,
+}
+
+impl Default for PullContext {
+    fn default() -> Self {
+        Self {
+            remote: "".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReaderOptions {
+    pub session_id: Option<String>,
+    pub allow_working: bool,
+}
+
+impl Default for ReaderOptions {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            allow_working: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FsMetaReader {
+    pub path: Option<String>,
+    pub obj_id: ObjId,
+    pub obj_type: Option<PathObjType>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileBufferHandle {
+    pub path: String,
+    pub buffer_id: String,
+    pub lease: WriteLease,
 }
 
 pub struct FsMetaDb {
@@ -172,6 +265,33 @@ impl FsMetaDb {
                 "FsMetaDb: create path_mount_index failed! {}",
                 e.to_string()
             );
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS obj_materialize (
+                obj_id TEXT PRIMARY KEY,
+                state INTEGER NOT NULL,
+                update_time INTEGER NOT NULL,
+                last_error TEXT
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!("FsMetaDb: create obj_materialize failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pull_task (
+                obj_id TEXT PRIMARY KEY,
+                remote TEXT NOT NULL,
+                update_time INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| {
+            warn!("FsMetaDb: create pull_task failed! {}", e.to_string());
             NdnError::DbError(e.to_string())
         })?;
 
@@ -308,6 +428,47 @@ impl FsMetaDb {
         Ok(())
     }
 
+    fn get_obj_materialize_state_tx(
+        tx: &Transaction<'_>,
+        obj_id: &ObjId,
+    ) -> NdnResult<ObjMaterializeState> {
+        let row = tx
+            .query_row(
+                "SELECT state FROM obj_materialize WHERE obj_id = ?1",
+                params![obj_id.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                warn!("FsMetaDb: query obj_materialize failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        match row {
+            Some(state) => ObjMaterializeState::from_i64(state),
+            None => Ok(ObjMaterializeState::NotPulled),
+        }
+    }
+
+    pub fn set_obj_materialize_state(
+        &self,
+        obj_id: &ObjId,
+        state: ObjMaterializeState,
+        last_error: Option<String>,
+    ) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Self::now_ts();
+        conn.execute(
+            "INSERT OR REPLACE INTO obj_materialize (obj_id, state, update_time, last_error) VALUES (?1, ?2, ?3, ?4)",
+            params![obj_id.to_string(), state as i64, now, last_error],
+        )
+        .map_err(|e| {
+            warn!("FsMetaDb: set_obj_materialize_state failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+        Ok(())
+    }
+
     pub fn add_file(&self, path: &str, obj_id: &ObjId) -> NdnResult<()> {
         self.add_committed_path(path, obj_id, PathObjType::File)
     }
@@ -386,6 +547,22 @@ impl FsMetaDb {
         &self,
         path: &str,
         lease: WriteLease,
+        expect_size: Option<u64>,
+    ) -> NdnResult<FileBufferHandle> {
+        let now = Self::now_ts();
+        let buffer_id = format!("fb:{}:{}:{}", lease.session_id, lease.fence, now);
+        self.create_file_with_buffer(path, lease.clone(), &buffer_id, expect_size)?;
+        Ok(FileBufferHandle {
+            path: path.to_string(),
+            buffer_id,
+            lease,
+        })
+    }
+
+    pub fn create_file_with_buffer(
+        &self,
+        path: &str,
+        lease: WriteLease,
         buffer_id: &str,
         expect_size: Option<u64>,
     ) -> NdnResult<()> {
@@ -451,6 +628,53 @@ impl FsMetaDb {
         Ok(())
     }
 
+    pub fn create_dir(&self, path: &str, dir_obj_id: &ObjId) -> NdnResult<()> {
+        self.add_committed_path(path, dir_obj_id, PathObjType::Dir)
+    }
+
+    pub fn append(&self, path: &str, lease: WriteLease, data: &[u8]) -> NdnResult<()> {
+        let _ = data.len();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction().map_err(|e| {
+            warn!("FsMetaDb: append tx failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        Self::check_lease_tx(&tx, path, &lease)?;
+
+        let state = tx
+            .query_row(
+                "SELECT state FROM working_entry WHERE path = ?1",
+                params![path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| {
+                warn!("FsMetaDb: append query failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        if state.is_none() {
+            return Err(NdnError::InvalidState("PATH_BUSY".to_string()));
+        }
+
+        let state = WorkingState::from_i64(state.unwrap())?;
+        if state != WorkingState::Writing {
+            return Err(NdnError::InvalidState("INVALID_STATE".to_string()));
+        }
+
+        tx.commit().map_err(|e| {
+            warn!("FsMetaDb: append commit failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        Ok(())
+    }
+
+    pub fn flush(&self, _fb: &FileBufferHandle) -> NdnResult<()> {
+        Ok(())
+    }
+
     pub fn close_file(&self, path: &str, lease: WriteLease) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction().map_err(|e| {
@@ -485,6 +709,10 @@ impl FsMetaDb {
         })?;
 
         Ok(())
+    }
+
+    pub fn close_file_by_buffer(&self, fb: &FileBufferHandle) -> NdnResult<()> {
+        self.close_file(&fb.path, fb.lease.clone())
     }
 
     pub fn cacl_name(
@@ -571,6 +799,141 @@ impl FsMetaDb {
         Ok(())
     }
 
+    fn get_obj_materialize_info(
+        &self,
+        obj_id: &ObjId,
+    ) -> NdnResult<(ObjMaterializeState, i64, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT state, update_time, last_error FROM obj_materialize WHERE obj_id = ?1",
+                params![obj_id.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| {
+                warn!(
+                    "FsMetaDb: get_obj_materialize_info failed! {}",
+                    e.to_string()
+                );
+                NdnError::DbError(e.to_string())
+            })?;
+
+        match row {
+            Some((state, update_time, last_error)) => Ok((
+                ObjMaterializeState::from_i64(state)?,
+                update_time,
+                last_error,
+            )),
+            None => Ok((ObjMaterializeState::NotPulled, 0, None)),
+        }
+    }
+
+    pub fn list(&self, path: &str, pos: u32, page_size: u32) -> NdnResult<ListResult> {
+        let conn = self.conn.lock().unwrap();
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, obj_id, obj_type, state FROM path_entry WHERE path LIKE ?1 AND state = ?2 ORDER BY path",
+            )
+            .map_err(|e| {
+                warn!("FsMetaDb: list prepare failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let rows = stmt
+            .query_map(
+                params![format!("{}%", prefix), PathState::Committed as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| {
+                warn!("FsMetaDb: list query failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (full_path, obj_id_str, obj_type, state) = row.map_err(|e| {
+                warn!("FsMetaDb: list row failed! {}", e.to_string());
+                NdnError::DbError(e.to_string())
+            })?;
+            if !full_path.starts_with(&prefix) {
+                continue;
+            }
+            let suffix = &full_path[prefix.len()..];
+            if suffix.is_empty() || suffix.contains('/') {
+                continue;
+            }
+            let obj_id = ObjId::new(&obj_id_str)?;
+            let obj_type = PathObjType::from_i64(obj_type)?;
+            let state = PathState::from_i64(state)?;
+            entries.push(ListEntry {
+                name: suffix.to_string(),
+                path: full_path,
+                obj_id,
+                obj_type,
+                state,
+            });
+        }
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let start = pos as usize;
+        let end = (start + page_size as usize).min(entries.len());
+        let page_entries = if start < entries.len() {
+            entries[start..end].to_vec()
+        } else {
+            Vec::new()
+        };
+        let has_more = end < entries.len();
+
+        Ok(ListResult {
+            entries: page_entries,
+            next_pos: end as u32,
+            has_more,
+        })
+    }
+
+    pub fn pull(&self, path: &str, remote: PullContext) -> NdnResult<()> {
+        let stat = self.stat(path)?;
+        let obj_id = stat
+            .obj_id
+            .ok_or_else(|| NdnError::InvalidState("INVALID_STATE".to_string()))?;
+        self.pull_by_objid(&obj_id, remote)
+    }
+
+    pub fn pull_by_objid(&self, obj_id: &ObjId, remote: PullContext) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Self::now_ts();
+        conn.execute(
+            "INSERT OR REPLACE INTO pull_task (obj_id, remote, update_time) VALUES (?1, ?2, ?3)",
+            params![obj_id.to_string(), remote.remote, now],
+        )
+        .map_err(|e| {
+            warn!("FsMetaDb: pull insert failed! {}", e.to_string());
+            NdnError::DbError(e.to_string())
+        })?;
+
+        self.set_obj_materialize_state(obj_id, ObjMaterializeState::Pulling, None)
+    }
+
     pub fn stat(&self, path: &str) -> NdnResult<PathStat> {
         let conn = self.conn.lock().unwrap();
         let row = conn
@@ -647,6 +1010,11 @@ impl FsMetaDb {
             None
         };
 
+        let (materialize_state, materialize_time, materialize_error) = match obj_id.as_ref() {
+            Some(obj_id) => self.get_obj_materialize_info(obj_id)?,
+            None => (ObjMaterializeState::NotPulled, 0, None),
+        };
+
         Ok(PathStat {
             path: path.to_string(),
             state: PathState::from_i64(state)?,
@@ -656,27 +1024,80 @@ impl FsMetaDb {
             ctime,
             mtime,
             working,
+            materialize_state,
+            materialize_time,
+            materialize_error,
         })
     }
 
-    pub fn stat_by_objid(&self, obj_id: &ObjId) -> NdnResult<PathStat> {
-        let conn = self.conn.lock().unwrap();
-        let row = conn
-            .query_row(
-                "SELECT path FROM path_entry WHERE obj_id = ?1 LIMIT 1",
-                params![obj_id.to_string()],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| {
-                warn!("FsMetaDb: stat_by_objid failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
-            })?;
+    pub fn stat_by_objid(&self, obj_id: &ObjId) -> NdnResult<ObjStat> {
+        let (materialize_state, materialize_time, materialize_error) =
+            self.get_obj_materialize_info(obj_id)?;
+        Ok(ObjStat {
+            obj_id: obj_id.clone(),
+            materialize_state,
+            materialize_time,
+            materialize_error,
+        })
+    }
 
-        match row {
-            Some(path) => self.stat(&path),
-            None => Err(NdnError::NotFound(obj_id.to_string())),
+    pub fn open_reader(&self, path: &str, opt: ReaderOptions) -> NdnResult<FsMetaReader> {
+        let stat = self.stat(path)?;
+        match stat.state {
+            PathState::Committed => {
+                let obj_id = stat
+                    .obj_id
+                    .ok_or_else(|| NdnError::InvalidState("INVALID_STATE".to_string()))?;
+                if stat.materialize_state != ObjMaterializeState::Ready {
+                    return Err(NdnError::InvalidState("NEED_PULL".to_string()));
+                }
+                Ok(FsMetaReader {
+                    path: Some(path.to_string()),
+                    obj_id,
+                    obj_type: stat.obj_type,
+                })
+            }
+            PathState::Working => {
+                if !opt.allow_working {
+                    return Err(NdnError::InvalidState("PATH_BUSY".to_string()));
+                }
+                if let Some(working) = stat.working {
+                    if let Some(session_id) = opt.session_id {
+                        if session_id != working.session_id {
+                            return Err(NdnError::InvalidState("PATH_BUSY".to_string()));
+                        }
+                    }
+                }
+                Err(NdnError::InvalidState("PATH_BUSY".to_string()))
+            }
+            PathState::Empty => Err(NdnError::NotFound(path.to_string())),
         }
+    }
+
+    pub fn open_reader_by_id(
+        &self,
+        obj_id: &ObjId,
+        _opt: ReaderOptions,
+    ) -> NdnResult<FsMetaReader> {
+        let (state, _, _) = self.get_obj_materialize_info(obj_id)?;
+        if state != ObjMaterializeState::Ready {
+            return Err(NdnError::InvalidState("NEED_PULL".to_string()));
+        }
+        Ok(FsMetaReader {
+            path: None,
+            obj_id: obj_id.clone(),
+            obj_type: None,
+        })
+    }
+
+    pub fn close_reader(&self, _reader: FsMetaReader) -> NdnResult<()> {
+        Ok(())
+    }
+
+    pub fn get_object(&self, _obj_id: &ObjId) -> NdnResult<Value> {
+        Err(NdnError::Unsupported(
+            "get_object not implemented".to_string(),
+        ))
     }
 
     pub fn delete(&self, path: &str) -> NdnResult<()> {
@@ -801,6 +1222,27 @@ impl FsMetaDb {
         })?;
 
         Ok(())
+    }
+
+    pub fn snapshot(&self, src: &str, dst: &str) -> NdnResult<()> {
+        self.copy_path(src, dst)
+    }
+
+    pub fn erase_obj_by_id(&self, obj_id: &ObjId) -> NdnResult<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM pull_task WHERE obj_id = ?1",
+            params![obj_id.to_string()],
+        )
+        .map_err(|e| {
+            warn!(
+                "FsMetaDb: erase_obj_by_id pull_task failed! {}",
+                e.to_string()
+            );
+            NdnError::DbError(e.to_string())
+        })?;
+
+        self.set_obj_materialize_state(obj_id, ObjMaterializeState::NotPulled, None)
     }
 
     pub fn set_meta(&self, path: &str, meta: Vec<u8>) -> NdnResult<()> {

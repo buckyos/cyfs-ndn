@@ -122,6 +122,42 @@ CREATE TABLE path_mount_index (
 
 ## 7. API 实现语义
 
+### 7.0 接口原型（签名级别）
+
+```rust
+// 绑定与查询
+fn add_file(&self, path: &Path, obj_id: ObjId) -> NdnResult<()>;
+fn add_dir(&self, path: &Path, dir_obj_id: ObjId) -> NdnResult<()>;
+fn stat(&self, path: &Path) -> NdnResult<PathStat>;
+fn stat_by_objid(&self, obj_id: ObjId) -> NdnResult<ObjStat>;
+fn list(&self, path: &Path, pos: u32, page_size: u32) -> NdnResult<ListResult>;
+fn pull(&self, path: &Path, remote: PullContext) -> NdnResult<()>;
+fn pull_by_objid(&self, obj_id: ObjId, remote: PullContext) -> NdnResult<()>;
+
+// 读
+fn open_reader(&self, path: &Path, opt: ReaderOptions) -> NdnResult<Reader>;
+fn open_reader_by_id(&self, obj_id: ObjId, opt: ReaderOptions) -> NdnResult<Reader>;
+fn get_object(&self, obj_id: ObjId) -> NdnResult<NamedObject>;
+fn close_reader(reader: Reader) -> NdnResult<()>;
+
+// 写（严格单写）
+fn create_dir(&self, path: &Path) -> NdnResult<()>;
+fn create_file(&self, path: &Path, expect_size: u32) -> NdnResult<FileBuffer>;
+fn append(&self, path: &Path, data: Buffer) -> NdnResult<()>;
+fn flush(&self, fb: FileBuffer) -> NdnResult<()>;
+fn close_file(&self, fb: FileBuffer) -> NdnResult<()>;
+fn cacl_name(&self, path: &Path) -> NdnResult<()>;
+
+// 删除/复制
+fn delete(&self, path: &Path) -> NdnResult<()>;
+fn move_path(&self, old_path: &Path, new_path: &Path) -> NdnResult<()>;
+fn copy_path(&self, src: &Path, dst: &Path) -> NdnResult<()>;
+fn snapshot(&self, src: &Path, dst: &Path) -> NdnResult<()>;
+
+// 物理删除
+fn erase_obj_by_id(&self, obj_id: ObjId) -> NdnResult<()>;
+```
+
 ### 7.1 绑定与查询
 
 - `add_file(path, obj_id)`
@@ -136,6 +172,20 @@ CREATE TABLE path_mount_index (
   - 返回 committed/working/materialization 状态
   - 若对象未 pull，返回 `NEED_PULL/NOT_PULLED`
 
+- `list(path, pos, page_size)`
+  - 仅列出显式 path 绑定的子项（不展开 DirObject）
+  - 返回分页结果与是否还有更多
+  - working 路径默认不可见（除非是同 session 读）
+
+- `pull(path, remote)`
+  - 仅提交 pull 任务，立即返回
+  - 不改变 `path -> obj_id` 绑定
+  - pull 进度与结果通过 `stat`/`stat_by_objid` 观测
+
+- `pull_by_objid(objid, remote)`
+  - 绕过 path 对指定对象发起 pull
+  - 对象可能来自 `add_file/add_dir` 的提前绑定
+
 ### 7.2 写流程
 
 - `create_file(path, expect_size)`
@@ -143,9 +193,17 @@ CREATE TABLE path_mount_index (
   - 生成 `buffer_id` 并写入 `working_entry`
   - `path_entry.state=working`
 
+- `create_dir(path)`
+  - 创建空目录（可直接生成空 DirObject 并提交）
+  - 若要支持 working dir buffer，可走 working -> committed 流程
+
 - `append(path, data)`
   - fs_meta_db 校验租约与状态
   - 数据写入由 file_buffer 执行
+
+- `flush(fb)`
+  - 仅确认 file_buffer 已落盘
+  - fs_meta_db 不变更状态
 
 - `close_file(fb)`
   - `working_entry.state=closed`
@@ -165,6 +223,14 @@ CREATE TABLE path_mount_index (
 
 - `open_reader_by_id(objid)`
   - 绕过 path，fs_meta_db 仅参与 stat/物化状态
+
+- `close_reader(reader)`
+  - 释放 reader 相关资源
+  - fs_meta_db 不维护 reader 状态
+
+- `get_object(objid)`
+  - 返回对象元数据（对象库）
+  - fs_meta_db 不直接读取对象体
 
 ### 7.4 删除与复制
 
