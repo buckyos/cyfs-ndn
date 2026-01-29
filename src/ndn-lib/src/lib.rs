@@ -18,6 +18,7 @@ mod coll;
 mod packed_obj_pipline;
 mod tools;
 mod base_content;
+mod fs_meta_db;
 //mod example;
 
 use std::path::PathBuf;
@@ -39,6 +40,7 @@ pub use object_array::*;
 pub use coll::*;
 pub use packed_obj_pipline::*;
 pub use tools::*;
+pub use fs_meta_db::*;
 
 
 
