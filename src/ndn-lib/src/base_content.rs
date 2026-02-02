@@ -108,12 +108,12 @@ impl BaseContentObject {
 /// 验签逻辑在上层根据 `curator` 对应的公钥完成。
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InclusionProof {
-    /// 被收录的内容 ObjId
-    pub content_id: ObjId,
+    /// 被收录的内容 ObjId,必须和content_obj一致
+    pub content_id: String,
     pub content_obj:serde_json::Value,
 
     /// 收录者身份（推荐 DID 字符串）
-    pub curator: String,
+    pub curator: DID,
     pub editor:Vec<String>,//editor is the editor of the curator organization
     pub meta:Option<serde_json::Value>,//extra meta info   
     pub rank:i64,//rank of the content ,1-100
@@ -131,18 +131,18 @@ pub struct InclusionProof {
 }
 
 impl InclusionProof {
-    pub fn new(content_id: ObjId, content_obj:serde_json::Value, curator: String,rank:i64) -> Self {
+    pub fn new(content_id: ObjId, content_obj:serde_json::Value, curator: DID,rank:i64,collection:Vec<String>) -> Self {
         let now = buckyos_get_unix_timestamp();
         Self {
-            content_id,
+            content_id: content_id.to_string(),
             content_obj:content_obj,
             curator,
             editor:Vec::new(),
             rank,
-            collection:Vec::new(),
+            collection,
             review_url:None,
             iat: now,
-            exp: 0,
+            exp: now + 3600*24*30*12,//12 months
             meta: None,
         }
     }
@@ -150,5 +150,27 @@ impl InclusionProof {
     pub fn gen_obj_id(&self) -> (ObjId, String) {
         let json_value = serde_json::to_value(self).unwrap();
         build_named_object_by_json(OBJ_TYPE_INCLUSION_PROOF, &json_value)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inclusion_proof() {
+        let content_id = ObjId::new("cyfile:1234").unwrap();
+        let content_obj = serde_json::json!({
+            "name": "test_app",
+        });
+        let curator = DID::new("web","gitpot.ai");
+        let rank = 1;
+        let mut inclusion_proof = InclusionProof::new(content_id, content_obj, curator, rank, vec!["apps".to_string()]);
+        inclusion_proof.editor = vec!["did:web:wcy.gitpot.ai".to_string()];
+        inclusion_proof.review_url = Some("https://gitpot.ai/reviews/apps/test_app".to_string());
+        let (obj_id, obj_str) = inclusion_proof.gen_obj_id();
+
+        println!("inclusion_proof: {}", serde_json::to_string_pretty(&inclusion_proof).unwrap());
     }
 }
