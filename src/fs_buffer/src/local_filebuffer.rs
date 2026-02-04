@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::fs::File as StdFile;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as StdFileExt;
@@ -160,13 +161,18 @@ impl LocalFileBufferService {
         format!("fb-{}-{}", ts, seq)
     }
 
+    fn buffer_prefix(handle_id: &str) -> String {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in handle_id.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        format!("{:02x}", hash & 0xff)
+    }
+
     fn buffer_path_by_id(&self, handle_id: &str) -> PathBuf {
         let file_name = format!("{}.buf", handle_id);
-        let prefix = file_name
-            .chars()
-            .take(2)
-            .collect::<String>()
-            .to_lowercase();
+        let prefix = Self::buffer_prefix(handle_id);
         self.buffer_dir.join(prefix).join(file_name)
     }
 
@@ -376,12 +382,14 @@ impl FileBufferService for LocalFileBufferService {
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekReader> {
         self.load_layout_if_needed(fb).await?;
+        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+            return Err(NdnError::Unsupported(
+                "BaseChunkList overlay not implemented".to_string(),
+            ));
+        }
         //打开BaseReader 
         //打开本地文件，如果有BaseReader,那么本地文件是一个“差异Chunk文件",只包含修改过的Chunk
         //根据BaseReader和本地文件，构造LocalFileBufferSeekReader
-        if let FileBufferOwner::BaseChunkList(_) = &fb.owner {
-            warn!("LocalFileBuffer: BaseChunkList overlay read is not implemented yet");
-        }
 
         let file_path = self.buffer_path(fb);
         let mut file = OpenOptions::new().read(true).open(file_path).await?;
@@ -402,14 +410,16 @@ impl FileBufferService for LocalFileBufferService {
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekWriter> {
         self.load_layout_if_needed(fb).await?;
+        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+            return Err(NdnError::Unsupported(
+                "BaseChunkList overlay not implemented".to_string(),
+            ));
+        }
         // 伪代码：
         // 打开BaseReader 
         // 用只读模式打开本地文件，如果有BaseReader,那么本地文件是一个“空洞文件"
         // 根据BaseReader和本地文件，构造LocalFileBufferSeekWriter
         self.ensure_writable(fb)?;
-        if let FileBufferOwner::BaseChunkList(_) = &fb.owner {
-            warn!("LocalFileBuffer: BaseChunkList overlay write is not implemented yet");
-        }
 
         let file_path = self.buffer_path(fb);
         let mut file = self.open_exclusive_rw(&file_path, true).await?;
@@ -418,9 +428,6 @@ impl FileBufferService for LocalFileBufferService {
         let inner_std = std_clone.into_std().await;
         let base_reader: Option<FileBufferSeekReader> = None;
         let compact_layout = base_reader.is_some();
-        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) && base_reader.is_none() {
-            warn!("LocalFileBuffer: BaseReader is required for dirty layout but not provided");
-        }
         let writer = LocalFileBufferSeekWriter::new(
             file,
             inner_std,
@@ -449,11 +456,27 @@ impl FileBufferService for LocalFileBufferService {
     }
 
     async fn close(&self, fb: &FileBufferHandle) -> NdnResult<()> {
-        self.flush(fb).await
+        self.flush(fb).await?;
+        let order = fb
+            .dirty_layout
+            .read()
+            .map(|layout| layout.order.clone())
+            .map_err(|_| NdnError::InvalidState("dirty layout poisoned".to_string()))?;
+        let handle_id = fb.handle_id.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.set_dirty_order(&handle_id, &order))
+            .await
+            .map_err(|e| NdnError::IoError(format!("persist layout join error: {}", e)))??;
+        Ok(())
     }
 
     async fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdnResult<()> {
         self.ensure_writable(fb)?;
+        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+            return Err(NdnError::Unsupported(
+                "BaseChunkList overlay not implemented".to_string(),
+            ));
+        }
         let file_path = self.buffer_path(fb);
         let mut file = self.open_exclusive_rw(&file_path, true).await?;
         let pos = file.seek(SeekFrom::End(0)).await?;
@@ -709,7 +732,6 @@ impl AsyncRead for LocalFileBufferSeekReader {
                     match reader {
                         ReaderTarget::Inner => {
                             this.inner_pos = desired_pos + read as u64;
-                            this.base_pos = this.pos;
                         }
                         ReaderTarget::Base => {
                             this.base_pos = this.pos;
@@ -769,7 +791,7 @@ impl AsyncSeek for LocalFileBufferSeekReader {
 
 pub struct LocalFileBufferSeekWriter {
     inner: File,
-    inner_std: StdFile,
+    inner_std: Arc<StdFile>,
     dirty_layout: Arc<RwLock<DirtyChunkLayout>>,
     base_reader: Option<FileBufferSeekReader>,
     chunk_size: u64,
@@ -780,6 +802,7 @@ pub struct LocalFileBufferSeekWriter {
     compact_layout: bool,
     prefill: Option<PrefillState>,
     pending_write: Option<u64>,
+    pending_pwrite: Option<PendingPwrite>,
 }
 
 impl LocalFileBufferSeekWriter {
@@ -796,7 +819,7 @@ impl LocalFileBufferSeekWriter {
     ) -> Self {
         Self {
             inner,
-            inner_std,
+            inner_std: Arc::new(inner_std),
             dirty_layout,
             base_reader,
             chunk_size,
@@ -807,6 +830,7 @@ impl LocalFileBufferSeekWriter {
             compact_layout,
             prefill: None,
             pending_write: None,
+            pending_pwrite: None,
         }
     }
 
@@ -917,15 +941,39 @@ impl LocalFileBufferSeekWriter {
                     }
                 }
                 PrefillPhase::WriteInner => {
-                    let buf = &state.buf;
-                    let slot_start = state.slot_start;
-                    match write_at_all(&self.inner_std, slot_start, buf) {
-                        Ok(()) => {
-                            self.inner_pos = slot_start + buf.len() as u64;
-                            self.prefill = None;
-                            return Poll::Ready(Ok(()));
+                    if state.write_handle.is_none() {
+                        let buf = std::mem::take(&mut state.buf);
+                        let slot_start = state.slot_start;
+                        let write_len = buf.len();
+                        let file = self.inner_std.clone();
+                        state.write_len = write_len;
+                        state.write_handle = Some(tokio::task::spawn_blocking(move || {
+                            write_at_all(&file, slot_start, &buf)
+                        }));
+                    }
+
+                    if let Some(handle) = state.write_handle.as_mut() {
+                        match Pin::new(handle).poll(cx) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(join_result) => {
+                                state.write_handle = None;
+                                match join_result {
+                                    Ok(Ok(())) => {
+                                        self.inner_pos =
+                                            state.slot_start + state.write_len as u64;
+                                        self.prefill = None;
+                                        return Poll::Ready(Ok(()));
+                                    }
+                                    Ok(Err(err)) => return Poll::Ready(Err(err)),
+                                    Err(err) => {
+                                        return Poll::Ready(Err(std::io::Error::new(
+                                            std::io::ErrorKind::Other,
+                                            format!("prefill join error: {}", err),
+                                        )))
+                                    }
+                                }
+                            }
                         }
-                        Err(err) => return Poll::Ready(Err(err)),
                     }
                 }
             }
@@ -941,12 +989,19 @@ struct PrefillState {
     eof: bool,
     phase: PrefillPhase,
     base_seek_pending: bool,
+    write_handle: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    write_len: usize,
 }
 
 enum PrefillPhase {
     SeekBase,
     ReadBase,
     WriteInner,
+}
+
+struct PendingPwrite {
+    desired_pos: u64,
+    handle: tokio::task::JoinHandle<std::io::Result<usize>>,
 }
 
 impl AsyncWrite for LocalFileBufferSeekWriter {
@@ -956,6 +1011,28 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
+        if let Some(pending) = this.pending_pwrite.as_mut() {
+            let desired_pos = pending.desired_pos;
+            match Pin::new(&mut pending.handle).poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(join_result) => {
+                    this.pending_pwrite = None;
+                    let n = match join_result {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(err)) => return Poll::Ready(Err(err)),
+                        Err(err) => {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                format!("pwrite join error: {}", err),
+                            )))
+                        }
+                    };
+                    this.pos += n as u64;
+                    this.inner_pos = desired_pos + n as u64;
+                    return Poll::Ready(Ok(n));
+                }
+            }
+        }
         if let Some(pending_pos) = this.pending_write {
             if this.compact_layout {
                 let chunk_size = this.chunk_size.max(1);
@@ -1051,6 +1128,8 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
                         eof: false,
                         phase: PrefillPhase::SeekBase,
                         base_seek_pending: false,
+                        write_handle: None,
+                        write_len: 0,
                     });
                     match this.drive_prefill(cx) {
                         Poll::Pending => return Poll::Pending,
@@ -1059,13 +1138,36 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
                     }
                 }
             }
-            match write_at_once(&this.inner_std, target_buf, desired_pos) {
-                Ok(n) => {
-                    this.pos += n as u64;
-                    this.inner_pos = desired_pos + n as u64;
-                    Poll::Ready(Ok(n))
+            let data = target_buf.to_vec();
+            let file = this.inner_std.clone();
+            let handle = tokio::task::spawn_blocking(move || write_at_once(&file, &data, desired_pos));
+            this.pending_pwrite = Some(PendingPwrite {
+                desired_pos,
+                handle,
+            });
+            if let Some(pending) = this.pending_pwrite.as_mut() {
+                let desired_pos = pending.desired_pos;
+                match Pin::new(&mut pending.handle).poll(cx) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(join_result) => {
+                        this.pending_pwrite = None;
+                        let n = match join_result {
+                            Ok(Ok(n)) => n,
+                            Ok(Err(err)) => return Poll::Ready(Err(err)),
+                            Err(err) => {
+                                return Poll::Ready(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    format!("pwrite join error: {}", err),
+                                )))
+                            }
+                        };
+                        this.pos += n as u64;
+                        this.inner_pos = desired_pos + n as u64;
+                        Poll::Ready(Ok(n))
+                    }
                 }
-                Err(err) => Poll::Ready(Err(err)),
+            } else {
+                Poll::Pending
             }
         }
     }
@@ -1264,6 +1366,72 @@ mod tests {
         let file_path = service.buffer_path(&fb);
         let meta = tokio::fs::metadata(&file_path).await.unwrap();
         assert!(meta.len() <= CHUNK_NORMAL_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_dirty_then_clean_read_across_chunks() {
+        let dir = tempdir().unwrap();
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let mut fb = service
+            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .await
+            .unwrap();
+        fb.owner = FileBufferOwner::BaseChunkList(vec![]);
+
+        let base_path = dir.path().join("base_dirty_clean.bin");
+        {
+            let mut base_file = tokio::fs::File::create(&base_path).await.unwrap();
+            write_filled(&mut base_file, 0x00, CHUNK_NORMAL_SIZE)
+                .await
+                .unwrap();
+            write_filled(&mut base_file, 0x11, CHUNK_NORMAL_SIZE)
+                .await
+                .unwrap();
+            base_file.flush().await.unwrap();
+        }
+        let base_reader: FileBufferSeekReader =
+            Box::pin(tokio::fs::File::open(&base_path).await.unwrap());
+
+        let file_path = service.buffer_path(&fb);
+        let mut file = service.open_exclusive_rw(&file_path, true).await.unwrap();
+        let pos = file.seek(SeekFrom::Start(0)).await.unwrap();
+        let std_clone = file.try_clone().await.unwrap();
+        let inner_std = std_clone.into_std().await;
+        let mut writer = LocalFileBufferSeekWriter::new(
+            file,
+            inner_std,
+            fb.dirty_layout.clone(),
+            CHUNK_NORMAL_SIZE,
+            pos,
+            fb.handle_id.clone(),
+            service.db.clone(),
+            true,
+            Some(base_reader),
+        );
+        writer.seek(SeekFrom::Start(10)).await.unwrap();
+        writer.write_all(b"DIRTY").await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let inner_file = tokio::fs::File::open(&file_path).await.unwrap();
+        let base_reader: FileBufferSeekReader =
+            Box::pin(tokio::fs::File::open(&base_path).await.unwrap());
+        let mut reader = LocalFileBufferSeekReader::new(
+            inner_file,
+            Some(base_reader),
+            fb.dirty_layout.clone(),
+            CHUNK_NORMAL_SIZE,
+            0,
+        );
+
+        reader
+            .seek(SeekFrom::Start(CHUNK_NORMAL_SIZE - 4))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&buf[4..], &[0x11, 0x11, 0x11, 0x11]);
     }
 
     //一个复杂的测试
