@@ -67,6 +67,36 @@ fn write_at_all(file: &StdFile, mut offset: u64, mut buf: &[u8]) -> std::io::Res
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ChunkPlan {
+    index: u64,
+    offset: u64,
+    max_len: usize,
+}
+
+fn plan_chunk(pos: u64, remaining: usize, chunk_size: u64) -> ChunkPlan {
+    let chunk_size = chunk_size.max(1);
+    let index = pos / chunk_size;
+    let offset = pos % chunk_size;
+    let max_len = std::cmp::min(remaining as u64, chunk_size - offset) as usize;
+    ChunkPlan {
+        index,
+        offset,
+        max_len,
+    }
+}
+
+fn start_seek_at<T: AsyncSeek>(target: Pin<&mut T>, pos: u64) -> std::io::Result<()> {
+    target.start_seek(SeekFrom::Start(pos))
+}
+
+fn poll_complete_seek<T: AsyncSeek>(
+    target: Pin<&mut T>,
+    cx: &mut Context<'_>,
+) -> Poll<std::io::Result<u64>> {
+    target.poll_complete(cx)
+}
+
 impl Default for DirtyChunkLayout {
     fn default() -> Self {
         Self {
@@ -260,76 +290,9 @@ impl LocalFileBufferService {
         Ok(())
     }
 
-    async fn calc_file_object(
-        &self,
-        file_path: &Path,
-        name_hint: &str,
-    ) -> NdnResult<FileObjectCalc> {
-        let meta = fs::metadata(file_path).await?;
-        let file_size = meta.len();
-        let mut file = File::open(file_path).await?;
-
-        let mut chunk_ids = Vec::new();
-        if file_size == 0 {
-            let chunk_id = ChunkHasher::new(None)
-                .map_err(|e| NdnError::InvalidParam(e.to_string()))?
-                .calc_mix_chunk_id_from_bytes(&[])?;
-            chunk_ids.push(chunk_id);
-        } else {
-            let mut remaining = file_size;
-            while remaining > 0 {
-                let chunk_len = std::cmp::min(CHUNK_NORMAL_SIZE, remaining);
-                let chunk_hasher = ChunkHasher::new(None)
-                    .map_err(|e| NdnError::InvalidParam(e.to_string()))?;
-                let hash_method = chunk_hasher.hash_method.clone();
-                let (hash_bytes, read_len) = chunk_hasher
-                    .calc_from_reader_with_length(&mut file, chunk_len)
-                    .await?;
-                if read_len == 0 {
-                    break;
-                }
-                let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(
-                    read_len,
-                    &hash_bytes,
-                    hash_method,
-                )?;
-                chunk_ids.push(chunk_id);
-                remaining = remaining.saturating_sub(read_len);
-            }
-        }
-
-        let (content_id, chunk_list_opt) = if chunk_ids.len() == 1 && file_size <= CHUNK_NORMAL_SIZE
-        {
-            (chunk_ids[0].to_string(), None)
-        } else {
-            let mut chunk_list = SimpleChunkList::new();
-            for chunk_id in chunk_ids.iter() {
-                chunk_list.append_chunk(chunk_id.clone())?;
-            }
-            let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
-            (chunk_list_id.to_string(), Some((chunk_list_id, chunk_list_str)))
-        };
-
-        let file_obj = FileObject::new(name_hint.to_string(), file_size, content_id);
-        let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
-
-        Ok(FileObjectCalc {
-            file_size,
-            file_obj_id,
-            file_obj_str,
-            chunk_ids,
-            chunk_list: chunk_list_opt,
-        })
-    }
 }
 
-struct FileObjectCalc {
-    file_size: u64,
-    file_obj_id: ObjId,
-    file_obj_str: String,
-    chunk_ids: Vec<ChunkId>,
-    chunk_list: Option<(ObjId, String)>,
-}
+
 
 #[async_trait]
 impl FileBufferService for LocalFileBufferService {
@@ -504,13 +467,7 @@ impl FileBufferService for LocalFileBufferService {
         Ok(())
     }
 
-    /// Staged 模式：让 buffer node 计算 hash（避免把数据搬回本地再算）
-    async fn cacl_name(&self, fb: &FileBufferHandle) -> NdnResult<ObjId> {
-        let file_path = self.buffer_path(fb);
-        let name_hint = fb.handle_id.as_str();
-        let calc = self.calc_file_object(&file_path, name_hint).await?;
-        Ok(calc.file_obj_id)
-    }
+
 
     // /// Finalize：把数据从 buffer node 推到 NamedStore internal（IO 密集型）
     // async fn move_to_store(&self, fb: &FileBufferHandle, store: &dyn NamedStore) -> NdnResult<()> {
@@ -577,7 +534,7 @@ pub struct LocalFileBufferSeekReader {
     pos: u64,
     inner_pos: u64,
     base_pos: u64,
-    sync_target: Option<ReaderTarget>,
+    read_state: ReadState,
 }
 
 impl LocalFileBufferSeekReader {
@@ -596,7 +553,7 @@ impl LocalFileBufferSeekReader {
             pos,
             inner_pos: pos,
             base_pos: pos,
-            sync_target: None,
+            read_state: ReadState::Idle,
         }
     }
 }
@@ -607,6 +564,109 @@ enum ReaderTarget {
     Base,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadState {
+    Idle,
+    Syncing(ReaderTarget),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReadPlan {
+    target: ReaderTarget,
+    desired_pos: u64,
+    max_len: usize,
+}
+
+impl LocalFileBufferSeekReader {
+    fn target_pos(&self, target: ReaderTarget) -> u64 {
+        match target {
+            ReaderTarget::Inner => self.inner_pos,
+            ReaderTarget::Base => self.base_pos,
+        }
+    }
+
+    fn set_target_pos(&mut self, target: ReaderTarget, pos: u64) {
+        match target {
+            ReaderTarget::Inner => self.inner_pos = pos,
+            ReaderTarget::Base => self.base_pos = pos,
+        }
+    }
+
+    fn base_reader_mut(&mut self) -> std::io::Result<&mut FileBufferSeekReader> {
+        self.base_reader
+            .as_mut()
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "base_reader missing"))
+    }
+
+    fn start_seek_target(&mut self, target: ReaderTarget, pos: u64) -> std::io::Result<()> {
+        match target {
+            ReaderTarget::Inner => start_seek_at(Pin::new(&mut self.inner), pos),
+            ReaderTarget::Base => {
+                let base = self.base_reader_mut()?;
+                start_seek_at(Pin::new(base), pos)
+            }
+        }
+    }
+
+    fn poll_complete_target(
+        &mut self,
+        target: ReaderTarget,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<u64>> {
+        match target {
+            ReaderTarget::Inner => poll_complete_seek(Pin::new(&mut self.inner), cx),
+            ReaderTarget::Base => {
+                let base = match self.base_reader_mut() {
+                    Ok(base) => base,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                poll_complete_seek(Pin::new(base), cx)
+            }
+        }
+    }
+
+    fn poll_read_target(
+        &mut self,
+        target: ReaderTarget,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match target {
+            ReaderTarget::Inner => Pin::new(&mut self.inner).poll_read(cx, buf),
+            ReaderTarget::Base => {
+                let base = match self.base_reader_mut() {
+                    Ok(base) => base,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                Pin::new(base).poll_read(cx, buf)
+            }
+        }
+    }
+
+    fn read_plan(&self, remaining: usize) -> std::io::Result<ReadPlan> {
+        let chunk_size = self.chunk_size.max(1);
+        let chunk = plan_chunk(self.pos, remaining, chunk_size);
+        let layout = self
+            .dirty_layout
+            .read()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "dirty layout poisoned"))?;
+        if let Some(slot) = layout.slot_of(chunk.index as u32) {
+            let local_offset = slot as u64 * chunk_size + chunk.offset;
+            Ok(ReadPlan {
+                target: ReaderTarget::Inner,
+                desired_pos: local_offset,
+                max_len: chunk.max_len,
+            })
+        } else {
+            Ok(ReadPlan {
+                target: ReaderTarget::Base,
+                desired_pos: self.pos,
+                max_len: chunk.max_len,
+            })
+        }
+    }
+}
+
 impl AsyncRead for LocalFileBufferSeekReader {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -615,30 +675,20 @@ impl AsyncRead for LocalFileBufferSeekReader {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         loop {
-            if let Some(target) = this.sync_target {
-                let poll = match target {
-                    ReaderTarget::Inner => Pin::new(&mut this.inner).poll_complete(cx),
-                    ReaderTarget::Base => {
-                        let base = this
-                            .base_reader
-                            .as_mut()
-                            .expect("base_reader missing while syncing");
-                        Pin::new(base).poll_complete(cx)
-                    }
-                };
-
-                match poll {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(pos)) => {
-                        match target {
-                            ReaderTarget::Inner => this.inner_pos = pos,
-                            ReaderTarget::Base => this.base_pos = pos,
+            match this.read_state {
+                ReadState::Syncing(target) => {
+                    let poll = this.poll_complete_target(target, cx);
+                    match poll {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Ok(pos)) => {
+                            this.set_target_pos(target, pos);
+                            this.read_state = ReadState::Idle;
+                            continue;
                         }
-                        this.sync_target = None;
-                        continue;
+                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                     }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
                 }
+                ReadState::Idle => {}
             }
 
             if this.base_reader.is_none() {
@@ -657,69 +707,23 @@ impl AsyncRead for LocalFileBufferSeekReader {
                 return Poll::Ready(Ok(()));
             }
 
-            let chunk_size = this.chunk_size.max(1);
-            let chunk_index = this.pos / chunk_size;
-            let chunk_offset = this.pos % chunk_size;
-            let max_len = std::cmp::min(remaining as u64, chunk_size - chunk_offset) as usize;
+            let plan = match this.read_plan(remaining) {
+                Ok(plan) => plan,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
 
-            let (target, local_offset) = {
-                let layout = this.dirty_layout.read().map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::Other, "dirty layout poisoned")
-                });
-                match layout {
-                    Ok(layout) => {
-                        if let Some(slot) = layout.slot_of(chunk_index as u32) {
-                            let local_offset = slot as u64 * this.chunk_size + chunk_offset;
-                            (ReaderTarget::Inner, Some(local_offset))
-                        } else {
-                            (ReaderTarget::Base, None)
-                        }
-                    }
-                    Err(err) => return Poll::Ready(Err(err)),
+            if this.target_pos(plan.target) != plan.desired_pos {
+                if let Err(err) = this.start_seek_target(plan.target, plan.desired_pos) {
+                    return Poll::Ready(Err(err));
                 }
-            };
-
-            let (reader_pos, reader) = match target {
-                ReaderTarget::Inner => (this.inner_pos, ReaderTarget::Inner),
-                ReaderTarget::Base => (this.base_pos, ReaderTarget::Base),
-            };
-
-            let desired_pos = match target {
-                ReaderTarget::Inner => local_offset.unwrap_or(this.pos),
-                ReaderTarget::Base => this.pos,
-            };
-
-            if reader_pos != desired_pos {
-                match reader {
-                    ReaderTarget::Inner => {
-                        if let Err(err) =
-                            Pin::new(&mut this.inner).start_seek(SeekFrom::Start(desired_pos))
-                        {
-                            return Poll::Ready(Err(err));
-                        }
-                    }
-                    ReaderTarget::Base => {
-                        let base = this.base_reader.as_mut().unwrap();
-                        if let Err(err) = Pin::new(base).start_seek(SeekFrom::Start(desired_pos)) {
-                            return Poll::Ready(Err(err));
-                        }
-                    }
-                }
-                this.sync_target = Some(reader);
+                this.read_state = ReadState::Syncing(plan.target);
                 continue;
             }
 
-            let mut temp = vec![0u8; max_len];
+            let mut temp = vec![0u8; plan.max_len];
             let mut temp_buf = ReadBuf::new(&mut temp);
 
-            let poll = match reader {
-                ReaderTarget::Inner => Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf),
-                ReaderTarget::Base => {
-                    let base = this.base_reader.as_mut().unwrap();
-                    Pin::new(base).poll_read(cx, &mut temp_buf)
-                }
-            };
-
+            let poll = this.poll_read_target(plan.target, cx, &mut temp_buf);
             match poll {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {
@@ -729,9 +733,9 @@ impl AsyncRead for LocalFileBufferSeekReader {
                     }
                     buf.put_slice(&temp[..read]);
                     this.pos += read as u64;
-                    match reader {
+                    match plan.target {
                         ReaderTarget::Inner => {
-                            this.inner_pos = desired_pos + read as u64;
+                            this.inner_pos = plan.desired_pos + read as u64;
                         }
                         ReaderTarget::Base => {
                             this.base_pos = this.pos;
@@ -748,6 +752,7 @@ impl AsyncRead for LocalFileBufferSeekReader {
 impl AsyncSeek for LocalFileBufferSeekReader {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
         let this = self.get_mut();
+        this.read_state = ReadState::Idle;
         if this.base_reader.is_none() {
             Pin::new(&mut this.inner).start_seek(position)?;
         } else if let Some(base) = this.base_reader.as_mut() {
@@ -759,19 +764,20 @@ impl AsyncSeek for LocalFileBufferSeekReader {
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
         let this = self.get_mut();
         if this.base_reader.is_none() {
-            let inner_poll = Pin::new(&mut this.inner).poll_complete(cx);
+            let inner_poll = poll_complete_seek(Pin::new(&mut this.inner), cx);
             match inner_poll {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(pos)) => {
                     this.pos = pos;
                     this.inner_pos = pos;
+                    this.read_state = ReadState::Idle;
                     Poll::Ready(Ok(pos))
                 }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
             }
         } else {
             let base_poll = if let Some(base) = this.base_reader.as_mut() {
-                Pin::new(base).poll_complete(cx)
+                poll_complete_seek(Pin::new(base), cx)
             } else {
                 Poll::Ready(Ok(this.pos))
             };
@@ -781,6 +787,7 @@ impl AsyncSeek for LocalFileBufferSeekReader {
                     this.pos = pos;
                     this.base_pos = pos;
                     this.inner_pos = u64::MAX;
+                    this.read_state = ReadState::Idle;
                     Poll::Ready(Ok(pos))
                 }
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
@@ -801,8 +808,7 @@ pub struct LocalFileBufferSeekWriter {
     db: Arc<LocalFileBufferDB>,
     compact_layout: bool,
     prefill: Option<PrefillState>,
-    pending_write: Option<u64>,
-    pending_pwrite: Option<PendingPwrite>,
+    write_state: WriteState,
 }
 
 impl LocalFileBufferSeekWriter {
@@ -829,8 +835,7 @@ impl LocalFileBufferSeekWriter {
             db,
             compact_layout,
             prefill: None,
-            pending_write: None,
-            pending_pwrite: None,
+            write_state: WriteState::Idle,
         }
     }
 
@@ -979,6 +984,62 @@ impl LocalFileBufferSeekWriter {
             }
         }
     }
+
+    fn poll_direct_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        pending_pos: u64,
+        max_len: Option<usize>,
+        track_dirty: bool,
+    ) -> Poll<std::io::Result<usize>> {
+        let target_buf = if let Some(max_len) = max_len {
+            &buf[..max_len]
+        } else {
+            buf
+        };
+
+        match Pin::new(&mut self.inner).poll_write(cx, target_buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(n)) => {
+                if track_dirty && self.base_reader.is_some() {
+                    if let Err(err) = self.ensure_slots_and_persist(self.pos, n) {
+                        return Poll::Ready(Err(err));
+                    }
+                }
+                self.pos += n as u64;
+                self.inner_pos = pending_pos + n as u64;
+                Poll::Ready(Ok(n))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_pending_pwrite(
+        &mut self,
+        cx: &mut Context<'_>,
+        pending: &mut PendingPwrite,
+    ) -> Poll<std::io::Result<usize>> {
+        let desired_pos = pending.desired_pos;
+        match Pin::new(&mut pending.handle).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(join_result) => {
+                let n = match join_result {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) => return Poll::Ready(Err(err)),
+                    Err(err) => {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            format!("pwrite join error: {}", err),
+                        )))
+                    }
+                };
+                self.pos += n as u64;
+                self.inner_pos = desired_pos + n as u64;
+                Poll::Ready(Ok(n))
+            }
+        }
+    }
 }
 
 struct PrefillState {
@@ -999,9 +1060,20 @@ enum PrefillPhase {
     WriteInner,
 }
 
+#[derive(Debug)]
 struct PendingPwrite {
     desired_pos: u64,
     handle: tokio::task::JoinHandle<std::io::Result<usize>>,
+}
+
+#[derive(Debug)]
+enum WriteState {
+    Idle,
+    PendingDirect {
+        pending_pos: u64,
+        max_len: Option<usize>,
+    },
+    PendingPwrite(PendingPwrite),
 }
 
 impl AsyncWrite for LocalFileBufferSeekWriter {
@@ -1011,68 +1083,35 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        if let Some(pending) = this.pending_pwrite.as_mut() {
-            let desired_pos = pending.desired_pos;
-            match Pin::new(&mut pending.handle).poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(join_result) => {
-                    this.pending_pwrite = None;
-                    let n = match join_result {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(err)) => return Poll::Ready(Err(err)),
-                        Err(err) => {
-                            return Poll::Ready(Err(std::io::Error::new(
-                                std::io::ErrorKind::Other,
-                                format!("pwrite join error: {}", err),
-                            )))
-                        }
-                    };
-                    this.pos += n as u64;
-                    this.inner_pos = desired_pos + n as u64;
-                    return Poll::Ready(Ok(n));
-                }
-            }
-        }
-        if let Some(pending_pos) = this.pending_write {
-            if this.compact_layout {
-                let chunk_size = this.chunk_size.max(1);
-                let chunk_offset = this.pos % chunk_size;
-                let max_len =
-                    std::cmp::min(buf.len() as u64, chunk_size - chunk_offset) as usize;
-                let target_buf = &buf[..max_len];
-                match Pin::new(&mut this.inner).poll_write(cx, target_buf) {
+        match std::mem::replace(&mut this.write_state, WriteState::Idle) {
+            WriteState::PendingDirect {
+                pending_pos,
+                max_len,
+            } => {
+                let track_dirty = !this.compact_layout && this.base_reader.is_some();
+                let poll = this.poll_direct_write(cx, buf, pending_pos, max_len, track_dirty);
+                match poll {
                     Poll::Pending => {
-                        this.pending_write = Some(pending_pos);
+                        this.write_state = WriteState::PendingDirect {
+                            pending_pos,
+                            max_len,
+                        };
                         return Poll::Pending;
                     }
-                    Poll::Ready(Ok(n)) => {
-                        this.pos += n as u64;
-                        this.inner_pos = pending_pos + n as u64;
-                        this.pending_write = None;
-                        return Poll::Ready(Ok(n));
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                }
-            } else {
-                match Pin::new(&mut this.inner).poll_write(cx, buf) {
-                    Poll::Pending => {
-                        this.pending_write = Some(pending_pos);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        if this.base_reader.is_some() {
-                            if let Err(err) = this.ensure_slots_and_persist(this.pos, n) {
-                                return Poll::Ready(Err(err));
-                            }
-                        }
-                        this.pos += n as u64;
-                        this.inner_pos = pending_pos + n as u64;
-                        this.pending_write = None;
-                        return Poll::Ready(Ok(n));
-                    }
-                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Ready(result) => return Poll::Ready(result),
                 }
             }
+            WriteState::PendingPwrite(mut pending) => {
+                let poll = this.poll_pending_pwrite(cx, &mut pending);
+                match poll {
+                    Poll::Pending => {
+                        this.write_state = WriteState::PendingPwrite(pending);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(result) => return Poll::Ready(result),
+                }
+            }
+            WriteState::Idle => {}
         }
 
         match this.drive_prefill(cx) {
@@ -1080,43 +1119,38 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
         }
+
         if !this.compact_layout {
-            match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            let pending_pos = this.inner_pos;
+            let track_dirty = this.base_reader.is_some();
+            let poll = this.poll_direct_write(cx, buf, pending_pos, None, track_dirty);
+            match poll {
                 Poll::Pending => {
-                    this.pending_write = Some(this.inner_pos);
+                    this.write_state = WriteState::PendingDirect {
+                        pending_pos,
+                        max_len: None,
+                    };
                     Poll::Pending
                 }
-                Poll::Ready(Ok(n)) => {
-                    if this.base_reader.is_some() {
-                        if let Err(err) = this.ensure_slots_and_persist(this.pos, n) {
-                            return Poll::Ready(Err(err));
-                        }
-                    }
-                    this.pos += n as u64;
-                    this.inner_pos += n as u64;
-                    this.pending_write = None;
-                    Poll::Ready(Ok(n))
-                }
-                Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                Poll::Ready(result) => Poll::Ready(result),
             }
         } else {
             let chunk_size = this.chunk_size.max(1);
-            let chunk_offset = this.pos % chunk_size;
-            let max_len = std::cmp::min(buf.len() as u64, chunk_size - chunk_offset) as usize;
-            let target_buf = &buf[..max_len];
+            let chunk = plan_chunk(this.pos, buf.len(), chunk_size);
+            let target_buf = &buf[..chunk.max_len];
 
-            let slots = match this.ensure_slots_and_persist(this.pos, max_len) {
+            let slots = match this.ensure_slots_and_persist(this.pos, chunk.max_len) {
                 Ok(slots) => slots,
                 Err(err) => return Poll::Ready(Err(err)),
             };
-            let current_chunk = (this.pos / chunk_size) as u32;
+            let current_chunk = chunk.index as u32;
             let slot = slots
                 .iter()
                 .find(|(idx, _, _)| *idx == current_chunk as u64)
                 .map(|(_, slot, is_new)| (*slot, *is_new))
                 .unwrap_or((0, false));
             let (slot, is_new) = slot;
-            let desired_pos = slot as u64 * chunk_size + chunk_offset;
+            let desired_pos = slot as u64 * chunk_size + chunk.offset;
 
             if is_new {
                 if let Some(_base) = this.base_reader.as_ref() {
@@ -1138,36 +1172,21 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
                     }
                 }
             }
+
             let data = target_buf.to_vec();
             let file = this.inner_std.clone();
             let handle = tokio::task::spawn_blocking(move || write_at_once(&file, &data, desired_pos));
-            this.pending_pwrite = Some(PendingPwrite {
+            let mut pending = PendingPwrite {
                 desired_pos,
                 handle,
-            });
-            if let Some(pending) = this.pending_pwrite.as_mut() {
-                let desired_pos = pending.desired_pos;
-                match Pin::new(&mut pending.handle).poll(cx) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(join_result) => {
-                        this.pending_pwrite = None;
-                        let n = match join_result {
-                            Ok(Ok(n)) => n,
-                            Ok(Err(err)) => return Poll::Ready(Err(err)),
-                            Err(err) => {
-                                return Poll::Ready(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("pwrite join error: {}", err),
-                                )))
-                            }
-                        };
-                        this.pos += n as u64;
-                        this.inner_pos = desired_pos + n as u64;
-                        Poll::Ready(Ok(n))
-                    }
+            };
+            let poll = this.poll_pending_pwrite(cx, &mut pending);
+            match poll {
+                Poll::Pending => {
+                    this.write_state = WriteState::PendingPwrite(pending);
+                    Poll::Pending
                 }
-            } else {
-                Poll::Pending
+                Poll::Ready(result) => Poll::Ready(result),
             }
         }
     }
@@ -1188,7 +1207,7 @@ impl AsyncSeek for LocalFileBufferSeekWriter {
 
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_complete(cx) {
+        match poll_complete_seek(Pin::new(&mut this.inner), cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(pos)) => {
                 this.pos = pos;
@@ -1353,11 +1372,17 @@ mod tests {
             .unwrap();
         tokio::io::AsyncWriteExt::flush(&mut writer).await.unwrap();
 
-        // reopen reader and ensure content exists
-        let mut reader = service
-            .open_reader(&fb, SeekFrom::Start(0))
-            .await
-            .unwrap();
+        // reopen reader and ensure content exists (BaseChunkList overlay not supported in service)
+        let inner_file = tokio::fs::File::open(&file_path).await.unwrap();
+        let base_reader: FileBufferSeekReader =
+            Box::pin(tokio::fs::File::open(&base_path).await.unwrap());
+        let mut reader = LocalFileBufferSeekReader::new(
+            inner_file,
+            Some(base_reader),
+            fb.dirty_layout.clone(),
+            CHUNK_NORMAL_SIZE,
+            0,
+        );
         let mut buf = [0u8; 3];
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"abc");
@@ -1520,6 +1545,11 @@ mod tests {
             0,
         );
         println!("reader opened!");
+
+        reader.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut buf = vec![0u8; 256];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert!(buf.iter().all(|b| *b == 0));
         
 
         reader

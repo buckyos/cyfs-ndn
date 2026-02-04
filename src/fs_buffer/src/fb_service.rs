@@ -44,7 +44,7 @@ pub trait FileBufferService: Send + Sync {
     async fn close(&self, fb: &FileBufferHandle) -> NdnResult<()>;
     async fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdnResult<()>;
     /// Staged 模式：让 buffer node 计算 hash（避免把数据搬回本地再算）
-    async fn cacl_name(&self, fb: &FileBufferHandle) -> NdnResult<ObjId>;
+    //async fn cacl_name(&self, fb: &FileBufferHandle) -> NdnResult<ObjId>;
 
     /// Finalize：把数据从 buffer node 推到 NamedStore internal（IO 密集型）
     //async fn move_to_store(&self, fb: &FileBufferHandle, store: &dyn NamedStore) -> NdnResult<()>;

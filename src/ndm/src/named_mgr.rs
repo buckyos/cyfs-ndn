@@ -271,7 +271,20 @@ impl NamedDataMgr {
         // 1) buffer.close(fb)
         // 2) meta_db.update_working_state(path, lease, BufferStage::Cooling{closed_at}, fb)
         // 3) 投递后台：推进 staged 状态机（cooling -> linked -> finalized）
-        unimplemented!()
+
+        // A) 快速 flush 到 BufferNode（保证缓冲落盘/可恢复）
+        let bn = buffer_master.get_node(&fb.buffer_node)?;
+        bn.flush(&fb.remote_path)?;
+
+        // B) 事务性地把 inode 状态变成 Cooling，并释放 lease
+        // 关键：要带 fence，防止旧 handle 写入或 close 覆盖新 session
+        fsmeta.update_file_state_with_fence(
+            fb.file_id, fb.session, fb.fence,
+            new_state = Cooling{buffer_node:fb.buffer_node, remote_path:fb.remote_path, closed_at:now()}
+        )?;
+
+        fsmeta.release_file_lease(fb.file_id, fb.session, fb.fence)?;
+        Ok(())
     }
 
     /// cacl_name：把 buffer 对象化为 ObjId，并提交 path（Working -> Committed）
@@ -384,8 +397,169 @@ impl NamedDataMgr {
         //  得到所有的，未物化的child
         //  尝试物化child,得到child objid
         // 更新当前Path的inode信息，并将状态设置为Committed（物化完成）
-    
     }
+
+    fn cacl_dir(dir_path: Path) -> Result<ObjId> {
+        // -------- 1) resolve dir inode
+        let dir_id = ensure_dir_inode(dir_path)?; // 目录操作必须有 inode（持 mount_mode/rev/base）
+        let dir_node = fsmeta.get_node(dir_id)?.ok_or(NotFound)?;
+        if dir_node.kind != Dir { return Err(NotFound); }
+        if dir_node.mount_mode == ReadOnly { return Err(ReadOnly); }
+
+        // -------- 2) snapshot（不持锁，避免长事务）
+        let base_oid_opt = dir_node.base_obj_id.clone();
+        let rev0 = dir_node.rev.unwrap_or(0);
+
+        // Upper layer：通常稀疏，可一次性读出
+        let upper_raw = fsmeta.list_dentries(dir_id)?; // Vec<DentryRecord>
+
+        // -------- 3) 把 Upper layer 归一化成 “name -> UpperOp(put/delete)”（并解析 FileId→ObjId）
+        // 这里是 NDM “调度其它组件” 的核心：既查 fsmeta，又决定是否需要 NeedPull/PathBusy
+        let mut upper_ops: BTreeMap<String, UpperOp> = BTreeMap::new();
+
+        for d in upper_raw {
+            match d.target {
+                Tombstone => {
+                    upper_ops.insert(d.name, UpperOp::Delete);
+                }
+                ObjId(oid) => {
+                    // 只要有 ObjId 就能写入 DirObject；不要求 materialized
+                    let kind = store.get_object_meta(&oid)?.map(|m| m.kind).unwrap_or(Unknown);
+                    upper_ops.insert(d.name, UpperOp::Put{obj_id:oid, kind});
+                }
+                FileId(child_id) => {
+                    // 必须把 inode 解析成一个“可引用的 ObjId”
+                    let child = fsmeta.get_node(child_id)?.ok_or(NotFound)?;
+
+                    let (obj_id, kind) = match child.kind {
+                        File => {
+                            // 选择可稳定引用的版本：Linked/Finalized/Committed
+                            match child.state {
+                                Linked{s,..} => (s.obj_id, File),
+                                Finalized{s,..} => (s.obj_id, File),
+                                Committed{base_obj_id} => (base_obj_id, File),
+
+                                // Working 态：目录快照怎么处理？
+                                // 方案 A（严格）：直接 PATH_BUSY
+                                // 方案 B（折中）：若 child.base_obj_id 存在，引用“最后已提交版本”
+                                Writing{..} | Cooling{..} => {
+                                    if let Some(base) = child.base_obj_id {
+                                        (base, File) // “只快照 committed 视图”
+                                    } else {
+                                        return Err(PathBusy);
+                                    }
+                                }
+
+                                _ => return Err(PathBusy),
+                            }
+                        }
+                        Dir => {
+                            // 目录 inode 自身必须有一个 base DirObject 才能被引用
+                            if let Some(oid) = child.base_obj_id {
+                                (oid, Dir)
+                            } else {
+                                // 允许把“空目录 inode”对象化成 EMPTY_DIR_OBJ（一次性常量对象）
+                                let empty = ensure_empty_dir_object_in_store()?;
+                                (empty, Dir)
+                            }
+                        }
+                    };
+
+                    upper_ops.insert(d.name, UpperOp::Put{obj_id, kind});
+                }
+            }
+        }
+
+        // -------- 4) base dir 必须 materialized（否则无法 merge）
+        let base_iter = match base_oid_opt {
+            None => DirIter::empty(),
+            Some(base_oid) => {
+                if !store.has_materialized(&base_oid)? { return Err(NeedPull); }
+                store.dir_children_iter_sorted(&base_oid)? // streaming iterator (name sorted)
+            }
+        };
+
+        // -------- 5) merge-join（流式，不把 base 全量载入）
+        // upper_ops 是 BTreeMap => name 有序；base_iter 也是有序
+        let mut upper_it = upper_ops.into_iter().peekable();
+        let mut out_children: Vec<DirChild> = Vec::new();
+
+        let mut base_it = base_iter.peekable();
+        while base_it.peek().is_some() || upper_it.peek().is_some() {
+            match (base_it.peek(), upper_it.peek()) {
+                (Some(base), Some((uname, uop))) => {
+                    if base.name < *uname {
+                        // base-only
+                        out_children.push(DirChild{name:base.name.clone(), kind:base.kind, obj_id:base.obj_id.clone()});
+                        base_it.next();
+                    } else if base.name > *uname {
+                        // upper-only
+                        apply_upper_only(&mut out_children, uname.clone(), uop.clone());
+                        upper_it.next();
+                    } else {
+                        // same name: upper wins
+                        apply_upper_override(&mut out_children, uname.clone(), uop.clone());
+                        base_it.next();
+                        upper_it.next();
+                    }
+                }
+                (Some(base), None) => {
+                    out_children.push(DirChild{...base...});
+                    base_it.next();
+                }
+                (None, Some((uname, uop))) => {
+                    apply_upper_only(&mut out_children, uname.clone(), uop.clone());
+                    upper_it.next();
+                }
+                (None, None) => break,
+            }
+        }
+
+        fn apply_upper_only(out: &mut Vec<DirChild>, name: String, op: UpperOp) {
+            match op {
+                Delete => { /* nothing */ }
+                Put{obj_id, kind} => out.push(DirChild{name, kind, obj_id})
+            }
+        }
+        fn apply_upper_override(out: &mut Vec<DirChild>, name: String, op: UpperOp) {
+            match op {
+                Delete => { /* remove */ }
+                Put{obj_id, kind} => out.push(DirChild{name, kind, obj_id})
+            }
+        }
+
+        // -------- 6) 构造新 DirObject 并写入 store
+        let new_dir = DirObject{children: out_children}; // must already be sorted & unique
+        let new_dir_obj_id = store.put_dir_object(&new_dir)?; // canonical encode -> hash -> obj_id
+
+        // -------- 7) fsmeta commit（短事务 + OCC）
+        // 这里体现“merge 很慢，但提交很快”：只在最后持锁很短时间
+        {
+            let mut tx = fsmeta.begin_txn()?;
+
+            let cur = tx.get_node(&dir_id)?.ok_or(NotFound)?;
+            if cur.rev != Some(rev0) {
+                tx.rollback()?;
+                return Err(Conflict); // 目录期间有并发修改，调用方可重试
+            }
+            if cur.mount_mode == Some(ReadOnly) { tx.rollback()?; return Err(ReadOnly); }
+
+            // 更新 base snapshot
+            let mut updated = cur.clone();
+            updated.base_obj_id = Some(new_dir_obj_id.clone());
+            updated.rev = Some(rev0 + 1);
+            tx.put_node(&updated)?;
+
+            // 清空 upper dentries（tombstone 一并清理）
+            tx.clear_all_dentries_under(dir_id)?;   // 需要 fsmeta 提供批量接口
+
+            tx.commit()?;
+        }
+
+        Ok(new_dir_obj_id)
+    }
+
+
 
     /// ========== 9.9 低层 Chunk 接口, 暂不实现 ==========
     // pub async fn open_chunk_writer(&self, chunk_id: &ChunkId, expect_size: Option<u64>, offset: u64) -> NdnResult<(Writer, ChunkWriteTicket)> {
@@ -427,6 +601,88 @@ impl NamedDataMgr {
     //     // 伪代码：store.open_chunklist_reader
     //     todo!()
     // }
+
+    fn cooling_to_linked(file_id: FileId) -> Result<()> {
+        // 1) 读 inode，必须仍然是 Cooling 且到达防抖窗口
+        let n = fsmeta.get_node(file_id)?.ok_or(NotFound)?;
+        let cooling = match n.state {
+            Cooling{buffer_node, remote_path, closed_at} => (buffer_node, remote_path, closed_at),
+            _ => return Ok(()), // 被复活/被新版本写覆盖了
+        };
+        if now() - cooling.closed_at < cfg.cooling_grace { return Ok(()); }
+
+        // 2) 关键：用 CAS 抢占“处理权”，避免多个后台重复 objectify
+        //    这里用一个中间态 CoolingProcessing 更稳（伪代码略）
+        if !fsmeta.cas_state(file_id, expected=Cooling{...}, new=CoolingProcessing{...})? {
+            return Ok(()); // 有人先处理/状态变了
+        }
+
+        // 3) BufferNode seal + objectify（本地计算 hash/chunklist，不传数据）
+        let bn = buffer_master.get_node(&cooling.buffer_node)?;
+        bn.seal(&cooling.remote_path)?;
+        let obj = bn.objectify(&cooling.remote_path)?; 
+        // obj: {file_obj_id, chunks: [ExternalChunkLink], file_size}
+
+        // 4) 在 named_store 写入：FileObject + chunk ExternalLink
+        //    这一步使得 open_reader_by_id(obj_id) 成立（虽然数据仍在 BufferNode）
+        for c in obj.chunks {
+            store.upsert_chunk_link(
+                c.chunk_id,
+                LinkType::ExternalFile{url:c.url, range:c.range, qcid:c.qcid}
+            )?;
+        }
+        store.put_file_object(FileObject{obj_id:obj.file_obj_id, chunks:..., size:obj.file_size})?;
+        store.put_object_meta(NamedObjectMeta{obj_id:obj.file_obj_id, kind:File, size:Some(obj.file_size)})?;
+
+        // 5) fsmeta：CAS 把状态推进到 Linked
+        //    注意：若这时用户又 create_file 把它复活成 Writing，这里必须 CAS 失败并放弃更新
+        if !fsmeta.cas_state(
+            file_id,
+            expected=CoolingProcessing{buffer_node:..., remote_path:...},
+            new=Linked{obj_id:obj.file_obj_id, buffer_node:..., remote_path:..., linked_at:now()}
+        )? {
+            // 竞争失败：产生了“孤儿对象/链接”，后续靠软状态清理或引用计数处理
+            // (这在家用 zero-op 初期可以接受：不自动删业务数据，只清软状态)
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    fn linked_to_finalized(file_id: FileId) -> Result<()> {
+        let n = fsmeta.get_node(file_id)?.ok_or(NotFound)?;
+        let linked = match n.state {
+            Linked{obj_id, buffer_node, remote_path, linked_at} => (obj_id, buffer_node, remote_path, linked_at),
+            _ => return Ok(()),
+        };
+        if now() - linked.linked_at < cfg.frozen_grace { return Ok(()); }
+
+        // CAS 抢占处理权（Finalizing 中间态）
+        if !fsmeta.cas_state(file_id, expected=Linked{...}, new=Finalizing{...})? {
+            return Ok(());
+        }
+
+        // 1) 让 BufferNode 推送数据到 named_store 内部 chunk 存储
+        let bn = buffer_master.get_node(&linked.buffer_node)?;
+        // push_to_store 内部会按 placement 写 chunk.tmp -> 校验 sha256 -> rename chunk.final -> COMPLETE
+        bn.push_to_store(&linked.remote_path, store)?;
+
+        // 2) named_store “提升”对象：ExternalLink -> Internal COMPLETE
+        store.promote_obj_to_internal(&linked.obj_id)?;
+
+        // 3) fsmeta：更新 inode 状态为 Finalized（稳定冷态）
+        fsmeta.cas_state(
+            file_id,
+            expected=Finalizing{...},
+            new=Finalized{obj_id:linked.obj_id, finalized_at:now()}
+        )?;
+
+        // 4) best-effort 清理 BufferNode 热文件
+        let _ = bn.delete_buffer_file(&linked.remote_path);
+        Ok(())
+    }
+
+
 }
 
 /// 后台任务管理器（占位）
