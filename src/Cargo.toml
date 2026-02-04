@@ -5,6 +5,7 @@ members = [
     #"./package-lib",
     "./ndn-lib",
     "./named_store",
+    "./fs_buffer",
 ]
 
 [workspace.dependencies]

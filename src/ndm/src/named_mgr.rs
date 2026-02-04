@@ -158,14 +158,99 @@ impl NamedDataMgr {
     }
 
     pub fn open_file_writer(&self, path: &NdmPath, expected_size: Option<u64>, flags) -> NdnResult<FileBufferHandle> {
-        // 伪代码：
-        // 1) meta_db.check_mount_conflict(path)
-        // 2) lease = meta_db.acquire_write_lease(path, current_session, flags)
-        // 3) fb = buffer.create_buffer(path, &lease, expected_size)
-        // 4) meta_db.update_working_state(path, &lease, BufferStage::Writing, &fb)
-        // 5) 返回 fb
-        unimplemented!()
+        // -------- A) 解析 parent/name（纯 NDM 逻辑）
+        let (parent_dir_path, name) = split_parent(path)?;
+        let parent_dir_id = ensure_dir_inode(parent_dir_path)?;     // 若是 ObjId dir -> materialize inode
+        let parent_node = fsmeta.get_node(parent_dir_id)?.ok_or(NotFound)?;
+        if parent_node.mount_mode == ReadOnly { return Err(ReadOnly); }
+
+        // -------- B) 确保 name 对应的是 “文件 inode”
+        // Strategy B: dentry target 允许 ObjId；但要写入必须转成 FileId
+        // 注意：这一步建议走 fsmeta txn，避免并发 create 同名
+        let file_id = {
+            let mut tx = fsmeta.begin_txn()?;
+
+            match tx.get_dentry(parent_dir_id, &name)? {
+                None | Some(Dentry{target: Tombstone,..}) => {
+                    // 新文件
+                    let fid = fsmeta.alloc_inode(File)?;
+                    tx.upsert_dentry(parent_dir_id, &name, Target::FileId(fid))?;
+                    // node 初始 committed base 为空，或指向空文件对象（实现选择）
+                    tx.put_node(NodeRecord::new_file(fid))?;
+                    tx.commit()?;
+                    fid
+                }
+
+                Some(Dentry{target: ObjId(oid), ..}) => {
+                    // 之前是只读绑定：写入需要 materialize inode，并把 base_obj_id=oid
+                    let fid = fsmeta.alloc_inode(File)?;
+                    let mut n = NodeRecord::new_file(fid);
+                    n.base_obj_id = Some(oid);
+                    tx.put_node(&n)?;
+                    tx.upsert_dentry(parent_dir_id, &name, Target::FileId(fid))?;
+                    tx.commit()?;
+                    fid
+                }
+
+                Some(Dentry{target: FileId(fid), ..}) => {
+                    // 已经是 inode
+                    tx.commit()?; // no-op
+                    fid
+                }
+            }
+        };
+
+        // -------- C) 获取严格单写 lease（fence）
+        // 这里必须由 fsmeta 保证 “同一时刻一个 writer”
+        // fence 用于防止 ABA：旧 writer 释放后新 writer 拿到新 fence，后台/旧请求不能覆盖新状态
+        let fence = fsmeta.acquire_file_lease(file_id, session, ttl=cfg.file_lease_ttl)?;
+
+        // -------- D) 决策：复用旧 buffer 还是开启新 buffer
+        // 这一步体现 NDM 的“指挥调度”：
+        // - Reading/Committed 在 store
+        // - Writing/Cooling/Linked 的热数据在 BufferNode
+        // - 状态机由 fsmeta node.state 驱动
+        let node = fsmeta.get_node(file_id)?.ok_or(NotFound)?;
+        match node.state {
+            Writing{..} => return Err(PathBusy), // 正在写（理论上 lease 已阻止，但这里再兜底）
+
+            Cooling{buffer_node, remote_path, closed_at} => {
+                // ✅ 复活：同一个 remote_path 继续写，重置 last_write_at
+                // 注意：这里不用等待后台；后台扫描看到 state=Writing 就不会 objectify
+                fsmeta.update_file_state_with_fence(
+                    file_id, session, fence,
+                    new_state = Writing{session,fence,buffer_node,remote_path,last_write_at=now()}
+                )?;
+                return Ok(FileBufferHandle{file_id,session,fence,buffer_node,remote_path});
+            }
+
+            Linked{obj_id, buffer_node, remote_path, ..} => {
+                // ⚠️ Linked 的 remote_path 已经被 ExternalLink 引用，不能再修改
+                // 开新版本：新建 remote_path（可选：在 BufferNode 内做 server-side copy 作为起点）
+                let bn = buffer_master.pick_node_for_write(expect_size)?;
+                let (node_id, new_remote_path) = buffer_master.create_remote_file(&bn, hint=&name)?;
+                // 可选：bn.clone_file(remote_path -> new_remote_path) or seed from obj_id
+                // 这里先简化：不做拷贝，走“重写式”写入
+                fsmeta.update_file_state_with_fence(
+                    file_id, session, fence,
+                    new_state = Writing{session,fence,buffer_node:node_id,remote_path:new_remote_path,last_write_at=now()}
+                )?;
+                return Ok(FileBufferHandle{file_id,session,fence,buffer_node:node_id,remote_path:new_remote_path});
+            }
+
+            Finalized{obj_id,..} | Committed{..} => {
+                // 已经是冷态对象，开新版本写：分配新 buffer
+                let bn = buffer_master.pick_node_for_write(expect_size)?;
+                let (node_id, remote_path) = buffer_master.create_remote_file(&bn, hint=&name)?;
+                fsmeta.update_file_state_with_fence(
+                    file_id, session, fence,
+                    new_state = Writing{session,fence,buffer_node:node_id,remote_path,last_write_at=now()}
+                )?;
+                return Ok(FileBufferHandle{file_id,session,fence,buffer_node:node_id,remote_path});
+            }
+        }
     }
+ 
 
     pub fn append(&self, path: &NdmPath, data: &[u8]) -> NdnResult<()> {
         // 伪代码：
