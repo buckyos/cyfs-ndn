@@ -591,132 +591,134 @@ impl AsyncRead for LocalFileBufferSeekReader {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        loop {
+            if let Some(target) = this.sync_target {
+                let poll = match target {
+                    ReaderTarget::Inner => Pin::new(&mut this.inner).poll_complete(cx),
+                    ReaderTarget::Base => {
+                        let base = this
+                            .base_reader
+                            .as_mut()
+                            .expect("base_reader missing while syncing");
+                        Pin::new(base).poll_complete(cx)
+                    }
+                };
 
-        if let Some(target) = this.sync_target {
-            let poll = match target {
-                ReaderTarget::Inner => Pin::new(&mut this.inner).poll_complete(cx),
+                match poll {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(pos)) => {
+                        match target {
+                            ReaderTarget::Inner => this.inner_pos = pos,
+                            ReaderTarget::Base => this.base_pos = pos,
+                        }
+                        this.sync_target = None;
+                        continue;
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
+            }
+
+            if this.base_reader.is_none() {
+                let before = buf.filled().len();
+                let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+                if let Poll::Ready(Ok(())) = &poll {
+                    let read = buf.filled().len() - before;
+                    this.pos += read as u64;
+                    this.inner_pos = this.pos;
+                }
+                return poll;
+            }
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let chunk_size = this.chunk_size.max(1);
+            let chunk_index = this.pos / chunk_size;
+            let chunk_offset = this.pos % chunk_size;
+            let max_len = std::cmp::min(remaining as u64, chunk_size - chunk_offset) as usize;
+
+            let (target, local_offset) = {
+                let layout = this.dirty_layout.read().map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "dirty layout poisoned")
+                });
+                match layout {
+                    Ok(layout) => {
+                        if let Some(slot) = layout.slot_of(chunk_index as u32) {
+                            let local_offset = slot as u64 * this.chunk_size + chunk_offset;
+                            (ReaderTarget::Inner, Some(local_offset))
+                        } else {
+                            (ReaderTarget::Base, None)
+                        }
+                    }
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
+            };
+
+            let (reader_pos, reader) = match target {
+                ReaderTarget::Inner => (this.inner_pos, ReaderTarget::Inner),
+                ReaderTarget::Base => (this.base_pos, ReaderTarget::Base),
+            };
+
+            let desired_pos = match target {
+                ReaderTarget::Inner => local_offset.unwrap_or(this.pos),
+                ReaderTarget::Base => this.pos,
+            };
+
+            if reader_pos != desired_pos {
+                match reader {
+                    ReaderTarget::Inner => {
+                        if let Err(err) =
+                            Pin::new(&mut this.inner).start_seek(SeekFrom::Start(desired_pos))
+                        {
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+                    ReaderTarget::Base => {
+                        let base = this.base_reader.as_mut().unwrap();
+                        if let Err(err) = Pin::new(base).start_seek(SeekFrom::Start(desired_pos)) {
+                            return Poll::Ready(Err(err));
+                        }
+                    }
+                }
+                this.sync_target = Some(reader);
+                continue;
+            }
+
+            let mut temp = vec![0u8; max_len];
+            let mut temp_buf = ReadBuf::new(&mut temp);
+
+            let poll = match reader {
+                ReaderTarget::Inner => Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf),
                 ReaderTarget::Base => {
-                    let base = this
-                        .base_reader
-                        .as_mut()
-                        .expect("base_reader missing while syncing");
-                    Pin::new(base).poll_complete(cx)
+                    let base = this.base_reader.as_mut().unwrap();
+                    Pin::new(base).poll_read(cx, &mut temp_buf)
                 }
             };
 
             match poll {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(_)) => {
-                    match target {
-                        ReaderTarget::Inner => this.inner_pos = this.pos,
-                        ReaderTarget::Base => this.base_pos = this.pos,
+                Poll::Ready(Ok(())) => {
+                    let read = temp_buf.filled().len();
+                    if read == 0 {
+                        return Poll::Ready(Ok(()));
                     }
-                    this.sync_target = None;
+                    buf.put_slice(&temp[..read]);
+                    this.pos += read as u64;
+                    match reader {
+                        ReaderTarget::Inner => {
+                            this.inner_pos = desired_pos + read as u64;
+                            this.base_pos = this.pos;
+                        }
+                        ReaderTarget::Base => {
+                            this.base_pos = this.pos;
+                        }
+                    }
+                    return Poll::Ready(Ok(()));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
             }
-        }
-
-        if this.base_reader.is_none() {
-            let before = buf.filled().len();
-            let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
-            if let Poll::Ready(Ok(())) = &poll {
-                let read = buf.filled().len() - before;
-                this.pos += read as u64;
-                this.inner_pos = this.pos;
-            }
-            return poll;
-        }
-
-        let remaining = buf.remaining();
-        if remaining == 0 {
-            return Poll::Ready(Ok(()));
-        }
-
-        let chunk_size = this.chunk_size.max(1);
-        let chunk_index = this.pos / chunk_size;
-        let chunk_offset = this.pos % chunk_size;
-        let max_len = std::cmp::min(remaining as u64, chunk_size - chunk_offset) as usize;
-
-        let (target, local_offset) = {
-            let layout = this.dirty_layout.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "dirty layout poisoned")
-            });
-            match layout {
-                Ok(layout) => {
-                    if let Some(slot) = layout.slot_of(chunk_index as u32) {
-                        let local_offset = slot as u64 * this.chunk_size + chunk_offset;
-                        (ReaderTarget::Inner, Some(local_offset))
-                    } else {
-                        (ReaderTarget::Base, None)
-                    }
-                }
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-        };
-
-        let (reader_pos, reader) = match target {
-            ReaderTarget::Inner => (this.inner_pos, ReaderTarget::Inner),
-            ReaderTarget::Base => (this.base_pos, ReaderTarget::Base),
-        };
-
-        let desired_pos = match target {
-            ReaderTarget::Inner => local_offset.unwrap_or(this.pos),
-            ReaderTarget::Base => this.pos,
-        };
-
-        if reader_pos != desired_pos {
-            match reader {
-                ReaderTarget::Inner => {
-                    if let Err(err) =
-                        Pin::new(&mut this.inner).start_seek(SeekFrom::Start(desired_pos))
-                    {
-                        return Poll::Ready(Err(err));
-                    }
-                }
-                ReaderTarget::Base => {
-                    let base = this.base_reader.as_mut().unwrap();
-                    if let Err(err) = Pin::new(base).start_seek(SeekFrom::Start(desired_pos)) {
-                        return Poll::Ready(Err(err));
-                    }
-                }
-            }
-            this.sync_target = Some(reader);
-            return Poll::Pending;
-        }
-
-        let mut temp = vec![0u8; max_len];
-        let mut temp_buf = ReadBuf::new(&mut temp);
-
-        let poll = match reader {
-            ReaderTarget::Inner => Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf),
-            ReaderTarget::Base => {
-                let base = this.base_reader.as_mut().unwrap();
-                Pin::new(base).poll_read(cx, &mut temp_buf)
-            }
-        };
-
-        match poll {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => {
-                let read = temp_buf.filled().len();
-                if read == 0 {
-                    return Poll::Ready(Ok(()));
-                }
-                buf.put_slice(&temp[..read]);
-                this.pos += read as u64;
-                match reader {
-                    ReaderTarget::Inner => {
-                        this.inner_pos = desired_pos + read as u64;
-                        this.base_pos = this.pos;
-                    }
-                    ReaderTarget::Base => {
-                        this.base_pos = this.pos;
-                    }
-                }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
 }
@@ -1336,6 +1338,8 @@ mod tests {
         writer.write_all(&vec![0xffu8; 512]).await.unwrap();
         writer.flush().await.unwrap();
         drop(writer);
+        
+        println!("writer completed!");
 
         let inner_file = tokio::fs::File::open(&file_path).await.unwrap();
         let base_reader: FileBufferSeekReader =
@@ -1347,6 +1351,8 @@ mod tests {
             CHUNK_NORMAL_SIZE,
             0,
         );
+        println!("reader opened!");
+        
 
         reader
             .seek(SeekFrom::Start(2 * CHUNK_NORMAL_SIZE))
@@ -1355,6 +1361,7 @@ mod tests {
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"WORLD");
+        println!("read WORLD ok");
 
         reader
             .seek(SeekFrom::Start(5 * CHUNK_NORMAL_SIZE + chunk_middle))
@@ -1363,10 +1370,12 @@ mod tests {
         let mut buf = [0u8; 5];
         reader.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"HELLO");
+        println!("read HELLO ok");
 
         reader.seek(SeekFrom::Start(base_size)).await.unwrap();
         let mut tail = vec![0u8; 512];
         reader.read_exact(&mut tail).await.unwrap();
         assert!(tail.iter().all(|b| *b == 0xff));
+        println!("read tail 0xff ok");
     }
 }
