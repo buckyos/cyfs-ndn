@@ -8,8 +8,7 @@
 //! - Placement：epoch backoff <= 2 + lazy migration
 //! - Link：SameAs / PartOf / ExternalFile(qcid)；Reader 允许走 link，Writer 永远只写 internal
 //! - erase_obj_by_id：驱逐本地物化数据（不删 namespace 绑定）
-//
-// 注意：以下均为“接口 + 注释伪代码”，函数体用 todo!/unimplemented! 占位。
+
 
 use std::{
     collections::{HashMap, HashSet},
@@ -276,47 +275,6 @@ pub struct PullContext {
     pub headers: HashMap<String, String>,
 }
 
-/// =======================
-/// 7) FileBuffer（写入缓冲 & 分级提交）
-/// =======================
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct BufferNodeId(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct FileBufferId(pub String);
-
-#[derive(Debug, Clone)]
-pub enum BufferStage {
-    Writing,
-    Cooling { closed_at: u64 },
-    Linked { obj_id: ObjId, linked_at: u64 },
-    Finalized { obj_id: ObjId, finalized_at: u64 },
-}
-
-#[derive(Debug, Clone)]
-pub struct FileBufferHandle {
-    pub id: FileBufferId,
-    pub path: NdmPath,
-    pub session: SessionId,
-    pub fence: FenceToken,
-
-    /// 单机版可为 local；分布式版对应 buffer node
-    pub node_id: BufferNodeId,
-    pub remote_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub enum CommitPolicy {
-    /// 传统模式：close 后立刻 objectify + 写入 internal store（慢，但简单）
-    ImmediateFinalize,
-
-    /// 分级提交：close 先进入 cooling；冷却后计算 objid 并 ExternalLink；冻结后搬入 internal
-    Staged {
-        cooling_ms: u64,
-        frozen_ms: u64,
-    },
-}
 
 /// =======================
 /// 8) 依赖抽象：FsMetaDb / NamedStore / FileBufferService / NdnFetcher
@@ -594,6 +552,14 @@ impl NamedDataMgr {
         // 3) fb = buffer.create_buffer(path, &lease, expected_size)
         // 4) meta_db.update_working_state(path, &lease, BufferStage::Writing, &fb)
         // 5) 返回 fb
+        todo!()
+    }
+
+    pub fn open_file_writer(&self, path: &NdmPath, session: &SessionId) -> NdnResult<FileBufferHandle> {
+        // 伪代码：
+        // 1) stat(path)
+        // 2) 若非 Working 或 session 不符：PathBusy
+        // 3) 返回 buffer handle
         todo!()
     }
 

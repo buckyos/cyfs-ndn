@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use crate::object::ObjId;
 use crate::{BaseContentObject, FileObject, NdnError, NdnResult, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
-use crate::object_map::{SimpleObjectMap, SimpleMapItem};
+use crate::{SimpleObjectMap, SimpleMapItem};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
