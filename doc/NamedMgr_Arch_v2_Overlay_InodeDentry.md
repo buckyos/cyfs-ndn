@@ -38,10 +38,10 @@
 
 ## 1. 关键术语（新增/更新）
 
-- **Inode / FileID（file_id）**：fs-meta-db 内部的永久身份标识（递增 u64），目录 rename 不会改变 file_id。
+- **Inode / IndexNodeId（file_id）**：fs-meta-db 内部的永久身份标识（递增 u64），目录 rename 不会改变 file_id。
 - **Dentry**：`(parent_file_id, name) -> target` 的“目录项”。
 - **DentryTarget（策略 B）**：dentry 的 target 允许两种形式：
-  - `Target::FileId(file_id)`：指向一个 inode（可进入 working/lease 等状态机）
+  - `Target::IndexNodeId(file_id)`：指向一个 inode（可进入 working/lease 等状态机）
   - `Target::ObjId(obj_id)`：直接指向一个已提交对象（视为 committed，只读、不可持有写租约）
 - **Tombstone / Whiteout**：一种特殊 dentry 标记，用于在 Overlay 中“显式删除/屏蔽”Base Layer 的同名项。
 - **Base Layer**：目录 inode 上记录的 `base_dir_obj_id`（可空，空表示 base 为空目录）。
@@ -185,7 +185,7 @@ NDM 负责合并：
   - read_only：禁止任何结构变更；list/open_reader 仍可用（若 base 已 pull）
 
 - `add_file(path, obj_id)`
-  - 推荐实现为：在父目录写入一个 dentry（Target::ObjId 或 Target::FileId 皆可）
+  - 推荐实现为：在父目录写入一个 dentry（Target::ObjId 或 Target::IndexNodeId 皆可）
   - 若需要后续写入/lease：应为该 path 分配 inode，并让 dentry 指向 file_id
 
 ### 5.2 list（无 pos/page_size）

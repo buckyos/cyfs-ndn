@@ -48,8 +48,8 @@
 ## 1. 关键术语
 
 * **Pool / NDM 实例：** 逻辑隔离边界（命名空间）。路径：`ndm://pool_id/ndm_id/path`。
-* **Inode / FileID：** 内部不可变的 64 位整数，用于标识文件或目录节点。重命名文件只会改变路径，不会改变 FileID。
-* **Dentry (目录项)：** 映射关系 `(ParentFileID, Name) -> Target`。
+* **Inode / IndexNodeId：** 内部不可变的 64 位整数，用于标识文件或目录节点。重命名文件只会改变路径，不会改变 IndexNodeId。
+* **Dentry (目录项)：** 映射关系 `(ParentIndexNodeId, Name) -> Target`。
 * **ObjId / ChunkId：** 内容寻址哈希 ID。
 * **Store Target：** 物理存储单元（卷/目录）。
 * **Placement Layout：** `ObjId -> [StoreTarget]` 的映射算法。
@@ -102,7 +102,7 @@
 * `parent_file_id`: 外键指向 Nodes。
 * `name`: 字符串 (文件名)。
 * `target_type`:
-* `FileId`: 指向一个可变的 Inode (用于 working/local 文件)。
+* `IndexNodeId`: 指向一个可变的 Inode (用于 working/local 文件)。
 * `ObjId`: 直接指向一个已提交的 Object (只读导入的优化)。
 * `Tombstone`: 显式隐藏一个名称。
 
@@ -116,7 +116,7 @@
 
 1. **查 Upper (Dentries):** 查询 `dentries` 表，条件 `parent = parent_id AND name = 'child'`。
 * 如果是 **Tombstone**: 返回 `NOT_FOUND` (显式删除)。
-* 如果是 **FileId**: 解析 Inode -> 返回句柄。
+* 如果是 **IndexNodeId**: 解析 Inode -> 返回句柄。
 * 如果是 **ObjId**: 返回 Object 句柄 (只读)。
 
 
@@ -147,7 +147,7 @@
 
 重命名目录（即使包含数百万子项）纯粹是元数据操作：
 
-1. **插入:** 新 Dentry `(NewParent, NewName) -> TargetFileId`。
+1. **插入:** 新 Dentry `(NewParent, NewName) -> TargetIndexNodeId`。
 2. **删除:** 插入 Tombstone `(OldParent, OldName) -> Tombstone`。
 
 * *注意:* 不需要递归处理子项。

@@ -1,0 +1,1115 @@
+use fs_buffer::SessionId;
+use krpc::{RPCContext, RPCErrors};
+use ndm::{
+    ClientSessionId, DentryRecord, DentryTarget, IndexNodeId, NodeKind, NodeRecord, NodeState,
+    ObjStat,
+};
+use ndn_lib::ObjId;
+use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const NODE_STATE_DIR_NORMAL: i64 = 0;
+const NODE_STATE_DIR_OVERLAY: i64 = 1;
+const NODE_STATE_WORKING: i64 = 2;
+const NODE_STATE_COOLING: i64 = 3;
+const NODE_STATE_LINKED: i64 = 4;
+const NODE_STATE_FINALIZED: i64 = 5;
+
+const DENTRY_TARGET_INODE: i64 = 0;
+const DENTRY_TARGET_OBJ: i64 = 1;
+const DENTRY_TARGET_TOMBSTONE: i64 = 2;
+
+const ROOT_KEY: &str = "root_dir";
+
+#[derive(Clone)]
+struct TxnEntry {
+    conn: Arc<Mutex<Connection>>,
+}
+
+pub struct FSMetaService {
+    db_path: String,
+    conn: Arc<Mutex<Connection>>,
+    txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
+    root_inode: IndexNodeId,
+    txn_seq: AtomicU64,
+}
+
+impl FSMetaService {
+    pub fn new(db_path: impl Into<String>) -> Result<Self, RPCErrors> {
+        let db_path = db_path.into();
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+            .map_err(|e| RPCErrors::ReasonError(format!("open db failed: {}", e)))?;
+        Self::init_connection(&conn)?;
+        Self::create_schema(&conn)?;
+        let root_inode = Self::ensure_root_dir(&conn)?;
+        Ok(Self {
+            db_path,
+            conn: Arc::new(Mutex::new(conn)),
+            txns: Arc::new(Mutex::new(HashMap::new())),
+            root_inode,
+            txn_seq: AtomicU64::new(1),
+        })
+    }
+
+    fn init_connection(conn: &Connection) -> Result<(), RPCErrors> {
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;",
+        )
+        .map_err(|e| RPCErrors::ReasonError(format!("pragma failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn create_schema(conn: &Connection) -> Result<(), RPCErrors> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS kv (
+                k TEXT PRIMARY KEY,
+                v_int INTEGER,
+                v_blob BLOB,
+                v_text TEXT
+            ) WITHOUT ROWID;
+
+            CREATE TABLE IF NOT EXISTS nodes (
+                inode_id INTEGER PRIMARY KEY,
+                kind INTEGER NOT NULL,
+                read_only INTEGER NOT NULL DEFAULT 0,
+                base_obj_id BLOB,
+                state INTEGER NOT NULL,
+                rev INTEGER,
+                meta_json TEXT,
+                lease_client_session TEXT,
+                lease_seq INTEGER,
+                lease_expire_at INTEGER,
+                fb_handle TEXT,
+                last_write_at INTEGER,
+                closed_at INTEGER,
+                linked_obj_id BLOB,
+                linked_qcid BLOB,
+                linked_filebuffer_id TEXT,
+                linked_at INTEGER,
+                finalized_obj_id BLOB,
+                finalized_at INTEGER,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_nodes_kind_state ON nodes(kind, state);
+            CREATE INDEX IF NOT EXISTS idx_nodes_cooling ON nodes(state, closed_at);
+            CREATE INDEX IF NOT EXISTS idx_nodes_linked ON nodes(state, linked_at);
+
+            CREATE TABLE IF NOT EXISTS dentries (
+                parent_inode_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                target_type INTEGER NOT NULL,
+                target_inode_id INTEGER,
+                target_obj_id BLOB,
+                mtime INTEGER,
+                PRIMARY KEY (parent_inode_id, name),
+                CHECK (
+                    (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
+                    (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
+                    (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL)
+                )
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
+            CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
+
+            CREATE TABLE IF NOT EXISTS obj_stat (
+                obj_id BLOB PRIMARY KEY,
+                ref_count INTEGER NOT NULL,
+                zero_since INTEGER,
+                updated_at INTEGER NOT NULL,
+                CHECK (ref_count >= 0)
+            ) WITHOUT ROWID;
+
+            CREATE INDEX IF NOT EXISTS idx_obj_stat_gc ON obj_stat(ref_count, zero_since);",
+        )
+        .map_err(|e| RPCErrors::ReasonError(format!("create schema failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn ensure_root_dir(conn: &Connection) -> Result<IndexNodeId, RPCErrors> {
+        let root = conn
+            .query_row(
+                "SELECT v_int FROM kv WHERE k = ?1",
+                params![ROOT_KEY],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| RPCErrors::ReasonError(format!("query root failed: {}", e)))?;
+        if let Some(id) = root {
+            return Ok(id as IndexNodeId);
+        }
+
+        let now = unix_timestamp();
+        conn.execute(
+            "INSERT INTO nodes (
+                inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                lease_client_session, lease_seq, lease_expire_at,
+                fb_handle, last_write_at, closed_at,
+                linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
+                finalized_obj_id, finalized_at, updated_at
+            ) VALUES (?1, ?2, 0, NULL, ?3, ?4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?5)",
+            params![
+                1i64,
+                node_kind_to_int(NodeKind::Dir),
+                NODE_STATE_DIR_NORMAL,
+                0i64,
+                now as i64
+            ],
+        )
+        .map_err(|e| RPCErrors::ReasonError(format!("init root node failed: {}", e)))?;
+
+        conn.execute(
+            "INSERT INTO kv (k, v_int) VALUES (?1, ?2)",
+            params![ROOT_KEY, 1i64],
+        )
+        .map_err(|e| RPCErrors::ReasonError(format!("init root kv failed: {}", e)))?;
+
+        Ok(1)
+    }
+
+    fn conn_for_txid(&self, txid: Option<&str>) -> Result<Arc<Mutex<Connection>>, RPCErrors> {
+        if let Some(txid) = txid {
+            let txns = self.txns.lock().unwrap();
+            let entry = txns
+                .get(txid)
+                .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
+            Ok(entry.conn.clone())
+        } else {
+            Ok(self.conn.clone())
+        }
+    }
+
+    async fn with_conn<T, F>(&self, txid: Option<&str>, f: F) -> Result<T, RPCErrors>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T, RPCErrors> + Send + 'static,
+    {
+        let conn = self.conn_for_txid(txid)?;
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            f(&conn)
+        })
+        .await
+        .map_err(|e| RPCErrors::ReasonError(format!("db task join failed: {}", e)))?
+    }
+
+    fn open_txn_connection(db_path: &str) -> Result<Connection, RPCErrors> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+            .map_err(|e| RPCErrors::ReasonError(format!("open txn db failed: {}", e)))?;
+        Self::init_connection(&conn)?;
+        conn.execute_batch("BEGIN")
+            .map_err(|e| RPCErrors::ReasonError(format!("begin txn failed: {}", e)))?;
+        Ok(conn)
+    }
+
+    fn node_state_cols(state: &NodeState) -> NodeStateCols {
+        match state {
+            NodeState::DirNormal => NodeStateCols {
+                state: NODE_STATE_DIR_NORMAL,
+                ..NodeStateCols::default()
+            },
+            NodeState::DirOverlay => NodeStateCols {
+                state: NODE_STATE_DIR_OVERLAY,
+                ..NodeStateCols::default()
+            },
+            NodeState::Working(s) => NodeStateCols {
+                state: NODE_STATE_WORKING,
+                fb_handle: Some(s.fb_handle.clone()),
+                last_write_at: Some(s.last_write_at),
+                ..NodeStateCols::default()
+            },
+            NodeState::Cooling(s) => NodeStateCols {
+                state: NODE_STATE_COOLING,
+                fb_handle: Some(s.fb_handle.clone()),
+                closed_at: Some(s.closed_at),
+                ..NodeStateCols::default()
+            },
+            NodeState::Linked(s) => NodeStateCols {
+                state: NODE_STATE_LINKED,
+                linked_obj_id: Some(obj_id_to_blob(&s.obj_id)),
+                linked_qcid: Some(obj_id_to_blob(&s.qcid)),
+                linked_filebuffer_id: Some(s.filebuffer_id.clone()),
+                linked_at: Some(s.linked_at),
+                ..NodeStateCols::default()
+            },
+            NodeState::Finalized(s) => NodeStateCols {
+                state: NODE_STATE_FINALIZED,
+                finalized_obj_id: Some(obj_id_to_blob(&s.obj_id)),
+                finalized_at: Some(s.finalized_at),
+                ..NodeStateCols::default()
+            },
+        }
+    }
+
+    fn parse_node_state(row: &rusqlite::Row<'_>) -> Result<NodeState, RPCErrors> {
+        let state = row.get::<_, i64>(4).map_err(map_db_err)?;
+        match state {
+            NODE_STATE_DIR_NORMAL => Ok(NodeState::DirNormal),
+            NODE_STATE_DIR_OVERLAY => Ok(NodeState::DirOverlay),
+            NODE_STATE_WORKING => {
+                let fb_handle: String = row.get(10).map_err(map_db_err)?;
+                let last_write_at: i64 = row.get(11).map_err(map_db_err)?;
+                Ok(NodeState::Working(ndm::FileWorkingState {
+                    fb_handle,
+                    last_write_at: last_write_at as u64,
+                }))
+            }
+            NODE_STATE_COOLING => {
+                let fb_handle: String = row.get(10).map_err(map_db_err)?;
+                let closed_at: i64 = row.get(12).map_err(map_db_err)?;
+                Ok(NodeState::Cooling(ndm::FileCoolingState {
+                    fb_handle,
+                    closed_at: closed_at as u64,
+                }))
+            }
+            NODE_STATE_LINKED => {
+                let obj_blob: Vec<u8> = row.get(13).map_err(map_db_err)?;
+                let qcid_blob: Vec<u8> = row.get(14).map_err(map_db_err)?;
+                let filebuffer_id: String = row.get(15).map_err(map_db_err)?;
+                let linked_at: i64 = row.get(16).map_err(map_db_err)?;
+                Ok(NodeState::Linked(ndm::FileLinkedState {
+                    obj_id: obj_id_from_blob(obj_blob)?,
+                    qcid: obj_id_from_blob(qcid_blob)?,
+                    filebuffer_id,
+                    linked_at: linked_at as u64,
+                }))
+            }
+            NODE_STATE_FINALIZED => {
+                let obj_blob: Vec<u8> = row.get(17).map_err(map_db_err)?;
+                let finalized_at: i64 = row.get(18).map_err(map_db_err)?;
+                Ok(NodeState::Finalized(ndm::FinalizedObjState {
+                    obj_id: obj_id_from_blob(obj_blob)?,
+                    finalized_at: finalized_at as u64,
+                }))
+            }
+            _ => Err(RPCErrors::ReasonError("invalid node state".to_string())),
+        }
+    }
+
+    fn parse_node(row: &rusqlite::Row<'_>) -> Result<NodeRecord, RPCErrors> {
+        let inode_id: i64 = row.get(0).map_err(map_db_err)?;
+        let kind: i64 = row.get(1).map_err(map_db_err)?;
+        let read_only: i64 = row.get(2).map_err(map_db_err)?;
+        let base_obj_id: Option<Vec<u8>> = row.get(3).map_err(map_db_err)?;
+        let rev: Option<i64> = row.get(5).map_err(map_db_err)?;
+        let meta_json: Option<String> = row.get(6).map_err(map_db_err)?;
+        let lease_client_session: Option<String> = row.get(7).map_err(map_db_err)?;
+        let lease_seq: Option<i64> = row.get(8).map_err(map_db_err)?;
+        let lease_expire_at: Option<i64> = row.get(9).map_err(map_db_err)?;
+
+        let state = Self::parse_node_state(row)?;
+        let base_obj_id = match base_obj_id {
+            Some(blob) => Some(obj_id_from_blob(blob)?),
+            None => None,
+        };
+        let meta = match meta_json {
+            Some(text) => Some(serde_json::from_str::<Value>(&text).map_err(|e| {
+                RPCErrors::ReasonError(format!("invalid meta json: {}", e))
+            })?),
+            None => None,
+        };
+
+        Ok(NodeRecord {
+            inode_id: inode_id as IndexNodeId,
+            kind: node_kind_from_int(kind)?,
+            read_only: read_only != 0,
+            base_obj_id,
+            state,
+            rev: rev.map(|v| v as u64),
+            meta,
+            lease_client_session: lease_client_session.map(ClientSessionId),
+            lease_seq: lease_seq.map(|v| v as u64),
+            lease_expire_at: lease_expire_at.map(|v| v as u64),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ndm::FsMetaHandler for FSMetaService {
+    async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
+        Ok(self.root_inode)
+    }
+
+    async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {
+        let seq = self.txn_seq.fetch_add(1, Ordering::SeqCst);
+        let txid = format!("tx-{}-{}", unix_timestamp(), seq);
+        let db_path = self.db_path.clone();
+        let conn = tokio::task::spawn_blocking(move || Self::open_txn_connection(&db_path))
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("open txn task failed: {}", e)))??;
+        let entry = TxnEntry {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        self.txns.lock().unwrap().insert(txid.clone(), entry);
+        Ok(txid)
+    }
+
+    async fn handle_get_inode(
+        &self,
+        id: IndexNodeId,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<Option<NodeRecord>, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                            lease_client_session, lease_seq, lease_expire_at,
+                            fb_handle, last_write_at, closed_at,
+                            linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
+                            finalized_obj_id, finalized_at
+                     FROM nodes WHERE inode_id = ?1",
+                )
+                .map_err(map_db_err)?;
+            let mut rows = stmt.query(params![id as i64]).map_err(map_db_err)?;
+            match rows.next().map_err(map_db_err)? {
+                Some(row) => Ok(Some(Self::parse_node(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn handle_set_inode(
+        &self,
+        node: NodeRecord,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let cols = Self::node_state_cols(&node.state);
+            let now = unix_timestamp() as i64;
+            let meta_json = node
+                .meta
+                .as_ref()
+                .map(|v| serde_json::to_string(v))
+                .transpose()
+                .map_err(|e| RPCErrors::ReasonError(format!("serialize meta failed: {}", e)))?;
+
+            conn.execute(
+                "INSERT INTO nodes (
+                    inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                    lease_client_session, lease_seq, lease_expire_at,
+                    fb_handle, last_write_at, closed_at,
+                    linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
+                    finalized_obj_id, finalized_at, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ON CONFLICT(inode_id) DO UPDATE SET
+                    kind = excluded.kind,
+                    read_only = excluded.read_only,
+                    base_obj_id = excluded.base_obj_id,
+                    state = excluded.state,
+                    rev = excluded.rev,
+                    meta_json = excluded.meta_json,
+                    lease_client_session = excluded.lease_client_session,
+                    lease_seq = excluded.lease_seq,
+                    lease_expire_at = excluded.lease_expire_at,
+                    fb_handle = excluded.fb_handle,
+                    last_write_at = excluded.last_write_at,
+                    closed_at = excluded.closed_at,
+                    linked_obj_id = excluded.linked_obj_id,
+                    linked_qcid = excluded.linked_qcid,
+                    linked_filebuffer_id = excluded.linked_filebuffer_id,
+                    linked_at = excluded.linked_at,
+                    finalized_obj_id = excluded.finalized_obj_id,
+                    finalized_at = excluded.finalized_at,
+                    updated_at = excluded.updated_at",
+                params![
+                    node.inode_id as i64,
+                    node_kind_to_int(node.kind),
+                    if node.read_only { 1i64 } else { 0i64 },
+                    node.base_obj_id.as_ref().map(obj_id_to_blob),
+                    cols.state,
+                    node.rev.map(|v| v as i64),
+                    meta_json,
+                    node.lease_client_session.as_ref().map(|s| s.0.clone()),
+                    node.lease_seq.map(|v| v as i64),
+                    node.lease_expire_at.map(|v| v as i64),
+                    cols.fb_handle,
+                    cols.last_write_at.map(|v| v as i64),
+                    cols.closed_at.map(|v| v as i64),
+                    cols.linked_obj_id,
+                    cols.linked_qcid,
+                    cols.linked_filebuffer_id,
+                    cols.linked_at.map(|v| v as i64),
+                    cols.finalized_obj_id,
+                    cols.finalized_at.map(|v| v as i64),
+                    now,
+                ],
+            )
+            .map_err(map_db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_update_inode_state(
+        &self,
+        node_id: IndexNodeId,
+        new_state: NodeState,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let cols = Self::node_state_cols(&new_state);
+            let now = unix_timestamp() as i64;
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET
+                        state = ?1,
+                        fb_handle = ?2,
+                        last_write_at = ?3,
+                        closed_at = ?4,
+                        linked_obj_id = ?5,
+                        linked_qcid = ?6,
+                        linked_filebuffer_id = ?7,
+                        linked_at = ?8,
+                        finalized_obj_id = ?9,
+                        finalized_at = ?10,
+                        updated_at = ?11
+                     WHERE inode_id = ?12",
+                    params![
+                        cols.state,
+                        cols.fb_handle,
+                        cols.last_write_at.map(|v| v as i64),
+                        cols.closed_at.map(|v| v as i64),
+                        cols.linked_obj_id,
+                        cols.linked_qcid,
+                        cols.linked_filebuffer_id,
+                        cols.linked_at.map(|v| v as i64),
+                        cols.finalized_obj_id,
+                        cols.finalized_at.map(|v| v as i64),
+                        now,
+                        node_id as i64,
+                    ],
+                )
+                .map_err(map_db_err)?;
+            if updated == 0 {
+                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_alloc_inode(
+        &self,
+        mut node: NodeRecord,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<IndexNodeId, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let cols = Self::node_state_cols(&node.state);
+            let now = unix_timestamp() as i64;
+            let meta_json = node
+                .meta
+                .as_ref()
+                .map(|v| serde_json::to_string(v))
+                .transpose()
+                .map_err(|e| RPCErrors::ReasonError(format!("serialize meta failed: {}", e)))?;
+
+            if node.inode_id == 0 {
+                conn.execute(
+                    "INSERT INTO nodes (
+                        kind, read_only, base_obj_id, state, rev, meta_json,
+                        lease_client_session, lease_seq, lease_expire_at,
+                        fb_handle, last_write_at, closed_at,
+                        linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
+                        finalized_obj_id, finalized_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    params![
+                        node_kind_to_int(node.kind),
+                        if node.read_only { 1i64 } else { 0i64 },
+                        node.base_obj_id.as_ref().map(obj_id_to_blob),
+                        cols.state,
+                        node.rev.map(|v| v as i64),
+                        meta_json,
+                        node.lease_client_session.as_ref().map(|s| s.0.clone()),
+                        node.lease_seq.map(|v| v as i64),
+                        node.lease_expire_at.map(|v| v as i64),
+                        cols.fb_handle,
+                        cols.last_write_at.map(|v| v as i64),
+                        cols.closed_at.map(|v| v as i64),
+                        cols.linked_obj_id,
+                        cols.linked_qcid,
+                        cols.linked_filebuffer_id,
+                        cols.linked_at.map(|v| v as i64),
+                        cols.finalized_obj_id,
+                        cols.finalized_at.map(|v| v as i64),
+                        now,
+                    ],
+                )
+                .map_err(map_db_err)?;
+                let id = conn.last_insert_rowid() as u64;
+                Ok(id)
+            } else {
+                conn.execute(
+                    "INSERT INTO nodes (
+                        inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                        lease_client_session, lease_seq, lease_expire_at,
+                        fb_handle, last_write_at, closed_at,
+                        linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
+                        finalized_obj_id, finalized_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    params![
+                        node.inode_id as i64,
+                        node_kind_to_int(node.kind),
+                        if node.read_only { 1i64 } else { 0i64 },
+                        node.base_obj_id.as_ref().map(obj_id_to_blob),
+                        cols.state,
+                        node.rev.map(|v| v as i64),
+                        meta_json,
+                        node.lease_client_session.as_ref().map(|s| s.0.clone()),
+                        node.lease_seq.map(|v| v as i64),
+                        node.lease_expire_at.map(|v| v as i64),
+                        cols.fb_handle,
+                        cols.last_write_at.map(|v| v as i64),
+                        cols.closed_at.map(|v| v as i64),
+                        cols.linked_obj_id,
+                        cols.linked_qcid,
+                        cols.linked_filebuffer_id,
+                        cols.linked_at.map(|v| v as i64),
+                        cols.finalized_obj_id,
+                        cols.finalized_at.map(|v| v as i64),
+                        now,
+                    ],
+                )
+                .map_err(map_db_err)?;
+                Ok(node.inode_id)
+            }
+        })
+        .await
+    }
+
+    async fn handle_get_dentry(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<Option<DentryRecord>, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                     FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                )
+                .map_err(map_db_err)?;
+            let mut rows = stmt.query(params![parent as i64, name]).map_err(map_db_err)?;
+            match rows.next().map_err(map_db_err)? {
+                Some(row) => Ok(Some(parse_dentry(row)?)),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    async fn handle_list_dentries(
+        &self,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<Vec<DentryRecord>, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                     FROM dentries WHERE parent_inode_id = ?1",
+                )
+                .map_err(map_db_err)?;
+            let mut rows = stmt.query(params![parent as i64]).map_err(map_db_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(map_db_err)? {
+                out.push(parse_dentry(row)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn handle_upsert_dentry(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        target: DentryTarget,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let now = unix_timestamp() as i64;
+            let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
+            conn.execute(
+                "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(parent_inode_id, name) DO UPDATE SET
+                    target_type = excluded.target_type,
+                    target_inode_id = excluded.target_inode_id,
+                    target_obj_id = excluded.target_obj_id,
+                    mtime = excluded.mtime",
+                params![
+                    parent as i64,
+                    name,
+                    target_type,
+                    target_inode_id,
+                    target_obj_id,
+                    now,
+                ],
+            )
+            .map_err(map_db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_remove_dentry_row(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            conn.execute(
+                "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                params![parent as i64, name],
+            )
+            .map_err(map_db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_set_tombstone(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.handle_upsert_dentry(parent, name, DentryTarget::Tombstone, txid, ctx)
+            .await
+    }
+
+    async fn handle_bump_dir_rev(
+        &self,
+        dir: IndexNodeId,
+        expected_rev: u64,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<u64, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET rev = rev + 1 WHERE inode_id = ?1 AND rev = ?2",
+                    params![dir as i64, expected_rev as i64],
+                )
+                .map_err(map_db_err)?;
+            if updated == 0 {
+                return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+            }
+            Ok(expected_rev + 1)
+        })
+        .await
+    }
+
+    async fn handle_commit(
+        &self,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let Some(txid) = txid else {
+            return Ok(());
+        };
+        let entry = self.txns.lock().unwrap().remove(&txid);
+        let Some(entry) = entry else {
+            return Err(RPCErrors::ReasonError("txid not found".to_string()));
+        };
+        tokio::task::spawn_blocking(move || {
+            let conn = entry.conn.lock().unwrap();
+            conn.execute_batch("COMMIT")
+                .map_err(|e| RPCErrors::ReasonError(format!("commit failed: {}", e)))
+        })
+        .await
+        .map_err(|e| RPCErrors::ReasonError(format!("commit join failed: {}", e)))??;
+        Ok(())
+    }
+
+    async fn handle_rollback(
+        &self,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let Some(txid) = txid else {
+            return Ok(());
+        };
+        let entry = self.txns.lock().unwrap().remove(&txid);
+        let Some(entry) = entry else {
+            return Err(RPCErrors::ReasonError("txid not found".to_string()));
+        };
+        tokio::task::spawn_blocking(move || {
+            let conn = entry.conn.lock().unwrap();
+            conn.execute_batch("ROLLBACK")
+                .map_err(|e| RPCErrors::ReasonError(format!("rollback failed: {}", e)))
+        })
+        .await
+        .map_err(|e| RPCErrors::ReasonError(format!("rollback join failed: {}", e)))??;
+        Ok(())
+    }
+
+    async fn handle_acquire_file_lease(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        ttl: Duration,
+        _ctx: RPCContext,
+    ) -> Result<u64, RPCErrors> {
+        self.with_conn(None, move |conn| {
+            let now = unix_timestamp() as i64;
+            let expire_at = now.saturating_add(ttl.as_secs() as i64);
+            let current = conn
+                .query_row(
+                    "SELECT lease_client_session, lease_seq, lease_expire_at FROM nodes WHERE inode_id = ?1",
+                    params![node_id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db_err)?
+                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+
+            let (cur_session, cur_seq, cur_expire) = current;
+            let expired = cur_expire.map(|v| v <= now).unwrap_or(true);
+
+            if !expired {
+                if cur_session.as_deref() != Some(&session.0) {
+                    return Err(RPCErrors::ReasonError("lease conflict".to_string()));
+                }
+                let seq = cur_seq.unwrap_or(0);
+                conn.execute(
+                    "UPDATE nodes SET lease_expire_at = ?1 WHERE inode_id = ?2",
+                    params![expire_at, node_id as i64],
+                )
+                .map_err(map_db_err)?;
+                return Ok(seq as u64);
+            }
+
+            let next_seq = cur_seq.unwrap_or(0) + 1;
+            conn.execute(
+                "UPDATE nodes SET lease_client_session = ?1, lease_seq = ?2, lease_expire_at = ?3 WHERE inode_id = ?4",
+                params![session.0, next_seq, expire_at, node_id as i64],
+            )
+            .map_err(map_db_err)?;
+            Ok(next_seq as u64)
+        })
+        .await
+    }
+
+    async fn handle_renew_file_lease(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        lease_seq: u64,
+        ttl: Duration,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(None, move |conn| {
+            let now = unix_timestamp() as i64;
+            let expire_at = now.saturating_add(ttl.as_secs() as i64);
+            let current = conn
+                .query_row(
+                    "SELECT lease_client_session, lease_seq FROM nodes WHERE inode_id = ?1",
+                    params![node_id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db_err)?
+                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+            let (cur_session, cur_seq) = current;
+            if cur_session.as_deref() != Some(&session.0) || cur_seq.unwrap_or(0) != lease_seq as i64 {
+                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
+            }
+            conn.execute(
+                "UPDATE nodes SET lease_expire_at = ?1 WHERE inode_id = ?2",
+                params![expire_at, node_id as i64],
+            )
+            .map_err(map_db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_release_file_lease(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        lease_seq: u64,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(None, move |conn| {
+            let current = conn
+                .query_row(
+                    "SELECT lease_client_session, lease_seq FROM nodes WHERE inode_id = ?1",
+                    params![node_id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(map_db_err)?
+                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+            let (cur_session, cur_seq) = current;
+            if cur_session.as_deref() != Some(&session.0) || cur_seq.unwrap_or(0) != lease_seq as i64 {
+                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
+            }
+            conn.execute(
+                "UPDATE nodes SET lease_client_session = NULL, lease_seq = NULL, lease_expire_at = NULL WHERE inode_id = ?1",
+                params![node_id as i64],
+            )
+            .map_err(map_db_err)?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handle_obj_stat_get(
+        &self,
+        obj_id: ObjId,
+        _ctx: RPCContext,
+    ) -> Result<Option<ObjStat>, RPCErrors> {
+        self.with_conn(None, move |conn| {
+            let obj_blob = obj_id_to_blob(&obj_id);
+            let row = conn
+                .query_row(
+                    "SELECT ref_count, zero_since, updated_at FROM obj_stat WHERE obj_id = ?1",
+                    params![obj_blob],
+                    |row| {
+                        let ref_count: i64 = row.get(0)?;
+                        let zero_since: Option<i64> = row.get(1)?;
+                        let updated_at: i64 = row.get(2)?;
+                        Ok(ObjStat {
+                            obj_id,
+                            ref_count: ref_count as u64,
+                            zero_since: zero_since.map(|v| v as u64),
+                            updated_at: updated_at as u64,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(map_db_err)?;
+            Ok(row)
+        })
+        .await
+    }
+
+    async fn handle_obj_stat_bump(
+        &self,
+        obj_id: ObjId,
+        delta: i64,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<u64, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let now = unix_timestamp() as i64;
+            let obj_blob = obj_id_to_blob(&obj_id);
+            let current = conn
+                .query_row(
+                    "SELECT ref_count, zero_since FROM obj_stat WHERE obj_id = ?1",
+                    params![obj_blob.clone()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+                )
+                .optional()
+                .map_err(map_db_err)?;
+
+            if let Some((ref_count, zero_since)) = current {
+                let next = ref_count + delta;
+                if next < 0 {
+                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
+                }
+                let zero_since = if next == 0 { Some(zero_since.unwrap_or(now)) } else { None };
+                conn.execute(
+                    "UPDATE obj_stat SET ref_count = ?1, zero_since = ?2, updated_at = ?3 WHERE obj_id = ?4",
+                    params![next, zero_since, now, obj_blob],
+                )
+                .map_err(map_db_err)?;
+                Ok(next as u64)
+            } else {
+                if delta <= 0 {
+                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
+                }
+                conn.execute(
+                    "INSERT INTO obj_stat (obj_id, ref_count, zero_since, updated_at) VALUES (?1, ?2, NULL, ?3)",
+                    params![obj_blob, delta, now],
+                )
+                .map_err(map_db_err)?;
+                Ok(delta as u64)
+            }
+        })
+        .await
+    }
+
+    async fn handle_obj_stat_list_zero(
+        &self,
+        older_than_ts: u64,
+        limit: u32,
+        _ctx: RPCContext,
+    ) -> Result<Vec<ObjId>, RPCErrors> {
+        self.with_conn(None, move |conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT obj_id FROM obj_stat
+                     WHERE ref_count = 0 AND zero_since IS NOT NULL AND zero_since <= ?1
+                     ORDER BY zero_since ASC LIMIT ?2",
+                )
+                .map_err(map_db_err)?;
+            let mut rows = stmt
+                .query(params![older_than_ts as i64, limit as i64])
+                .map_err(map_db_err)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(map_db_err)? {
+                let obj_blob: Vec<u8> = row.get(0).map_err(map_db_err)?;
+                out.push(obj_id_from_blob(obj_blob)?);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn handle_obj_stat_delete_if_zero(
+        &self,
+        obj_id: ObjId,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<bool, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let obj_blob = obj_id_to_blob(&obj_id);
+            let removed = conn
+                .execute(
+                    "DELETE FROM obj_stat WHERE obj_id = ?1 AND ref_count = 0",
+                    params![obj_blob],
+                )
+                .map_err(map_db_err)?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+}
+
+#[derive(Default)]
+struct NodeStateCols {
+    state: i64,
+    fb_handle: Option<String>,
+    last_write_at: Option<u64>,
+    closed_at: Option<u64>,
+    linked_obj_id: Option<Vec<u8>>,
+    linked_qcid: Option<Vec<u8>>,
+    linked_filebuffer_id: Option<String>,
+    linked_at: Option<u64>,
+    finalized_obj_id: Option<Vec<u8>>,
+    finalized_at: Option<u64>,
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn obj_id_to_blob(obj_id: &ObjId) -> Vec<u8> {
+    obj_id.to_bytes()
+}
+
+fn obj_id_from_blob(blob: Vec<u8>) -> Result<ObjId, RPCErrors> {
+    ObjId::from_bytes(&blob)
+        .map_err(|e| RPCErrors::ReasonError(format!("invalid obj_id bytes: {}", e)))
+}
+
+fn node_kind_to_int(kind: NodeKind) -> i64 {
+    match kind {
+        NodeKind::File => 0,
+        NodeKind::Dir => 1,
+        NodeKind::Object => 2,
+    }
+}
+
+fn node_kind_from_int(value: i64) -> Result<NodeKind, RPCErrors> {
+    match value {
+        0 => Ok(NodeKind::File),
+        1 => Ok(NodeKind::Dir),
+        2 => Ok(NodeKind::Object),
+        _ => Err(RPCErrors::ReasonError("invalid node kind".to_string())),
+    }
+}
+
+fn dentry_target_cols(
+    target: &DentryTarget,
+) -> Result<(i64, Option<i64>, Option<Vec<u8>>), RPCErrors> {
+    match target {
+        DentryTarget::IndexNodeId(id) => Ok((DENTRY_TARGET_INODE, Some(*id as i64), None)),
+        DentryTarget::ObjId(obj_id) => Ok((DENTRY_TARGET_OBJ, None, Some(obj_id_to_blob(obj_id)))),
+        DentryTarget::Tombstone => Ok((DENTRY_TARGET_TOMBSTONE, None, None)),
+    }
+}
+
+fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
+    let parent: i64 = row.get(0).map_err(map_db_err)?;
+    let name: String = row.get(1).map_err(map_db_err)?;
+    let target_type: i64 = row.get(2).map_err(map_db_err)?;
+    let target_inode_id: Option<i64> = row.get(3).map_err(map_db_err)?;
+    let target_obj_id: Option<Vec<u8>> = row.get(4).map_err(map_db_err)?;
+    let mtime: Option<i64> = row.get(5).map_err(map_db_err)?;
+    let target = match target_type {
+        DENTRY_TARGET_INODE => DentryTarget::IndexNodeId(
+            target_inode_id.ok_or_else(|| {
+                RPCErrors::ReasonError("missing target_inode_id".to_string())
+            })? as IndexNodeId,
+        ),
+        DENTRY_TARGET_OBJ => DentryTarget::ObjId(obj_id_from_blob(
+            target_obj_id.ok_or_else(|| {
+                RPCErrors::ReasonError("missing target_obj_id".to_string())
+            })?,
+        )?),
+        DENTRY_TARGET_TOMBSTONE => DentryTarget::Tombstone,
+        _ => return Err(RPCErrors::ReasonError("invalid dentry target".to_string())),
+    };
+    Ok(DentryRecord {
+        parent: parent as IndexNodeId,
+        name,
+        target,
+        mtime: mtime.map(|v| v as u64),
+    })
+}
+
+fn map_db_err(err: rusqlite::Error) -> RPCErrors {
+    RPCErrors::ReasonError(format!("db error: {}", err))
+}

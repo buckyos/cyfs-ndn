@@ -2,7 +2,7 @@
 //
 // Architecture v2 (pseudocode-ish):
 // - Overlay directories (Upper = fsmeta dentries, Base = DirObject children).
-// - Inode/Dentry in fsmeta with Strategy B: dentry target can be FileId OR ObjId OR Tombstone.
+// - Inode/Dentry in fsmeta with Strategy B: dentry target can be IndexNodeId OR ObjId OR Tombstone.
 // - list() has no pos/page_size; merge happens in NDM.
 // - File write path uses staged commit with GFS-like FileBuffer nodes:
 //   Writing -> Cooling -> Linked (ExternalLink in store) -> Finalized (internal chunk store).
@@ -33,7 +33,7 @@ pub struct ObjId(pub String); // e.g. sha256:...
 pub struct ChunkId(pub String); // e.g. sha256:...
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FileId(pub u64); // inode number (fsmeta internal)
+pub struct IndexNodeId(pub u64); // inode number (fsmeta internal)
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(pub String);
@@ -63,7 +63,7 @@ impl NdmPath {
     }
 }
 
-pub type NdmResult<T> = Result<T, NdmError>;
+pub type NdnResult<T> = Result<T, NdmError>;
 
 /// ------------------------------
 /// Errors
@@ -215,7 +215,7 @@ pub struct FileFinalizedState2 {
 
 #[derive(Clone, Debug)]
 pub struct NodeRecord {
-    pub file_id: FileId,
+    pub file_id: IndexNodeId,
     pub kind: NodeKind,
     pub mount_mode: Option<MountMode>, // only for dirs
     pub base_obj_id: Option<ObjId>,    // committed base snapshot (file or dir)
@@ -230,14 +230,14 @@ pub struct NodeRecord {
 /// Dentry target (Strategy B)
 #[derive(Clone, Debug)]
 pub enum DentryTarget {
-    FileId(FileId),
+    IndexNodeId(IndexNodeId),
     ObjId(ObjId),
     Tombstone,
 }
 
 #[derive(Clone, Debug)]
 pub struct DentryRecord {
-    pub parent: FileId,
+    pub parent: IndexNodeId,
     pub name: String,
     pub target: DentryTarget,
     pub mtime: Option<SystemTime>,
@@ -250,69 +250,69 @@ pub struct DentryRecord {
 /// Transaction object for fsmeta updates.
 /// In a real implementation, this is backed by SQLite txn or Raft log txn.
 pub trait FsMetaTxn: Send {
-    fn get_node(&mut self, id: &FileId) -> NdmResult<Option<NodeRecord>>;
-    fn put_node(&mut self, node: &NodeRecord) -> NdmResult<()>;
+    fn get_node(&mut self, id: &IndexNodeId) -> NdnResult<Option<NodeRecord>>;
+    fn put_node(&mut self, node: &NodeRecord) -> NdnResult<()>;
 
-    fn get_dentry(&mut self, parent: &FileId, name: &str) -> NdmResult<Option<DentryRecord>>;
-    fn list_dentries(&mut self, parent: &FileId) -> NdmResult<Vec<DentryRecord>>;
+    fn get_dentry(&mut self, parent: &IndexNodeId, name: &str) -> NdnResult<Option<DentryRecord>>;
+    fn list_dentries(&mut self, parent: &IndexNodeId) -> NdnResult<Vec<DentryRecord>>;
 
-    fn upsert_dentry(&mut self, parent: &FileId, name: &str, target: DentryTarget) -> NdmResult<()>;
-    fn remove_dentry_row(&mut self, parent: &FileId, name: &str) -> NdmResult<()>;
+    fn upsert_dentry(&mut self, parent: &IndexNodeId, name: &str, target: DentryTarget) -> NdnResult<()>;
+    fn remove_dentry_row(&mut self, parent: &IndexNodeId, name: &str) -> NdnResult<()>;
 
     /// Set a tombstone (whiteout). Must not "DELETE" in overlay mode.
-    fn set_tombstone(&mut self, parent: &FileId, name: &str) -> NdmResult<()> {
+    fn set_tombstone(&mut self, parent: &IndexNodeId, name: &str) -> NdnResult<()> {
         self.upsert_dentry(parent, name, DentryTarget::Tombstone)
     }
 
     /// Atomically bump directory rev (OCC).
-    fn bump_dir_rev(&mut self, dir: &FileId, expected_rev: u64) -> NdmResult<u64>;
+    fn bump_dir_rev(&mut self, dir: &IndexNodeId, expected_rev: u64) -> NdnResult<u64>;
 
-    fn commit(self: Box<Self>) -> NdmResult<()>;
-    fn rollback(self: Box<Self>) -> NdmResult<()>;
+    fn commit(self: Box<Self>) -> NdnResult<()>;
+    fn rollback(self: Box<Self>) -> NdnResult<()>;
 }
 
 /// FsMeta API (strong consistency domain)
 pub trait FsMetaService: Send + Sync {
-    fn begin_txn(&self) -> NdmResult<Box<dyn FsMetaTxn>>;
+    fn begin_txn(&self) -> NdnResult<Box<dyn FsMetaTxn>>;
 
-    fn root_dir(&self) -> NdmResult<FileId>;
+    fn root_dir(&self) -> NdnResult<IndexNodeId>;
 
-    fn alloc_inode(&self, kind: NodeKind, mount_mode: Option<MountMode>) -> NdmResult<FileId>;
+    fn alloc_inode(&self, kind: NodeKind, mount_mode: Option<MountMode>) -> NdnResult<IndexNodeId>;
 
     /// Acquire strict single-writer lease for file inode.
     /// - Must return a fencing token (monotonic per file_id).
     /// - Subsequent writes must provide the same (session, fence).
     fn acquire_file_lease(
         &self,
-        file_id: &FileId,
+        file_id: &IndexNodeId,
         session: &SessionId,
         ttl: Duration,
-    ) -> NdmResult<LeaseFence>;
+    ) -> NdnResult<LeaseFence>;
 
     fn renew_file_lease(
         &self,
-        file_id: &FileId,
+        file_id: &IndexNodeId,
         session: &SessionId,
         fence: LeaseFence,
         ttl: Duration,
-    ) -> NdmResult<()>;
+    ) -> NdnResult<()>;
 
-    fn release_file_lease(&self, file_id: &FileId, session: &SessionId, fence: LeaseFence) -> NdmResult<()>;
+    fn release_file_lease(&self, file_id: &IndexNodeId, session: &SessionId, fence: LeaseFence) -> NdnResult<()>;
 
     /// Read node record (non-transactional).
-    fn get_node(&self, id: &FileId) -> NdmResult<Option<NodeRecord>>;
+    fn get_node(&self, id: &IndexNodeId) -> NdnResult<Option<NodeRecord>>;
 
     /// Read dentry record (Upper layer only).
-    fn get_dentry(&self, parent: &FileId, name: &str) -> NdmResult<Option<DentryRecord>>;
+    fn get_dentry(&self, parent: &IndexNodeId, name: &str) -> NdnResult<Option<DentryRecord>>;
 
     /// List all upper-layer dentries for merge (usually sparse).
-    fn list_dentries(&self, parent: &FileId) -> NdmResult<Vec<DentryRecord>>;
+    fn list_dentries(&self, parent: &IndexNodeId) -> NdnResult<Vec<DentryRecord>>;
 
     /// For background lifecycle: scan file nodes in Cooling/Linked states.
-    fn scan_files_by_state(&self, state: ScanFileState, limit: usize) -> NdmResult<Vec<NodeRecord>>;
+    fn scan_files_by_state(&self, state: ScanFileState, limit: usize) -> NdnResult<Vec<NodeRecord>>;
 
     /// Update file node state (atomic check via lease fencing where needed).
-    fn update_file_state(&self, file_id: &FileId, new_state: NodeState) -> NdmResult<()>;
+    fn update_file_state(&self, file_id: &IndexNodeId, new_state: NodeState) -> NdnResult<()>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -327,7 +327,7 @@ pub enum ScanFileState {
 
 #[derive(Clone, Debug)]
 pub struct FileBufferHandle {
-    pub file_id: FileId,
+    pub file_id: IndexNodeId,
     pub session: SessionId,
     pub fence: LeaseFence,
     pub buffer_node: String,
@@ -353,28 +353,28 @@ pub struct BufferObjectification {
 
 /// Client to a buffer node.
 pub trait BufferNodeClient: Send + Sync {
-    fn append(&self, remote_path: &str, data: &[u8]) -> NdmResult<()>;
-    fn flush(&self, remote_path: &str) -> NdmResult<()>;
+    fn append(&self, remote_path: &str, data: &[u8]) -> NdnResult<()>;
+    fn flush(&self, remote_path: &str) -> NdnResult<()>;
 
     /// Seal the buffer file so it becomes immutable for hashing/reading.
-    fn seal(&self, remote_path: &str) -> NdmResult<()>;
+    fn seal(&self, remote_path: &str) -> NdnResult<()>;
 
     /// Compute chunklist + file object id; return chunk external links (no data copy).
-    fn objectify(&self, remote_path: &str) -> NdmResult<BufferObjectification>;
+    fn objectify(&self, remote_path: &str) -> NdnResult<BufferObjectification>;
 
     /// Copy data to named_store internal targets (expensive IO).
-    fn push_to_store(&self, remote_path: &str, store: &dyn NamedStore) -> NdmResult<()>;
+    fn push_to_store(&self, remote_path: &str, store: &dyn NamedStore) -> NdnResult<()>;
 
-    fn delete_buffer_file(&self, remote_path: &str) -> NdmResult<()>;
+    fn delete_buffer_file(&self, remote_path: &str) -> NdnResult<()>;
 }
 
 /// Master that assigns buffer nodes (GFS master-like).
 pub trait BufferMaster: Send + Sync {
-    fn pick_node_for_write(&self, expect_size: Option<u64>) -> NdmResult<Arc<dyn BufferNodeClient>>;
-    fn get_node(&self, node_id: &str) -> NdmResult<Arc<dyn BufferNodeClient>>;
+    fn pick_node_for_write(&self, expect_size: Option<u64>) -> NdnResult<Arc<dyn BufferNodeClient>>;
+    fn get_node(&self, node_id: &str) -> NdnResult<Arc<dyn BufferNodeClient>>;
 
     /// Allocate remote path on a node; returns (node_id, remote_path).
-    fn create_remote_file(&self, node: &dyn BufferNodeClient, hint: &str) -> NdmResult<(String, String)>;
+    fn create_remote_file(&self, node: &dyn BufferNodeClient, hint: &str) -> NdnResult<(String, String)>;
 }
 
 /// ------------------------------
@@ -390,31 +390,31 @@ pub enum LinkType {
 
 pub trait NamedStore: Send + Sync {
     /// Get object meta (kind, size, etc). Might require object header only.
-    fn get_object_meta(&self, obj_id: &ObjId) -> NdmResult<Option<NamedObjectMeta>>;
+    fn get_object_meta(&self, obj_id: &ObjId) -> NdnResult<Option<NamedObjectMeta>>;
 
-    fn get_dir_object(&self, obj_id: &ObjId) -> NdmResult<DirObject>;
-    fn get_file_object(&self, obj_id: &ObjId) -> NdmResult<FileObject>;
+    fn get_dir_object(&self, obj_id: &ObjId) -> NdnResult<DirObject>;
+    fn get_file_object(&self, obj_id: &ObjId) -> NdnResult<FileObject>;
 
     /// Open reader by object id (object + inner_path resolution is out of scope here).
-    fn open_reader_by_id(&self, obj_id: &ObjId) -> NdmResult<Box<dyn NdmReader>>;
+    fn open_reader_by_id(&self, obj_id: &ObjId) -> NdnResult<Box<dyn NdmReader>>;
 
     /// Ensure object body/chunks are present locally, or schedule pull.
-    fn has_materialized(&self, obj_id: &ObjId) -> NdmResult<bool>;
-    fn schedule_pull(&self, obj_id: &ObjId, remote: PullContext) -> NdmResult<()>;
+    fn has_materialized(&self, obj_id: &ObjId) -> NdnResult<bool>;
+    fn schedule_pull(&self, obj_id: &ObjId, remote: PullContext) -> NdnResult<()>;
 
     /// Put a (small) object metadata into object DB. For FileObject/DirObject, obj_id must match content hash.
-    fn put_object_meta(&self, meta: &NamedObjectMeta) -> NdmResult<()>;
-    fn put_dir_object(&self, dir: &DirObject) -> NdmResult<()>;
-    fn put_file_object(&self, file: &FileObject) -> NdmResult<()>;
+    fn put_object_meta(&self, meta: &NamedObjectMeta) -> NdnResult<()>;
+    fn put_dir_object(&self, dir: &DirObject) -> NdnResult<()>;
+    fn put_file_object(&self, file: &FileObject) -> NdnResult<()>;
 
     /// Register link mapping for a chunk (ExternalFile/SameAs/PartOf).
-    fn upsert_chunk_link(&self, chunk_id: &ChunkId, link: LinkType) -> NdmResult<()>;
+    fn upsert_chunk_link(&self, chunk_id: &ChunkId, link: LinkType) -> NdnResult<()>;
 
     /// Promote chunk(s) from external links to internal storage: remove link or mark COMPLETE.
-    fn promote_obj_to_internal(&self, obj_id: &ObjId) -> NdmResult<()>;
+    fn promote_obj_to_internal(&self, obj_id: &ObjId) -> NdnResult<()>;
 
     /// Physical erase (evict local materialized body/chunks). Keep meta/index as needed.
-    fn erase_obj_data(&self, obj_id: &ObjId) -> NdmResult<()>;
+    fn erase_obj_data(&self, obj_id: &ObjId) -> NdnResult<()>;
 }
 
 /// ------------------------------
@@ -441,7 +441,7 @@ pub struct PathStat {
 
 #[derive(Clone, Debug)]
 pub enum ResolvedRef {
-    Inode(FileId),
+    Inode(IndexNodeId),
     ObjId(ObjId),
 }
 
@@ -531,7 +531,7 @@ impl NamedDataMgr {
     }
 
     /// One tick of background lifecycle processing.
-    pub fn bg_tick(&self) -> NdmResult<()> {
+    pub fn bg_tick(&self) -> NdnResult<()> {
         // 1) process Cooling -> Linked
         let cooling = self.fsmeta.scan_files_by_state(ScanFileState::Cooling, self.cfg.background_scan_limit)?;
         for node in cooling {
@@ -554,7 +554,7 @@ impl NamedDataMgr {
     /// Resolve a path to a Ref (inode or obj).
     /// - Traversal uses Upper dentries first.
     /// - On miss, consult Base DirObject (NDM reads store).
-    pub fn resolve_path(&self, path: &NdmPath) -> NdmResult<ResolvedRef> {
+    pub fn resolve_path(&self, path: &NdmPath) -> NdnResult<ResolvedRef> {
         let root = self.fsmeta.root_dir()?;
         let mut cur_dir = root;
 
@@ -569,7 +569,7 @@ impl NamedDataMgr {
             let child = self.lookup_one_in_dir(cur_dir.clone(), name)?;
             match child {
                 LookupOne::Tombstone => return Err(NdmError::NotFound),
-                LookupOne::UpperFileId(fid) => {
+                LookupOne::UpperIndexNodeId(fid) => {
                     if is_last {
                         return Ok(ResolvedRef::Inode(fid));
                     }
@@ -609,16 +609,16 @@ impl NamedDataMgr {
     }
 
     /// Lookup a single name under a directory inode, applying overlay rules:
-    /// - If upper dentry exists: FileId/ObjId/Tombstone
+    /// - If upper dentry exists: IndexNodeId/ObjId/Tombstone
     /// - Else consult base DirObject (if any)
-    fn lookup_one_in_dir(&self, parent_dir: FileId, name: &str) -> NdmResult<LookupOne> {
+    fn lookup_one_in_dir(&self, parent_dir: IndexNodeId, name: &str) -> NdnResult<LookupOne> {
         if !is_valid_name(name) {
             return Err(NdmError::InvalidName);
         }
 
         if let Some(d) = self.fsmeta.get_dentry(&parent_dir, name)? {
             return Ok(match d.target {
-                DentryTarget::FileId(fid) => LookupOne::UpperFileId(fid),
+                DentryTarget::IndexNodeId(fid) => LookupOne::UpperIndexNodeId(fid),
                 DentryTarget::ObjId(oid) => LookupOne::UpperObjId(oid),
                 DentryTarget::Tombstone => LookupOne::Tombstone,
             });
@@ -651,7 +651,7 @@ impl NamedDataMgr {
     /// If the path resolves to an ObjId(DirObject), materialize:
     /// - alloc inode kind=dir, set base_obj_id=that DirObject, mount_mode=Overlay
     /// - update parent dentry to point to file_id
-    pub fn ensure_dir_inode(&self, path: &NdmPath) -> NdmResult<FileId> {
+    pub fn ensure_dir_inode(&self, path: &NdmPath) -> NdnResult<IndexNodeId> {
         // PSEUDOCODE:
         // 1) Resolve parent + name (need parent dir inode)
         // 2) lookup_one_in_dir(parent, name)
@@ -665,7 +665,7 @@ impl NamedDataMgr {
     /// Read APIs
     /// ------------------------------
 
-    pub fn open_reader_by_id(&self, obj_id: &ObjId) -> NdmResult<Box<dyn NdmReader>> {
+    pub fn open_reader_by_id(&self, obj_id: &ObjId) -> NdnResult<Box<dyn NdmReader>> {
         // Read committed object by ObjId.
         // If not materialized: return NEED_PULL (or schedule pull depending on policy).
         if !self.store.has_materialized(obj_id)? {
@@ -674,7 +674,7 @@ impl NamedDataMgr {
         self.store.open_reader_by_id(obj_id)
     }
 
-    pub fn open_reader(&self, path: &NdmPath) -> NdmResult<Box<dyn NdmReader>> {
+    pub fn open_reader(&self, path: &NdmPath) -> NdnResult<Box<dyn NdmReader>> {
         // Resolve to inode or objid
         match self.resolve_path(path)? {
             ResolvedRef::ObjId(oid) => self.open_reader_by_id(&oid),
@@ -703,7 +703,7 @@ impl NamedDataMgr {
         }
     }
 
-    pub fn get_object_meta(&self, obj_id: &ObjId) -> NdmResult<NamedObjectMeta> {
+    pub fn get_object_meta(&self, obj_id: &ObjId) -> NdnResult<NamedObjectMeta> {
         self.store.get_object_meta(obj_id)?.ok_or(NdmError::NotFound)
     }
 
@@ -711,17 +711,17 @@ impl NamedDataMgr {
     /// Pull APIs
     /// ------------------------------
 
-    pub fn pull(&self, path: &NdmPath, remote: PullContext) -> NdmResult<()> {
+    pub fn pull(&self, path: &NdmPath, remote: PullContext) -> NdnResult<()> {
         // Resolve path to obj id. If inode, read its committed/linked obj id.
         let obj_id = self.resolve_objid_for_read(path)?;
         self.store.schedule_pull(&obj_id, remote)
     }
 
-    pub fn pull_by_objid(&self, obj_id: &ObjId, remote: PullContext) -> NdmResult<()> {
+    pub fn pull_by_objid(&self, obj_id: &ObjId, remote: PullContext) -> NdnResult<()> {
         self.store.schedule_pull(obj_id, remote)
     }
 
-    fn resolve_objid_for_read(&self, path: &NdmPath) -> NdmResult<ObjId> {
+    fn resolve_objid_for_read(&self, path: &NdmPath) -> NdnResult<ObjId> {
         match self.resolve_path(path)? {
             ResolvedRef::ObjId(oid) => Ok(oid),
             ResolvedRef::Inode(fid) => {
@@ -740,7 +740,7 @@ impl NamedDataMgr {
     /// Stat APIs
     /// ------------------------------
 
-    pub fn stat(&self, path: &NdmPath) -> NdmResult<PathStat> {
+    pub fn stat(&self, path: &NdmPath) -> NdnResult<PathStat> {
         match self.resolve_path(path)? {
             ResolvedRef::ObjId(oid) => {
                 let meta = self.store.get_object_meta(&oid)?.ok_or(NdmError::NotFound)?;
@@ -794,7 +794,7 @@ impl NamedDataMgr {
     /// Directory APIs (Overlay merge in NDM)
     /// ------------------------------
 
-    pub fn list(&self, dir_path: &NdmPath) -> NdmResult<Vec<DirEntryView>> {
+    pub fn list(&self, dir_path: &NdmPath) -> NdnResult<Vec<DirEntryView>> {
         // Resolve dir_path to a directory inode (recommended) or an ObjId dir.
         let resolved = self.resolve_path(dir_path)?;
 
@@ -857,7 +857,7 @@ impl NamedDataMgr {
                         DentryTarget::Tombstone => {
                             result.remove(&name);
                         }
-                        DentryTarget::FileId(fid) => {
+                        DentryTarget::IndexNodeId(fid) => {
                             // Need kind. We can read inode kind.
                             let inode = self.fsmeta.get_node(&fid)?.ok_or(NdmError::NotFound)?;
                             let kind = match inode.kind {
@@ -897,33 +897,33 @@ impl NamedDataMgr {
     }
 
     /// Create an empty directory at path (mutable).
-    pub fn create_dir(&self, dir_path: &NdmPath, mount_mode: MountMode) -> NdmResult<()> {
+    pub fn create_dir(&self, dir_path: &NdmPath, mount_mode: MountMode) -> NdnResult<()> {
         // PSEUDOCODE:
         // 1) Resolve parent dir inode; ensure it is inode (materialize if needed).
         // 2) Check parent mount_mode != ReadOnly.
         // 3) alloc inode kind=dir, set mount_mode, base_obj_id = empty DirObject or None.
-        // 4) In parent dentries: upsert name -> FileId(new_dir)
+        // 4) In parent dentries: upsert name -> IndexNodeId(new_dir)
         todo!("create_dir")
     }
 
     /// Bind an existing DirObjectId at path.
     /// - overlay: allow upper dentries modifications
     /// - read_only: forbid modifications
-    pub fn add_dir(&self, path: &NdmPath, dir_obj_id: ObjId, mount_mode: MountMode) -> NdmResult<()> {
+    pub fn add_dir(&self, path: &NdmPath, dir_obj_id: ObjId, mount_mode: MountMode) -> NdnResult<()> {
         // PSEUDOCODE:
         // Always create a dir inode so we can store mount_mode/rev/base_obj_id.
         // 1) resolve parent dir inode
         // 2) alloc inode kind=dir (mount_mode)
         // 3) set node.base_obj_id = dir_obj_id, node.rev = 0
-        // 4) parent dentries: name -> FileId(new_inode)
+        // 4) parent dentries: name -> IndexNodeId(new_inode)
         todo!("add_dir")
     }
 
     /// Bind an existing FileObjectId at path (O(1) meta).
     /// Strategy B allows either:
-    /// - Create inode and use dentry->FileId (preferred if future writes expected)
+    /// - Create inode and use dentry->IndexNodeId (preferred if future writes expected)
     /// - Or set dentry->ObjId directly (fast, read-only unless later materialized)
-    pub fn add_file(&self, path: &NdmPath, file_obj_id: ObjId) -> NdmResult<()> {
+    pub fn add_file(&self, path: &NdmPath, file_obj_id: ObjId) -> NdnResult<()> {
         // PSEUDOCODE:
         // 1) resolve parent dir inode
         // 2) parent mount_mode must allow
@@ -933,7 +933,7 @@ impl NamedDataMgr {
 
     /// Delete a name from directory view.
     /// Overlay semantics: write tombstone so base won't "reappear".
-    pub fn delete(&self, path: &NdmPath) -> NdmResult<()> {
+    pub fn delete(&self, path: &NdmPath) -> NdnResult<()> {
         // PSEUDOCODE:
         // 1) resolve parent dir inode + name
         // 2) check mount_mode != ReadOnly
@@ -945,13 +945,13 @@ impl NamedDataMgr {
     /// Overlay semantics:
     /// - If entry is upper: move/rename dentry row.
     /// - If entry is base-only: add new name with ObjId + tombstone old name.
-    pub fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdmResult<()> {
+    pub fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
         // PSEUDOCODE:
         // 1) parse old_parent, old_name; new_parent, new_name
         // 2) ensure both parents are dir inodes
         // 3) read mount_mode of both dirs (deny if ReadOnly)
         // 4) Determine source entry by overlay lookup:
-        //    - if upper has FileId/ObjId: we can "move" that dentry row
+        //    - if upper has IndexNodeId/ObjId: we can "move" that dentry row
         //    - if base-only: we need base child obj_id to create new dentry ObjId and tombstone old
         // 5) Transaction:
         //    - Check new_name not conflicting (unless overwrite allowed)
@@ -964,7 +964,7 @@ impl NamedDataMgr {
     /// - Build new DirObject (sorted)
     /// - Put into store
     /// - Commit in fsmeta: set base_obj_id=new, clear dentries, bump rev
-    pub fn cacl_dir(&self, dir_path: &NdmPath) -> NdmResult<ObjId> {
+    pub fn cacl_dir(&self, dir_path: &NdmPath) -> NdnResult<ObjId> {
         // PSEUDOCODE:
         // 1) resolve to dir inode
         // 2) read dir node: base_obj_id + rev0 + mount_mode
@@ -982,20 +982,20 @@ impl NamedDataMgr {
     /// ------------------------------
 
     /// Create or open a writable file (strict single writer).
-    /// - Allocates / reuses inode (FileId)
+    /// - Allocates / reuses inode (IndexNodeId)
     /// - Acquires file lease (session+fence)
     /// - Allocates a FileBuffer on a BufferNode (GFS-like)
-    pub fn create_file(&self, path: &NdmPath, expect_size: Option<u64>, session: SessionId) -> NdmResult<FileBufferHandle> {
+    pub fn create_file(&self, path: &NdmPath, expect_size: Option<u64>, session: SessionId) -> NdnResult<FileBufferHandle> {
         // PSEUDOCODE:
         // 1) resolve parent dir inode + name; check mount_mode != ReadOnly
-        // 2) ensure dentry -> FileId (materialize inode if currently ObjId)
+        // 2) ensure dentry -> IndexNodeId (materialize inode if currently ObjId)
         // 3) acquire lease on that file inode (session, ttl) => fence
         // 4) pick buffer node and create remote file path
         // 5) fsmeta.update_file_state(file_id, Writing{...})
         todo!("create_file")
     }
 
-    pub fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdmResult<()> {
+    pub fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdnResult<()> {
         // 1) verify lease (session+fence) by reading inode state or relying on buffer node fencing
         // 2) rpc append to buffer node
         // 3) update last_write_at (optional batched)
@@ -1003,14 +1003,14 @@ impl NamedDataMgr {
         node.append(&fb.remote_path, data)
     }
 
-    pub fn flush(&self, fb: &FileBufferHandle) -> NdmResult<()> {
+    pub fn flush(&self, fb: &FileBufferHandle) -> NdnResult<()> {
         let node = self.buffer_master.get_node(&fb.buffer_node)?;
         node.flush(&fb.remote_path)
     }
 
     /// Close the file: end the write session.
     /// IMPORTANT: close does NOT immediately hash/commit. It enters Cooling.
-    pub fn close_file(&self, fb: FileBufferHandle) -> NdmResult<()> {
+    pub fn close_file(&self, fb: FileBufferHandle) -> NdnResult<()> {
         // PSEUDOCODE:
         // 1) flush
         // 2) mark inode state: Writing -> Cooling {node, path, closed_at}
@@ -1020,7 +1020,7 @@ impl NamedDataMgr {
     }
 
     /// Force objectification now (Cooling->Linked), useful for "publish now".
-    pub fn force_link(&self, path: &NdmPath) -> NdmResult<ObjId> {
+    pub fn force_link(&self, path: &NdmPath) -> NdnResult<ObjId> {
         // PSEUDOCODE:
         // 1) resolve to file inode
         // 2) if Writing: require close or deny
@@ -1030,7 +1030,7 @@ impl NamedDataMgr {
     }
 
     /// Force finalization now (Linked->Finalized): move data into internal store.
-    pub fn force_finalize(&self, path: &NdmPath) -> NdmResult<ObjId> {
+    pub fn force_finalize(&self, path: &NdmPath) -> NdnResult<ObjId> {
         // PSEUDOCODE:
         // 1) resolve to file inode
         // 2) if Linked: push_to_store and promote_obj_to_internal; update state Finalized
@@ -1039,7 +1039,7 @@ impl NamedDataMgr {
     }
 
     /// Snapshot semantics: copy committed version (no data copy).
-    pub fn snapshot(&self, src: &NdmPath, dst: &NdmPath) -> NdmResult<()> {
+    pub fn snapshot(&self, src: &NdmPath, dst: &NdmPath) -> NdnResult<()> {
         // PSEUDOCODE:
         // - If src is working (Writing/Cooling) => PATH_BUSY
         // - Otherwise bind dst to same ObjId (dentry ObjId or inode base snapshot)
@@ -1047,7 +1047,7 @@ impl NamedDataMgr {
     }
 
     /// Erase local materialized data by ObjId. Does not change namespace bindings.
-    pub fn erase_obj_by_id(&self, obj_id: &ObjId) -> NdmResult<()> {
+    pub fn erase_obj_by_id(&self, obj_id: &ObjId) -> NdnResult<()> {
         self.store.erase_obj_data(obj_id)
     }
 
@@ -1055,7 +1055,7 @@ impl NamedDataMgr {
     /// Internal helpers for file lifecycle
     /// ------------------------------
 
-    fn try_cooling_to_linked(&self, node: &NodeRecord) -> NdmResult<()> {
+    fn try_cooling_to_linked(&self, node: &NodeRecord) -> NdnResult<()> {
         // Only if enough time passed since closed_at
         let cooling = match &node.state {
             NodeState::Cooling(s) => s.clone(),
@@ -1111,7 +1111,7 @@ impl NamedDataMgr {
         Ok(())
     }
 
-    fn try_linked_to_finalized(&self, node: &NodeRecord) -> NdmResult<()> {
+    fn try_linked_to_finalized(&self, node: &NodeRecord) -> NdnResult<()> {
         let linked = match &node.state {
             NodeState::Linked(s) => s.clone(),
             _ => return Ok(()),
@@ -1149,7 +1149,7 @@ impl NamedDataMgr {
 /// ------------------------------
 #[derive(Clone, Debug)]
 enum LookupOne {
-    UpperFileId(FileId),
+    UpperIndexNodeId(IndexNodeId),
     UpperObjId(ObjId),
     BaseObjId(ObjId),
     Tombstone,
@@ -1187,7 +1187,7 @@ fn is_valid_name(name: &str) -> bool {
 /// 3) Directory concurrency:
 ///    - For short operations, a SQLite txn may be enough.
 ///    - For distributed fsmeta, use dir.rev OCC (expected_rev) in bump_dir_rev.
-///    - For cross-dir move, lock/txn ordering by FileId to avoid deadlocks.
+///    - For cross-dir move, lock/txn ordering by IndexNodeId to avoid deadlocks.
 ///
 /// 4) File staged commit:
 ///    - close_file should be fast: only transition to Cooling and release lease.

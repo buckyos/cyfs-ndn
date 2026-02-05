@@ -1,5 +1,5 @@
 [package]
-name = "ndm"
+name = "fs_meta"
 version = "0.5.1"
 edition = "2021"
 publish = false
@@ -11,6 +11,11 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 krpc = { workspace = true }
+rusqlite = { workspace = true }
 ndn-lib = { path = "../ndn-lib" }
 fs-buffer = { path = "../fs_buffer" }
 named_store = { path = "../named_store" }
+ndm ={ path = "../ndm" }
+
+[dev-dependencies]
+tempfile = "3"

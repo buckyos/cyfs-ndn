@@ -1,4 +1,58 @@
 
+// ------------------------------
+// Options / Plan types
+// ------------------------------
+
+#[derive(Clone, Copy)]
+struct MoveOptions {
+    /// Whether to overwrite destination if destination is visible in Upper layer.
+    overwrite_upper: bool,
+
+    /// If true: also check destination Base (merged view no-clobber).
+    /// This requires Base materialized, otherwise NEED_PULL.
+    strict_check_base: bool,
+}
+
+impl Default for MoveOptions {
+    fn default() -> Self {
+        Self {
+            overwrite_upper: false,
+            strict_check_base: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum MoveSource {
+    /// Source resolved from Upper dentry (fast, no base needed)
+    Upper {
+        target: DentryTarget,      // IndexNodeId | ObjId
+        kind_hint: ObjectKind,     // used for cycle check & optional validations
+    },
+    /// Source resolved from Base (no upper dentry exists)
+    Base {
+        obj_id: ObjId,
+        kind: ObjectKind,
+        /// To protect correctness: we snapshot (rev, base_obj_id) of src parent,
+        /// and later verify rev in txn (OCC). base_obj_id is optional.
+        src_parent_rev0: u64,
+        src_parent_base0: Option<ObjId>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct MovePlan {
+    src_parent: IndexNodeId,
+    src_name: String,
+    dst_parent: IndexNodeId,
+    dst_name: String,
+
+    /// Snapshot rev for OCC; move must bump rev for any modified dir.
+    src_rev0: u64,
+    dst_rev0: u64,
+
+    source: MoveSource,
+}
 
 pub struct NamedDataMgr {
     pub instance: NdmInstanceId,
@@ -79,6 +133,173 @@ impl NamedDataMgr {
         unimplemented!()
     }
 
+     fn check_dest_conflict_pre(
+        &self,
+        dst_parent: IndexNodeId,
+        dst_name: &str,
+        dst_dir_node: &NodeRecord,
+        opts: MoveOptions,
+    ) -> NdnResult<()> {
+        // Upper check (fast)
+        if let Some(d) = self.fsmeta.get_dentry(&dst_parent, dst_name)? {
+            match d.target {
+                DentryTarget::Tombstone => { /* treat as not-exists */ }
+                DentryTarget::IndexNodeId(_) | DentryTarget::ObjId(_) => {
+                    if !opts.overwrite_upper {
+                        return Err(NdmError::AlreadyExists);
+                    }
+                }
+            }
+        }
+
+        if !opts.strict_check_base {
+            // Overlay-friendly policy:
+            // - do not check Base existence
+            // - allow shadowing Base entry without pulling it
+            return Ok(());
+        }
+
+        // Strict policy: also check Base (merged view no-clobber)
+        let base = match &dst_dir_node.base_obj_id {
+            None => return Ok(()),
+            Some(oid) => oid.clone(),
+        };
+        if !self.store.has_materialized(&base)? {
+            return Err(NdmError::NeedPull);
+        }
+        let dir_obj = self.store.get_dir_object(&base)?;
+        if dir_obj.children.iter().any(|c| c.name == dst_name) {
+            return Err(NdmError::AlreadyExists);
+        }
+        Ok(())
+    }
+
+    fn plan_move_source(
+            &self,
+            src_parent: IndexNodeId,
+            src_name: &str,
+            src_dir_node: &NodeRecord,
+            src_rev0: u64,
+        ) -> NdnResult<MoveSource> {
+            // 1) Upper first
+            if let Some(d) = self.fsmeta.get_dentry(&src_parent, src_name)? {
+                return match d.target {
+                    DentryTarget::Tombstone => Err(NdmError::NotFound),
+                    DentryTarget::IndexNodeId(fid) => {
+                        // need kind hint for cycle check
+                        let inode = self.fsmeta.get_node(&fid)?.ok_or(NdmError::NotFound)?;
+                        let kind_hint = match inode.kind {
+                            NodeKind::Dir => ObjectKind::Dir,
+                            NodeKind::File => ObjectKind::File,
+                        };
+                        Ok(MoveSource::Upper { target: DentryTarget::IndexNodeId(fid), kind_hint })
+                    }
+                    DentryTarget::ObjId(oid) => {
+                        // kind hint best-effort (meta may be missing if not pulled)
+                        let kind_hint = self.store.get_object_meta(&oid)?.map(|m| m.kind).unwrap_or(ObjectKind::Unknown);
+                        Ok(MoveSource::Upper { target: DentryTarget::ObjId(oid), kind_hint })
+                    }
+                };
+            }
+
+            // 2) Upper miss => Base-only
+            let base0 = src_dir_node.base_obj_id.clone();
+            let base_oid = base0.clone().ok_or(NdmError::NotFound)?;
+
+            // Must read DirObject to know which ObjId we are moving.
+            // If base is not materialized, we cannot discover child obj_id => NEED_PULL.
+            if !self.store.has_materialized(&base_oid)? {
+                return Err(NdmError::NeedPull);
+            }
+
+            let dir_obj = self.store.get_dir_object(&base_oid)?;
+            for c in dir_obj.children.iter() {
+                if c.name == src_name {
+                    return Ok(MoveSource::Base {
+                        obj_id: c.obj_id.clone(),
+                        kind: c.kind.clone(),
+                        src_parent_rev0: src_rev0,
+                        src_parent_base0: base0,
+                    });
+                }
+            }
+
+            Err(NdmError::NotFound)
+        }
+    }
+
+    // helpers (pseudocode)
+    fn is_dir_like(src: &MoveSource) -> bool {
+        match src {
+            MoveSource::Upper { kind_hint, .. } => *kind_hint == ObjectKind::Dir,
+            MoveSource::Base { kind, .. } => *kind == ObjectKind::Dir,
+        }
+    }   
+    fn move_path_with_opts(&self, old_path: &NdmPath, new_path: &NdmPath, opts: MoveOptions) -> NdnResult<()> {
+        // -------- 0) trivial / safety checks
+        // normalize paths (remove trailing '/', resolve "." etc.) - pseudocode
+        if normalize_path(old_path) == normalize_path(new_path) {
+            return Ok(()); // no-op
+        }
+        if is_root_path(old_path) {
+            return Err(NdmError::InvalidName); // refuse moving root
+        }
+
+        // -------- 1) parse (src_parent_path, src_name), (dst_parent_path, dst_name)
+        let (src_parent_path, src_name) = split_parent_name(old_path)?;
+        let (dst_parent_path, dst_name) = split_parent_name(new_path)?;
+        if !is_valid_name(&src_name) || !is_valid_name(&dst_name) {
+            return Err(NdmError::InvalidName);
+        }
+
+        // -------- 2) ensure parents are directory inodes (mutable ops require inode)
+        // This may materialize a directory inode if it was ObjId-only.
+        let src_parent = self.ensure_dir_inode(&src_parent_path)?;
+        let dst_parent = self.ensure_dir_inode(&dst_parent_path)?;
+
+        // -------- 3) snapshot parent nodes (mount_mode, base_obj_id, rev)
+        let src_dir = self.fsmeta.get_node(&src_parent)?.ok_or(NdmError::NotFound)?;
+        let dst_dir = self.fsmeta.get_node(&dst_parent)?.ok_or(NdmError::NotFound)?;
+        if src_dir.kind != NodeKind::Dir || dst_dir.kind != NodeKind::Dir {
+            return Err(NdmError::NotFound);
+        }
+        if src_dir.mount_mode == Some(MountMode::ReadOnly) || dst_dir.mount_mode == Some(MountMode::ReadOnly) {
+            return Err(NdmError::ReadOnly);
+        }
+
+        let src_rev0 = src_dir.rev.unwrap_or(0);
+        let dst_rev0 = dst_dir.rev.unwrap_or(0);
+
+        // -------- 4) build a MovePlan (resolve source with overlay rules)
+        // IMPORTANT: any slow IO (reading base DirObject) must happen OUTSIDE fsmeta txn.
+        let source = self.plan_move_source(src_parent.clone(), &src_name, &src_dir, src_rev0)?;
+
+        // -------- 5) cycle prevention (best-effort, cheap)
+        // Only meaningful if moving a directory.
+        if is_dir_like(&source) {
+            // prevent moving "/a" into "/a/..."
+            if is_descendant_path(new_path, old_path) {
+                return Err(NdmError::InvalidName);
+            }
+        }
+
+        // -------- 6) destination conflict check (policy-driven)
+        // default: check Upper only; allow shadowing Base without pull.
+        self.check_dest_conflict_pre(dst_parent.clone(), &dst_name, &dst_dir, opts)?;
+
+        // -------- 7) commit in one fsmeta transaction (atomic across two dirs)
+        let plan = MovePlan {
+            src_parent: src_parent.clone(),
+            src_name: src_name.clone(),
+            dst_parent: dst_parent.clone(),
+            dst_name: dst_name.clone(),
+            src_rev0,
+            dst_rev0,
+            source,
+        };
+
+        self.apply_move_plan_txn(plan, opts)
+    }
     pub fn copy_path(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         // 伪代码：
         // 如果src指向的是Object 复制绑定（语义上“快照”），仍是 O(1)
@@ -165,7 +386,7 @@ impl NamedDataMgr {
         if parent_node.mount_mode == ReadOnly { return Err(ReadOnly); }
 
         // -------- B) 确保 name 对应的是 “文件 inode”
-        // Strategy B: dentry target 允许 ObjId；但要写入必须转成 FileId
+        // Strategy B: dentry target 允许 ObjId；但要写入必须转成 IndexNodeId
         // 注意：这一步建议走 fsmeta txn，避免并发 create 同名
         let file_id = {
             let mut tx = fsmeta.begin_txn()?;
@@ -174,7 +395,7 @@ impl NamedDataMgr {
                 None | Some(Dentry{target: Tombstone,..}) => {
                     // 新文件
                     let fid = fsmeta.alloc_inode(File)?;
-                    tx.upsert_dentry(parent_dir_id, &name, Target::FileId(fid))?;
+                    tx.upsert_dentry(parent_dir_id, &name, Target::IndexNodeId(fid))?;
                     // node 初始 committed base 为空，或指向空文件对象（实现选择）
                     tx.put_node(NodeRecord::new_file(fid))?;
                     tx.commit()?;
@@ -187,12 +408,12 @@ impl NamedDataMgr {
                     let mut n = NodeRecord::new_file(fid);
                     n.base_obj_id = Some(oid);
                     tx.put_node(&n)?;
-                    tx.upsert_dentry(parent_dir_id, &name, Target::FileId(fid))?;
+                    tx.upsert_dentry(parent_dir_id, &name, Target::IndexNodeId(fid))?;
                     tx.commit()?;
                     fid
                 }
 
-                Some(Dentry{target: FileId(fid), ..}) => {
+                Some(Dentry{target: IndexNodeId(fid), ..}) => {
                     // 已经是 inode
                     tx.commit()?; // no-op
                     fid
@@ -413,7 +634,7 @@ impl NamedDataMgr {
         // Upper layer：通常稀疏，可一次性读出
         let upper_raw = fsmeta.list_dentries(dir_id)?; // Vec<DentryRecord>
 
-        // -------- 3) 把 Upper layer 归一化成 “name -> UpperOp(put/delete)”（并解析 FileId→ObjId）
+        // -------- 3) 把 Upper layer 归一化成 “name -> UpperOp(put/delete)”（并解析 IndexNodeId→ObjId）
         // 这里是 NDM “调度其它组件” 的核心：既查 fsmeta，又决定是否需要 NeedPull/PathBusy
         let mut upper_ops: BTreeMap<String, UpperOp> = BTreeMap::new();
 
@@ -427,7 +648,7 @@ impl NamedDataMgr {
                     let kind = store.get_object_meta(&oid)?.map(|m| m.kind).unwrap_or(Unknown);
                     upper_ops.insert(d.name, UpperOp::Put{obj_id:oid, kind});
                 }
-                FileId(child_id) => {
+                IndexNodeId(child_id) => {
                     // 必须把 inode 解析成一个“可引用的 ObjId”
                     let child = fsmeta.get_node(child_id)?.ok_or(NotFound)?;
 
@@ -602,7 +823,7 @@ impl NamedDataMgr {
     //     todo!()
     // }
 
-    fn cooling_to_linked(file_id: FileId) -> Result<()> {
+    fn cooling_to_linked(file_id: IndexNodeId) -> Result<()> {
         // 1) 读 inode，必须仍然是 Cooling 且到达防抖窗口
         let n = fsmeta.get_node(file_id)?.ok_or(NotFound)?;
         let cooling = match n.state {
@@ -649,7 +870,7 @@ impl NamedDataMgr {
         Ok(())
     }
 
-    fn linked_to_finalized(file_id: FileId) -> Result<()> {
+    fn linked_to_finalized(file_id: IndexNodeId) -> Result<()> {
         let n = fsmeta.get_node(file_id)?.ok_or(NotFound)?;
         let linked = match n.state {
             Linked{obj_id, buffer_node, remote_path, linked_at} => (obj_id, buffer_node, remote_path, linked_at),

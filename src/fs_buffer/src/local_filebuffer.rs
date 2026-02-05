@@ -97,6 +97,29 @@ fn poll_complete_seek<T: AsyncSeek>(
     target.poll_complete(cx)
 }
 
+enum FileBufferBaseReader {
+    None,
+    BaseChunkList(Vec<ChunkId>),
+    //FsNode(u64), // fs_meta里的NodeId,先不支持
+}
+
+impl Default for FileBufferBaseReader {
+    fn default() -> Self {
+        FileBufferBaseReader::None
+    }
+}
+
+
+pub struct FileBufferHandle {
+    handle_id: String,
+    file_inode_id: u64,
+    base_reader: FileBufferBaseReader,
+    read_only: bool,
+    //state: BufferStage,
+    dirty_layout: Arc<RwLock<DirtyChunkLayout>>,
+}
+
+
 impl Default for DirtyChunkLayout {
     fn default() -> Self {
         Self {
@@ -138,26 +161,7 @@ impl DirtyChunkLayout {
     }
 }
 
-enum FileBufferOwner {
-    None,
-    BaseChunkList(Vec<ChunkId>),
-    //FsNode(u64), // fs_meta里的NodeId,先不支持
-}
 
-impl Default for FileBufferOwner {
-    fn default() -> Self {
-        FileBufferOwner::None
-    }
-}
-
-pub struct FileBufferHandle {
-    handle_id: String,
-    fnode_id: u64,
-    owner: FileBufferOwner,
-    read_only: bool,
-    //state: BufferStage,
-    dirty_layout: Arc<RwLock<DirtyChunkLayout>>,
-}
 
 pub struct LocalFileBufferService {
     // 管理本地 buffer 的数据结构
@@ -332,8 +336,8 @@ impl FileBufferService for LocalFileBufferService {
 
         Ok(FileBufferHandle {
             handle_id,
-            fnode_id: 0,
-            owner: FileBufferOwner::default(),
+            file_inode_id: 0,
+            base_reader: FileBufferBaseReader::default(),
             read_only: false,
             dirty_layout: Arc::new(RwLock::new(DirtyChunkLayout::default())),
         })
@@ -345,7 +349,7 @@ impl FileBufferService for LocalFileBufferService {
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekReader> {
         self.load_layout_if_needed(fb).await?;
-        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
             return Err(NdnError::Unsupported(
                 "BaseChunkList overlay not implemented".to_string(),
             ));
@@ -373,7 +377,7 @@ impl FileBufferService for LocalFileBufferService {
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekWriter> {
         self.load_layout_if_needed(fb).await?;
-        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
             return Err(NdnError::Unsupported(
                 "BaseChunkList overlay not implemented".to_string(),
             ));
@@ -435,7 +439,7 @@ impl FileBufferService for LocalFileBufferService {
 
     async fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdnResult<()> {
         self.ensure_writable(fb)?;
-        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
             return Err(NdnError::Unsupported(
                 "BaseChunkList overlay not implemented".to_string(),
             ));
@@ -444,7 +448,7 @@ impl FileBufferService for LocalFileBufferService {
         let mut file = self.open_exclusive_rw(&file_path, true).await?;
         let pos = file.seek(SeekFrom::End(0)).await?;
         file.write_all(data).await?;
-        if matches!(fb.owner, FileBufferOwner::BaseChunkList(_)) {
+        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
             let mut layout = fb
                 .dirty_layout
                 .write()
@@ -465,6 +469,12 @@ impl FileBufferService for LocalFileBufferService {
             }
         }
         Ok(())
+    }
+
+    async fn cacl_name(&self, _fb: &FileBufferHandle) -> NdnResult<ObjId> {
+        Err(NdnError::Unsupported(
+            "cacl_name not implemented".to_string(),
+        ))
     }
 
 
@@ -1338,7 +1348,7 @@ mod tests {
             .alloc_buffer(&dummy_path(), &dummy_lease(), None)
             .await
             .unwrap();
-        fb.owner = FileBufferOwner::BaseChunkList(vec![]);
+        fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
 
         let base_path = dir.path().join("base2.bin");
         {
@@ -1401,7 +1411,7 @@ mod tests {
             .alloc_buffer(&dummy_path(), &dummy_lease(), None)
             .await
             .unwrap();
-        fb.owner = FileBufferOwner::BaseChunkList(vec![]);
+        fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
 
         let base_path = dir.path().join("base_dirty_clean.bin");
         {
@@ -1476,7 +1486,7 @@ mod tests {
             .alloc_buffer(&dummy_path(), &dummy_lease(), None)
             .await
             .unwrap();
-        fb.owner = FileBufferOwner::BaseChunkList(vec![]);
+        fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
 
         let base_path = dir_path.join("base_large.bin");
         {

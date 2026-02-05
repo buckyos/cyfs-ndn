@@ -5,7 +5,7 @@ fsmeta db的表结构设计，根本上是Path->Obj,但这对目录Rename特别�
 
 它的致命弱点正如你所说：**目录 Rename 是 O(N) 的灾难**。如果你把 `/home/user/photos` 重命名为 `/home/user/backup`，而下面有 10 万张照片，你需要修改 10 万条数据库记录的主键。
 
-要解决这个问题，必须引入**中间层（Indirection）**。最经典且行之有效的设计是回归 Unix 文件系统的 **Inode 模型**，即：**把“文件的身份（FileID）”与“文件的路径（Name）”解耦**。
+要解决这个问题，必须引入**中间层（Indirection）**。最经典且行之有效的设计是回归 Unix 文件系统的 **Inode 模型**，即：**把“文件的身份（IndexNodeId）”与“文件的路径（Name）”解耦**。
 
 以下是针对 NDM 场景优化的 `fs-meta-db` 设计方案：
 
@@ -15,7 +15,7 @@ fsmeta db的表结构设计，根本上是Path->Obj,但这对目录Rename特别�
 
 我们需要两张核心表：一张存树状结构（Dentry），一张存元数据绑定（Inode/Node）。
 
-* **FileID (u64)**: 内部使用的唯一递增 ID（类似 Inode Number）。它是文件/目录在元数据库中的永久身份证，**永远不变**。
+* **IndexNodeId (u64)**: 内部使用的唯一递增 ID（类似 Inode Number）。它是文件/目录在元数据库中的永久身份证，**永远不变**。
 * **ObjId (String)**: 内容的哈希（CAS），**随内容变化**。
 
 #### 1.1 表结构定义 (SQLite / SQL 风格)
@@ -25,7 +25,7 @@ fsmeta db的表结构设计，根本上是Path->Obj,但这对目录Rename特别�
 
 | 字段 | 类型 | 说明 | 索引 |
 | --- | --- | --- | --- |
-| **parent_id** | u64 | 父目录的 FileID (Root 为 0 或 1) | PK (Composite) |
+| **parent_id** | u64 | 父目录的 IndexNodeId (Root 为 0 或 1) | PK (Composite) |
 | **name** | string | 文件/子目录名 (如 "movie.mp4") | PK (Composite) |
 | **file_id** | u64 | 指向 nodes 表的外键 | Index (反查用) |
 | type | u8 | 缓存一下是 Dir 还是 File，减少 Join |  |
@@ -51,8 +51,8 @@ fsmeta db的表结构设计，根本上是Path->Obj,但这对目录Rename特别�
 **场景**：将 `/movies/action` (内含 100万个文件) 重命名为 `/movies/history`。
 
 * 假设：
-* `movies` 的 FileID = 100
-* `action` 的 FileID = 200
+* `movies` 的 IndexNodeId = 100
+* `action` 的 IndexNodeId = 200
 
 
 * **当前 DB 记录 (`dentries`)**: `parent_id=100, name="action", file_id=200`
@@ -82,7 +82,7 @@ WHERE parent_id = 100 AND name = "action";
 
 **场景**：文件写入完成，ObjId 从 `OldHash` 变为 `NewHash`。
 
-* FileID 不变。
+* IndexNodeId 不变。
 * 操作：
 ```sql
 UPDATE nodes 
@@ -152,7 +152,7 @@ impl FsMetaDb {
 
 虽然 Rename 快了，但“解析路径”变慢了（需要 N 次查询）。在 NDM 这种高性能场景下，必须引入 **Dentry Cache**。
 
-* **内存结构**：`HashMap<(ParentID, Name), FileID>`。
+* **内存结构**：`HashMap<(ParentID, Name), IndexNodeId>`。
 * **逻辑**：
 1. 解析路径时，先查内存 Cache。
 2. 命中则继续下一级。
@@ -183,13 +183,13 @@ NDM 文档中提到目录本身也可以是一个 `DirObject` (包含子项列�
 
 
 **总结**：
-请坚决放弃 Key 为 Path 的设计。采用 **ParentID + Name -> FileID** 的设计。这不仅解决了 Rename 问题，也更符合文件系统的标准实现逻辑，同时也完美兼容 NDM 的 `ObjId` 绑定逻辑。
+请坚决放弃 Key 为 Path 的设计。采用 **ParentID + Name -> IndexNodeId** 的设计。这不仅解决了 Rename 问题，也更符合文件系统的标准实现逻辑，同时也完美兼容 NDM 的 `ObjId` 绑定逻辑。
 
 -----
 
-按这个设计，get_children(path->dentries->fileid) 就是完成了List
+按这个设计，get_children(path->dentries->IndexNodeId) 就是完成了List
 
-如果fileid指向了dirobject,那么我可以以List的结果为优先进行合并（这个合并是在ndm里完成的，不需要fsmeta的参与）
+如果IndexNodeId指向了dirobject,那么我可以以List的结果为优先进行合并（这个合并是在ndm里完成的，不需要fsmeta的参与）
 
 -----
 
@@ -326,7 +326,7 @@ impl DirMerger {
 在这个设计下，**`fs-meta-db` 实际上就是目录的 "FileBuffer"**。
 
 * **FileBuffer** 暂存的是 `[Offset, Data]` 的修改。
-* **FsMetaDB** 暂存的是 `[Name, FileID]` 的修改。
+* **FsMetaDB** 暂存的是 `[Name, IndexNodeId]` 的修改。
 
 #### 伪代码：目录的“落盘”过程 (`cacl_dir`)
 

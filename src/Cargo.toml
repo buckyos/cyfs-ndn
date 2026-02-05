@@ -6,6 +6,8 @@ members = [
     "./ndn-lib",
     "./named_store",
     "./fs_buffer",
+    "./ndm",
+    "./fs_meta"
 ]
 
 [workspace.dependencies]
@@ -25,3 +27,8 @@ rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "main" }
 name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "main"}
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "main"}
+krpc = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC", branch = "main" }
+rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", branch = "main" }
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+casbin = { version = "2.9", features = ["logging","explain"] }
+lazy_static = "1.5"
