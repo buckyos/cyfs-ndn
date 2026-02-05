@@ -1,5 +1,6 @@
 use fs_buffer::SessionId;
 use krpc::{RPCContext, RPCErrors};
+use log::{info, warn};
 use ndm::{
     ClientSessionId, DentryRecord, DentryTarget, IndexNodeId, NodeKind, NodeRecord, NodeState,
     ObjStat,
@@ -8,9 +9,9 @@ use ndn_lib::ObjId;
 use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const NODE_STATE_DIR_NORMAL: i64 = 0;
 const NODE_STATE_DIR_OVERLAY: i64 = 1;
@@ -25,9 +26,22 @@ const DENTRY_TARGET_TOMBSTONE: i64 = 2;
 
 const ROOT_KEY: &str = "root_dir";
 
+/// Default transaction timeout: 5 minutes
+const TXN_TIMEOUT_SECS: u64 = 300;
+/// Interval for cleaning up stale transactions: 30 seconds
+const TXN_CLEANUP_INTERVAL_SECS: u64 = 30;
+
 #[derive(Clone)]
 struct TxnEntry {
     conn: Arc<Mutex<Connection>>,
+    /// When this transaction was created (monotonic time)
+    created_at: Instant,
+    /// Last time this transaction was used (monotonic time)
+    last_used_at: Arc<Mutex<Instant>>,
+    /// Whether this transaction is being closed (commit/rollback in progress)
+    closing: Arc<AtomicBool>,
+    /// Number of in-flight operations using this transaction
+    in_flight: Arc<AtomicU64>,
 }
 
 pub struct FSMetaService {
@@ -36,10 +50,18 @@ pub struct FSMetaService {
     txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
     root_inode: IndexNodeId,
     txn_seq: AtomicU64,
+    /// Transaction timeout in seconds
+    txn_timeout_secs: u64,
+    /// Handle to stop the cleanup task on drop
+    _cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FSMetaService {
     pub fn new(db_path: impl Into<String>) -> Result<Self, RPCErrors> {
+        Self::new_with_timeout(db_path, TXN_TIMEOUT_SECS)
+    }
+
+    pub fn new_with_timeout(db_path: impl Into<String>, txn_timeout_secs: u64) -> Result<Self, RPCErrors> {
         let db_path = db_path.into();
         let conn = Connection::open_with_flags(
             &db_path,
@@ -51,12 +73,93 @@ impl FSMetaService {
         Self::init_connection(&conn)?;
         Self::create_schema(&conn)?;
         let root_inode = Self::ensure_root_dir(&conn)?;
+
+        let txns = Arc::new(Mutex::new(HashMap::new()));
+
+        // Start background cleanup task
+        let cleanup_handle = Self::start_cleanup_task(txns.clone(), txn_timeout_secs);
+
         Ok(Self {
             db_path,
             conn: Arc::new(Mutex::new(conn)),
-            txns: Arc::new(Mutex::new(HashMap::new())),
+            txns,
             root_inode,
             txn_seq: AtomicU64::new(1),
+            txn_timeout_secs,
+            _cleanup_handle: Some(cleanup_handle),
+        })
+    }
+
+    /// Start a background task that periodically cleans up stale transactions
+    fn start_cleanup_task(
+        txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
+        timeout_secs: u64,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(TXN_CLEANUP_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+
+                // Collect stale transactions
+                let stale_txids: Vec<(String, TxnEntry)> = {
+                    let mut txns_guard = match txns.lock() {
+                        Ok(g) => g,
+                        Err(e) => {
+                            warn!("txn cleanup: failed to lock txns map: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let timeout = Duration::from_secs(timeout_secs);
+                    let now = Instant::now();
+                    let stale: Vec<String> = txns_guard
+                        .iter()
+                        .filter(|(_, entry)| {
+                            let last_used = entry.last_used_at.lock().map(|g| *g).unwrap_or(entry.created_at);
+                            now.duration_since(last_used) > timeout
+                        })
+                        .map(|(txid, _)| txid.clone())
+                        .collect();
+
+                    stale
+                        .into_iter()
+                        .filter_map(|txid| {
+                            txns_guard.remove(&txid).map(|entry| (txid, entry))
+                        })
+                        .collect()
+                };
+
+                // Rollback stale transactions outside the lock
+                for (txid, entry) in stale_txids {
+                    // Mark as closing to prevent new operations
+                    entry.closing.store(true, Ordering::SeqCst);
+
+                    // Wait for in-flight operations to complete (with timeout)
+                    let wait_start = Instant::now();
+                    while entry.in_flight.load(Ordering::SeqCst) > 0 {
+                        if wait_start.elapsed() > Duration::from_secs(5) {
+                            warn!("txn cleanup: timeout waiting for in-flight ops for txid={}", txid);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    // Rollback the transaction
+                    let txid_clone = txid.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        if let Ok(conn) = entry.conn.lock() {
+                            let _ = conn.execute_batch("ROLLBACK");
+                        }
+                    })
+                    .await;
+
+                    if let Err(e) = result {
+                        warn!("txn cleanup: rollback task failed for txid={}: {}", txid_clone, e);
+                    } else {
+                        info!("txn cleanup: rolled back stale transaction txid={}", txid_clone);
+                    }
+                }
+            }
         })
     }
 
@@ -179,16 +282,20 @@ impl FSMetaService {
         Ok(1)
     }
 
-    fn conn_for_txid(&self, txid: Option<&str>) -> Result<Arc<Mutex<Connection>>, RPCErrors> {
-        if let Some(txid) = txid {
-            let txns = self.txns.lock().unwrap();
-            let entry = txns
-                .get(txid)
-                .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
-            Ok(entry.conn.clone())
-        } else {
-            Ok(self.conn.clone())
+    /// Get connection and entry for a transaction
+    fn get_txn_entry(&self, txid: &str) -> Result<TxnEntry, RPCErrors> {
+        let txns = self.txns.lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
+        let entry = txns
+            .get(txid)
+            .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
+
+        // Check if transaction is being closed
+        if entry.closing.load(Ordering::SeqCst) {
+            return Err(RPCErrors::ReasonError("transaction is closing".to_string()));
         }
+
+        Ok(entry.clone())
     }
 
     async fn with_conn<T, F>(&self, txid: Option<&str>, f: F) -> Result<T, RPCErrors>
@@ -196,13 +303,43 @@ impl FSMetaService {
         T: Send + 'static,
         F: FnOnce(&Connection) -> Result<T, RPCErrors> + Send + 'static,
     {
-        let conn = self.conn_for_txid(txid)?;
-        tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            f(&conn)
-        })
-        .await
-        .map_err(|e| RPCErrors::ReasonError(format!("db task join failed: {}", e)))?
+        if let Some(txid) = txid {
+            let entry = self.get_txn_entry(txid)?;
+
+            // Increment in-flight counter
+            entry.in_flight.fetch_add(1, Ordering::SeqCst);
+
+            // Update last_used_at
+            if let Ok(mut last_used) = entry.last_used_at.lock() {
+                *last_used = Instant::now();
+            }
+
+            let conn = entry.conn.clone();
+            let in_flight = entry.in_flight.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                let conn_guard = conn.lock()
+                    .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
+                let result = f(&conn_guard);
+                drop(conn_guard);
+                // Decrement in-flight counter
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                result
+            })
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("db task join failed: {}", e)))?;
+
+            result
+        } else {
+            let conn = self.conn.clone();
+            tokio::task::spawn_blocking(move || {
+                let conn_guard = conn.lock()
+                    .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
+                f(&conn_guard)
+            })
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("db task join failed: {}", e)))?
+        }
     }
 
     fn open_txn_connection(db_path: &str) -> Result<Connection, RPCErrors> {
@@ -214,7 +351,8 @@ impl FSMetaService {
         )
             .map_err(|e| RPCErrors::ReasonError(format!("open txn db failed: {}", e)))?;
         Self::init_connection(&conn)?;
-        conn.execute_batch("BEGIN")
+        // Use BEGIN IMMEDIATE to acquire write lock early, avoiding mid-transaction SQLITE_BUSY
+        conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| RPCErrors::ReasonError(format!("begin txn failed: {}", e)))?;
         Ok(conn)
     }
@@ -354,10 +492,19 @@ impl ndm::FsMetaHandler for FSMetaService {
         let conn = tokio::task::spawn_blocking(move || Self::open_txn_connection(&db_path))
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("open txn task failed: {}", e)))??;
+
+        let now = Instant::now();
         let entry = TxnEntry {
             conn: Arc::new(Mutex::new(conn)),
+            created_at: now,
+            last_used_at: Arc::new(Mutex::new(now)),
+            closing: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicU64::new(0)),
         };
-        self.txns.lock().unwrap().insert(txid.clone(), entry);
+
+        self.txns.lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
+            .insert(txid.clone(), entry);
         Ok(txid)
     }
 
@@ -511,7 +658,7 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     async fn handle_alloc_inode(
         &self,
-        mut node: NodeRecord,
+        node: NodeRecord,
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<IndexNodeId, RPCErrors> {
@@ -715,14 +862,17 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
         self.with_conn(txid.as_deref(), move |conn| {
+            let now = unix_timestamp() as i64;
+            // Use COALESCE to handle NULL rev (treat as 0), also update updated_at
             let updated = conn
                 .execute(
-                    "UPDATE nodes SET rev = rev + 1 WHERE inode_id = ?1 AND rev = ?2",
-                    params![dir as i64, expected_rev as i64],
+                    "UPDATE nodes SET rev = COALESCE(rev, 0) + 1, updated_at = ?3 
+                     WHERE inode_id = ?1 AND COALESCE(rev, 0) = ?2",
+                    params![dir as i64, expected_rev as i64, now],
                 )
                 .map_err(map_db_err)?;
             if updated == 0 {
-                return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+                return Err(RPCErrors::ReasonError("rev mismatch or inode not found".to_string()));
             }
             Ok(expected_rev + 1)
         })
@@ -737,18 +887,50 @@ impl ndm::FsMetaHandler for FSMetaService {
         let Some(txid) = txid else {
             return Ok(());
         };
-        let entry = self.txns.lock().unwrap().remove(&txid);
-        let Some(entry) = entry else {
-            return Err(RPCErrors::ReasonError("txid not found".to_string()));
+
+        // Step 1: Mark as closing (but don't remove yet)
+        let entry = {
+            let txns = self.txns.lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
+            let entry = txns
+                .get(&txid)
+                .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
+
+            // Mark as closing - new operations will be rejected
+            if entry.closing.swap(true, Ordering::SeqCst) {
+                return Err(RPCErrors::ReasonError("transaction already closing".to_string()));
+            }
+            entry.clone()
         };
-        tokio::task::spawn_blocking(move || {
-            let conn = entry.conn.lock().unwrap();
-            conn.execute_batch("COMMIT")
+
+        // Step 2: Wait for in-flight operations to complete
+        let wait_start = Instant::now();
+        while entry.in_flight.load(Ordering::SeqCst) > 0 {
+            if wait_start.elapsed() > Duration::from_secs(30) {
+                // Timeout - still try to commit but warn
+                warn!("commit: timeout waiting for in-flight ops for txid={}", txid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Step 3: Execute COMMIT
+        let conn = entry.conn.clone();
+        let commit_result = tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
+            conn_guard.execute_batch("COMMIT")
                 .map_err(|e| RPCErrors::ReasonError(format!("commit failed: {}", e)))
         })
         .await
         .map_err(|e| RPCErrors::ReasonError(format!("commit join failed: {}", e)))??;
-        Ok(())
+
+        // Step 4: Remove from map only after successful commit
+        self.txns.lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
+            .remove(&txid);
+
+        Ok(commit_result)
     }
 
     async fn handle_rollback(
@@ -759,18 +941,49 @@ impl ndm::FsMetaHandler for FSMetaService {
         let Some(txid) = txid else {
             return Ok(());
         };
-        let entry = self.txns.lock().unwrap().remove(&txid);
-        let Some(entry) = entry else {
-            return Err(RPCErrors::ReasonError("txid not found".to_string()));
+
+        // Step 1: Mark as closing (but don't remove yet)
+        let entry = {
+            let txns = self.txns.lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
+            let entry = txns
+                .get(&txid)
+                .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
+
+            // Mark as closing - new operations will be rejected
+            if entry.closing.swap(true, Ordering::SeqCst) {
+                return Err(RPCErrors::ReasonError("transaction already closing".to_string()));
+            }
+            entry.clone()
         };
-        tokio::task::spawn_blocking(move || {
-            let conn = entry.conn.lock().unwrap();
-            conn.execute_batch("ROLLBACK")
+
+        // Step 2: Wait for in-flight operations to complete
+        let wait_start = Instant::now();
+        while entry.in_flight.load(Ordering::SeqCst) > 0 {
+            if wait_start.elapsed() > Duration::from_secs(30) {
+                warn!("rollback: timeout waiting for in-flight ops for txid={}", txid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Step 3: Execute ROLLBACK
+        let conn = entry.conn.clone();
+        let rollback_result = tokio::task::spawn_blocking(move || {
+            let conn_guard = conn.lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
+            conn_guard.execute_batch("ROLLBACK")
                 .map_err(|e| RPCErrors::ReasonError(format!("rollback failed: {}", e)))
         })
         .await
         .map_err(|e| RPCErrors::ReasonError(format!("rollback join failed: {}", e)))??;
-        Ok(())
+
+        // Step 4: Remove from map only after successful rollback
+        self.txns.lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
+            .remove(&txid);
+
+        Ok(rollback_result)
     }
 
     async fn handle_acquire_file_lease(
@@ -783,45 +996,74 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(None, move |conn| {
             let now = unix_timestamp() as i64;
             let expire_at = now.saturating_add(ttl.as_secs() as i64);
-            let current = conn
-                .query_row(
-                    "SELECT lease_client_session, lease_seq, lease_expire_at FROM nodes WHERE inode_id = ?1",
-                    params![node_id as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                            row.get::<_, Option<i64>>(2)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
-            let (cur_session, cur_seq, cur_expire) = current;
-            let expired = cur_expire.map(|v| v <= now).unwrap_or(true);
-
-            if !expired {
-                if cur_session.as_deref() != Some(&session.0) {
-                    return Err(RPCErrors::ReasonError("lease conflict".to_string()));
-                }
-                let seq = cur_seq.unwrap_or(0);
-                conn.execute(
-                    "UPDATE nodes SET lease_expire_at = ?1 WHERE inode_id = ?2",
-                    params![expire_at, node_id as i64],
+            // Case 1: Try to renew existing lease (same session, not expired)
+            // This is an atomic conditional update
+            let renewed = conn
+                .execute(
+                    "UPDATE nodes SET lease_expire_at = ?1 
+                     WHERE inode_id = ?2 
+                       AND lease_client_session = ?3 
+                       AND lease_expire_at > ?4",
+                    params![expire_at, node_id as i64, &session.0, now],
                 )
                 .map_err(map_db_err)?;
+
+            if renewed > 0 {
+                // Successfully renewed, get current seq
+                let seq: i64 = conn
+                    .query_row(
+                        "SELECT COALESCE(lease_seq, 0) FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_db_err)?;
                 return Ok(seq as u64);
             }
 
-            let next_seq = cur_seq.unwrap_or(0) + 1;
-            conn.execute(
-                "UPDATE nodes SET lease_client_session = ?1, lease_seq = ?2, lease_expire_at = ?3 WHERE inode_id = ?4",
-                params![session.0, next_seq, expire_at, node_id as i64],
-            )
-            .map_err(map_db_err)?;
-            Ok(next_seq as u64)
+            // Case 2: Try to acquire new lease (expired or no existing lease)
+            // Atomically update only if lease is expired or null
+            let acquired = conn
+                .execute(
+                    "UPDATE nodes SET 
+                        lease_client_session = ?1, 
+                        lease_seq = COALESCE(lease_seq, 0) + 1, 
+                        lease_expire_at = ?2
+                     WHERE inode_id = ?3 
+                       AND (lease_expire_at IS NULL OR lease_expire_at <= ?4)",
+                    params![&session.0, expire_at, node_id as i64, now],
+                )
+                .map_err(map_db_err)?;
+
+            if acquired > 0 {
+                // Successfully acquired, get new seq
+                let seq: i64 = conn
+                    .query_row(
+                        "SELECT lease_seq FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_db_err)?;
+                return Ok(seq as u64);
+            }
+
+            // Case 3: Neither renewed nor acquired - check if inode exists
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                    params![node_id as i64],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(map_db_err)?
+                .unwrap_or(false);
+
+            if !exists {
+                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+            }
+
+            // Inode exists but lease held by another session and not expired
+            Err(RPCErrors::ReasonError("lease conflict".to_string()))
         })
         .await
     }
@@ -837,29 +1079,35 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(None, move |conn| {
             let now = unix_timestamp() as i64;
             let expire_at = now.saturating_add(ttl.as_secs() as i64);
-            let current = conn
-                .query_row(
-                    "SELECT lease_client_session, lease_seq FROM nodes WHERE inode_id = ?1",
-                    params![node_id as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                        ))
-                    },
+
+            // Atomic conditional update - only if session and seq match
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET lease_expire_at = ?1 
+                     WHERE inode_id = ?2 
+                       AND lease_client_session = ?3 
+                       AND lease_seq = ?4",
+                    params![expire_at, node_id as i64, &session.0, lease_seq as i64],
                 )
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
-            let (cur_session, cur_seq) = current;
-            if cur_session.as_deref() != Some(&session.0) || cur_seq.unwrap_or(0) != lease_seq as i64 {
+                .map_err(map_db_err)?;
+
+            if updated == 0 {
+                // Check if inode exists to provide better error message
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?
+                    .unwrap_or(false);
+
+                if !exists {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
                 return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
             }
-            conn.execute(
-                "UPDATE nodes SET lease_expire_at = ?1 WHERE inode_id = ?2",
-                params![expire_at, node_id as i64],
-            )
-            .map_err(map_db_err)?;
             Ok(())
         })
         .await
@@ -873,29 +1121,37 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         self.with_conn(None, move |conn| {
-            let current = conn
-                .query_row(
-                    "SELECT lease_client_session, lease_seq FROM nodes WHERE inode_id = ?1",
-                    params![node_id as i64],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            row.get::<_, Option<i64>>(1)?,
-                        ))
-                    },
+            // Atomic conditional update - only clear session and expire, but keep seq for fencing token
+            // This prevents seq from being reused (monotonically increasing)
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET 
+                        lease_client_session = NULL, 
+                        lease_expire_at = NULL
+                     WHERE inode_id = ?1 
+                       AND lease_client_session = ?2 
+                       AND lease_seq = ?3",
+                    params![node_id as i64, &session.0, lease_seq as i64],
                 )
-                .optional()
-                .map_err(map_db_err)?
-                .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
-            let (cur_session, cur_seq) = current;
-            if cur_session.as_deref() != Some(&session.0) || cur_seq.unwrap_or(0) != lease_seq as i64 {
+                .map_err(map_db_err)?;
+
+            if updated == 0 {
+                // Check if inode exists to provide better error message
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?
+                    .unwrap_or(false);
+
+                if !exists {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
                 return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
             }
-            conn.execute(
-                "UPDATE nodes SET lease_client_session = NULL, lease_seq = NULL, lease_expire_at = NULL WHERE inode_id = ?1",
-                params![node_id as i64],
-            )
-            .map_err(map_db_err)?;
             Ok(())
         })
         .await
@@ -941,38 +1197,53 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(txid.as_deref(), move |conn| {
             let now = unix_timestamp() as i64;
             let obj_blob = obj_id_to_blob(&obj_id);
-            let current = conn
-                .query_row(
-                    "SELECT ref_count, zero_since FROM obj_stat WHERE obj_id = ?1",
-                    params![obj_blob.clone()],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+
+            if delta > 0 {
+                // Positive delta: use atomic INSERT ... ON CONFLICT DO UPDATE
+                // This handles both new records and existing records atomically
+                conn.execute(
+                    "INSERT INTO obj_stat (obj_id, ref_count, zero_since, updated_at) 
+                     VALUES (?1, ?2, NULL, ?3)
+                     ON CONFLICT(obj_id) DO UPDATE SET 
+                        ref_count = ref_count + excluded.ref_count,
+                        zero_since = NULL,
+                        updated_at = excluded.updated_at",
+                    params![obj_blob.clone(), delta, now],
                 )
-                .optional()
+                .map_err(map_db_err)?;
+            } else {
+                // Negative or zero delta: use atomic conditional UPDATE
+                // Only update if the result would be non-negative
+                let updated = conn
+                    .execute(
+                        "UPDATE obj_stat SET 
+                            ref_count = ref_count + ?2,
+                            zero_since = CASE 
+                                WHEN ref_count + ?2 = 0 THEN COALESCE(zero_since, ?3)
+                                ELSE NULL 
+                            END,
+                            updated_at = ?3
+                         WHERE obj_id = ?1 AND ref_count + ?2 >= 0",
+                        params![obj_blob.clone(), delta, now],
+                    )
+                    .map_err(map_db_err)?;
+
+                if updated == 0 {
+                    // Either record doesn't exist or would become negative
+                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
+                }
+            }
+
+            // Get the new ref_count
+            let new_ref_count: i64 = conn
+                .query_row(
+                    "SELECT ref_count FROM obj_stat WHERE obj_id = ?1",
+                    params![obj_blob],
+                    |row| row.get(0),
+                )
                 .map_err(map_db_err)?;
 
-            if let Some((ref_count, zero_since)) = current {
-                let next = ref_count + delta;
-                if next < 0 {
-                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
-                }
-                let zero_since = if next == 0 { Some(zero_since.unwrap_or(now)) } else { None };
-                conn.execute(
-                    "UPDATE obj_stat SET ref_count = ?1, zero_since = ?2, updated_at = ?3 WHERE obj_id = ?4",
-                    params![next, zero_since, now, obj_blob],
-                )
-                .map_err(map_db_err)?;
-                Ok(next as u64)
-            } else {
-                if delta <= 0 {
-                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
-                }
-                conn.execute(
-                    "INSERT INTO obj_stat (obj_id, ref_count, zero_since, updated_at) VALUES (?1, ?2, NULL, ?3)",
-                    params![obj_blob, delta, now],
-                )
-                .map_err(map_db_err)?;
-                Ok(delta as u64)
-            }
+            Ok(new_ref_count as u64)
         })
         .await
     }
