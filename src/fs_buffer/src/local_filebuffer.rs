@@ -35,8 +35,8 @@ const BUFFER_DIR_NAME: &str = "buffers";
 const BUFFER_DB_FILE: &str = "file_buffer.db";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct DirtyChunkLayout {
-    order: Vec<u32>,
+pub struct DirtyChunkLayout {
+    pub order: Vec<u32>,
     #[serde(skip)]
     index: HashMap<u32, u32>,
 }
@@ -97,7 +97,8 @@ fn poll_complete_seek<T: AsyncSeek>(
     target.poll_complete(cx)
 }
 
-enum FileBufferBaseReader {
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum FileBufferBaseReader {
     None,
     BaseChunkList(Vec<ChunkId>),
     //FsNode(u64), // fs_meta里的NodeId,先不支持
@@ -110,13 +111,56 @@ impl Default for FileBufferBaseReader {
 }
 
 
-pub struct FileBufferHandle {
-    handle_id: String,
-    file_inode_id: u64,
-    base_reader: FileBufferBaseReader,
-    read_only: bool,
+/// Serializable part of FileBufferRecord for persistence
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FileBufferRecordMeta {
+    pub handle_id: String,
+    pub file_inode_id: u64,
+    pub base_reader: FileBufferBaseReader,
+    pub read_only: bool,
+}
+
+pub struct FileBufferRecord {
+    pub handle_id: String,
+    pub file_inode_id: u64,
+    pub base_reader: FileBufferBaseReader,
+    pub read_only: bool,
     //state: BufferStage,
-    dirty_layout: Arc<RwLock<DirtyChunkLayout>>,
+    pub dirty_layout: Arc<RwLock<DirtyChunkLayout>>,
+}
+
+impl FileBufferRecord {
+    /// Convert to serializable meta for persistence
+    pub fn to_meta(&self) -> FileBufferRecordMeta {
+        FileBufferRecordMeta {
+            handle_id: self.handle_id.clone(),
+            file_inode_id: self.file_inode_id,
+            base_reader: self.base_reader.clone(),
+            read_only: self.read_only,
+        }
+    }
+
+    /// Create from meta with empty dirty layout
+    pub fn from_meta(meta: FileBufferRecordMeta) -> Self {
+        Self {
+            handle_id: meta.handle_id,
+            file_inode_id: meta.file_inode_id,
+            base_reader: meta.base_reader,
+            read_only: meta.read_only,
+            dirty_layout: Arc::new(RwLock::new(DirtyChunkLayout::default())),
+        }
+    }
+
+    /// Create from meta with specified dirty layout
+    pub fn from_meta_with_layout(meta: FileBufferRecordMeta, order: Vec<u32>) -> Self {
+        Self {
+            handle_id: meta.handle_id,
+            file_inode_id: meta.file_inode_id,
+            base_reader: meta.base_reader,
+            read_only: meta.read_only,
+            dirty_layout: Arc::new(RwLock::new(DirtyChunkLayout::new(order))),
+        }
+    }
 }
 
 
@@ -170,6 +214,8 @@ pub struct LocalFileBufferService {
     size_limit: u64,
     size_used: RwLock<u64>,
     db: Arc<LocalFileBufferDB>,
+    // In-memory index: handle_id -> FileBufferRecord
+    records: RwLock<HashMap<String, Arc<RwLock<FileBufferRecord>>>>,
 }
 
 impl LocalFileBufferService {
@@ -177,13 +223,58 @@ impl LocalFileBufferService {
         let buffer_dir = base_dir.join(BUFFER_DIR_NAME);
         let db_path = base_dir.join(BUFFER_DB_FILE);
         let db = Arc::new(LocalFileBufferDB::new(db_path).unwrap());
+        
+        // Load existing records from database into memory index
+        let records = match db.load_all() {
+            Ok(loaded) => {
+                let mut map = HashMap::new();
+                for record in loaded {
+                    let handle_id = record.handle_id.clone();
+                    map.insert(handle_id, Arc::new(RwLock::new(record)));
+                }
+                RwLock::new(map)
+            }
+            Err(e) => {
+                warn!("LocalFileBufferService: failed to load records from db: {}", e);
+                RwLock::new(HashMap::new())
+            }
+        };
+        
         Self {
             base_dir,
             buffer_dir,
             size_limit,
             size_used: RwLock::new(0),
             db,
+            records,
         }
+    }
+
+    /// Get a record from the in-memory index
+    fn get_record(&self, handle_id: &str) -> NdnResult<Arc<RwLock<FileBufferRecord>>> {
+        let records = self.records.read()
+            .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
+        records.get(handle_id)
+            .cloned()
+            .ok_or_else(|| NdnError::NotFound(format!("buffer not found: {}", handle_id)))
+    }
+
+    /// Insert a record into the in-memory index
+    fn insert_record(&self, record: FileBufferRecord) -> NdnResult<Arc<RwLock<FileBufferRecord>>> {
+        let handle_id = record.handle_id.clone();
+        let arc_record = Arc::new(RwLock::new(record));
+        let mut records = self.records.write()
+            .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
+        records.insert(handle_id, arc_record.clone());
+        Ok(arc_record)
+    }
+
+    /// Remove a record from the in-memory index
+    fn remove_record(&self, handle_id: &str) -> NdnResult<()> {
+        let mut records = self.records.write()
+            .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
+        records.remove(handle_id);
+        Ok(())
     }
 
     fn next_handle_id() -> String {
@@ -210,7 +301,7 @@ impl LocalFileBufferService {
         self.buffer_dir.join(prefix).join(file_name)
     }
 
-    fn buffer_path(&self, fb: &FileBufferHandle) -> PathBuf {
+    fn buffer_path(&self, fb: &FileBufferRecord) -> PathBuf {
         self.buffer_path_by_id(&fb.handle_id)
     }
 
@@ -234,7 +325,7 @@ impl LocalFileBufferService {
         });
     }
 
-    async fn load_layout_if_needed(&self, fb: &FileBufferHandle) -> NdnResult<()> {
+    async fn load_layout_if_needed(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         let need_load = fb
             .dirty_layout
             .read()
@@ -287,7 +378,7 @@ impl LocalFileBufferService {
         Ok(File::from_std(std_file))
     }
 
-    fn ensure_writable(&self, fb: &FileBufferHandle) -> NdnResult<()> {
+    fn ensure_writable(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         if fb.read_only {
             return Err(NdnError::PermissionDenied("file buffer is read-only".to_string()));
         }
@@ -301,12 +392,7 @@ impl LocalFileBufferService {
 #[async_trait]
 impl FileBufferService for LocalFileBufferService {
     //这个函数通常由fs-meta service调用
-    async fn alloc_buffer(
-        &self,
-        _path: &NdmPath,
-        _lease: &WriteLease,
-        expected_size: Option<u64>,
-    ) -> NdnResult<FileBufferHandle> {
+    async fn alloc_buffer(&self, _path: &NdmPath, file_inode_id: u64, base_chunk_list:Vec<ChunkId>, _lease: &WriteLease, expected_size: Option<u64>) -> NdnResult<FileBufferRecord> {
         if self.size_limit > 0 {
             if let Some(expect) = expected_size {
                 let mut used = self.size_used.write().unwrap();
@@ -334,18 +420,90 @@ impl FileBufferService for LocalFileBufferService {
             .open(&file_path)
             .await?;
 
-        Ok(FileBufferHandle {
-            handle_id,
-            file_inode_id: 0,
-            base_reader: FileBufferBaseReader::default(),
+        let base_reader = if base_chunk_list.is_empty() {
+            FileBufferBaseReader::None
+        } else {
+            FileBufferBaseReader::BaseChunkList(base_chunk_list)
+        };
+
+        let record = FileBufferRecord {
+            handle_id: handle_id.clone(),
+            file_inode_id,
+            base_reader,
             read_only: false,
             dirty_layout: Arc::new(RwLock::new(DirtyChunkLayout::default())),
+        };
+
+        // Add to database
+        let db = self.db.clone();
+        let record_for_db = record.to_meta();
+        let dirty_order: Vec<u32> = Vec::new();
+        tokio::task::spawn_blocking(move || {
+            let temp_record = FileBufferRecord::from_meta_with_layout(record_for_db, dirty_order);
+            db.add_buffer(&temp_record)
+        })
+        .await
+        .map_err(|e| NdnError::IoError(format!("add buffer join error: {}", e)))??;
+
+        // Add to in-memory index
+        self.insert_record(record)?;
+
+        // Return a copy from the index
+        let arc_record = self.get_record(&handle_id)?;
+        let result = {
+            let guard = arc_record.read()
+                .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
+            FileBufferRecord {
+                handle_id: guard.handle_id.clone(),
+                file_inode_id: guard.file_inode_id,
+                base_reader: guard.base_reader.clone(),
+                read_only: guard.read_only,
+                dirty_layout: guard.dirty_layout.clone(),
+            }
+        };
+        Ok(result)
+    }
+
+    async fn get_buffer(&self, handle_id: &str) -> NdnResult<FileBufferRecord> {
+        // First try in-memory index
+        if let Ok(arc_record) = self.get_record(handle_id) {
+            let guard = arc_record.read()
+                .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
+            return Ok(FileBufferRecord {
+                handle_id: guard.handle_id.clone(),
+                file_inode_id: guard.file_inode_id,
+                base_reader: guard.base_reader.clone(),
+                read_only: guard.read_only,
+                dirty_layout: guard.dirty_layout.clone(),
+            });
+        }
+
+        // Fall back to database
+        let db = self.db.clone();
+        let handle_id_owned = handle_id.to_string();
+        let record = tokio::task::spawn_blocking(move || db.get_buffer(&handle_id_owned))
+            .await
+            .map_err(|e| NdnError::IoError(format!("get buffer join error: {}", e)))??;
+        
+        // Insert into memory index
+        self.insert_record(record)?;
+        
+        // Return from index
+        let arc_record = self.get_record(handle_id)?;
+        let guard = arc_record.read()
+            .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
+        Ok(FileBufferRecord {
+            handle_id: guard.handle_id.clone(),
+            file_inode_id: guard.file_inode_id,
+            base_reader: guard.base_reader.clone(),
+            read_only: guard.read_only,
+            dirty_layout: guard.dirty_layout.clone(),
         })
     }
 
     async fn open_reader(
         &self,
-        fb: &FileBufferHandle,
+        fb: &FileBufferRecord,
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekReader> {
         self.load_layout_if_needed(fb).await?;
@@ -373,7 +531,7 @@ impl FileBufferService for LocalFileBufferService {
 
     async fn open_writer(
         &self,
-        fb: &FileBufferHandle,
+        fb: &FileBufferRecord,
         seek_from: SeekFrom,
     ) -> NdnResult<FileBufferSeekWriter> {
         self.load_layout_if_needed(fb).await?;
@@ -409,7 +567,7 @@ impl FileBufferService for LocalFileBufferService {
         Ok(Box::pin(writer))
     }
 
-    async fn flush(&self, fb: &FileBufferHandle) -> NdnResult<()> {
+    async fn flush(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         // 伪代码：
         // 如果没有BaseReader，直接 fsync 本地文件
         // 如果有BaseReader，刷新 dirty chunk 到磁盘，并更新必要的元数据
@@ -422,7 +580,7 @@ impl FileBufferService for LocalFileBufferService {
         Ok(())
     }
 
-    async fn close(&self, fb: &FileBufferHandle) -> NdnResult<()> {
+    async fn close(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         self.flush(fb).await?;
         let order = fb
             .dirty_layout
@@ -437,7 +595,7 @@ impl FileBufferService for LocalFileBufferService {
         Ok(())
     }
 
-    async fn append(&self, fb: &FileBufferHandle, data: &[u8]) -> NdnResult<()> {
+    async fn append(&self, fb: &FileBufferRecord, data: &[u8]) -> NdnResult<()> {
         self.ensure_writable(fb)?;
         if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
             return Err(NdnError::Unsupported(
@@ -471,7 +629,7 @@ impl FileBufferService for LocalFileBufferService {
         Ok(())
     }
 
-    async fn cacl_name(&self, _fb: &FileBufferHandle) -> NdnResult<ObjId> {
+    async fn cacl_name(&self, _fb: &FileBufferRecord) -> NdnResult<ObjId> {
         Err(NdnError::Unsupported(
             "cacl_name not implemented".to_string(),
         ))
@@ -516,20 +674,29 @@ impl FileBufferService for LocalFileBufferService {
     //     Ok(())
     // }
 
-    async fn remove(&self, fb: &FileBufferHandle) -> NdnResult<()> {
-        // 伪代码：
-        // - 删除本地文件 / 释放 mmap 内存
+    async fn remove(&self, fb: &FileBufferRecord) -> NdnResult<()> {
+        // Remove from in-memory index first
+        self.remove_record(&fb.handle_id)?;
+        
+        // Delete the local buffer file
         let file_path = self.buffer_path(fb);
         if let Ok(meta) = fs::metadata(&file_path).await {
             let mut used = self.size_used.write().unwrap();
             *used = used.saturating_sub(meta.len());
         }
-        fs::remove_file(file_path).await?;
+        // Ignore file not found error
+        if let Err(e) = fs::remove_file(&file_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(NdnError::IoError(format!("remove file failed: {}", e)));
+            }
+        }
+        
+        // Remove from database
         let handle_id = fb.handle_id.clone();
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.remove(&handle_id))
             .await
-            .map_err(|e| NdnError::IoError(format!("remove layout join error: {}", e)))??;
+            .map_err(|e| NdnError::IoError(format!("remove db entry join error: {}", e)))??;
         Ok(())
     }
 }
@@ -1243,7 +1410,7 @@ mod tests {
     fn dummy_lease() -> WriteLease {
         WriteLease {
             session: crate::fb_service::SessionId("s1".to_string()),
-            fence: crate::fb_service::FenceToken(1),
+            session_seq: 1,
             expires_at: 0,
         }
     }
@@ -1264,7 +1431,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
-            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .alloc_buffer(&dummy_path(), 1, vec![], &dummy_lease(), None)
             .await
             .unwrap();
 
@@ -1290,7 +1457,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
-            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .alloc_buffer(&dummy_path(), 1, vec![], &dummy_lease(), None)
             .await
             .unwrap();
 
@@ -1345,7 +1512,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let mut fb = service
-            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .alloc_buffer(&dummy_path(), 1, vec![], &dummy_lease(), None)
             .await
             .unwrap();
         fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
@@ -1408,7 +1575,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let mut fb = service
-            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .alloc_buffer(&dummy_path(), 1, vec![], &dummy_lease(), None)
             .await
             .unwrap();
         fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
@@ -1483,7 +1650,7 @@ mod tests {
         print!("temp dir path: {:?}\n", dir_path);
         let service = LocalFileBufferService::new(dir_path.clone(), 0);
         let mut fb = service
-            .alloc_buffer(&dummy_path(), &dummy_lease(), None)
+            .alloc_buffer(&dummy_path(), 1, vec![], &dummy_lease(), None)
             .await
             .unwrap();
         fb.base_reader = FileBufferBaseReader::BaseChunkList(vec![]);
