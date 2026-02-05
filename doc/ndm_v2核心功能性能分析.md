@@ -11,7 +11,7 @@ coding场景，build过程大量创建小文件，使用后批量删除
 
 > meta看来的树结构 `inode -> inode -> DirObject / DirObject / DirObject(Parent) / filename`
 
-第一步总是要确保文件能打开成功(获得写权限)
+总是要确保文件能打开成功(获得写权限)
 
 - 从路径得到parent_dir的inode_id，查询次数和路径的深度有关，但有cache可以让这个过程变成一次数据库查询 [metadb.read 1]
 - 通过inode_id，查询得到parent_inode，判断状态是否可读。上面这种路径，[metadb.read 1]
@@ -25,6 +25,7 @@ coding场景，build过程大量创建小文件，使用后批量删除
     通过DirObject定位到了一个FileObject,需要BaseFileObject  [是否需要 DirObjId_inner_path -> objid的cache?]
   - 申请file_write_lease,主要是记录现在个inode暂时分配给了“那个lease-session,多长时间” [metadb.write 1]
   - 添加目录项 upsert_dentry(parent_dir_id, &name, Target::IndexNodeId(fid) [metadb.write 1]
+  
 - 基于lease_session + file_inode + fb_id，返回filebuffer_handle
 
 总计: [metadb.read 2,metadb.write 3]
