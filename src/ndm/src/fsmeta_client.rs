@@ -4,10 +4,12 @@
 /// ------------------------------
 use fs_buffer::SessionId;
 use krpc::{kRPC, RPCErrors, RPCHandler, RPCContext,RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::ObjId;
+use ndn_lib::{NdnError, NdnResult, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
+
+use crate::NdmPath;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientSessionId(pub String);
@@ -104,6 +106,8 @@ pub struct DentryRecord {
     pub mtime: Option<u64>,
 }
 
+
+
 // /// ------------------------------
 // /// FsMeta Service original Traits
 // /// ------------------------------
@@ -167,6 +171,23 @@ impl FsMetaRootDirReq {
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
             RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRootDirReq: {}", e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaResolvePathReq {
+    pub path: String,
+}
+
+impl FsMetaResolvePathReq {
+    pub fn new(path: String) -> Self {
+        Self { path }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaResolvePathReq: {}", e))
         })
     }
 }
@@ -609,6 +630,34 @@ impl FsMetaClient {
                 result
                     .as_u64()
                     .ok_or_else(|| RPCErrors::ParserResponseError("Expected u64 result".to_string()))
+            }
+        }
+    }
+
+    pub async fn resolve_path(
+        &self,
+        path: &NdmPath,
+    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_resolve_path(path, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaResolvePathReq::new(path.as_str().to_string());
+                let req_json = serde_json::to_value(&req)
+                    .map_err(|e| NdnError::Internal(format!("Failed to serialize request: {}", e)))?;
+
+                let result = client
+                    .call("resolve_path", req_json)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("resolve_path rpc failed: {}", e)))?;
+                serde_json::from_value(result).map_err(|e| {
+                    NdnError::Internal(format!(
+                        "Expected Option<(IndexNodeId, NodeRecord)> result: {}",
+                        e
+                    ))
+                })
             }
         }
     }
@@ -1079,9 +1128,11 @@ impl FsMetaClient {
     }
 }
 
+// ========== Kernel : FsMetaHandler ==========
 #[async_trait::async_trait]
 pub trait FsMetaHandler: Send + Sync {
     async fn handle_root_dir(&self, ctx: RPCContext) -> Result<IndexNodeId, RPCErrors>;
+    async fn handle_resolve_path(&self, path: &NdmPath,ctx:RPCContext) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> ;
     async fn handle_begin_txn(&self, ctx: RPCContext) -> Result<String, RPCErrors>;
     async fn handle_get_inode(
         &self,
@@ -1223,6 +1274,16 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
             "root_dir" => {
                 let _req = FsMetaRootDirReq::from_json(req.params)?;
                 let result = self.0.handle_root_dir(ctx).await?;
+                RPCResult::Success(serde_json::json!(result))
+            }
+            "resolve_path" => {
+                let req = FsMetaResolvePathReq::from_json(req.params)?;
+                let path = NdmPath::new(req.path);
+                let result = self
+                    .0
+                    .handle_resolve_path(&path, ctx)
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("resolve_path failed: {}", e)))?;
                 RPCResult::Success(serde_json::json!(result))
             }
             "begin_txn" => {
@@ -1423,6 +1484,66 @@ mod tests {
     impl FsMetaHandler for MockHandler {
         async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
             Ok(self.state.lock().unwrap().root_dir)
+        }
+
+        async fn handle_resolve_path(
+            &self,
+            path: &NdmPath,
+            _ctx: RPCContext,
+        ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
+            let state = self.state.lock().unwrap();
+
+            let root_id = state.root_dir;
+            if path.is_root() {
+                let node = state.inodes.get(&root_id).cloned();
+                return Ok(node.map(|n| (root_id, n)));
+            }
+
+            let components: Vec<&str> = path
+                .as_str()
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let mut current_id = root_id;
+
+            for (i, component) in components.iter().enumerate() {
+                let is_last = i == components.len() - 1;
+
+                let dentry = state
+                    .dentries
+                    .get(&(current_id, component.to_string()))
+                    .cloned();
+
+                match dentry {
+                    Some(d) => match d.target {
+                        DentryTarget::IndexNodeId(id) => {
+                            if is_last {
+                                let node = state.inodes.get(&id).cloned();
+                                return Ok(node.map(|n| (id, n)));
+                            }
+                            current_id = id;
+                        }
+                        DentryTarget::ObjId(_obj_id) => {
+                            if is_last {
+                                return Ok(None);
+                            }
+                            return Err(NdnError::NotFound(format!(
+                                "path {} requires materialization",
+                                path.as_str()
+                            )));
+                        }
+                        DentryTarget::Tombstone => {
+                            return Ok(None);
+                        }
+                    },
+                    None => {
+                        return Ok(None);
+                    }
+                }
+            }
+
+            Ok(None)
         }
 
         async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {

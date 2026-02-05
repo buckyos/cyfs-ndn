@@ -119,11 +119,18 @@
 * 如果是 **IndexNodeId**: 解析 Inode -> 返回句柄。
 * 如果是 **ObjId**: 返回 Object 句柄 (只读)。
 
+2. **Path->Vec<inode_id> Cache** 
+* 为了加快查询 Dentries的速度，建立该Cache.可以让大部分查询都在O（1）时间完成
+* get(path:String) -> Vec<u64>,返回路径上每一个深度的inode_id
+* 深度更大的Cache可以覆盖深度浅的，以减少Cache的总条目
+* 当系统的 路径 `/a/b/` 指向的inode改变时，要删除所有以 `/a/b/` 为前缀的cache记录
 
-2. **查 Base (DirObject):** 如果 Upper 未命中，查询 `base_obj_id` (DirObject)。
+
+3. **查 Base (DirObject):** 如果 Upper 未命中，查询 `base_obj_id` (DirObject)。
 * 如果 Base 为空/Null: 返回 `NOT_FOUND`。
 * 如果 Base 未 Pull: 返回 `NEED_PULL` (元数据存在，但 Body 缺失)。
 * 如果 Base 中存在: 返回 Object 句柄。
+
 
 
 

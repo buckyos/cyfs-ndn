@@ -1034,4 +1034,149 @@ mod tests {
         let fetched_after = svc.handle_get_inode(950, None, ctx).await.unwrap();
         assert!(fetched_after.is_some());
     }
+
+    // ==================== Resolve Path Cache Tests ====================
+
+    #[tokio::test]
+    async fn test_resolve_path_cache_invalidate_prefix_on_edge_change() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Build /a/b/c where each component is a directory inode.
+        let a = create_dir_node(10);
+        let b1 = create_dir_node(11);
+        let c = create_dir_node(12);
+        svc.handle_set_inode(a.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(a.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b1.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            b1.inode_id,
+            "c".to_string(),
+            DentryTarget::IndexNodeId(c.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Populate cache.
+        let resolved = svc
+            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(resolved.unwrap().0, c.inode_id);
+
+        // Change edge /a/b -> new inode, should invalidate /a/b/* cache entries.
+        let b2 = create_dir_node(20);
+        svc.handle_set_inode(b2.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_upsert_dentry(
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b2.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resolved2 = svc
+            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx)
+            .await
+            .unwrap();
+        assert!(resolved2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_cache_invalidate_on_commit() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Build /a/b/c.
+        let a = create_dir_node(30);
+        let b1 = create_dir_node(31);
+        let c = create_dir_node(32);
+        svc.handle_set_inode(a.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(a.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b1.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            b1.inode_id,
+            "c".to_string(),
+            DentryTarget::IndexNodeId(c.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Populate cache.
+        let resolved = svc
+            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(resolved.unwrap().0, c.inode_id);
+
+        // Mutate /a/b within a transaction.
+        let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
+        let b2 = create_dir_node(40);
+        svc.handle_set_inode(b2.clone(), Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b2.inode_id),
+            Some(txid.clone()),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_commit(Some(txid), ctx.clone()).await.unwrap();
+
+        // After commit, the cached /a/b/* entries must be invalidated.
+        let resolved2 = svc
+            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx)
+            .await
+            .unwrap();
+        assert!(resolved2.is_none());
+    }
 }

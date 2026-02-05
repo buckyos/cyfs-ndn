@@ -2,16 +2,18 @@ use fs_buffer::SessionId;
 use krpc::{RPCContext, RPCErrors};
 use log::{info, warn};
 use ndm::{
-    ClientSessionId, DentryRecord, DentryTarget, IndexNodeId, NodeKind, NodeRecord, NodeState,
-    ObjStat,
+    ClientSessionId, DentryRecord, DentryTarget, IndexNodeId, NdmPath, NodeKind, NodeRecord,
+    NodeState, ObjStat,
 };
-use ndn_lib::ObjId;
+use ndn_lib::{NdnError, NdnResult, ObjId};
 use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::path_resolve_cache::PathResolveCache;
 
 const NODE_STATE_DIR_NORMAL: i64 = 0;
 const NODE_STATE_DIR_OVERLAY: i64 = 1;
@@ -42,6 +44,9 @@ struct TxnEntry {
     closing: Arc<AtomicBool>,
     /// Number of in-flight operations using this transaction
     in_flight: Arc<AtomicU64>,
+
+    /// Dentry edges touched in this transaction (for cache invalidation on commit)
+    touched_edges: Arc<Mutex<HashSet<(IndexNodeId, String)>>>,
 }
 
 pub struct FSMetaService {
@@ -54,6 +59,8 @@ pub struct FSMetaService {
     txn_timeout_secs: u64,
     /// Handle to stop the cleanup task on drop
     _cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+
+    resolve_path_cache: Arc<RwLock<PathResolveCache>>,
 }
 
 impl FSMetaService {
@@ -87,6 +94,7 @@ impl FSMetaService {
             txn_seq: AtomicU64::new(1),
             txn_timeout_secs,
             _cleanup_handle: Some(cleanup_handle),
+            resolve_path_cache: Arc::new(RwLock::new(PathResolveCache::default())),
         })
     }
 
@@ -485,6 +493,104 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(self.root_inode)
     }
 
+    async fn handle_resolve_path(
+        &self,
+        path: &NdmPath,
+        ctx: RPCContext,
+    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
+        if path.is_root() {
+            let root_id = self
+                .handle_root_dir(ctx.clone())
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
+            let node = self
+                .handle_get_inode(root_id, None, ctx)
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get root inode: {}", e)))?;
+            return Ok(node.map(|n| (root_id, n)));
+        }
+
+        let components: Vec<&str> = path
+            .as_str()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let cached_ids = self
+            .resolve_path_cache
+            .write()
+            .ok()
+            .and_then(|mut cache| cache.get_ids_for_path(&components));
+        if let Some(ids) = cached_ids {
+            let inode_id = ids[components.len()];
+            let node = self
+                .handle_get_inode(inode_id, None, ctx)
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
+            return Ok(node.map(|n| (inode_id, n)));
+        }
+
+        let root_id = self
+            .handle_root_dir(ctx.clone())
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
+
+        let mut ids: Vec<IndexNodeId> = Vec::with_capacity(components.len() + 1);
+        ids.push(root_id);
+        let mut current_id = root_id;
+
+        for (i, component) in components.iter().enumerate() {
+            let is_last = i == components.len() - 1;
+
+            let dentry = self
+                .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
+
+            match dentry {
+                Some(d) => match d.target {
+                    DentryTarget::IndexNodeId(id) => {
+                        ids.push(id);
+                        if is_last {
+                            let node = self
+                                .handle_get_inode(id, None, ctx.clone())
+                                .await
+                                .map_err(|e| {
+                                    NdnError::Internal(format!("failed to get inode: {}", e))
+                                })?;
+                            if node.is_some() {
+                                if let Ok(mut cache) = self.resolve_path_cache.write() {
+                                    let comps: Vec<String> =
+                                        components.iter().map(|s| (*s).to_string()).collect();
+                                    cache.put_ids_for_path(comps, ids.clone());
+                                }
+                            }
+                            return Ok(node.map(|n| (id, n)));
+                        }
+                        current_id = id;
+                    }
+                    DentryTarget::ObjId(_obj_id) => {
+                        if is_last {
+                            return Ok(None);
+                        }
+                        return Err(NdnError::NotFound(format!(
+                            "path {} requires materialization",
+                            path.as_str()
+                        )));
+                    }
+                    DentryTarget::Tombstone => {
+                        return Ok(None);
+                    }
+                },
+                None => {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {
         let seq = self.txn_seq.fetch_add(1, Ordering::SeqCst);
         let txid = format!("tx-{}-{}", unix_timestamp(), seq);
@@ -500,6 +606,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             last_used_at: Arc::new(Mutex::new(now)),
             closing: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicU64::new(0)),
+            touched_edges: Arc::new(Mutex::new(HashSet::new())),
         };
 
         self.txns.lock()
@@ -799,7 +906,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
+        let name_for_invalidate = name.clone();
+        let result = self.with_conn(txid.as_deref(), move |conn| {
             let now = unix_timestamp() as i64;
             let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
             conn.execute(
@@ -822,7 +930,22 @@ impl ndm::FsMetaHandler for FSMetaService {
             .map_err(map_db_err)?;
             Ok(())
         })
-        .await
+        .await;
+
+        result?;
+
+        if let Some(txid) = txid {
+            let entry = self.get_txn_entry(&txid)?;
+            entry
+                .touched_edges
+                .lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e)))?
+                .insert((parent, name_for_invalidate));
+        } else if let Ok(mut cache) = self.resolve_path_cache.write() {
+            cache.invalidate_by_edge(parent, &name_for_invalidate);
+        }
+
+        Ok(())
     }
 
     async fn handle_remove_dentry_row(
@@ -832,7 +955,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
+        let name_for_invalidate = name.clone();
+        let result = self.with_conn(txid.as_deref(), move |conn| {
             conn.execute(
                 "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
                 params![parent as i64, name],
@@ -840,7 +964,22 @@ impl ndm::FsMetaHandler for FSMetaService {
             .map_err(map_db_err)?;
             Ok(())
         })
-        .await
+        .await;
+
+        result?;
+
+        if let Some(txid) = txid {
+            let entry = self.get_txn_entry(&txid)?;
+            entry
+                .touched_edges
+                .lock()
+                .map_err(|e| RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e)))?
+                .insert((parent, name_for_invalidate));
+        } else if let Ok(mut cache) = self.resolve_path_cache.write() {
+            cache.invalidate_by_edge(parent, &name_for_invalidate);
+        }
+
+        Ok(())
     }
 
     async fn handle_set_tombstone(
@@ -929,6 +1068,22 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.txns.lock()
             .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
             .remove(&txid);
+
+        // Step 5: Invalidate resolve_path cache entries affected by this txn
+        let edges: Vec<(IndexNodeId, String)> = entry
+            .touched_edges
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e)))?
+            .iter()
+            .cloned()
+            .collect();
+        if !edges.is_empty() {
+            if let Ok(mut cache) = self.resolve_path_cache.write() {
+                for (parent, name) in edges {
+                    cache.invalidate_by_edge(parent, &name);
+                }
+            }
+        }
 
         Ok(commit_result)
     }

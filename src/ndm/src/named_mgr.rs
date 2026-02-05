@@ -177,6 +177,27 @@ pub struct StoreTarget {
     pub path: String,
 }
 
+//Open write flags
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenWriteFlag {
+    /// Append to existing file (file must exist)
+    /// Returns error if file not found
+    Append,
+    
+    /// Continue previous write session (file must exist, state must be Cooling/Working)
+    /// For resuming interrupted writes
+    ContinueWrite,
+    
+    /// Create new file exclusively (fails if file exists)
+    CreateExclusive,
+    
+    /// Create if not exist, truncate if exists
+    CreateOrTruncate,
+    
+    /// Create if not exist, append if exists (useful for distributed logging)
+    CreateOrAppend,
+}
+
 // ------------------------------
 // NamedDataMgr Implementation
 // ------------------------------
@@ -220,73 +241,7 @@ impl NamedDataMgr {
 
     /// Resolve a path to its inode, creating directory inodes as needed
     async fn resolve_path(&self, path: &NdmPath) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
-        if path.is_root() {
-            let root_id = self.fsmeta.root_dir().await.map_err(|e| {
-                NdnError::Internal(format!("failed to get root dir: {}", e))
-            })?;
-            let node = self.fsmeta.get_inode(root_id, None).await.map_err(|e| {
-                NdnError::Internal(format!("failed to get root inode: {}", e))
-            })?;
-            return Ok(node.map(|n| (root_id, n)));
-        }
-
-        // Walk the path from root
-        let components: Vec<&str> = path
-            .as_str()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let root_id = self.fsmeta.root_dir().await.map_err(|e| {
-            NdnError::Internal(format!("failed to get root dir: {}", e))
-        })?;
-
-        let mut current_id = root_id;
-
-        for (i, component) in components.iter().enumerate() {
-            let is_last = i == components.len() - 1;
-
-            // Look up dentry
-            let dentry = self
-                .fsmeta
-                .get_dentry(current_id, component.to_string(), None)
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-            match dentry {
-                Some(d) => match d.target {
-                    DentryTarget::IndexNodeId(id) => {
-                        if is_last {
-                            let node = self.fsmeta.get_inode(id, None).await.map_err(|e| {
-                                NdnError::Internal(format!("failed to get inode: {}", e))
-                            })?;
-                            return Ok(node.map(|n| (id, n)));
-                        }
-                        current_id = id;
-                    }
-                    DentryTarget::ObjId(_obj_id) => {
-                        // For now, ObjId targets need materialization for traversal
-                        if is_last {
-                            // Return info about ObjId binding
-                            return Ok(None); // TODO: handle ObjId targets better
-                        }
-                        return Err(NdnError::NotFound(format!(
-                            "path {} requires materialization",
-                            path.as_str()
-                        )));
-                    }
-                    DentryTarget::Tombstone => {
-                        return Ok(None);
-                    }
-                },
-                None => {
-                    return Ok(None);
-                }
-            }
-        }
-
-        // Should not reach here
-        Ok(None)
+        self.fsmeta.resolve_path(path).await
     }
 
     // ========== Basic Operations ==========

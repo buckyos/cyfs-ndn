@@ -3,6 +3,8 @@
 
 pub mod fs_meta_service;
 
+mod path_resolve_cache;
+
 #[cfg(test)]
 mod fs_meta_service_tests;
 
