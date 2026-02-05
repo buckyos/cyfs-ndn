@@ -4,11 +4,12 @@
 //! a unified file/directory namespace with overlay semantics.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use fs_buffer::{FileBufferService, SessionId};
 use named_store::NamedLocalStore;
-use ndn_lib::{ChunkId, NdnError, NdnResult, ObjId};
+use ndn_lib::{ChunkId, DirObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, SimpleMapItem};
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, NodeKind, NodeRecord, NodeState,
@@ -605,6 +606,7 @@ impl NamedDataMgr {
     pub async fn open_file_writer(
         &self,
         path: &NdmPath,
+        flag: OpenWriteFlag,
         expected_size: Option<u64>,
     ) -> NdnResult<String> {
         let (parent_path, name) = path
@@ -631,6 +633,14 @@ impl NamedDataMgr {
             .await
             .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
 
+        // Helper macro for rollback on error
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.fsmeta.rollback(Some(txid.clone())).await;
+                return Err($err);
+            }};
+        }
+
         // Check existing dentry
         let dentry = self
             .fsmeta
@@ -638,66 +648,46 @@ impl NamedDataMgr {
             .await
             .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
 
-        let file_id = match dentry {
+        // Determine if file exists
+        let file_exists = matches!(
+            &dentry,
+            Some(DentryRecord { target: DentryTarget::IndexNodeId(_), .. })
+                | Some(DentryRecord { target: DentryTarget::ObjId(_), .. })
+        );
+
+        // Validate flag against file existence
+        match flag {
+            OpenWriteFlag::Append | OpenWriteFlag::ContinueWrite => {
+                if !file_exists {
+                    rollback_and_err!(NdnError::NotFound(format!(
+                        "file not found for {:?}: {}",
+                        flag, path.0
+                    )));
+                }
+            }
+            OpenWriteFlag::CreateExclusive => {
+                if file_exists {
+                    rollback_and_err!(NdnError::AlreadyExists(format!(
+                        "file already exists: {}",
+                        path.0
+                    )));
+                }
+            }
+            OpenWriteFlag::CreateOrTruncate | OpenWriteFlag::CreateOrAppend => {
+                // Both cases are allowed regardless of file existence
+            }
+        }
+
+        // Resolve or create file_id based on dentry and flag
+        let (file_id, existing_base_obj, existing_state) = match dentry {
             None | Some(DentryRecord { target: DentryTarget::Tombstone, .. }) => {
-                // New file
+                // File doesn't exist - create new inode
+                // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
                     read_only: false,
                     base_obj_id: None,
-                    state: NodeState::DirNormal, // Will be updated to Working
-                    rev: None,
-                    meta: None,
-                    lease_client_session: None,
-                    lease_seq: None,
-                    lease_expire_at: None,
-                };
-
-                let fid = self
-                    .fsmeta
-                    .alloc_inode(new_node, Some(txid.clone()))
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
-
-                self.fsmeta
-                    .upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                    )
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-                fid
-            }
-            Some(DentryRecord { target: DentryTarget::IndexNodeId(fid), .. }) => {
-                // Existing inode - check state
-                let node = self
-                    .fsmeta
-                    .get_inode(fid, Some(txid.clone()))
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
-                    .ok_or_else(|| NdnError::NotFound("inode not found".to_string()))?;
-
-                if matches!(node.state, NodeState::Working(_)) {
-                    self.fsmeta
-                        .rollback(Some(txid))
-                        .await
-                        .map_err(|e| NdnError::Internal(format!("failed to rollback: {}", e)))?;
-                    return Err(NdnError::InvalidState("file is already being written".to_string()));
-                }
-
-                fid
-            }
-            Some(DentryRecord { target: DentryTarget::ObjId(oid), .. }) => {
-                // Materialize inode from ObjId
-                let new_node = NodeRecord {
-                    inode_id: 0,
-                    kind: NodeKind::File,
-                    read_only: false,
-                    base_obj_id: Some(oid),
                     state: NodeState::DirNormal,
                     rev: None,
                     meta: None,
@@ -722,11 +712,162 @@ impl NamedDataMgr {
                     .await
                     .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
 
-                fid
+                (fid, None, NodeState::DirNormal)
+            }
+            Some(DentryRecord { target: DentryTarget::IndexNodeId(fid), .. }) => {
+                // Existing inode - get current state
+                let node = self
+                    .fsmeta
+                    .get_inode(fid, Some(txid.clone()))
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
+                    .ok_or_else(|| NdnError::NotFound("inode not found".to_string()))?;
+
+                // Validate state based on flag
+                match (&flag, &node.state) {
+                    // ContinueWrite: allow Working or Cooling state
+                    (OpenWriteFlag::ContinueWrite, NodeState::Working(_))
+                    | (OpenWriteFlag::ContinueWrite, NodeState::Cooling(_)) => {
+                        // OK - will resume the existing buffer
+                    }
+                    // For other flags, Working state is not allowed (file busy)
+                    (_, NodeState::Working(_)) => {
+                        rollback_and_err!(NdnError::InvalidState(
+                            "file is already being written".to_string()
+                        ));
+                    }
+                    // ContinueWrite requires Working or Cooling state
+                    (OpenWriteFlag::ContinueWrite, _) => {
+                        rollback_and_err!(NdnError::InvalidState(format!(
+                            "ContinueWrite requires Working or Cooling state, current: {:?}",
+                            node.state
+                        )));
+                    }
+                    // All other combinations are OK
+                    _ => {}
+                }
+
+                (fid, node.base_obj_id.clone(), node.state.clone())
+            }
+            Some(DentryRecord { target: DentryTarget::ObjId(oid), .. }) => {
+                // Dentry points to ObjId directly - materialize inode
+                let new_node = NodeRecord {
+                    inode_id: 0,
+                    kind: NodeKind::File,
+                    read_only: false,
+                    base_obj_id: Some(oid.clone()),
+                    state: NodeState::DirNormal,
+                    rev: None,
+                    meta: None,
+                    lease_client_session: None,
+                    lease_seq: None,
+                    lease_expire_at: None,
+                };
+
+                let fid = self
+                    .fsmeta
+                    .alloc_inode(new_node, Some(txid.clone()))
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
+
+                self.fsmeta
+                    .upsert_dentry(
+                        parent_id,
+                        name.clone(),
+                        DentryTarget::IndexNodeId(fid),
+                        Some(txid.clone()),
+                    )
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
+
+                (fid, Some(oid), NodeState::DirNormal)
             }
         };
 
-        // Acquire lease
+        // Determine write mode based on flag and existing state
+        let (should_truncate, existing_chunks, resume_handle) = match flag {
+            OpenWriteFlag::CreateExclusive | OpenWriteFlag::CreateOrTruncate => {
+                // Fresh start - no existing data
+                (true, vec![], None)
+            }
+            OpenWriteFlag::Append | OpenWriteFlag::CreateOrAppend => {
+                // Append mode - need to load existing chunks if file has content
+                let chunks = if let Some(ref base_oid) = existing_base_obj {
+                    self.load_file_chunks(base_oid).await.unwrap_or_default()
+                } else {
+                    vec![]
+                };
+                (false, chunks, None)
+            }
+            OpenWriteFlag::ContinueWrite => {
+                // Resume existing write session
+                match existing_state {
+                    NodeState::Working(ws) => {
+                        // File is still in Working state - reuse existing buffer
+                        (false, vec![], Some(ws.fb_handle))
+                    }
+                    NodeState::Cooling(cs) => {
+                        // File is in Cooling state - reopen the buffer
+                        (false, vec![], Some(cs.fb_handle))
+                    }
+                    _ => {
+                        // Should not reach here due to earlier validation
+                        rollback_and_err!(NdnError::InvalidState(
+                            "unexpected state for ContinueWrite".to_string()
+                        ));
+                    }
+                }
+            }
+        };
+
+        // Handle ContinueWrite with existing buffer
+        if let Some(handle) = resume_handle {
+            // For ContinueWrite, verify the buffer exists and can be resumed
+            let _fb = self
+                .buffer
+                .get_buffer(&handle)
+                .await
+                .map_err(|_| NdnError::InvalidState(format!(
+                    "buffer {} not found for ContinueWrite, may have been cleaned up",
+                    handle
+                )))?;
+
+            // Re-acquire lease
+            let session = SessionId(format!("{}:{}", self.instance, file_id));
+            let lease_seq = self
+                .fsmeta
+                .acquire_file_lease(file_id, session.clone(), std::time::Duration::from_secs(300))
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to acquire lease: {}", e)))?;
+
+            // Update inode state to Working with the existing buffer handle
+            let working_state = NodeState::Working(crate::FileWorkingState {
+                fb_handle: handle.clone(),
+                last_write_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+
+            self.fsmeta
+                .update_inode_state(file_id, working_state, Some(txid.clone()))
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to update inode state: {}", e)))?;
+
+            self.fsmeta
+                .commit(Some(txid))
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
+
+            // Note: The buffer's lease info may need to be updated separately
+            // if FileBufferService supports lease renewal. For now, we assume
+            // the buffer is still valid for continued writes.
+            let _ = (session, lease_seq); // Suppress unused warnings
+
+            return Ok(handle);
+        }
+
+        // Acquire lease for new/truncated/append writes
         let session = SessionId(format!("{}:{}", self.instance, file_id));
         let lease_seq = self
             .fsmeta
@@ -746,7 +887,7 @@ impl NamedDataMgr {
             .alloc_buffer(
                 &fs_buffer::NdmPath(path.0.clone()),
                 file_id,
-                vec![],
+                existing_chunks,
                 &lease,
                 expected_size,
             )
@@ -761,6 +902,23 @@ impl NamedDataMgr {
                 .as_secs(),
         });
 
+        // If truncating, clear base_obj_id by updating the inode
+        if should_truncate && existing_base_obj.is_some() {
+            // Get current inode and clear base_obj_id
+            let mut node = self
+                .fsmeta
+                .get_inode(file_id, Some(txid.clone()))
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get inode for truncate: {}", e)))?
+                .ok_or_else(|| NdnError::NotFound("inode not found for truncate".to_string()))?;
+            
+            node.base_obj_id = None;
+            self.fsmeta
+                .set_inode(node, Some(txid.clone()))
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to clear base obj: {}", e)))?;
+        }
+
         self.fsmeta
             .update_inode_state(file_id, working_state, Some(txid.clone()))
             .await
@@ -774,8 +932,34 @@ impl NamedDataMgr {
         Ok(fb.handle_id)
     }
 
+    /// Load existing file chunks from base object for append operations
+    async fn load_file_chunks(&self, obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
+        let store = self.store.lock().await;
+        let file_obj_json = store
+            .get_object_impl(obj_id, None)
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to get file object: {}", e)))?;
+        
+        // Extract chunk list from file object JSON
+        // Expected format: { "chunks": ["sha256:xxx", "sha256:yyy", ...] }
+        if let Some(chunks_arr) = file_obj_json.get("chunks").and_then(|v| v.as_array()) {
+            let mut chunks = Vec::with_capacity(chunks_arr.len());
+            for chunk_val in chunks_arr {
+                if let Some(chunk_str) = chunk_val.as_str() {
+                    let chunk_id = ChunkId::new(chunk_str)
+                        .map_err(|e| NdnError::Internal(format!("invalid chunk id: {}", e)))?;
+                    chunks.push(chunk_id);
+                }
+            }
+            Ok(chunks)
+        } else {
+            // File has no chunks (empty file or different format)
+            Ok(vec![])
+        }
+    }
+
     pub async fn append(&self, path: &NdmPath, data: &[u8]) -> NdnResult<()> {
-        let handle_id = self.open_file_writer(path, Some(data.len() as u64)).await?;
+        let handle_id = self.open_file_writer(path, OpenWriteFlag::CreateOrAppend, Some(data.len() as u64)).await?;
         let fb = self.buffer.get_buffer(&handle_id).await?;
         self.buffer.append(&fb, data).await?;
         self.buffer.close(&fb).await?;
@@ -935,6 +1119,10 @@ impl NamedDataMgr {
 
     /// Ensure directory inode exists at path, creating parent directories as needed.
     /// Uses iterative approach to avoid async recursion.
+    /// 
+    /// This method handles the case where the path passes through a DirObject:
+    /// - When a dentry points to ObjId (DirObject) instead of IndexNodeId
+    /// - It materializes the directory by creating inode with base_obj_id pointing to the DirObject
     async fn ensure_dir_inode(&self, path: &NdmPath) -> NdnResult<IndexNodeId> {
         if path.is_root() {
             return self.fsmeta.root_dir().await.map_err(|e| {
@@ -943,53 +1131,252 @@ impl NamedDataMgr {
         }
 
         // Try to resolve existing path first
-        if let Some((id, node)) = self.resolve_path(path).await? {
-            if node.kind != NodeKind::Dir {
-                return Err(NdnError::InvalidParam(format!(
-                    "{} is not a directory",
-                    path.as_str()
-                )));
-            }
-            return Ok(id);
-        }
-
-        // Collect all missing ancestors
-        let mut missing_paths = Vec::new();
-        let mut current_path = path.clone();
-        
-        loop {
-            if current_path.is_root() {
-                break;
-            }
-            
-            if let Some((_, node)) = self.resolve_path(&current_path).await? {
+        match self.resolve_path(path).await {
+            Ok(Some((id, node))) => {
                 if node.kind != NodeKind::Dir {
                     return Err(NdnError::InvalidParam(format!(
                         "{} is not a directory",
-                        current_path.as_str()
+                        path.as_str()
                     )));
                 }
-                break; // Found an existing directory
+                return Ok(id);
             }
-            
-            missing_paths.push(current_path.clone());
-            if let Some((parent, _)) = current_path.split_parent_name() {
-                current_path = parent;
-            } else {
-                break;
+            Ok(None) => {
+                // Path doesn't exist, will create it below
+            }
+            Err(e) => {
+                // Check if this is a "requires materialization" error
+                let err_msg = e.to_string();
+                if !err_msg.contains("requires materialization") {
+                    return Err(e);
+                }
+                // Path passes through DirObject, need to materialize
             }
         }
 
-        // Create directories from root to leaf
-        for missing_path in missing_paths.into_iter().rev() {
-            self.create_dir_internal(&missing_path).await?;
+        // Resolve path with materialization support
+        // Walk through the path components, materializing DirObjects as needed
+        let components: Vec<&str> = path
+            .as_str()
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let root_id = self.fsmeta.root_dir().await.map_err(|e| {
+            NdnError::Internal(format!("failed to get root dir: {}", e))
+        })?;
+
+        let mut current_id = root_id;
+
+        for (i, component) in components.iter().enumerate() {
+            let dentry = self
+                .fsmeta
+                .get_dentry(current_id, component.to_string(), None)
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
+
+            match dentry {
+                Some(d) => match d.target {
+                    DentryTarget::IndexNodeId(id) => {
+                        // Already an inode, verify it's a directory
+                        let node = self
+                            .fsmeta
+                            .get_inode(id, None)
+                            .await
+                            .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
+                            .ok_or_else(|| NdnError::NotFound("inode not found".to_string()))?;
+                        
+                        if node.kind != NodeKind::Dir {
+                            return Err(NdnError::InvalidParam(format!(
+                                "{} is not a directory",
+                                components[..=i].join("/")
+                            )));
+                        }
+                        current_id = id;
+                    }
+                    DentryTarget::ObjId(obj_id) => {
+                        // Dentry points to a DirObject - need to materialize
+                        // Verify it's a directory object
+                        if obj_id.obj_type != OBJ_TYPE_DIR {
+                            return Err(NdnError::InvalidParam(format!(
+                                "path component {} points to non-directory object",
+                                component
+                            )));
+                        }
+
+                        // Materialize: create inode with base_obj_id pointing to this DirObject
+                        let new_id = self
+                            .materialize_dir_from_obj(current_id, component.to_string(), &obj_id)
+                            .await?;
+                        current_id = new_id;
+                    }
+                    DentryTarget::Tombstone => {
+                        // Tombstone - need to create new directory
+                        let remaining_path = format!("/{}", components[..=i].join("/"));
+                        self.create_dir_internal(&NdmPath::new(&remaining_path)).await?;
+                        
+                        // Get the newly created inode
+                        let new_dentry = self
+                            .fsmeta
+                            .get_dentry(current_id, component.to_string(), None)
+                            .await
+                            .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?
+                            .ok_or_else(|| NdnError::Internal("failed to create directory".to_string()))?;
+                        
+                        if let DentryTarget::IndexNodeId(id) = new_dentry.target {
+                            current_id = id;
+                        } else {
+                            return Err(NdnError::Internal("unexpected dentry target after creation".to_string()));
+                        }
+                    }
+                },
+                None => {
+                    // Directory doesn't exist - create it
+                    let remaining_path = format!("/{}", components[..=i].join("/"));
+                    self.create_dir_internal(&NdmPath::new(&remaining_path)).await?;
+                    
+                    // Get the newly created inode
+                    let new_dentry = self
+                        .fsmeta
+                        .get_dentry(current_id, component.to_string(), None)
+                        .await
+                        .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?
+                        .ok_or_else(|| NdnError::Internal("failed to create directory".to_string()))?;
+                    
+                    if let DentryTarget::IndexNodeId(id) = new_dentry.target {
+                        current_id = id;
+                    } else {
+                        return Err(NdnError::Internal("unexpected dentry target after creation".to_string()));
+                    }
+                }
+            }
         }
 
-        // Return the final directory inode
-        let resolved = self.resolve_path(path).await?;
-        resolved
-            .map(|(id, _)| id)
-            .ok_or_else(|| NdnError::Internal("failed to create directory".to_string()))
+        Ok(current_id)
+    }
+
+    /// Materialize a directory from a DirObject.
+    /// Creates a new inode with base_obj_id pointing to the DirObject,
+    /// and updates the dentry to point to the new inode.
+    async fn materialize_dir_from_obj(
+        &self,
+        parent_id: IndexNodeId,
+        name: String,
+        dir_obj_id: &ObjId,
+    ) -> NdnResult<IndexNodeId> {
+        let txid = self
+            .fsmeta
+            .begin_txn()
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
+
+        // Helper macro for rollback on error (similar to open_file_writer)
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.fsmeta.rollback(Some(txid.clone())).await;
+                return Err($err);
+            }};
+        }
+
+        // Create new directory inode with base_obj_id pointing to the DirObject
+        let new_node = NodeRecord {
+            inode_id: 0,
+            kind: NodeKind::Dir,
+            read_only: false,
+            base_obj_id: Some(dir_obj_id.clone()),
+            state: NodeState::DirOverlay, // Overlay mode: upper layer changes on top of base DirObject
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+
+        let new_id = match self
+            .fsmeta
+            .alloc_inode(new_node, Some(txid.clone()))
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                rollback_and_err!(NdnError::Internal(format!("failed to alloc inode: {}", e)));
+            }
+        };
+
+        // Update dentry to point to the new inode
+        if let Err(e) = self
+            .fsmeta
+            .upsert_dentry(
+                parent_id,
+                name,
+                DentryTarget::IndexNodeId(new_id),
+                Some(txid.clone()),
+            )
+            .await
+        {
+            rollback_and_err!(NdnError::Internal(format!("failed to upsert dentry: {}", e)));
+        }
+
+        self.fsmeta
+            .commit(Some(txid))
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
+
+        Ok(new_id)
+    }
+
+    /// Lookup a child entry in a DirObject by inner_path.
+    /// Returns the ObjId if the child exists and is a directory.
+    #[allow(dead_code)]
+    async fn lookup_in_dir_object(
+        &self,
+        dir_obj_id: &ObjId,
+        child_name: &str,
+    ) -> NdnResult<Option<ObjId>> {
+        // Get the DirObject from store
+        let store = self.store.lock().await;
+        let obj_json = store
+            .get_object_impl(dir_obj_id, None)
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to get DirObject: {}", e)))?;
+        drop(store);
+
+        // Parse as DirObject
+        let dir_obj: DirObject = serde_json::from_value(obj_json)
+            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))?;
+
+        // Look up child in the object map
+        match dir_obj.get(child_name) {
+            Some(item) => {
+                match item {
+                    SimpleMapItem::ObjId(child_obj_id) => {
+                        if child_obj_id.obj_type == OBJ_TYPE_DIR {
+                            Ok(Some(child_obj_id.clone()))
+                        } else {
+                            // Child exists but is not a directory
+                            Err(NdnError::InvalidParam(format!(
+                                "{} in DirObject is not a directory",
+                                child_name
+                            )))
+                        }
+                    }
+                    SimpleMapItem::Object(obj_type, _) | SimpleMapItem::ObjectJwt(obj_type, _) => {
+                        if obj_type == OBJ_TYPE_DIR {
+                            // Embedded directory object - need to compute its ObjId
+                            let (child_obj_id, _) = item.get_obj_id()
+                                .map_err(|e| NdnError::Internal(format!("failed to get obj_id: {}", e)))?;
+                            Ok(Some(child_obj_id))
+                        } else {
+                            Err(NdnError::InvalidParam(format!(
+                                "{} in DirObject is not a directory",
+                                child_name
+                            )))
+                        }
+                    }
+                }
+            }
+            None => Ok(None), // Child not found in DirObject
+        }
     }
 
     /// Internal directory creation that doesn't recursively call ensure_dir_inode.

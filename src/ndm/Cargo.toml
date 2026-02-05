@@ -11,7 +11,9 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 krpc = { workspace = true }
+name-lib = { workspace = true }
 lazy_static = { workspace = true }
 ndn-lib = { path = "../ndn-lib" }
 fs-buffer = { path = "../fs_buffer" }
 named_store = { path = "../named_store" }
+

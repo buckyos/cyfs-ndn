@@ -17,9 +17,9 @@ pub struct ClientSessionId(pub String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
-    File,
-    Dir,
-    Object,
+    File,//File,Can finalized to FileObject
+    Dir,//Dir,Can finalized to DirObject
+    Object,//Other Object,immutable object
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
