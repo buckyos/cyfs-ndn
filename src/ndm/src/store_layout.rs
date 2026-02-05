@@ -3,6 +3,11 @@ use name_lib::DID;
 use ndn_lib::ObjId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use named_store::NamedLocalStore;
+use ndn_lib::{NdnError, NdnResult};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct StoreTarget {
@@ -297,11 +302,305 @@ impl StoreLayout {
     }
 }
 
-//usage:
-// sync store layout from fsmeta
-// select targets for a given ObjId
-// get store target by store_id
-// get object by store.get_object(ObjId)
+// ------------------------------
+// StoreLayoutMgr - Multi-version store layout manager
+// ------------------------------
+
+
+/// Trait for store provider that can get objects by ObjId
+#[async_trait::async_trait]
+pub trait StoreProvider: Send + Sync {
+    async fn get_object_impl(&self, obj_id: &ObjId, txid: Option<String>) -> NdnResult<serde_json::Value>;
+    fn store_id(&self) -> &str;
+}
+
+#[async_trait::async_trait]
+impl StoreProvider for NamedLocalStore {
+    async fn get_object_impl(&self, obj_id: &ObjId, txid: Option<String>) -> NdnResult<serde_json::Value> {
+        self.get_object_impl(obj_id, txid).await
+    }
+    
+    fn store_id(&self) -> &str {
+        self.store_id()
+    }
+}
+
+/// Version info for a store layout
+#[derive(Debug, Clone)]
+pub struct LayoutVersion {
+    pub epoch: u64,
+    pub layout: StoreLayout,
+}
+
+/// StoreLayoutMgr manages multiple versions of StoreLayout for seamless data migration
+/// 
+/// During layout changes (e.g., adding/removing stores), objects may still exist
+/// in locations determined by older layouts. This manager maintains up to 3 versions:
+/// - versions[0]: current layout (newest)
+/// - versions[1]: previous layout  
+/// - versions[2]: oldest layout being migrated from
+/// 
+/// When getting an object:
+/// 1. Try current layout first
+/// 2. If NotFound, try previous layouts
+/// 3. Return the first successful result or final error
+pub struct StoreLayoutMgr {
+    /// Store layouts ordered by epoch (newest first)
+    /// Maximum 3 versions: [current, previous, oldest]
+    versions: RwLock<Vec<LayoutVersion>>,
+    
+    /// Store instances keyed by store_id
+    stores: RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>,
+    
+    /// Maximum number of layout versions to keep
+    max_versions: usize,
+}
+
+impl StoreLayoutMgr {
+    /// Create a new StoreLayoutMgr
+    pub fn new() -> Self {
+        Self {
+            versions: RwLock::new(Vec::new()),
+            stores: RwLock::new(HashMap::new()),
+            max_versions: 3,
+        }
+    }
+    
+    /// Create with custom max versions
+    pub fn with_max_versions(max_versions: usize) -> Self {
+        Self {
+            versions: RwLock::new(Vec::new()),
+            stores: RwLock::new(HashMap::new()),
+            max_versions: max_versions.max(1),
+        }
+    }
+    
+    /// Register a store instance
+    pub async fn register_store(&self, store: Arc<tokio::sync::Mutex<NamedLocalStore>>) {
+        let store_id = {
+            let guard = store.lock().await;
+            guard.store_id().to_string()
+        };
+        let mut stores = self.stores.write().await;
+        stores.insert(store_id, store);
+    }
+    
+    /// Unregister a store instance
+    pub async fn unregister_store(&self, store_id: &str) {
+        let mut stores = self.stores.write().await;
+        stores.remove(store_id);
+    }
+    
+    /// Add a new layout version
+    /// If epoch is newer than current, it becomes the new current version
+    /// Old versions are kept up to max_versions limit
+    pub async fn add_layout(&self, layout: StoreLayout) {
+        let epoch = layout.epoch;
+        let version = LayoutVersion { epoch, layout };
+        
+        let mut versions = self.versions.write().await;
+        
+        // Find insertion position (maintain descending epoch order)
+        let pos = versions.iter().position(|v| v.epoch < epoch).unwrap_or(versions.len());
+        
+        // Check if this epoch already exists
+        if versions.iter().any(|v| v.epoch == epoch) {
+            // Replace existing version with same epoch
+            if let Some(idx) = versions.iter().position(|v| v.epoch == epoch) {
+                versions[idx] = version;
+            }
+        } else {
+            versions.insert(pos, version);
+        }
+        
+        // Trim to max_versions
+        while versions.len() > self.max_versions {
+            versions.pop();
+        }
+    }
+    
+    /// Get current layout (newest version)
+    pub async fn current_layout(&self) -> Option<StoreLayout> {
+        let versions = self.versions.read().await;
+        versions.first().map(|v| v.layout.clone())
+    }
+    
+    /// Get layout by epoch
+    pub async fn get_layout(&self, epoch: u64) -> Option<StoreLayout> {
+        let versions = self.versions.read().await;
+        versions.iter().find(|v| v.epoch == epoch).map(|v| v.layout.clone())
+    }
+    
+    /// Get all layout versions (newest first)
+    pub async fn all_versions(&self) -> Vec<LayoutVersion> {
+        let versions = self.versions.read().await;
+        versions.clone()
+    }
+    
+    /// Get object from stores, trying layouts from newest to oldest
+    /// 
+    /// Algorithm:
+    /// 1. For each layout version (newest first):
+    ///    a. Use layout.select_primary_target(obj_id) to find target store
+    ///    b. Get the store instance by store_id
+    ///    c. Try store.get_object_impl(obj_id)
+    ///    d. If found, return success
+    ///    e. If NotFound, continue to next layout version
+    /// 2. If all layouts exhausted, return NotFound
+    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+        let versions = self.versions.read().await;
+        let stores = self.stores.read().await;
+        
+        if versions.is_empty() {
+            return Err(NdnError::NotFound("no layout versions available".to_string()));
+        }
+        
+        let mut last_error: Option<NdnError> = None;
+        let mut tried_stores: Vec<String> = Vec::new();
+        
+        for version in versions.iter() {
+            // Select target store from this layout version
+            let target = match version.layout.select_primary_target(obj_id) {
+                Some(t) => t,
+                None => continue, // No target in this layout, try next
+            };
+            
+            // Skip if we already tried this store
+            if tried_stores.contains(&target.store_id) {
+                continue;
+            }
+            tried_stores.push(target.store_id.clone());
+            
+            // Get store instance
+            let store = match stores.get(&target.store_id) {
+                Some(s) => s,
+                None => {
+                    last_error = Some(NdnError::NotFound(format!(
+                        "store {} not registered", 
+                        target.store_id
+                    )));
+                    continue;
+                }
+            };
+            
+            // Try to get object from this store
+            let store_guard = store.lock().await;
+            match store_guard.get_object_impl(obj_id, None).await {
+                Ok(obj) => return Ok(obj),
+                Err(NdnError::NotFound(_)) => {
+                    // NotFound in this store, try next layout version
+                    last_error = Some(NdnError::NotFound(format!(
+                        "object not found in store {}", 
+                        target.store_id
+                    )));
+                    continue;
+                }
+                Err(e) => {
+                    // Other error, still try next layout but record this error
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+        
+        // All layouts exhausted
+        Err(last_error.unwrap_or_else(|| {
+            NdnError::NotFound(format!(
+                "object {:?} not found in any layout version",
+                obj_id
+            ))
+        }))
+    }
+    
+    /// Get object with extended fallback - try all targets in each layout
+    /// 
+    /// More aggressive search: for each layout, try all possible targets
+    /// (not just primary) before moving to next layout version
+    pub async fn get_object_exhaustive(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+        let versions = self.versions.read().await;
+        let stores = self.stores.read().await;
+        
+        if versions.is_empty() {
+            return Err(NdnError::NotFound("no layout versions available".to_string()));
+        }
+        
+        let mut last_error: Option<NdnError> = None;
+        let mut tried_stores: Vec<String> = Vec::new();
+        
+        for version in versions.iter() {
+            // Get all possible targets from this layout
+            let targets = version.layout.select_targets(obj_id);
+            
+            for target in targets {
+                // Skip if we already tried this store
+                if tried_stores.contains(&target.store_id) {
+                    continue;
+                }
+                tried_stores.push(target.store_id.clone());
+                
+                // Get store instance
+                let store = match stores.get(&target.store_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                
+                // Try to get object from this store
+                let store_guard = store.lock().await;
+                match store_guard.get_object_impl(obj_id, None).await {
+                    Ok(obj) => return Ok(obj),
+                    Err(NdnError::NotFound(_)) => continue,
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
+                    }
+                }
+            }
+        }
+        
+        Err(last_error.unwrap_or_else(|| {
+            NdnError::NotFound(format!(
+                "object {:?} not found in any store",
+                obj_id
+            ))
+        }))
+    }
+    
+    /// Select primary store for a new object (uses current layout)
+    pub async fn select_store_for_write(&self, obj_id: &ObjId) -> Option<Arc<tokio::sync::Mutex<NamedLocalStore>>> {
+        let versions = self.versions.read().await;
+        let stores = self.stores.read().await;
+        
+        let current = versions.first()?;
+        let target = current.layout.select_primary_target(obj_id)?;
+        stores.get(&target.store_id).cloned()
+    }
+    
+    /// Get number of active layout versions
+    pub async fn version_count(&self) -> usize {
+        let versions = self.versions.read().await;
+        versions.len()
+    }
+    
+    /// Get current epoch
+    pub async fn current_epoch(&self) -> Option<u64> {
+        let versions = self.versions.read().await;
+        versions.first().map(|v| v.epoch)
+    }
+    
+    /// Remove old layout versions, keeping only the newest one
+    pub async fn compact(&self) {
+        let mut versions = self.versions.write().await;
+        if versions.len() > 1 {
+            versions.truncate(1);
+        }
+    }
+}
+
+impl Default for StoreLayoutMgr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1093,5 +1392,167 @@ mod tests {
         println!("  Duration: {:?}", duration);
         println!("  Throughput: {:.0} ops/sec", ops_per_sec);
         println!("  Latency: {:.1} ns/op", ns_per_op);
+    }
+    
+    // ========== StoreLayoutMgr Tests ==========
+    
+    fn create_layout_with_epoch(epoch: u64, targets: Vec<StoreTarget>) -> StoreLayout {
+        StoreLayout::new(epoch, targets, 10000, 1000)
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_basic() {
+        let mgr = StoreLayoutMgr::new();
+        
+        // Initially empty
+        assert_eq!(mgr.version_count().await, 0);
+        assert!(mgr.current_layout().await.is_none());
+        assert!(mgr.current_epoch().await.is_none());
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_add_versions() {
+        let mgr = StoreLayoutMgr::new();
+        
+        let targets1 = vec![create_test_target("store1", 1, true, false)];
+        let layout1 = create_layout_with_epoch(1, targets1);
+        mgr.add_layout(layout1).await;
+        
+        assert_eq!(mgr.version_count().await, 1);
+        assert_eq!(mgr.current_epoch().await, Some(1));
+        
+        // Add newer version
+        let targets2 = vec![
+            create_test_target("store1", 1, true, false),
+            create_test_target("store2", 1, true, false),
+        ];
+        let layout2 = create_layout_with_epoch(2, targets2);
+        mgr.add_layout(layout2).await;
+        
+        assert_eq!(mgr.version_count().await, 2);
+        assert_eq!(mgr.current_epoch().await, Some(2));
+        
+        // Add even newer version
+        let targets3 = vec![
+            create_test_target("store1", 1, true, false),
+            create_test_target("store2", 1, true, false),
+            create_test_target("store3", 1, true, false),
+        ];
+        let layout3 = create_layout_with_epoch(3, targets3);
+        mgr.add_layout(layout3).await;
+        
+        assert_eq!(mgr.version_count().await, 3);
+        assert_eq!(mgr.current_epoch().await, Some(3));
+        
+        // Adding a 4th version should trim the oldest
+        let targets4 = vec![
+            create_test_target("store1", 1, true, false),
+            create_test_target("store2", 1, true, false),
+            create_test_target("store3", 1, true, false),
+            create_test_target("store4", 1, true, false),
+        ];
+        let layout4 = create_layout_with_epoch(4, targets4);
+        mgr.add_layout(layout4).await;
+        
+        assert_eq!(mgr.version_count().await, 3); // Still 3, oldest trimmed
+        assert_eq!(mgr.current_epoch().await, Some(4));
+        
+        // Verify version 1 is gone
+        assert!(mgr.get_layout(1).await.is_none());
+        assert!(mgr.get_layout(2).await.is_some());
+        assert!(mgr.get_layout(3).await.is_some());
+        assert!(mgr.get_layout(4).await.is_some());
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_version_ordering() {
+        let mgr = StoreLayoutMgr::new();
+        
+        // Add versions out of order
+        let targets2 = vec![create_test_target("store1", 1, true, false)];
+        let layout2 = create_layout_with_epoch(2, targets2);
+        mgr.add_layout(layout2).await;
+        
+        let targets1 = vec![create_test_target("store1", 1, true, false)];
+        let layout1 = create_layout_with_epoch(1, targets1);
+        mgr.add_layout(layout1).await;
+        
+        let targets3 = vec![create_test_target("store1", 1, true, false)];
+        let layout3 = create_layout_with_epoch(3, targets3);
+        mgr.add_layout(layout3).await;
+        
+        // Current should be the newest (epoch 3)
+        assert_eq!(mgr.current_epoch().await, Some(3));
+        
+        // Versions should be ordered newest first
+        let versions = mgr.all_versions().await;
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].epoch, 3);
+        assert_eq!(versions[1].epoch, 2);
+        assert_eq!(versions[2].epoch, 1);
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_compact() {
+        let mgr = StoreLayoutMgr::new();
+        
+        for epoch in 1..=3 {
+            let targets = vec![create_test_target("store1", 1, true, false)];
+            let layout = create_layout_with_epoch(epoch, targets);
+            mgr.add_layout(layout).await;
+        }
+        
+        assert_eq!(mgr.version_count().await, 3);
+        
+        mgr.compact().await;
+        
+        assert_eq!(mgr.version_count().await, 1);
+        assert_eq!(mgr.current_epoch().await, Some(3));
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_custom_max_versions() {
+        let mgr = StoreLayoutMgr::with_max_versions(2);
+        
+        for epoch in 1..=5 {
+            let targets = vec![create_test_target("store1", 1, true, false)];
+            let layout = create_layout_with_epoch(epoch, targets);
+            mgr.add_layout(layout).await;
+        }
+        
+        // Should only keep 2 versions
+        assert_eq!(mgr.version_count().await, 2);
+        assert_eq!(mgr.current_epoch().await, Some(5));
+        
+        // Only epochs 4 and 5 should exist
+        assert!(mgr.get_layout(3).await.is_none());
+        assert!(mgr.get_layout(4).await.is_some());
+        assert!(mgr.get_layout(5).await.is_some());
+    }
+    
+    #[tokio::test]
+    async fn test_store_layout_mgr_replace_same_epoch() {
+        let mgr = StoreLayoutMgr::new();
+        
+        let targets1 = vec![create_test_target("store1", 1, true, false)];
+        let layout1 = create_layout_with_epoch(1, targets1);
+        mgr.add_layout(layout1).await;
+        
+        assert_eq!(mgr.version_count().await, 1);
+        
+        // Add layout with same epoch should replace
+        let targets1_updated = vec![
+            create_test_target("store1", 1, true, false),
+            create_test_target("store2", 1, true, false),
+        ];
+        let layout1_updated = create_layout_with_epoch(1, targets1_updated);
+        mgr.add_layout(layout1_updated).await;
+        
+        // Should still be 1 version, not 2
+        assert_eq!(mgr.version_count().await, 1);
+        
+        // The updated layout should have 2 targets
+        let current = mgr.current_layout().await.unwrap();
+        assert_eq!(current.targets.len(), 2);
     }
 }

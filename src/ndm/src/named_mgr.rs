@@ -13,7 +13,7 @@ use ndn_lib::{ChunkId, DirObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, Simp
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, NodeKind, NodeRecord, NodeState,
-    ObjStat,
+    ObjStat, StoreLayoutMgr,
 };
 
 // ------------------------------
@@ -216,6 +216,10 @@ pub struct NamedDataMgr {
 
     /// Background task manager
     bg: Arc<tokio::sync::Mutex<BackgroundMgr>>,
+    
+    /// Optional store layout manager for multi-version store fallback
+    /// When set, get_object operations will try multiple layout versions
+    layout_mgr: Option<Arc<StoreLayoutMgr>>,
 }
 
 impl NamedDataMgr {
@@ -235,7 +239,40 @@ impl NamedDataMgr {
             fetcher,
             default_commit_policy,
             bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
+            layout_mgr: None,
         }
+    }
+    
+    /// Create with store layout manager for multi-version store fallback
+    pub fn with_layout_mgr(
+        instance: NdmInstanceId,
+        fsmeta: Arc<FsMetaClient>,
+        store: Arc<tokio::sync::Mutex<NamedLocalStore>>,
+        buffer: Arc<dyn FileBufferService>,
+        fetcher: Option<Arc<dyn NdnFetcher>>,
+        default_commit_policy: CommitPolicy,
+        layout_mgr: Arc<StoreLayoutMgr>,
+    ) -> Self {
+        Self {
+            instance,
+            fsmeta,
+            store,
+            buffer,
+            fetcher,
+            default_commit_policy,
+            bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
+            layout_mgr: Some(layout_mgr),
+        }
+    }
+    
+    /// Set the store layout manager
+    pub fn set_layout_mgr(&mut self, layout_mgr: Arc<StoreLayoutMgr>) {
+        self.layout_mgr = Some(layout_mgr);
+    }
+    
+    /// Get the store layout manager if set
+    pub fn layout_mgr(&self) -> Option<&Arc<StoreLayoutMgr>> {
+        self.layout_mgr.as_ref()
     }
 
     // ========== Path Resolution ==========
@@ -581,8 +618,7 @@ impl NamedDataMgr {
     }
 
     pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Vec<u8>> {
-        let store = self.store.lock().await;
-        let obj = store.get_object_impl(obj_id, None).await?;
+        let obj = self.get_object_impl(obj_id).await?;
         Ok(serde_json::to_vec(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
     }
 
@@ -596,9 +632,28 @@ impl NamedDataMgr {
             .obj_id
             .ok_or_else(|| NdnError::NotFound("no object bound to path".to_string()))?;
 
-        let store = self.store.lock().await;
-        let obj = store.get_object_impl(&obj_id, None).await?;
+        let obj = self.get_object_impl(&obj_id).await?;
         Ok(serde_json::to_string(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
+    }
+    
+    /// Internal method to get object with multi-version layout fallback
+    /// 
+    /// If layout_mgr is set:
+    /// 1. Try current layout version first
+    /// 2. If NotFound, try previous layout versions
+    /// 3. Return the first successful result or final error
+    /// 
+    /// If layout_mgr is not set:
+    /// - Use the default store directly
+    async fn get_object_impl(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+        // If layout manager is set, use multi-version fallback
+        if let Some(layout_mgr) = &self.layout_mgr {
+            return layout_mgr.get_object(obj_id).await;
+        }
+        
+        // Otherwise, use the default store directly
+        let store = self.store.lock().await;
+        store.get_object_impl(obj_id, None).await
     }
 
     // ========== Write Operations (File) ==========
