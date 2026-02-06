@@ -716,7 +716,7 @@ mod tests {
                 Box::pin(async move {
                     let store = fallback_store.lock().await;
                     store
-                        .open_chunk_reader_impl(&chunk_id, offset, auto_cache)
+                        .open_chunk_reader(&chunk_id, offset, auto_cache)
                         .await
                 })
             },

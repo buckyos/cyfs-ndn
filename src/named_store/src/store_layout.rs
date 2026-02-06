@@ -321,7 +321,7 @@ impl StoreProvider for NamedLocalStore {
         obj_id: &ObjId,
         txid: Option<String>,
     ) -> NdnResult<serde_json::Value> {
-        self.get_object_impl(obj_id, txid).await
+        self.get_object(obj_id, txid).await
     }
 
     fn store_id(&self) -> &str {

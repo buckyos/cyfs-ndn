@@ -2,23 +2,24 @@ use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStor
 use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult,
-    ObjId,
+    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError,
+    NdnResult, ObjId, SimpleChunkList, OBJ_TYPE_FILE,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom};
 
 const CONFIG_FILE_NAME: &str = "named_store.json";
 const DEFAULT_DB_FILE: &str = "named_store.db";
 const CHUNK_DIR_NAME: &str = "chunks";
-const CHUNK_FINAL_EXT: &str = "final";
 const CHUNK_TMP_EXT: &str = "tmp";
 static STORE_REGISTRY: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -28,7 +29,6 @@ pub struct NamedLocalConfig {
     pub read_only: bool,
     pub db_path: Option<PathBuf>,
     pub chunk_dir: Option<PathBuf>,
-    pub mmap_cache_dir: Option<PathBuf>,
 }
 
 impl Default for NamedLocalConfig {
@@ -37,7 +37,6 @@ impl Default for NamedLocalConfig {
             read_only: false,
             db_path: None,
             chunk_dir: None,
-            mmap_cache_dir: None,
         }
     }
 }
@@ -55,7 +54,6 @@ pub struct NamedLocalStore {
     store_id: String,
     db: Arc<NamedLocalStoreDB>,
     chunk_dir: PathBuf,
-    mmap_cache_dir: Option<PathBuf>,
 }
 
 impl NamedLocalStore {
@@ -160,7 +158,6 @@ impl NamedLocalStore {
             store_id: store_id.clone(),
             db,
             chunk_dir,
-            mmap_cache_dir: config.mmap_cache_dir,
         };
 
         let mut registry = STORE_REGISTRY.lock().unwrap();
@@ -187,7 +184,7 @@ impl NamedLocalStore {
         Ok(ObjectState::NotExist)
     }
 
-    pub async fn get_object_impl(
+    pub async fn get_object(
         &self,
         obj_id: &ObjId,
         inner_obj_path: Option<String>,
@@ -214,23 +211,28 @@ impl NamedLocalStore {
         }
     }
 
-    pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
+    pub async fn put_object(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
         self.ensure_writable()?;
         self.db
             .set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
     }
 
-    pub async fn remove_object_impl(&self, obj_id: &ObjId) -> NdnResult<()> {
+    pub async fn remove_object(&self, obj_id: &ObjId) -> NdnResult<()> {
         self.ensure_writable()?;
-        self.db.remove_object(obj_id)
+        if obj_id.is_chunk() {
+            let chunk_id = ChunkId::from_obj_id(obj_id);
+            self.remove_chunk(&chunk_id).await
+        } else {
+            self.db.remove_object(obj_id)
+        }
     }
 
-    async fn get_chunk_item_impl(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
+    async fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
         self.db.get_chunk_item(chunk_id)
     }
 
-    pub async fn have_chunk_impl(&self, chunk_id: &ChunkId) -> bool {
-        let query_result = self.query_chunk_state_impl(chunk_id).await;
+    pub async fn have_chunk(&self, chunk_id: &ChunkId) -> bool {
+        let query_result = self.query_chunk_state(chunk_id).await;
         if let Ok((chunk_state, _chunk_size, _progress)) = query_result {
             chunk_state.can_open_reader()
         } else {
@@ -238,11 +240,11 @@ impl NamedLocalStore {
         }
     }
 
-    pub async fn query_chunk_state_impl(
+    pub async fn query_chunk_state(
         &self,
         chunk_id: &ChunkId,
     ) -> NdnResult<(ChunkStoreState, u64, String)> {
-        let chunk_item = self.get_chunk_item_impl(chunk_id).await;
+        let chunk_item = self.get_chunk_item(chunk_id).await;
         if let Ok(chunk_item) = chunk_item {
             Ok((
                 chunk_item.chunk_state,
@@ -254,71 +256,86 @@ impl NamedLocalStore {
         }
     }
 
-    pub async fn open_store_chunk_reader_impl(
+    pub async fn open_reader(
         &self,
-        chunk_id: &ChunkId,
-        offset: u64,
+        obj_id: &ObjId,
+        inner_obj_path: Option<String>,
     ) -> NdnResult<(ChunkReader, u64)> {
-        let (chunk_state, chunk_size, _progress) = self.query_chunk_state_impl(chunk_id).await?;
-        if chunk_state != ChunkStoreState::Completed {
-            return Err(NdnError::InComplete(format!(
-                "chunk {} state not support open reader! state:{}",
-                chunk_id.to_string(),
-                chunk_state.to_str()
-            )));
-        }
+        let mut current_obj_id = obj_id.clone();
+        let mut current_inner_path = inner_obj_path;
+        let mut size_override: Option<u64> = None;
 
-        if offset > chunk_size {
-            return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
-        }
+        loop {
+            if current_obj_id.is_chunk() {
+                if current_inner_path.is_some() {
+                    return Err(NdnError::InvalidObjType(format!(
+                        "{} is chunk, no inner_obj_path",
+                        current_obj_id
+                    )));
+                }
+                let chunk_id = ChunkId::from_obj_id(&current_obj_id);
+                let (reader, size) = self.open_chunk_reader(&chunk_id, 0, false).await?;
+                return Ok((reader, size_override.unwrap_or(size)));
+            }
 
-        let chunk_real_path = self.get_chunk_final_path(chunk_id);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .open(&chunk_real_path)
-            .await
-            .map_err(|e| {
-                warn!("open_chunk_reader: open file failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
+            if current_obj_id.is_chunk_list() {
+                if current_inner_path.is_some() {
+                    return Err(NdnError::InvalidObjType(format!(
+                        "{} is chunklist, no inner_obj_path",
+                        current_obj_id
+                    )));
+                }
+                let (reader, size) = self.open_chunklist_reader(&current_obj_id, 0).await?;
+                return Ok((reader, size_override.unwrap_or(size)));
+            }
+
+            if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
+                let obj_json = self.get_object(&current_obj_id, None).await?;
+                let file_obj: FileObject = serde_json::from_value(obj_json)
+                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                if file_obj.content.is_empty() {
+                    return Err(NdnError::InvalidData(format!(
+                        "file {} content is empty",
+                        current_obj_id
+                    )));
+                }
+                if file_obj.size > 0 {
+                    size_override = Some(file_obj.size);
+                }
+                current_obj_id = ObjId::new(file_obj.content.as_str())?;
+                continue;
+            }
+
+            let inner_path = current_inner_path.take().ok_or_else(|| {
+                NdnError::InvalidObjType(format!(
+                    "{} is object, can't open reader without inner_obj_path",
+                    current_obj_id
+                ))
             })?;
 
-        if offset > 0 {
-            file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                warn!("open_chunk_reader: seek file failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
+            let (_obj_type, obj_str) = self.db.get_object(&current_obj_id).map_err(|e| {
+                if e.is_not_found() {
+                    NdnError::NotFound(current_obj_id.to_string())
+                } else {
+                    e
+                }
             })?;
-        }
 
-        let limited = file.take(chunk_size - offset);
-        Ok((Box::pin(limited), chunk_size))
+            let json_value: Value =
+                serde_json::from_str(&obj_str).map_err(|e| NdnError::DecodeError(e.to_string()))?;
+            let path_to = self.extract_json_by_path(&json_value, inner_path.as_str())?;
+            current_obj_id = Self::value_to_obj_id(&path_to)?;
+        }
     }
 
-    pub async fn open_chunk_reader_impl(
+
+    pub async fn open_chunk_reader(
         &self,
         chunk_id: &ChunkId,
         offset: u64,
         _auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
-        if let Some(mcache_file_path) = self.get_cache_mmap_path(chunk_id) {
-            if let Ok(mut file) = OpenOptions::new().read(true).open(&mcache_file_path).await {
-                let file_meta = file
-                    .metadata()
-                    .await
-                    .map_err(|e| NdnError::IoError(format!("read cache metadata failed: {}", e)))?;
-                if offset > 0 {
-                    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                        warn!(
-                            "get_chunk_reader: seek cache file failed! {}",
-                            e.to_string()
-                        );
-                        NdnError::IoError(e.to_string())
-                    })?;
-                }
-                return Ok((Box::pin(file), file_meta.len()));
-            }
-        }
-
-        let chunk_item = self.get_chunk_item_impl(chunk_id).await?;
+        let chunk_item = self.get_chunk_item(chunk_id).await?;
         match chunk_item.chunk_state {
             ChunkStoreState::Completed => {
                 let chunk_real_path = self.get_chunk_final_path(&chunk_item.chunk_id);
@@ -390,7 +407,69 @@ impl NamedLocalStore {
         }
     }
 
-    pub async fn open_chunk_writer_impl(
+    pub async fn open_chunklist_reader(
+        &self,
+        chunklist_id: &ObjId,
+        offset: u64,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        if !chunklist_id.is_chunk_list() {
+            return Err(NdnError::InvalidObjType(format!(
+                "{} is not a chunklist",
+                chunklist_id
+            )));
+        }
+
+        let (_obj_type, obj_str) = self.db.get_object(chunklist_id).map_err(|e| {
+            if e.is_not_found() {
+                NdnError::NotFound(chunklist_id.to_string())
+            } else {
+                e
+            }
+        })?;
+        let chunk_list = SimpleChunkList::from_json(&obj_str)
+            .map_err(|e| NdnError::DecodeError(format!("parse chunklist failed: {}", e)))?;
+
+        if offset > chunk_list.total_size {
+            return Err(NdnError::OffsetTooLarge(format!(
+                "{} offset {} > total {}",
+                chunklist_id, offset, chunk_list.total_size
+            )));
+        }
+
+        let mut remain_offset = offset;
+        let mut readers: Vec<ChunkReader> = Vec::new();
+
+        for chunk_id in chunk_list.body.iter() {
+            let chunk_size = chunk_id.get_length().ok_or_else(|| {
+                NdnError::InvalidData(format!(
+                    "chunk {} has no encoded length for simple chunklist {}",
+                    chunk_id.to_string(),
+                    chunklist_id
+                ))
+            })?;
+
+            if remain_offset >= chunk_size {
+                remain_offset -= chunk_size;
+                continue;
+            }
+
+            let chunk_offset = remain_offset;
+            remain_offset = 0;
+            let (reader, _) = self.open_chunk_reader(chunk_id, chunk_offset, false).await?;
+            readers.push(reader);
+        }
+
+        if readers.is_empty() {
+            return Ok((Box::pin(tokio::io::empty()), chunk_list.total_size));
+        }
+
+        Ok((
+            Box::pin(ConcatChunkReader::new(readers)),
+            chunk_list.total_size,
+        ))
+    }
+
+    pub async fn open_chunk_writer(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
@@ -492,7 +571,7 @@ impl NamedLocalStore {
         Ok((Box::pin(file), chunk_item.progress.clone()))
     }
 
-    pub async fn open_new_chunk_writer_impl(
+    pub async fn open_new_chunk_writer(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
@@ -537,7 +616,9 @@ impl NamedLocalStore {
         Ok(Box::pin(file))
     }
 
-    pub async fn update_chunk_progress_impl(
+    //系统并不鼓励保存大Chunk,这通常是为了兼容一些已有文件的
+    //日常不要使用这个接口
+    pub async fn update_chunk_progress(
         &self,
         chunk_id: &ChunkId,
         progress: String,
@@ -545,7 +626,7 @@ impl NamedLocalStore {
         self.db.update_chunk_progress(chunk_id, progress)
     }
 
-    pub async fn complete_chunk_writer_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+    pub async fn complete_chunk_writer(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         self.ensure_writable()?;
 
         let mut chunk_item = self.db.get_chunk_item(chunk_id)?;
@@ -578,7 +659,7 @@ impl NamedLocalStore {
         Ok(())
     }
 
-    pub async fn remove_chunk_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+    pub async fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         self.ensure_writable()?;
 
         let final_path = self.get_chunk_final_path(chunk_id);
@@ -595,18 +676,10 @@ impl NamedLocalStore {
             }
         }
 
-        if let Some(cache_path) = self.get_cache_mmap_path(chunk_id) {
-            if let Err(err) = fs::remove_file(&cache_path).await {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    return Err(NdnError::IoError(err.to_string()));
-                }
-            }
-        }
-
         self.db.remove_chunk(chunk_id)
     }
 
-    pub async fn add_chunk_by_link_to_local_file_impl(
+    pub async fn add_chunk_by_link_to_local_file(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
@@ -627,7 +700,7 @@ impl NamedLocalStore {
     }
 
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
-        let (mut chunk_reader, chunk_size) = self.open_store_chunk_reader_impl(chunk_id, 0).await?;
+        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         chunk_reader.read_to_end(&mut buffer).await.map_err(|e| {
             warn!("get_chunk_data: read file failed! {}", e.to_string());
@@ -642,7 +715,7 @@ impl NamedLocalStore {
         offset: u64,
         piece_size: u32,
     ) -> NdnResult<Vec<u8>> {
-        let (mut reader, chunk_size) = self.open_store_chunk_reader_impl(chunk_id, 0).await?;
+        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
         if offset > chunk_size {
             return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
         }
@@ -654,14 +727,14 @@ impl NamedLocalStore {
         Ok(buffer)
     }
 
-    pub async fn put_chunk_by_reader_impl(
+    pub async fn put_chunk_by_reader(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
         reader: &mut ChunkReader,
     ) -> NdnResult<()> {
         let mut chunk_writer = self
-            .open_new_chunk_writer_impl(chunk_id, chunk_size)
+            .open_new_chunk_writer(chunk_id, chunk_size)
             .await?;
         let mut limited = reader.take(chunk_size);
         let copy_bytes = tokio::io::copy(&mut limited, &mut chunk_writer).await?;
@@ -671,7 +744,7 @@ impl NamedLocalStore {
                 chunk_size, copy_bytes
             )));
         }
-        self.complete_chunk_writer_impl(chunk_id).await?;
+        self.complete_chunk_writer(chunk_id).await?;
         Ok(())
     }
 
@@ -695,25 +768,22 @@ impl NamedLocalStore {
                 ChunkId::from_hash_result(&hash_bytes, chunk_id.chunk_type.clone())
             };
             if verify_id != *chunk_id {
-                warn!(
-                    "put_chunk: chunk_id not equal hash_bytes! {}",
-                    chunk_id.to_string()
-                );
-                return Err(NdnError::InvalidId(format!(
-                    "chunk_id not equal hash_bytes! {}",
-                    chunk_id.to_string()
+                return Err(NdnError::VerifyError(format!(
+                    "verify chunk failed! expected:{} actual:{}",
+                    chunk_id.to_string(),
+                    verify_id.to_string()
                 )));
             }
         }
 
         let mut chunk_writer = self
-            .open_new_chunk_writer_impl(chunk_id, chunk_data.len() as u64)
+            .open_new_chunk_writer(chunk_id, chunk_data.len() as u64)
             .await?;
         chunk_writer.write_all(chunk_data).await.map_err(|e| {
             warn!("put_chunk: write file failed! {}", e.to_string());
             NdnError::IoError(e.to_string())
         })?;
-        self.complete_chunk_writer_impl(chunk_id).await?;
+        self.complete_chunk_writer(chunk_id).await?;
 
         Ok(())
     }
@@ -725,6 +795,30 @@ impl NamedLocalStore {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    fn value_to_obj_id(value: &Value) -> NdnResult<ObjId> {
+        match value {
+            Value::String(v) => ObjId::new(v),
+            Value::Object(map) => {
+                if let Some(Value::String(v)) = map.get("obj_id") {
+                    return ObjId::new(v);
+                }
+
+                if let Ok(obj_id) = serde_json::from_value::<ObjId>(value.clone()) {
+                    return Ok(obj_id);
+                }
+
+                Err(NdnError::InvalidParam(format!(
+                    "cannot convert object value to ObjId: {}",
+                    value
+                )))
+            }
+            _ => Err(NdnError::InvalidParam(format!(
+                "cannot convert value to ObjId: {}",
+                value
+            ))),
         }
     }
 
@@ -797,7 +891,7 @@ impl NamedLocalStore {
     }
 
     fn get_chunk_final_path(&self, chunk_id: &ChunkId) -> PathBuf {
-        let file_name = format!("{}.{}", self.chunk_file_name(chunk_id), CHUNK_FINAL_EXT);
+        let file_name = self.chunk_file_name(chunk_id);
         let prefix = &file_name[0..2.min(file_name.len())];
         self.chunk_dir.join(prefix).join(file_name)
     }
@@ -808,10 +902,47 @@ impl NamedLocalStore {
         self.chunk_dir.join(prefix).join(file_name)
     }
 
-    fn get_cache_mmap_path(&self, chunk_id: &ChunkId) -> Option<PathBuf> {
-        let mmap_dir = self.mmap_cache_dir.as_ref()?;
-        let file_name = self.chunk_file_name(chunk_id);
-        Some(mmap_dir.join(file_name))
+}
+
+struct ConcatChunkReader {
+    readers: Vec<ChunkReader>,
+    current: usize,
+}
+
+impl ConcatChunkReader {
+    fn new(readers: Vec<ChunkReader>) -> Self {
+        Self { readers, current: 0 }
+    }
+}
+
+impl AsyncRead for ConcatChunkReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let this = self.as_mut().get_mut();
+            if this.current >= this.readers.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let before = buf.filled().len();
+            let reader = this.readers.get_mut(this.current).expect("reader index");
+            let mut pinned = Pin::new(reader);
+
+            match pinned.as_mut().poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let after = buf.filled().len();
+                    if after > before {
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.current += 1;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
     }
 }
 
@@ -825,7 +956,7 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{ChunkHasher, MIN_QCID_FILE_SIZE};
+    use ndn_lib::{build_named_object_by_json, ChunkHasher, MIN_QCID_FILE_SIZE, SimpleChunkList};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -849,13 +980,96 @@ mod tests {
         store.put_chunk(&chunk_id, &data, true).await.unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0, false)
             .await
             .unwrap();
         assert_eq!(size, data.len() as u64);
         let mut read_back = Vec::new();
         reader.read_to_end(&mut read_back).await.unwrap();
         assert_eq!(read_back, data);
+    }
+
+    #[tokio::test]
+    async fn test_open_chunklist_reader() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let chunk_a = b"hello ".to_vec();
+        let chunk_b = b"named ".to_vec();
+        let chunk_c = b"store".to_vec();
+        let expected = [chunk_a.as_slice(), chunk_b.as_slice(), chunk_c.as_slice()].concat();
+
+        let chunk_a_id = calc_chunk_id(&chunk_a);
+        let chunk_b_id = calc_chunk_id(&chunk_b);
+        let chunk_c_id = calc_chunk_id(&chunk_c);
+
+        store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
+        store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
+        store.put_chunk(&chunk_c_id, &chunk_c, true).await.unwrap();
+
+        let chunk_list = SimpleChunkList::from_chunk_list(vec![
+            chunk_a_id.clone(),
+            chunk_b_id.clone(),
+            chunk_c_id.clone(),
+        ])
+        .unwrap();
+        let (chunk_list_id, chunk_list_obj) = chunk_list.gen_obj_id();
+        store
+            .put_object(&chunk_list_id, chunk_list_obj.as_str())
+            .await
+            .unwrap();
+
+        let (mut reader, size) = store.open_chunklist_reader(&chunk_list_id, 0).await.unwrap();
+        assert_eq!(size, expected.len() as u64);
+
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).await.unwrap();
+        assert_eq!(read_back, expected);
+    }
+
+    #[tokio::test]
+    async fn test_open_reader_via_inner_path_to_chunklist() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let chunk_a = b"aa".to_vec();
+        let chunk_b = b"bb".to_vec();
+        let expected = [chunk_a.as_slice(), chunk_b.as_slice()].concat();
+
+        let chunk_a_id = calc_chunk_id(&chunk_a);
+        let chunk_b_id = calc_chunk_id(&chunk_b);
+        store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
+        store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
+
+        let chunk_list = SimpleChunkList::from_chunk_list(vec![chunk_a_id, chunk_b_id]).unwrap();
+        let (chunk_list_id, chunk_list_obj) = chunk_list.gen_obj_id();
+        store
+            .put_object(&chunk_list_id, chunk_list_obj.as_str())
+            .await
+            .unwrap();
+
+        let meta = serde_json::json!({
+            "target": chunk_list_id.to_string()
+        });
+        let (meta_obj_id, meta_obj_str) = build_named_object_by_json("meta", &meta);
+        store
+            .put_object(&meta_obj_id, meta_obj_str.as_str())
+            .await
+            .unwrap();
+
+        let (mut reader, size) = store
+            .open_reader(&meta_obj_id, Some("/target".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(size, expected.len() as u64);
+
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).await.unwrap();
+        assert_eq!(read_back, expected);
     }
 
     #[tokio::test]
@@ -887,12 +1101,12 @@ mod tests {
         };
 
         store
-            .add_chunk_by_link_to_local_file_impl(&chunk_id, data.len() as u64, &info)
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
             .await
             .unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0, false)
             .await
             .unwrap();
         assert_eq!(size, data.len() as u64);
@@ -927,12 +1141,12 @@ mod tests {
         };
 
         store
-            .add_chunk_by_link_to_local_file_impl(&chunk_id, data.len() as u64, &info)
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
             .await
             .unwrap();
 
         let err = store
-            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0, false)
             .await
             .err()
             .expect("expected verify error");
@@ -962,12 +1176,12 @@ mod tests {
         };
 
         store
-            .add_chunk_by_link_to_local_file_impl(&chunk_id, data.len() as u64, &info)
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
             .await
             .unwrap();
 
         let err = store
-            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0, false)
             .await
             .err()
             .expect("expected invalid link error");
@@ -994,7 +1208,7 @@ mod tests {
         let chunk_size = data.len() as u64;
 
         let (mut writer, _progress) = store
-            .open_chunk_writer_impl(&chunk_id, chunk_size, 0)
+            .open_chunk_writer(&chunk_id, chunk_size, 0)
             .await
             .unwrap();
 
@@ -1003,15 +1217,15 @@ mod tests {
             writer.write_all(chunk).await.unwrap();
             pos += chunk.len() as u64;
             store
-                .update_chunk_progress_impl(&chunk_id, json!({ "pos": pos }).to_string())
+                .update_chunk_progress(&chunk_id, json!({ "pos": pos }).to_string())
                 .await
                 .unwrap();
         }
         writer.flush().await.unwrap();
-        store.complete_chunk_writer_impl(&chunk_id).await.unwrap();
+        store.complete_chunk_writer(&chunk_id).await.unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0, false)
             .await
             .unwrap();
         assert_eq!(size, chunk_size);

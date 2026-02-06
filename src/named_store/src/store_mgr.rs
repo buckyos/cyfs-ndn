@@ -13,10 +13,58 @@
 use crate::{
     ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalStore, ObjectState, StoreLayout,
 };
-use ndn_lib::{ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult, ObjId};
+use ndn_lib::{
+    ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList,
+    OBJ_TYPE_FILE,
+};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::RwLock;
+use tokio::io::{AsyncRead, ReadBuf};
+
+struct ConcatChunkReader {
+    readers: Vec<ChunkReader>,
+    current: usize,
+}
+
+impl ConcatChunkReader {
+    fn new(readers: Vec<ChunkReader>) -> Self {
+        Self { readers, current: 0 }
+    }
+}
+
+impl AsyncRead for ConcatChunkReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let this = self.as_mut().get_mut();
+            if this.current >= this.readers.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let before = buf.filled().len();
+            let reader = this.readers.get_mut(this.current).expect("reader index");
+            let mut pinned = Pin::new(reader);
+            match pinned.as_mut().poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let after = buf.filled().len();
+                    if after > before {
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.current += 1;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
 pub struct NamedStoreMgr {
     /// Store layouts ordered by epoch (newest first)
@@ -167,7 +215,7 @@ impl NamedStoreMgr {
 
             // Try to get object from this store
             let store_guard = store.lock().await;
-            match store_guard.get_object_impl(obj_id, None).await {
+            match store_guard.get_object(obj_id, None).await {
                 Ok(obj) => return Ok(obj),
                 Err(NdnError::NotFound(_)) => {
                     // NotFound in this store, try next layout version
@@ -230,7 +278,7 @@ impl NamedStoreMgr {
 
                 // Try to get object from this store
                 let store_guard = store.lock().await;
-                match store_guard.get_object_impl(obj_id, None).await {
+                match store_guard.get_object(obj_id, None).await {
                     Ok(obj) => return Ok(obj),
                     Err(NdnError::NotFound(_)) => continue,
                     Err(e) => {
@@ -332,7 +380,7 @@ impl NamedStoreMgr {
             .ok_or_else(|| NdnError::NotFound("no available store for write".to_string()))?;
 
         let store_guard = store.lock().await;
-        store_guard.put_object_impl(obj_id, obj_data).await
+        store_guard.put_object(obj_id, obj_data).await
     }
 
     /// Remove object from all possible layout targets (best-effort)
@@ -358,7 +406,7 @@ impl NamedStoreMgr {
 
             if let Some(store) = stores.get(&target.store_id) {
                 let store_guard = store.lock().await;
-                let _ = store_guard.remove_object_impl(obj_id).await;
+                let _ = store_guard.remove_object(obj_id).await;
             }
         }
 
@@ -396,7 +444,7 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            if store_guard.have_chunk_impl(chunk_id).await {
+            if store_guard.have_chunk(chunk_id).await {
                 return true;
             }
         }
@@ -436,7 +484,7 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            let (state, size, progress) = store_guard.query_chunk_state_impl(chunk_id).await?;
+            let (state, size, progress) = store_guard.query_chunk_state(chunk_id).await?;
             if state != ChunkStoreState::NotExist {
                 return Ok((state, size, progress));
             }
@@ -491,7 +539,7 @@ impl NamedStoreMgr {
 
             let store_guard = store.lock().await;
             match store_guard
-                .open_chunk_reader_impl(chunk_id, offset, auto_cache)
+                .open_chunk_reader(chunk_id, offset, auto_cache)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -515,6 +563,146 @@ impl NamedStoreMgr {
                 chunk_id.to_string()
             ))
         }))
+    }
+
+    /// Open chunklist reader by chunklist object id.
+    pub async fn open_chunklist_reader(
+        &self,
+        chunklist_id: &ObjId,
+        offset: u64,
+        auto_cache: bool,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        if !chunklist_id.is_chunk_list() {
+            return Err(NdnError::InvalidObjType(format!(
+                "{} is not chunklist",
+                chunklist_id.to_string()
+            )));
+        }
+
+        let chunklist_json = self.get_object(chunklist_id).await?;
+        let chunk_list = SimpleChunkList::from_json_value(chunklist_json)
+            .map_err(|e| NdnError::DecodeError(format!("parse chunklist failed: {}", e)))?;
+
+        if offset > chunk_list.total_size {
+            return Err(NdnError::OffsetTooLarge(format!(
+                "{} offset {} > total {}",
+                chunklist_id.to_string(),
+                offset,
+                chunk_list.total_size
+            )));
+        }
+
+        let mut remain_offset = offset;
+        let mut readers: Vec<ChunkReader> = Vec::new();
+        for chunk_id in chunk_list.body.iter() {
+            let chunk_size = chunk_id.get_length().ok_or_else(|| {
+                NdnError::InvalidData(format!(
+                    "chunk {} has no encoded length in chunklist {}",
+                    chunk_id.to_string(),
+                    chunklist_id.to_string()
+                ))
+            })?;
+
+            if remain_offset >= chunk_size {
+                remain_offset -= chunk_size;
+                continue;
+            }
+
+            let chunk_offset = remain_offset;
+            remain_offset = 0;
+            let (reader, _) = self
+                .open_chunk_reader(chunk_id, chunk_offset, auto_cache)
+                .await?;
+            readers.push(reader);
+        }
+
+        if readers.is_empty() {
+            return Ok((Box::pin(tokio::io::empty()), chunk_list.total_size));
+        }
+
+        Ok((
+            Box::pin(ConcatChunkReader::new(readers)),
+            chunk_list.total_size,
+        ))
+    }
+
+    /// Compatibility alias for typo-ed API name.
+    pub async fn open_chunklist_rader(
+        &self,
+        chunklist_id: &ObjId,
+        offset: u64,
+        auto_cache: bool,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        self.open_chunklist_reader(chunklist_id, offset, auto_cache)
+            .await
+    }
+
+    /// Open a generic reader by object id and optional inner path.
+    pub async fn open_reader(
+        &self,
+        obj_id: &ObjId,
+        inner_obj_path: Option<String>,
+        auto_cache: bool,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        let mut current_obj_id = obj_id.clone();
+        let mut current_inner_path = inner_obj_path;
+        let mut size_override: Option<u64> = None;
+
+        loop {
+            if current_obj_id.is_chunk() {
+                if current_inner_path.is_some() {
+                    return Err(NdnError::InvalidObjType(format!(
+                        "{} is chunk, no inner_obj_path",
+                        current_obj_id.to_string()
+                    )));
+                }
+
+                let chunk_id = ChunkId::from_obj_id(&current_obj_id);
+                let (reader, size) = self.open_chunk_reader(&chunk_id, 0, auto_cache).await?;
+                return Ok((reader, size_override.unwrap_or(size)));
+            }
+
+            if current_obj_id.is_chunk_list() {
+                if current_inner_path.is_some() {
+                    return Err(NdnError::InvalidObjType(format!(
+                        "{} is chunklist, no inner_obj_path",
+                        current_obj_id.to_string()
+                    )));
+                }
+
+                let (reader, size) = self
+                    .open_chunklist_reader(&current_obj_id, 0, auto_cache)
+                    .await?;
+                return Ok((reader, size_override.unwrap_or(size)));
+            }
+
+            if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
+                let obj_json = self.get_object(&current_obj_id).await?;
+                let file_obj: FileObject = serde_json::from_value(obj_json)
+                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                if file_obj.content.is_empty() {
+                    return Err(NdnError::InvalidData(format!(
+                        "file {} content is empty",
+                        current_obj_id.to_string()
+                    )));
+                }
+                if file_obj.size > 0 {
+                    size_override = Some(file_obj.size);
+                }
+                current_obj_id = ObjId::new(file_obj.content.as_str())?;
+                continue;
+            }
+
+            let inner_path = current_inner_path.take().ok_or_else(|| {
+                NdnError::InvalidObjType(format!(
+                    "{} is object, can't open reader without inner_obj_path",
+                    current_obj_id.to_string()
+                ))
+            })?;
+            let obj_json = self.get_object(&current_obj_id).await?;
+            let path_to = Self::extract_json_by_path(&obj_json, inner_path.as_str())?;
+            current_obj_id = Self::value_to_obj_id(&path_to)?;
+        }
     }
 
     /// Remove chunk from all possible layout targets (best-effort)
@@ -541,85 +729,16 @@ impl NamedStoreMgr {
 
             if let Some(store) = stores.get(&target.store_id) {
                 let store_guard = store.lock().await;
-                let _ = store_guard.remove_chunk_impl(chunk_id).await;
+                let _ = store_guard.remove_chunk(chunk_id).await;
             }
         }
 
         Ok(())
     }
 
-    /// Open store chunk reader (tries all layout versions)
-    pub async fn open_store_chunk_reader(
-        &self,
-        chunk_id: &ChunkId,
-        offset: u64,
-    ) -> NdnResult<(ChunkReader, u64)> {
-        let obj_id = chunk_id.to_obj_id();
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-
-        if versions.is_empty() {
-            return Err(NdnError::NotFound(
-                "no layout versions available".to_string(),
-            ));
-        }
-
-        let mut last_error: Option<NdnError> = None;
-        let mut tried_stores: Vec<String> = Vec::new();
-
-        for version in versions.iter() {
-            let target = match version.layout.select_primary_target(&obj_id) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if tried_stores.contains(&target.store_id) {
-                continue;
-            }
-            tried_stores.push(target.store_id.clone());
-
-            let store = match stores.get(&target.store_id) {
-                Some(s) => s,
-                None => {
-                    last_error = Some(NdnError::NotFound(format!(
-                        "store {} not registered",
-                        target.store_id
-                    )));
-                    continue;
-                }
-            };
-
-            let store_guard = store.lock().await;
-            match store_guard
-                .open_store_chunk_reader_impl(chunk_id, offset)
-                .await
-            {
-                Ok(result) => return Ok(result),
-                Err(NdnError::NotFound(_)) | Err(NdnError::InComplete(_)) => {
-                    last_error = Some(NdnError::NotFound(format!(
-                        "chunk not found in store {}",
-                        target.store_id
-                    )));
-                    continue;
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            NdnError::NotFound(format!(
-                "chunk {} not found in any store",
-                chunk_id.to_string()
-            ))
-        }))
-    }
-
     /// Get chunk data (tries all layout versions)
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
-        let (mut chunk_reader, chunk_size) = self.open_store_chunk_reader(chunk_id, 0).await?;
+        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         use tokio::io::AsyncReadExt;
         chunk_reader
@@ -636,7 +755,7 @@ impl NamedStoreMgr {
         offset: u64,
         piece_size: u32,
     ) -> NdnResult<Vec<u8>> {
-        let (mut reader, chunk_size) = self.open_store_chunk_reader(chunk_id, offset).await?;
+        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, offset, false).await?;
         if offset > chunk_size {
             return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
         }
@@ -666,7 +785,7 @@ impl NamedStoreMgr {
 
         let store_guard = store.lock().await;
         store_guard
-            .open_chunk_writer_impl(chunk_id, chunk_size, offset)
+            .open_chunk_writer(chunk_id, chunk_size, offset)
             .await
     }
 
@@ -684,7 +803,7 @@ impl NamedStoreMgr {
 
         let store_guard = store.lock().await;
         store_guard
-            .open_new_chunk_writer_impl(chunk_id, chunk_size)
+            .open_new_chunk_writer(chunk_id, chunk_size)
             .await
     }
 
@@ -728,10 +847,10 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            let (chunk_state, _, _) = store_guard.query_chunk_state_impl(chunk_id).await?;
+            let (chunk_state, _, _) = store_guard.query_chunk_state(chunk_id).await?;
             if chunk_state == ChunkStoreState::Incompleted {
                 return store_guard
-                    .update_chunk_progress_impl(chunk_id, progress)
+                    .update_chunk_progress(chunk_id, progress)
                     .await;
             }
         }
@@ -767,9 +886,9 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            let (chunk_state, _, _) = store_guard.query_chunk_state_impl(chunk_id).await?;
+            let (chunk_state, _, _) = store_guard.query_chunk_state(chunk_id).await?;
             if chunk_state == ChunkStoreState::Incompleted {
-                return store_guard.complete_chunk_writer_impl(chunk_id).await;
+                return store_guard.complete_chunk_writer(chunk_id).await;
             }
         }
 
@@ -794,7 +913,7 @@ impl NamedStoreMgr {
 
         let store_guard = store.lock().await;
         store_guard
-            .put_chunk_by_reader_impl(chunk_id, chunk_size, reader)
+            .put_chunk_by_reader(chunk_id, chunk_size, reader)
             .await
     }
 
@@ -832,7 +951,7 @@ impl NamedStoreMgr {
 
         let store_guard = store.lock().await;
         store_guard
-            .add_chunk_by_link_to_local_file_impl(chunk_id, chunk_size, chunk_local_info)
+            .add_chunk_by_link_to_local_file(chunk_id, chunk_size, chunk_local_info)
             .await
     }
 
@@ -886,6 +1005,58 @@ impl NamedStoreMgr {
         }
 
         None
+    }
+
+    fn value_to_obj_id(value: &Value) -> NdnResult<ObjId> {
+        match value {
+            Value::String(v) => ObjId::new(v),
+            Value::Object(map) => {
+                if let Some(Value::String(v)) = map.get("obj_id") {
+                    return ObjId::new(v);
+                }
+
+                if let Ok(obj_id) = serde_json::from_value::<ObjId>(value.clone()) {
+                    return Ok(obj_id);
+                }
+
+                Err(NdnError::InvalidParam(format!(
+                    "cannot convert object value to ObjId: {}",
+                    value
+                )))
+            }
+            _ => Err(NdnError::InvalidParam(format!(
+                "cannot convert value to ObjId: {}",
+                value
+            ))),
+        }
+    }
+
+    fn extract_json_by_path(value: &Value, path: &str) -> NdnResult<Value> {
+        let mut current = value;
+        for segment in path.split('/') {
+            if segment.is_empty() {
+                continue;
+            }
+            current = match current {
+                Value::Object(map) => map
+                    .get(segment)
+                    .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?,
+                Value::Array(list) => {
+                    let index: usize = segment.parse().map_err(|_| {
+                        NdnError::InvalidParam(format!("invalid array index: {}", segment))
+                    })?;
+                    list.get(index)
+                        .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?
+                }
+                _ => {
+                    return Err(NdnError::NotFound(format!(
+                        "inner path not found: {}",
+                        path
+                    )))
+                }
+            };
+        }
+        Ok(current.clone())
     }
 }
 
