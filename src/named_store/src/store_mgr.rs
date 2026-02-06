@@ -11,7 +11,8 @@
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
 use crate::{
-    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalStore, ObjectState, StoreLayout,
+    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalStore, ObjectState,
+    SimpleChunkListReader, StoreLayout,
 };
 use ndn_lib::{
     ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList,
@@ -19,60 +20,17 @@ use ndn_lib::{
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use tokio::sync::RwLock;
-use tokio::io::{AsyncRead, ReadBuf};
-
-struct ConcatChunkReader {
-    readers: Vec<ChunkReader>,
-    current: usize,
-}
-
-impl ConcatChunkReader {
-    fn new(readers: Vec<ChunkReader>) -> Self {
-        Self { readers, current: 0 }
-    }
-}
-
-impl AsyncRead for ConcatChunkReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let this = self.as_mut().get_mut();
-            if this.current >= this.readers.len() {
-                return Poll::Ready(Ok(()));
-            }
-
-            let before = buf.filled().len();
-            let reader = this.readers.get_mut(this.current).expect("reader index");
-            let mut pinned = Pin::new(reader);
-            match pinned.as_mut().poll_read(cx, buf) {
-                Poll::Ready(Ok(())) => {
-                    let after = buf.filled().len();
-                    if after > before {
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.current += 1;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
+ 
+#[derive(Clone)]
 pub struct NamedStoreMgr {
     /// Store layouts ordered by epoch (newest first)
     /// Maximum 3 versions: [current, previous, oldest]
-    versions: RwLock<Vec<LayoutVersion>>,
+    versions: Arc<RwLock<Vec<LayoutVersion>>>,
 
     /// Store instances keyed by store_id
-    stores: RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>,
+    stores: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>>,
 
     /// Maximum number of layout versions to keep
     max_versions: usize,
@@ -82,8 +40,8 @@ impl NamedStoreMgr {
     /// Create a new NamedStoreMgr
     pub fn new() -> Self {
         Self {
-            versions: RwLock::new(Vec::new()),
-            stores: RwLock::new(HashMap::new()),
+            versions: Arc::new(RwLock::new(Vec::new())),
+            stores: Arc::new(RwLock::new(HashMap::new())),
             max_versions: 3,
         }
     }
@@ -91,8 +49,8 @@ impl NamedStoreMgr {
     /// Create with custom max versions
     pub fn with_max_versions(max_versions: usize) -> Self {
         Self {
-            versions: RwLock::new(Vec::new()),
-            stores: RwLock::new(HashMap::new()),
+            versions: Arc::new(RwLock::new(Vec::new())),
+            stores: Arc::new(RwLock::new(HashMap::new())),
             max_versions: max_versions.max(1),
         }
     }
@@ -583,47 +541,16 @@ impl NamedStoreMgr {
         let chunk_list = SimpleChunkList::from_json_value(chunklist_json)
             .map_err(|e| NdnError::DecodeError(format!("parse chunklist failed: {}", e)))?;
 
-        if offset > chunk_list.total_size {
-            return Err(NdnError::OffsetTooLarge(format!(
-                "{} offset {} > total {}",
-                chunklist_id.to_string(),
-                offset,
-                chunk_list.total_size
-            )));
-        }
+        let total_size = chunk_list.total_size;
+        let reader = SimpleChunkListReader::new(
+            Arc::new(self.clone()),
+            chunk_list,
+            std::io::SeekFrom::Start(offset),
+            auto_cache,
+        )
+        .await?;
 
-        let mut remain_offset = offset;
-        let mut readers: Vec<ChunkReader> = Vec::new();
-        for chunk_id in chunk_list.body.iter() {
-            let chunk_size = chunk_id.get_length().ok_or_else(|| {
-                NdnError::InvalidData(format!(
-                    "chunk {} has no encoded length in chunklist {}",
-                    chunk_id.to_string(),
-                    chunklist_id.to_string()
-                ))
-            })?;
-
-            if remain_offset >= chunk_size {
-                remain_offset -= chunk_size;
-                continue;
-            }
-
-            let chunk_offset = remain_offset;
-            remain_offset = 0;
-            let (reader, _) = self
-                .open_chunk_reader(chunk_id, chunk_offset, auto_cache)
-                .await?;
-            readers.push(reader);
-        }
-
-        if readers.is_empty() {
-            return Ok((Box::pin(tokio::io::empty()), chunk_list.total_size));
-        }
-
-        Ok((
-            Box::pin(ConcatChunkReader::new(readers)),
-            chunk_list.total_size,
-        ))
+        Ok((Box::pin(reader), total_size))
     }
 
     /// Compatibility alias for typo-ed API name.

@@ -3,19 +3,17 @@ use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
     caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError,
-    NdnResult, ObjId, SimpleChunkList, OBJ_TYPE_FILE,
+    NdnResult, ObjId, OBJ_TYPE_FILE,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const CONFIG_FILE_NAME: &str = "named_store.json";
 const DEFAULT_DB_FILE: &str = "named_store.db";
@@ -279,14 +277,10 @@ impl NamedLocalStore {
             }
 
             if current_obj_id.is_chunk_list() {
-                if current_inner_path.is_some() {
-                    return Err(NdnError::InvalidObjType(format!(
-                        "{} is chunklist, no inner_obj_path",
-                        current_obj_id
-                    )));
-                }
-                let (reader, size) = self.open_chunklist_reader(&current_obj_id, 0).await?;
-                return Ok((reader, size_override.unwrap_or(size)));
+                return Err(NdnError::Unsupported(format!(
+                    "open chunklist in local store is not supported, use NamedStoreMgr::open_chunklist_reader: {}",
+                    current_obj_id
+                )));
             }
 
             if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
@@ -405,68 +399,6 @@ impl NamedLocalStore {
                 chunk_item.chunk_state.to_str()
             ))),
         }
-    }
-
-    pub async fn open_chunklist_reader(
-        &self,
-        chunklist_id: &ObjId,
-        offset: u64,
-    ) -> NdnResult<(ChunkReader, u64)> {
-        if !chunklist_id.is_chunk_list() {
-            return Err(NdnError::InvalidObjType(format!(
-                "{} is not a chunklist",
-                chunklist_id
-            )));
-        }
-
-        let (_obj_type, obj_str) = self.db.get_object(chunklist_id).map_err(|e| {
-            if e.is_not_found() {
-                NdnError::NotFound(chunklist_id.to_string())
-            } else {
-                e
-            }
-        })?;
-        let chunk_list = SimpleChunkList::from_json(&obj_str)
-            .map_err(|e| NdnError::DecodeError(format!("parse chunklist failed: {}", e)))?;
-
-        if offset > chunk_list.total_size {
-            return Err(NdnError::OffsetTooLarge(format!(
-                "{} offset {} > total {}",
-                chunklist_id, offset, chunk_list.total_size
-            )));
-        }
-
-        let mut remain_offset = offset;
-        let mut readers: Vec<ChunkReader> = Vec::new();
-
-        for chunk_id in chunk_list.body.iter() {
-            let chunk_size = chunk_id.get_length().ok_or_else(|| {
-                NdnError::InvalidData(format!(
-                    "chunk {} has no encoded length for simple chunklist {}",
-                    chunk_id.to_string(),
-                    chunklist_id
-                ))
-            })?;
-
-            if remain_offset >= chunk_size {
-                remain_offset -= chunk_size;
-                continue;
-            }
-
-            let chunk_offset = remain_offset;
-            remain_offset = 0;
-            let (reader, _) = self.open_chunk_reader(chunk_id, chunk_offset, false).await?;
-            readers.push(reader);
-        }
-
-        if readers.is_empty() {
-            return Ok((Box::pin(tokio::io::empty()), chunk_list.total_size));
-        }
-
-        Ok((
-            Box::pin(ConcatChunkReader::new(readers)),
-            chunk_list.total_size,
-        ))
     }
 
     pub async fn open_chunk_writer(
@@ -904,48 +836,6 @@ impl NamedLocalStore {
 
 }
 
-struct ConcatChunkReader {
-    readers: Vec<ChunkReader>,
-    current: usize,
-}
-
-impl ConcatChunkReader {
-    fn new(readers: Vec<ChunkReader>) -> Self {
-        Self { readers, current: 0 }
-    }
-}
-
-impl AsyncRead for ConcatChunkReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let this = self.as_mut().get_mut();
-            if this.current >= this.readers.len() {
-                return Poll::Ready(Ok(()));
-            }
-
-            let before = buf.filled().len();
-            let reader = this.readers.get_mut(this.current).expect("reader index");
-            let mut pinned = Pin::new(reader);
-
-            match pinned.as_mut().poll_read(cx, buf) {
-                Poll::Ready(Ok(())) => {
-                    let after = buf.filled().len();
-                    if after > before {
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.current += 1;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
-
 fn current_unix_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -990,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_chunklist_reader() {
+    async fn test_local_store_open_chunklist_reader_unsupported() {
         let temp_dir = TempDir::new().unwrap();
         let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
@@ -999,7 +889,6 @@ mod tests {
         let chunk_a = b"hello ".to_vec();
         let chunk_b = b"named ".to_vec();
         let chunk_c = b"store".to_vec();
-        let expected = [chunk_a.as_slice(), chunk_b.as_slice(), chunk_c.as_slice()].concat();
 
         let chunk_a_id = calc_chunk_id(&chunk_a);
         let chunk_b_id = calc_chunk_id(&chunk_b);
@@ -1021,16 +910,16 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut reader, size) = store.open_chunklist_reader(&chunk_list_id, 0).await.unwrap();
-        assert_eq!(size, expected.len() as u64);
-
-        let mut read_back = Vec::new();
-        reader.read_to_end(&mut read_back).await.unwrap();
-        assert_eq!(read_back, expected);
+        let err = store
+            .open_reader(&chunk_list_id, None)
+            .await
+            .err()
+            .expect("expected unsupported error");
+        assert!(matches!(err, NdnError::Unsupported(_)));
     }
 
     #[tokio::test]
-    async fn test_open_reader_via_inner_path_to_chunklist() {
+    async fn test_open_reader_via_inner_path_to_chunklist_unsupported() {
         let temp_dir = TempDir::new().unwrap();
         let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
@@ -1038,7 +927,6 @@ mod tests {
 
         let chunk_a = b"aa".to_vec();
         let chunk_b = b"bb".to_vec();
-        let expected = [chunk_a.as_slice(), chunk_b.as_slice()].concat();
 
         let chunk_a_id = calc_chunk_id(&chunk_a);
         let chunk_b_id = calc_chunk_id(&chunk_b);
@@ -1061,15 +949,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut reader, size) = store
+        let err = store
             .open_reader(&meta_obj_id, Some("/target".to_string()))
             .await
-            .unwrap();
-        assert_eq!(size, expected.len() as u64);
-
-        let mut read_back = Vec::new();
-        reader.read_to_end(&mut read_back).await.unwrap();
-        assert_eq!(read_back, expected);
+            .err()
+            .expect("expected unsupported error");
+        assert!(matches!(err, NdnError::Unsupported(_)));
     }
 
     #[tokio::test]

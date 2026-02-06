@@ -4,9 +4,7 @@
 //! a unified file/directory namespace with overlay semantics.
 
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use fs_buffer::{FileBufferSeekWriter, FileBufferService};
 use named_store::{
@@ -18,7 +16,7 @@ use ndn_lib::{
     SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, MoveOptions, NodeKind, NodeRecord,
@@ -72,55 +70,6 @@ pub struct ReadOptions {
 
 /// Inner path for accessing content within an object
 pub type InnerPath = String;
-
-// ------------------------------
-// Composite Readers
-// ------------------------------
-
-struct ConcatChunkReader {
-    readers: Vec<ndn_lib::ChunkReader>,
-    current: usize,
-}
-
-impl ConcatChunkReader {
-    fn new(readers: Vec<ndn_lib::ChunkReader>) -> Self {
-        Self { readers, current: 0 }
-    }
-}
-
-impl AsyncRead for ConcatChunkReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        loop {
-            let this = self.as_mut().get_mut();
-            if this.current >= this.readers.len() {
-                return Poll::Ready(Ok(()));
-            }
-
-            let before = buf.filled().len();
-            let reader = this
-                .readers
-                .get_mut(this.current)
-                .expect("reader index");
-            let mut pinned = Pin::new(reader);
-            match pinned.as_mut().poll_read(cx, buf) {
-                Poll::Ready(Ok(())) => {
-                    let after = buf.filled().len();
-                    if after > before {
-                        return Poll::Ready(Ok(()));
-                    }
-                    this.current += 1;
-                    continue;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-    }
-}
 
 // ------------------------------
 // Move-related types
@@ -600,73 +549,13 @@ impl NamedDataMgr {
                 Ok((Box::new(reader), 0))
             }
             crate::OpenFileReaderResp::Object(obj_id, inner_path) => {
-                self.open_reader_by_id(&obj_id, inner_path.as_ref(), ReadOptions::default())
-                    .await
+                let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+                    NdnError::NotFound("store layout manager not configured".to_string())
+                })?;
+                let (reader, size) = layout_mgr.open_reader(&obj_id, inner_path, false).await?;
+                Ok((Box::new(reader), size))
             }
         }
-    }
-
-    //move to store_layout_mgr
-    pub async fn open_reader_by_id(
-        &self,
-        obj_id: &ObjId,
-        _inner_path: Option<&InnerPath>,
-        _opts: ReadOptions,
-    ) -> NdnResult<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, u64)> {
-        if obj_id.is_chunk() {
-            let chunk_id = ChunkId::from_obj_id(obj_id);
-            let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
-                NdnError::NotFound("store layout manager not configured".to_string())
-            })?;
-            let (reader, size) = layout_mgr.open_chunk_reader(&chunk_id, 0, false).await?;
-            return Ok((Box::new(reader), size));
-        }
-
-        if obj_id.obj_type == OBJ_TYPE_FILE {
-            let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
-                NdnError::NotFound("store layout manager not configured".to_string())
-            })?;
-            let file_obj = self.load_file_object(obj_id).await?;
-            let content_id = ObjId::new(file_obj.content.as_str())?;
-
-            if content_id.is_chunk() {
-                let chunk_id = ChunkId::from_obj_id(&content_id);
-                let (reader, size) = layout_mgr.open_chunk_reader(&chunk_id, 0, false).await?;
-                let size = if file_obj.size > 0 { file_obj.size } else { size };
-                return Ok((Box::new(reader), size));
-            }
-
-            if content_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
-                let chunk_list = self.load_chunk_list(&content_id).await?;
-                let mut readers = Vec::with_capacity(chunk_list.body.len());
-                for chunk_id in chunk_list.body.iter() {
-                    let (reader, _) = layout_mgr.open_chunk_reader(chunk_id, 0, false).await?;
-                    readers.push(reader);
-                }
-                let size = if file_obj.size > 0 {
-                    file_obj.size
-                } else {
-                    chunk_list.total_size
-                };
-                let reader = ConcatChunkReader::new(readers);
-                return Ok((Box::new(reader), size));
-            }
-
-            return Err(NdnError::Unsupported(format!(
-                "unsupported file content type: {}",
-                content_id.obj_type
-            )));
-        }
-
-        if obj_id.obj_type == OBJ_TYPE_DIR {
-            return Err(NdnError::InvalidParam(
-                "directory object is not readable".to_string(),
-            ));
-        }
-
-        Err(NdnError::Unsupported(
-            "non-chunk object reading not implemented".to_string(),
-        ))
     }
 
     pub async fn get_object_by_path(&self, path: &NdmPath) -> NdnResult<String> {
