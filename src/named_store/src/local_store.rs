@@ -1,4 +1,4 @@
-use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkState, NamedLocalStoreDB};
+use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
 use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
@@ -69,9 +69,9 @@ impl NamedLocalStore {
                 "NamedLocalStore: create base dir:{}",
                 root_path.to_string_lossy()
             );
-            fs::create_dir_all(root_path.clone()).await.map_err(|e| {
-                NdnError::IoError(format!("create base dir failed: {}", e))
-            })?;
+            fs::create_dir_all(root_path.clone())
+                .await
+                .map_err(|e| NdnError::IoError(format!("create base dir failed: {}", e)))?;
         }
         let mgr_id = root_path
             .file_name()
@@ -82,14 +82,14 @@ impl NamedLocalStore {
         let mgr_json_file = root_path.join(CONFIG_FILE_NAME);
         let mgr_config = if !mgr_json_file.exists() {
             let config = NamedLocalConfig::default();
-            let mgr_json_str = serde_json::to_string(&config)
-                .map_err(|e| NdnError::Internal(e.to_string()))?;
-            let mut file = File::create(mgr_json_file.clone()).await.map_err(|e| {
-                NdnError::IoError(format!("create config failed: {}", e))
-            })?;
-            file.write_all(mgr_json_str.as_bytes()).await.map_err(|e| {
-                NdnError::IoError(format!("write config failed: {}", e))
-            })?;
+            let mgr_json_str =
+                serde_json::to_string(&config).map_err(|e| NdnError::Internal(e.to_string()))?;
+            let mut file = File::create(mgr_json_file.clone())
+                .await
+                .map_err(|e| NdnError::IoError(format!("create config failed: {}", e)))?;
+            file.write_all(mgr_json_str.as_bytes())
+                .await
+                .map_err(|e| NdnError::IoError(format!("write config failed: {}", e)))?;
             config
         } else {
             let mgr_json_str = fs::read_to_string(&mgr_json_file).await.map_err(|e| {
@@ -136,9 +136,9 @@ impl NamedLocalStore {
             .unwrap_or_else(|| root_path.join(CHUNK_DIR_NAME));
 
         if !read_only {
-            fs::create_dir_all(&chunk_dir).await.map_err(|e| {
-                NdnError::IoError(format!("create chunk dir failed: {}", e))
-            })?;
+            fs::create_dir_all(&chunk_dir)
+                .await
+                .map_err(|e| NdnError::IoError(format!("create chunk dir failed: {}", e)))?;
         }
 
         let db = Arc::new(NamedLocalStoreDB::new(
@@ -146,7 +146,12 @@ impl NamedLocalStore {
         )?);
 
         let store_id = store_id
-            .or_else(|| root_path.file_name().and_then(|name| name.to_str()).map(|s| s.to_string()))
+            .or_else(|| {
+                root_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_else(|| "default".to_string());
 
         let store = NamedLocalStore {
@@ -159,9 +164,9 @@ impl NamedLocalStore {
         };
 
         let mut registry = STORE_REGISTRY.lock().unwrap();
-        registry.entry(store_id).or_insert_with(|| {
-            Arc::new(tokio::sync::Mutex::new(store.clone()))
-        });
+        registry
+            .entry(store_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(store.clone())));
 
         Ok(store)
     }
@@ -199,8 +204,8 @@ impl NamedLocalStore {
             }
         })?;
 
-        let json_value: Value = serde_json::from_str(&obj_str)
-            .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+        let json_value: Value =
+            serde_json::from_str(&obj_str).map_err(|e| NdnError::DecodeError(e.to_string()))?;
 
         if let Some(inner_path) = inner_obj_path {
             self.extract_json_by_path(&json_value, inner_path.as_str())
@@ -211,7 +216,8 @@ impl NamedLocalStore {
 
     pub async fn put_object_impl(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
         self.ensure_writable()?;
-        self.db.set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
+        self.db
+            .set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
     }
 
     async fn get_chunk_item_impl(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
@@ -230,7 +236,7 @@ impl NamedLocalStore {
     pub async fn query_chunk_state_impl(
         &self,
         chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkState, u64, String)> {
+    ) -> NdnResult<(ChunkStoreState, u64, String)> {
         let chunk_item = self.get_chunk_item_impl(chunk_id).await;
         if let Ok(chunk_item) = chunk_item {
             Ok((
@@ -239,7 +245,7 @@ impl NamedLocalStore {
                 chunk_item.progress,
             ))
         } else {
-            Ok((ChunkState::NotExist, 0, String::new()))
+            Ok((ChunkStoreState::NotExist, 0, String::new()))
         }
     }
 
@@ -249,7 +255,7 @@ impl NamedLocalStore {
         offset: u64,
     ) -> NdnResult<(ChunkReader, u64)> {
         let (chunk_state, chunk_size, _progress) = self.query_chunk_state_impl(chunk_id).await?;
-        if chunk_state != ChunkState::Completed {
+        if chunk_state != ChunkStoreState::Completed {
             return Err(NdnError::InComplete(format!(
                 "chunk {} state not support open reader! state:{}",
                 chunk_id.to_string(),
@@ -290,9 +296,10 @@ impl NamedLocalStore {
     ) -> NdnResult<(ChunkReader, u64)> {
         if let Some(mcache_file_path) = self.get_cache_mmap_path(chunk_id) {
             if let Ok(mut file) = OpenOptions::new().read(true).open(&mcache_file_path).await {
-                let file_meta = file.metadata().await.map_err(|e| {
-                    NdnError::IoError(format!("read cache metadata failed: {}", e))
-                })?;
+                let file_meta = file
+                    .metadata()
+                    .await
+                    .map_err(|e| NdnError::IoError(format!("read cache metadata failed: {}", e)))?;
                 if offset > 0 {
                     file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
                         warn!(
@@ -308,7 +315,7 @@ impl NamedLocalStore {
 
         let chunk_item = self.get_chunk_item_impl(chunk_id).await?;
         match chunk_item.chunk_state {
-            ChunkState::Completed => {
+            ChunkStoreState::Completed => {
                 let chunk_real_path = self.get_chunk_final_path(&chunk_item.chunk_id);
                 let mut file = OpenOptions::new()
                     .read(true)
@@ -323,14 +330,17 @@ impl NamedLocalStore {
                         return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
                     }
                     file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                        warn!("open_chunk_reader: seek chunk file failed! {}", e.to_string());
+                        warn!(
+                            "open_chunk_reader: seek chunk file failed! {}",
+                            e.to_string()
+                        );
                         NdnError::IoError(e.to_string())
                     })?;
                 }
                 let limited = file.take(chunk_item.chunk_size - offset);
                 Ok((Box::pin(limited), chunk_item.chunk_size))
             }
-            ChunkState::LocalLink(local_info) => {
+            ChunkStoreState::LocalLink(local_info) => {
                 self.verify_local_link(chunk_id, &local_info).await?;
 
                 let chunk_real_path = PathBuf::from(local_info.path);
@@ -384,11 +394,11 @@ impl NamedLocalStore {
         self.ensure_writable()?;
 
         let chunk_item = self.db.get_chunk_item(chunk_id);
-        let mut chunk_state = ChunkState::NotExist;
+        let mut chunk_state = ChunkStoreState::NotExist;
 
         if let Ok(item) = chunk_item {
             chunk_state = item.chunk_state.clone();
-            if chunk_state == ChunkState::Completed {
+            if chunk_state == ChunkStoreState::Completed {
                 return Err(NdnError::AlreadyExists(format!(
                     "chunk {} already completed",
                     chunk_id.to_string()
@@ -411,14 +421,17 @@ impl NamedLocalStore {
             })?;
         }
 
-        let file = if chunk_state == ChunkState::Incompleted {
+        let file = if chunk_state == ChunkStoreState::Incompleted {
             let file_meta = fs::metadata(&chunk_tmp_path).await.map_err(|e| {
                 warn!("open_chunk_writer: get metadata failed! {}", e.to_string());
                 NdnError::IoError(e.to_string())
             })?;
 
             if offset > file_meta.len() {
-                warn!("open_chunk_writer: offset too large! {}", chunk_id.to_string());
+                warn!(
+                    "open_chunk_writer: offset too large! {}",
+                    chunk_id.to_string()
+                );
                 return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
             }
 
@@ -466,7 +479,7 @@ impl NamedLocalStore {
             Ok(item) => item,
             Err(_) => ChunkItem::new_incompleted(chunk_id, chunk_size),
         };
-        chunk_item.chunk_state = ChunkState::Incompleted;
+        chunk_item.chunk_state = ChunkStoreState::Incompleted;
         if chunk_item.progress.is_empty() {
             chunk_item.progress = serde_json::json!({ "pos": offset }).to_string();
         }
@@ -500,7 +513,10 @@ impl NamedLocalStore {
         }
 
         let file = File::create(&chunk_tmp_path).await.map_err(|e| {
-            warn!("open_new_chunk_writer: create file failed! {}", e.to_string());
+            warn!(
+                "open_new_chunk_writer: create file failed! {}",
+                e.to_string()
+            );
             NdnError::IoError(e.to_string())
         })?;
 
@@ -550,7 +566,7 @@ impl NamedLocalStore {
             NdnError::IoError(e.to_string())
         })?;
 
-        chunk_item.chunk_state = ChunkState::Completed;
+        chunk_item.chunk_state = ChunkStoreState::Completed;
         chunk_item.progress = String::new();
         chunk_item.update_time = current_unix_ts();
         self.db.set_chunk_item(&chunk_item)?;
@@ -578,8 +594,7 @@ impl NamedLocalStore {
     }
 
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
-        let (mut chunk_reader, chunk_size) =
-            self.open_store_chunk_reader_impl(chunk_id, 0).await?;
+        let (mut chunk_reader, chunk_size) = self.open_store_chunk_reader_impl(chunk_id, 0).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         chunk_reader.read_to_end(&mut buffer).await.map_err(|e| {
             warn!("get_chunk_data: read file failed! {}", e.to_string());
@@ -612,7 +627,9 @@ impl NamedLocalStore {
         chunk_size: u64,
         reader: &mut ChunkReader,
     ) -> NdnResult<()> {
-        let mut chunk_writer = self.open_new_chunk_writer_impl(chunk_id, chunk_size).await?;
+        let mut chunk_writer = self
+            .open_new_chunk_writer_impl(chunk_id, chunk_size)
+            .await?;
         let mut limited = reader.take(chunk_size);
         let copy_bytes = tokio::io::copy(&mut limited, &mut chunk_writer).await?;
         if copy_bytes != chunk_size {
@@ -685,9 +702,9 @@ impl NamedLocalStore {
                 continue;
             }
             current = match current {
-                Value::Object(map) => map.get(segment).ok_or_else(|| {
-                    NdnError::NotFound(format!("inner path not found: {}", path))
-                })?,
+                Value::Object(map) => map
+                    .get(segment)
+                    .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?,
                 Value::Array(list) => {
                     let index: usize = segment.parse().map_err(|_| {
                         NdnError::InvalidParam(format!("invalid array index: {}", segment))
@@ -798,7 +815,10 @@ mod tests {
 
         store.put_chunk(&chunk_id, &data, true).await.unwrap();
 
-        let (mut reader, size) = store.open_chunk_reader_impl(&chunk_id, 0, false).await.unwrap();
+        let (mut reader, size) = store
+            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .await
+            .unwrap();
         assert_eq!(size, data.len() as u64);
         let mut read_back = Vec::new();
         reader.read_to_end(&mut read_back).await.unwrap();
@@ -838,7 +858,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut reader, size) = store.open_chunk_reader_impl(&chunk_id, 0, false).await.unwrap();
+        let (mut reader, size) = store
+            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .await
+            .unwrap();
         assert_eq!(size, data.len() as u64);
         let mut read_back = Vec::new();
         reader.read_to_end(&mut read_back).await.unwrap();
@@ -954,7 +977,10 @@ mod tests {
         writer.flush().await.unwrap();
         store.complete_chunk_writer_impl(&chunk_id).await.unwrap();
 
-        let (mut reader, size) = store.open_chunk_reader_impl(&chunk_id, 0, false).await.unwrap();
+        let (mut reader, size) = store
+            .open_chunk_reader_impl(&chunk_id, 0, false)
+            .await
+            .unwrap();
         assert_eq!(size, chunk_size);
 
         let hasher = ChunkHasher::new(None).unwrap();

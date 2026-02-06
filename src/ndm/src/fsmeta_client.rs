@@ -4,12 +4,12 @@
 /// ------------------------------
 use fs_buffer::SessionId;
 use krpc::{kRPC, RPCErrors, RPCHandler, RPCContext,RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::{NdnError, NdnResult, ObjId};
+use ndn_lib::{NdnError, NdnResult, ObjId, NdmPath};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-use crate::NdmPath;
+use crate::OpenWriteFlag;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientSessionId(pub String);
@@ -159,6 +159,19 @@ pub struct DentryRecord {
 /// ------------------------------
 /// FsMeta kRPC Protocol
 /// ------------------------------
+pub enum OpenFileReaderResp {
+    Object(ObjId,Option<String>),
+    FileBufferId(String),
+}
+
+#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
+pub struct MoveOptions {
+    /// Whether to overwrite destination if destination is visible in Upper layer.
+    pub overwrite_upper: bool,
+    /// If true: also check destination Base (merged view no-clobber).
+    /// This requires Base materialized, otherwise NEED_PULL.
+    pub strict_check_base: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsMetaRootDirReq;
@@ -592,6 +605,27 @@ impl FsMetaObjStatDeleteIfZeroReq {
         serde_json::from_value(value).map_err(|e| {
             RPCErrors::ParseRequestError(
                 format!("Failed to parse FsMetaObjStatDeleteIfZeroReq: {}", e),
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaOpenFileWriterReq {
+    pub path: String,
+    pub flag: OpenWriteFlag,
+    pub expected_size: Option<u64>,
+}
+
+impl FsMetaOpenFileWriterReq {
+    pub fn new(path: String, flag: OpenWriteFlag, expected_size: Option<u64>) -> Self {
+        Self { path, flag, expected_size }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(
+                format!("Failed to parse FsMetaOpenFileWriterReq: {}", e),
             )
         })
     }
@@ -1126,6 +1160,164 @@ impl FsMetaClient {
             }
         }
     }
+
+    pub async fn open_file_writer(
+        &self,
+        path: &NdmPath,
+        flag: OpenWriteFlag,
+        expected_size: Option<u64>,
+    ) -> NdnResult<String> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_open_file_writer(path, flag, expected_size, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("open_file_writer failed: {}", e)))
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaOpenFileWriterReq::new(path.0.clone(), flag, expected_size);
+                let req_json = serde_json::to_value(&req)
+                    .map_err(|e| NdnError::Internal(format!("Failed to serialize request: {}", e)))?;
+
+                let result = client
+                    .call("open_file_writer", req_json)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("open_file_writer rpc failed: {}", e)))?;
+                result
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| NdnError::Internal("Expected String result".to_string()))
+            }
+        }
+    }
+
+    pub async fn close_file_writer(&self, file_inode_id: IndexNodeId) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_close_file_writer(file_inode_id, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("close_file_writer failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "close_file_writer is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn open_file_reader(&self, path: &NdmPath) -> NdnResult<OpenFileReaderResp> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_open_file_reader(path.clone(), ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("open_file_reader failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "open_file_reader is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn set_file(&self, path: &NdmPath, obj_id: ObjId) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_set_file(path, obj_id, ctx)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| NdnError::Internal(format!("set_file failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "set_file is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_set_dir(path, dir_obj_id, ctx)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| NdnError::Internal(format!("set_dir failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "set_dir is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn delete(&self, path: &NdmPath) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_delete(path, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("delete failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "delete is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn move_path_with_opts(
+        &self,
+        old_path: &NdmPath,
+        new_path: &NdmPath,
+        opts: MoveOptions,
+    ) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_move_path_with_opts(old_path, new_path, opts, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("move_path failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "move_path is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_make_link(link_path, target, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("make_link failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "make_link is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
+
+    pub async fn create_dir(&self, path: &NdmPath) -> NdnResult<()> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_create_dir(path, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("create_dir failed: {}", e)))
+            }
+            Self::KRPC(_) => Err(NdnError::Unsupported(
+                "create_dir is not supported in kRPC client".to_string(),
+            )),
+        }
+    }
 }
 
 // ========== Kernel : FsMetaHandler ==========
@@ -1249,6 +1441,50 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<bool, RPCErrors>;
+
+    //下面向是业务的高阶接口(减少调用fsmeta rpc的次数)
+    async fn handle_set_file(&self, path: &NdmPath, obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors>;
+
+    async fn handle_set_dir(&self, path: &NdmPath, dir_obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors>;
+
+    async fn handle_delete(&self,path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
+
+    async fn handle_move_path_with_opts(
+        &self,
+        old_path: &NdmPath,
+        new_path: &NdmPath,
+        opts: MoveOptions,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
+
+    async fn handle_make_link(&self,link_path: &NdmPath, target: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
+
+    async fn handle_create_dir(&self, path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
+
+
+    //return FileHandleId,which is a unique identifier for the file buffer
+    async fn handle_open_file_writer(
+        &self,
+        path: &NdmPath,
+        flag: OpenWriteFlag,
+        expected_size: Option<u64>,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors>;
+
+    async fn handle_close_file_writer(
+        &self,
+        file_inode_id: IndexNodeId,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
+
+    //return ObjectId + innerpath or file_buffer_handle_id
+    async fn handle_open_file_reader(
+        &self,
+        path: NdmPath,
+        ctx: RPCContext,
+    ) -> Result<OpenFileReaderResp, RPCErrors>;
+
+
 }
 
 pub struct FsMetaServerHandler<T: FsMetaHandler>(pub T);
@@ -1419,6 +1655,15 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                 let result = self
                     .0
                     .handle_obj_stat_delete_if_zero(req.obj_id, req.txid, ctx)
+                    .await?;
+                RPCResult::Success(serde_json::json!(result))
+            }
+            "open_file_writer" => {
+                let req = FsMetaOpenFileWriterReq::from_json(req.params)?;
+                let path = NdmPath::new(req.path);
+                let result = self
+                    .0
+                    .handle_open_file_writer(&path, req.flag, req.expected_size, ctx)
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
@@ -1833,6 +2078,82 @@ mod tests {
                 state.obj_stats.remove(&obj_id);
             }
             Ok(should_delete)
+        }
+
+        async fn handle_set_file(
+            &self,
+            _path: &NdmPath,
+            _obj_id: ObjId,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            Ok(String::new())
+        }
+
+        async fn handle_set_dir(
+            &self,
+            _path: &NdmPath,
+            _dir_obj_id: ObjId,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            Ok(String::new())
+        }
+
+        async fn handle_delete(&self, _path: &NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_move_path_with_opts(
+            &self,
+            _old_path: &NdmPath,
+            _new_path: &NdmPath,
+            _opts: MoveOptions,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_make_link(
+            &self,
+            _link_path: &NdmPath,
+            _target: &NdmPath,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_create_dir(
+            &self,
+            _path: &NdmPath,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_open_file_writer(
+            &self,
+            _path: &NdmPath,
+            _flag: OpenWriteFlag,
+            _expected_size: Option<u64>,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            // Mock implementation - just return a dummy handle
+            Ok("mock-file-handle".to_string())
+        }
+
+        async fn handle_close_file_writer(
+            &self,
+            _file_inode_id: IndexNodeId,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_open_file_reader(
+            &self,
+            _path: NdmPath,
+            _ctx: RPCContext,
+        ) -> Result<OpenFileReaderResp, RPCErrors> {
+            Err(RPCErrors::ReasonError("not implemented".to_string()))
         }
     }
 

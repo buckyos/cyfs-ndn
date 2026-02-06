@@ -1,13 +1,9 @@
 //store layout从fsmeta下载后，完全保存在本地，select target操作不需要与fsmeta交互
+use crate::NamedLocalStore;
 use name_lib::DID;
-use ndn_lib::ObjId;
+use ndn_lib::{NdnResult, ObjId};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use named_store::NamedLocalStore;
-use ndn_lib::{NdnError, NdnResult};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
 #[derive(Debug, Clone)]
 pub struct StoreTarget {
@@ -22,12 +18,12 @@ pub struct StoreTarget {
 
 /// StoreLayout using Maglev Consistent Hashing for O(1) target selection
 /// with minimal data redistribution when nodes are added/removed.
-/// 
+///
 /// Design based on Google's Maglev paper:
 /// - Each target generates a preference list based on its store_id
 /// - Targets take turns filling slots in a lookup table according to their preferences
 /// - Lookup: hash(obj_id) % table_size -> lookup_table[index] -> target
-/// 
+///
 /// Benefits:
 /// - O(1) lookup performance
 /// - Minimal redistribution: adding 1 node to N nodes only moves ~1/(N+1) of data
@@ -40,15 +36,15 @@ pub struct StoreLayout {
     pub total_capacity: u64,
     pub total_used: u64,
     pub total_weight: u64,
-    
+
     /// Maglev lookup table: lookup_table[hash % M] = target_index
     /// Size M should be a prime number larger than total_weight for good distribution
     /// Using i32 to allow -1 as empty marker during construction
     lookup_table: Vec<i32>,
-    
+
     /// Indices of enabled, non-readonly targets
     active_target_indices: Vec<usize>,
-    
+
     /// Lookup table size (prime number)
     table_size: usize,
 }
@@ -56,13 +52,13 @@ pub struct StoreLayout {
 impl StoreLayout {
     /// Small prime for small clusters (< 1000 total weight)
     const SMALL_TABLE_SIZE: usize = 65537;
-    
+
     /// Medium prime for medium clusters (< 100000 total weight)  
     const MEDIUM_TABLE_SIZE: usize = 655373;
-    
+
     /// Large prime for large clusters
     const LARGE_TABLE_SIZE: usize = 6553577;
-    
+
     /// Choose appropriate table size based on total weight
     /// Table size should be at least 10x total_weight for good distribution
     fn choose_table_size(total_weight: u64) -> usize {
@@ -74,7 +70,7 @@ impl StoreLayout {
             Self::LARGE_TABLE_SIZE
         }
     }
-    
+
     /// Create a new StoreLayout and build the Maglev lookup table
     pub fn new(
         epoch: u64,
@@ -82,13 +78,14 @@ impl StoreLayout {
         total_capacity: u64,
         total_used: u64,
     ) -> Self {
-        let total_weight: u64 = targets.iter()
+        let total_weight: u64 = targets
+            .iter()
             .filter(|t| t.enabled && !t.readonly && t.weight > 0)
             .map(|t| t.weight as u64)
             .sum();
-        
+
         let table_size = Self::choose_table_size(total_weight);
-        
+
         let mut layout = StoreLayout {
             epoch,
             targets,
@@ -99,11 +96,11 @@ impl StoreLayout {
             active_target_indices: Vec::new(),
             table_size,
         };
-        
+
         layout.rebuild_maglev();
         layout
     }
-    
+
     /// Hash a string with a seed to get deterministic but different hash values
     #[inline]
     fn hash_with_seed(s: &str, seed: u64) -> u64 {
@@ -112,9 +109,9 @@ impl StoreLayout {
         s.hash(&mut hasher);
         hasher.finish()
     }
-    
+
     /// Rebuild the Maglev lookup table
-    /// 
+    ///
     /// Algorithm:
     /// 1. For each active target, compute (offset, skip) based on store_id hash
     /// 2. Each target has a preference sequence: offset, offset+skip, offset+2*skip, ...
@@ -122,22 +119,22 @@ impl StoreLayout {
     /// 4. Result: each slot maps to exactly one target
     pub fn rebuild_maglev(&mut self) {
         self.active_target_indices.clear();
-        
+
         // Collect active targets
         for (index, target) in self.targets.iter().enumerate() {
             if target.enabled && !target.readonly && target.weight > 0 {
                 self.active_target_indices.push(index);
             }
         }
-        
+
         let n = self.active_target_indices.len();
         if n == 0 {
             self.lookup_table = Vec::new();
             return;
         }
-        
+
         let m = self.table_size;
-        
+
         // Compute (offset, skip) for each active target
         // offset = h1(store_id) % M
         // skip = h2(store_id) % (M-1) + 1  (must be non-zero)
@@ -146,25 +143,25 @@ impl StoreLayout {
             let target = &self.targets[target_idx];
             let h1 = Self::hash_with_seed(&target.store_id, 0);
             let h2 = Self::hash_with_seed(&target.store_id, 1);
-            
+
             let offset = (h1 % m as u64) as usize;
             let skip = ((h2 % (m as u64 - 1)) + 1) as usize;
-            
+
             permutation_params.push((offset, skip, target.weight));
         }
-        
+
         // Initialize lookup table with -1 (empty)
         let mut table: Vec<i32> = vec![-1; m];
-        
+
         // next[i] = how many steps target i has taken in its preference sequence
         let mut next: Vec<usize> = vec![0; n];
-        
+
         // weight_counter[i] = how many more slots target i should fill this round
         // Used to implement weighted distribution
         let mut weight_counter: Vec<u32> = permutation_params.iter().map(|(_, _, w)| *w).collect();
-        
+
         let mut filled = 0;
-        
+
         // Keep filling until all slots are claimed
         while filled < m {
             // Each round, targets with remaining weight get to fill slots
@@ -174,26 +171,26 @@ impl StoreLayout {
                     continue;
                 }
                 weight_counter[i] -= 1;
-                
+
                 let (offset, skip, _) = permutation_params[i];
-                
+
                 // Find next empty slot in this target's preference sequence
                 let mut pos = (offset + next[i] * skip) % m;
                 while table[pos] != -1 {
                     next[i] += 1;
                     pos = (offset + next[i] * skip) % m;
                 }
-                
+
                 // Claim this slot
                 table[pos] = self.active_target_indices[i] as i32;
                 next[i] += 1;
                 filled += 1;
-                
+
                 if filled == m {
                     break;
                 }
             }
-            
+
             // Reset weight counters for next round
             let all_zero = weight_counter.iter().all(|&w| w == 0);
             if all_zero {
@@ -202,10 +199,10 @@ impl StoreLayout {
                 }
             }
         }
-        
+
         self.lookup_table = table;
     }
-    
+
     /// Fast hash function for ObjId -> u64
     #[inline]
     fn hash_obj_id(obj_id: &ObjId) -> u64 {
@@ -213,9 +210,9 @@ impl StoreLayout {
         obj_id.obj_hash.hash(&mut hasher);
         hasher.finish()
     }
-    
+
     /// O(1) select primary target for a given ObjId using Maglev lookup
-    /// 
+    ///
     /// Algorithm:
     /// 1. hash = hash(obj_id)
     /// 2. index = hash % table_size
@@ -225,31 +222,31 @@ impl StoreLayout {
         if self.lookup_table.is_empty() {
             return None;
         }
-        
+
         let hash = Self::hash_obj_id(obj_id);
         let index = (hash % self.table_size as u64) as usize;
         let target_index = self.lookup_table[index] as usize;
-        
+
         Some(self.targets[target_index].clone())
     }
-    
+
     /// Select up to N targets for a given ObjId
     /// Uses multiple hash probes to get different targets
     pub fn select_n_targets(&self, obj_id: &ObjId, n: usize) -> Vec<StoreTarget> {
         if self.lookup_table.is_empty() {
             return Vec::new();
         }
-        
+
         let n = n.min(self.active_target_indices.len());
         if n == 0 {
             return Vec::new();
         }
-        
+
         let base_hash = Self::hash_obj_id(obj_id);
-        
+
         let mut selected_target_indices: Vec<usize> = Vec::with_capacity(n);
         let mut probe = 0u64;
-        
+
         // Keep probing until we have n unique targets
         while selected_target_indices.len() < n {
             // Mix the probe number with base hash to get different positions
@@ -258,44 +255,44 @@ impl StoreLayout {
             } else {
                 base_hash.wrapping_add(probe.wrapping_mul(0x9e3779b97f4a7c15))
             };
-            
+
             let index = (hash % self.table_size as u64) as usize;
             let target_index = self.lookup_table[index] as usize;
-            
+
             // Only add if not already selected
             if !selected_target_indices.contains(&target_index) {
                 selected_target_indices.push(target_index);
             }
-            
+
             probe += 1;
-            
+
             // Safety: prevent infinite loop
             if probe > self.table_size as u64 + 1000 {
                 break;
             }
         }
-        
+
         selected_target_indices
             .into_iter()
             .map(|idx| self.targets[idx].clone())
             .collect()
     }
-    
+
     /// Select all targets for a given ObjId, ordered by preference
     pub fn select_targets(&self, obj_id: &ObjId) -> Vec<StoreTarget> {
         self.select_n_targets(obj_id, self.active_target_indices.len())
     }
-    
+
     /// Get the lookup table size (for testing/debugging)
     pub fn total_vnodes(&self) -> usize {
         self.table_size
     }
-    
+
     /// Get the number of active targets
     pub fn active_target_count(&self) -> usize {
         self.active_target_indices.len()
     }
-    
+
     /// Get actual lookup table length (for testing)
     pub fn lookup_table_size(&self) -> usize {
         self.lookup_table.len()
@@ -303,23 +300,30 @@ impl StoreLayout {
 }
 
 // ------------------------------
-// StoreLayoutMgr - Multi-version store layout manager
+// NamedStoreMgr - Multi-version store layout manager
 // ------------------------------
-
 
 /// Trait for store provider that can get objects by ObjId
 #[async_trait::async_trait]
 pub trait StoreProvider: Send + Sync {
-    async fn get_object_impl(&self, obj_id: &ObjId, txid: Option<String>) -> NdnResult<serde_json::Value>;
+    async fn get_object_impl(
+        &self,
+        obj_id: &ObjId,
+        txid: Option<String>,
+    ) -> NdnResult<serde_json::Value>;
     fn store_id(&self) -> &str;
 }
 
 #[async_trait::async_trait]
 impl StoreProvider for NamedLocalStore {
-    async fn get_object_impl(&self, obj_id: &ObjId, txid: Option<String>) -> NdnResult<serde_json::Value> {
+    async fn get_object_impl(
+        &self,
+        obj_id: &ObjId,
+        txid: Option<String>,
+    ) -> NdnResult<serde_json::Value> {
         self.get_object_impl(obj_id, txid).await
     }
-    
+
     fn store_id(&self) -> &str {
         self.store_id()
     }
@@ -332,282 +336,17 @@ pub struct LayoutVersion {
     pub layout: StoreLayout,
 }
 
-/// StoreLayoutMgr manages multiple versions of StoreLayout for seamless data migration
-/// 
-/// During layout changes (e.g., adding/removing stores), objects may still exist
-/// in locations determined by older layouts. This manager maintains up to 3 versions:
-/// - versions[0]: current layout (newest)
-/// - versions[1]: previous layout  
-/// - versions[2]: oldest layout being migrated from
-/// 
-/// When getting an object:
-/// 1. Try current layout first
-/// 2. If NotFound, try previous layouts
-/// 3. Return the first successful result or final error
-pub struct StoreLayoutMgr {
-    /// Store layouts ordered by epoch (newest first)
-    /// Maximum 3 versions: [current, previous, oldest]
-    versions: RwLock<Vec<LayoutVersion>>,
-    
-    /// Store instances keyed by store_id
-    stores: RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>,
-    
-    /// Maximum number of layout versions to keep
-    max_versions: usize,
-}
-
-impl StoreLayoutMgr {
-    /// Create a new StoreLayoutMgr
-    pub fn new() -> Self {
-        Self {
-            versions: RwLock::new(Vec::new()),
-            stores: RwLock::new(HashMap::new()),
-            max_versions: 3,
-        }
-    }
-    
-    /// Create with custom max versions
-    pub fn with_max_versions(max_versions: usize) -> Self {
-        Self {
-            versions: RwLock::new(Vec::new()),
-            stores: RwLock::new(HashMap::new()),
-            max_versions: max_versions.max(1),
-        }
-    }
-    
-    /// Register a store instance
-    pub async fn register_store(&self, store: Arc<tokio::sync::Mutex<NamedLocalStore>>) {
-        let store_id = {
-            let guard = store.lock().await;
-            guard.store_id().to_string()
-        };
-        let mut stores = self.stores.write().await;
-        stores.insert(store_id, store);
-    }
-    
-    /// Unregister a store instance
-    pub async fn unregister_store(&self, store_id: &str) {
-        let mut stores = self.stores.write().await;
-        stores.remove(store_id);
-    }
-    
-    /// Add a new layout version
-    /// If epoch is newer than current, it becomes the new current version
-    /// Old versions are kept up to max_versions limit
-    pub async fn add_layout(&self, layout: StoreLayout) {
-        let epoch = layout.epoch;
-        let version = LayoutVersion { epoch, layout };
-        
-        let mut versions = self.versions.write().await;
-        
-        // Find insertion position (maintain descending epoch order)
-        let pos = versions.iter().position(|v| v.epoch < epoch).unwrap_or(versions.len());
-        
-        // Check if this epoch already exists
-        if versions.iter().any(|v| v.epoch == epoch) {
-            // Replace existing version with same epoch
-            if let Some(idx) = versions.iter().position(|v| v.epoch == epoch) {
-                versions[idx] = version;
-            }
-        } else {
-            versions.insert(pos, version);
-        }
-        
-        // Trim to max_versions
-        while versions.len() > self.max_versions {
-            versions.pop();
-        }
-    }
-    
-    /// Get current layout (newest version)
-    pub async fn current_layout(&self) -> Option<StoreLayout> {
-        let versions = self.versions.read().await;
-        versions.first().map(|v| v.layout.clone())
-    }
-    
-    /// Get layout by epoch
-    pub async fn get_layout(&self, epoch: u64) -> Option<StoreLayout> {
-        let versions = self.versions.read().await;
-        versions.iter().find(|v| v.epoch == epoch).map(|v| v.layout.clone())
-    }
-    
-    /// Get all layout versions (newest first)
-    pub async fn all_versions(&self) -> Vec<LayoutVersion> {
-        let versions = self.versions.read().await;
-        versions.clone()
-    }
-    
-    /// Get object from stores, trying layouts from newest to oldest
-    /// 
-    /// Algorithm:
-    /// 1. For each layout version (newest first):
-    ///    a. Use layout.select_primary_target(obj_id) to find target store
-    ///    b. Get the store instance by store_id
-    ///    c. Try store.get_object_impl(obj_id)
-    ///    d. If found, return success
-    ///    e. If NotFound, continue to next layout version
-    /// 2. If all layouts exhausted, return NotFound
-    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-        
-        if versions.is_empty() {
-            return Err(NdnError::NotFound("no layout versions available".to_string()));
-        }
-        
-        let mut last_error: Option<NdnError> = None;
-        let mut tried_stores: Vec<String> = Vec::new();
-        
-        for version in versions.iter() {
-            // Select target store from this layout version
-            let target = match version.layout.select_primary_target(obj_id) {
-                Some(t) => t,
-                None => continue, // No target in this layout, try next
-            };
-            
-            // Skip if we already tried this store
-            if tried_stores.contains(&target.store_id) {
-                continue;
-            }
-            tried_stores.push(target.store_id.clone());
-            
-            // Get store instance
-            let store = match stores.get(&target.store_id) {
-                Some(s) => s,
-                None => {
-                    last_error = Some(NdnError::NotFound(format!(
-                        "store {} not registered", 
-                        target.store_id
-                    )));
-                    continue;
-                }
-            };
-            
-            // Try to get object from this store
-            let store_guard = store.lock().await;
-            match store_guard.get_object_impl(obj_id, None).await {
-                Ok(obj) => return Ok(obj),
-                Err(NdnError::NotFound(_)) => {
-                    // NotFound in this store, try next layout version
-                    last_error = Some(NdnError::NotFound(format!(
-                        "object not found in store {}", 
-                        target.store_id
-                    )));
-                    continue;
-                }
-                Err(e) => {
-                    // Other error, still try next layout but record this error
-                    last_error = Some(e);
-                    continue;
-                }
-            }
-        }
-        
-        // All layouts exhausted
-        Err(last_error.unwrap_or_else(|| {
-            NdnError::NotFound(format!(
-                "object {:?} not found in any layout version",
-                obj_id
-            ))
-        }))
-    }
-    
-    /// Get object with extended fallback - try all targets in each layout
-    /// 
-    /// More aggressive search: for each layout, try all possible targets
-    /// (not just primary) before moving to next layout version
-    pub async fn get_object_exhaustive(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-        
-        if versions.is_empty() {
-            return Err(NdnError::NotFound("no layout versions available".to_string()));
-        }
-        
-        let mut last_error: Option<NdnError> = None;
-        let mut tried_stores: Vec<String> = Vec::new();
-        
-        for version in versions.iter() {
-            // Get all possible targets from this layout
-            let targets = version.layout.select_targets(obj_id);
-            
-            for target in targets {
-                // Skip if we already tried this store
-                if tried_stores.contains(&target.store_id) {
-                    continue;
-                }
-                tried_stores.push(target.store_id.clone());
-                
-                // Get store instance
-                let store = match stores.get(&target.store_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                
-                // Try to get object from this store
-                let store_guard = store.lock().await;
-                match store_guard.get_object_impl(obj_id, None).await {
-                    Ok(obj) => return Ok(obj),
-                    Err(NdnError::NotFound(_)) => continue,
-                    Err(e) => {
-                        last_error = Some(e);
-                        continue;
-                    }
-                }
-            }
-        }
-        
-        Err(last_error.unwrap_or_else(|| {
-            NdnError::NotFound(format!(
-                "object {:?} not found in any store",
-                obj_id
-            ))
-        }))
-    }
-    
-    /// Select primary store for a new object (uses current layout)
-    pub async fn select_store_for_write(&self, obj_id: &ObjId) -> Option<Arc<tokio::sync::Mutex<NamedLocalStore>>> {
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-        
-        let current = versions.first()?;
-        let target = current.layout.select_primary_target(obj_id)?;
-        stores.get(&target.store_id).cloned()
-    }
-    
-    /// Get number of active layout versions
-    pub async fn version_count(&self) -> usize {
-        let versions = self.versions.read().await;
-        versions.len()
-    }
-    
-    /// Get current epoch
-    pub async fn current_epoch(&self) -> Option<u64> {
-        let versions = self.versions.read().await;
-        versions.first().map(|v| v.epoch)
-    }
-    
-    /// Remove old layout versions, keeping only the newest one
-    pub async fn compact(&self) {
-        let mut versions = self.versions.write().await;
-        if versions.len() > 1 {
-            versions.truncate(1);
-        }
-    }
-}
-
-impl Default for StoreLayoutMgr {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn create_test_target(store_id: &str, weight: u32, enabled: bool, readonly: bool) -> StoreTarget {
+    fn create_test_target(
+        store_id: &str,
+        weight: u32,
+        enabled: bool,
+        readonly: bool,
+    ) -> StoreTarget {
         StoreTarget {
             store_id: store_id.to_string(),
             device_did: None,
@@ -634,7 +373,7 @@ mod tests {
     fn test_select_targets_empty_layout() {
         let layout = create_test_layout(vec![]);
         let obj_id = create_test_obj_id(b"test_object_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
         assert!(selected.is_empty());
     }
@@ -647,7 +386,7 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_object_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
         assert!(selected.is_empty());
     }
@@ -660,19 +399,17 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_object_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
         assert!(selected.is_empty());
     }
 
     #[test]
     fn test_select_targets_single_target() {
-        let targets = vec![
-            create_test_target("store1", 1, true, false),
-        ];
+        let targets = vec![create_test_target("store1", 1, true, false)];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_object_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].store_id, "store1");
@@ -687,11 +424,11 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_object_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
         // Should return all enabled, non-readonly targets
         assert_eq!(selected.len(), 3);
-        
+
         // All store_ids should be present (order may vary based on hash)
         let store_ids: Vec<&str> = selected.iter().map(|t| t.store_id.as_str()).collect();
         assert!(store_ids.contains(&"store1"));
@@ -709,10 +446,10 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"consistent_hash_test");
-        
+
         let selected1 = layout.select_targets(&obj_id);
         let selected2 = layout.select_targets(&obj_id);
-        
+
         assert_eq!(selected1.len(), selected2.len());
         for i in 0..selected1.len() {
             assert_eq!(selected1[i].store_id, selected2[i].store_id);
@@ -727,17 +464,17 @@ mod tests {
             create_test_target("store3", 1, true, false),
         ];
         let layout = create_test_layout(targets);
-        
+
         let obj_id1 = create_test_obj_id(b"object_hash_1");
         let obj_id2 = create_test_obj_id(b"object_hash_2");
-        
+
         let selected1 = layout.select_targets(&obj_id1);
         let selected2 = layout.select_targets(&obj_id2);
-        
+
         // Both should return 3 targets
         assert_eq!(selected1.len(), 3);
         assert_eq!(selected2.len(), 3);
-        
+
         // The primary target might differ (not guaranteed, but likely with different hashes)
         // Just verify they are valid
         assert!(!selected1[0].store_id.is_empty());
@@ -747,16 +484,16 @@ mod tests {
     #[test]
     fn test_select_targets_skips_disabled_and_readonly() {
         let targets = vec![
-            create_test_target("store1", 1, true, false),   // enabled, writable
-            create_test_target("store2", 1, false, false),  // disabled
-            create_test_target("store3", 1, true, true),    // readonly
-            create_test_target("store4", 1, true, false),   // enabled, writable
+            create_test_target("store1", 1, true, false), // enabled, writable
+            create_test_target("store2", 1, false, false), // disabled
+            create_test_target("store3", 1, true, true),  // readonly
+            create_test_target("store4", 1, true, false), // enabled, writable
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_hash");
-        
+
         let selected = layout.select_targets(&obj_id);
-        
+
         // Only store1 and store4 should be selected
         assert_eq!(selected.len(), 2);
         let store_ids: Vec<&str> = selected.iter().map(|t| t.store_id.as_str()).collect();
@@ -775,10 +512,10 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_hash");
-        
+
         let selected = layout.select_n_targets(&obj_id, 2);
         assert_eq!(selected.len(), 2);
-        
+
         // Requesting more than available should return all
         let selected_all = layout.select_n_targets(&obj_id, 10);
         assert_eq!(selected_all.len(), 3);
@@ -792,10 +529,10 @@ mod tests {
         ];
         let layout = create_test_layout(targets);
         let obj_id = create_test_obj_id(b"test_hash");
-        
+
         let primary = layout.select_primary_target(&obj_id);
         assert!(primary.is_some());
-        
+
         // Should be consistent
         let primary2 = layout.select_primary_target(&obj_id);
         assert_eq!(primary.unwrap().store_id, primary2.unwrap().store_id);
@@ -805,7 +542,7 @@ mod tests {
     fn test_select_primary_target_empty() {
         let layout = create_test_layout(vec![]);
         let obj_id = create_test_obj_id(b"test_hash");
-        
+
         let primary = layout.select_primary_target(&obj_id);
         assert!(primary.is_none());
     }
@@ -818,9 +555,9 @@ mod tests {
             create_test_target("store_high", 10, true, false),
         ];
         let layout = create_test_layout(targets);
-        
+
         let mut primary_counts: HashMap<String, u32> = HashMap::new();
-        
+
         // Test with many different ObjIds
         for i in 0..1000 {
             let obj_id = create_test_obj_id(format!("object_{}", i).as_bytes());
@@ -828,10 +565,10 @@ mod tests {
                 *primary_counts.entry(primary.store_id).or_insert(0) += 1;
             }
         }
-        
+
         let low_count = *primary_counts.get("store_low").unwrap_or(&0);
         let high_count = *primary_counts.get("store_high").unwrap_or(&0);
-        
+
         // store_high (weight=10) should get significantly more than store_low (weight=1)
         // With consistent hashing, the ratio should be approximately 10:1
         // Allow some variance due to hash distribution
@@ -852,13 +589,13 @@ mod tests {
             create_test_target("store3", 1, true, false),
         ];
         let layout = create_test_layout(targets);
-        
+
         // Test multiple times to ensure determinism
         for _ in 0..100 {
             let obj_id = create_test_obj_id(b"determinism_test");
             let selected1 = layout.select_targets(&obj_id);
             let selected2 = layout.select_targets(&obj_id);
-            
+
             assert_eq!(selected1.len(), selected2.len());
             for i in 0..selected1.len() {
                 assert_eq!(selected1[i].store_id, selected2[i].store_id);
@@ -875,35 +612,35 @@ mod tests {
             create_test_target("store2", 1, true, false),
         ];
         let layout_before = create_test_layout(targets_before);
-        
+
         let targets_after = vec![
             create_test_target("store1", 1, true, false),
             create_test_target("store2", 1, true, false),
             create_test_target("store3", 1, true, false),
         ];
         let layout_after = create_test_layout(targets_after);
-        
+
         let mut unchanged_count = 0;
         let total_tests = 10000;
-        
+
         for i in 0..total_tests {
             let obj_id = create_test_obj_id(format!("object_{}", i).as_bytes());
             let primary_before = layout_before.select_primary_target(&obj_id);
             let primary_after = layout_after.select_primary_target(&obj_id);
-            
+
             if let (Some(pb), Some(pa)) = (primary_before, primary_after) {
                 if pb.store_id == pa.store_id {
                     unchanged_count += 1;
                 }
             }
         }
-        
+
         // With Maglev consistent hashing:
         // When going from N to N+1 targets, approximately N/(N+1) stay unchanged
         // For 2->3 targets: ~2/3 = 66.7% should be unchanged
         // The new target gets ~1/3 = 33.3% of the data
         let unchanged_ratio = unchanged_count as f64 / total_tests as f64;
-        
+
         // Allow 10% tolerance due to hash distribution variance
         // Expected: ~66.7% unchanged, so we check for > 55%
         assert!(
@@ -911,7 +648,7 @@ mod tests {
             "Expected at least 55% unchanged (ideal ~66.7%), got {:.2}%",
             unchanged_ratio * 100.0
         );
-        
+
         // Also check that not too many stayed unchanged (would indicate problem)
         assert!(
             unchanged_ratio < 0.80,
@@ -921,13 +658,13 @@ mod tests {
     }
 
     /// Large-scale Maglev consistent hashing performance and redistribution test
-    /// 
+    ///
     /// This test verifies:
     /// 1. Maglev lookup table construction performance with 10K+ targets
-    /// 2. O(1) select performance 
+    /// 2. O(1) select performance
     /// 3. Minimal redistribution when adding nodes (close to theoretical 1/(N+1))
     /// 4. Memory efficiency
-    /// 
+    ///
     /// Run with: cargo test test_large_scale_redistribution -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -970,10 +707,10 @@ mod tests {
             .collect();
         let layout1 = StoreLayout::new(1, targets1, NUM_TARGETS_1 as u64 * 1000, 0);
         let build_time1 = start.elapsed();
-        
+
         let table_size = layout1.lookup_table_size();
         let memory_mb = (table_size * std::mem::size_of::<i32>()) as f64 / 1024.0 / 1024.0;
-        
+
         println!("  Build time:      {:?}", build_time1);
         println!("  Table size:      {} slots", table_size);
         println!("  Memory usage:    {:.2} MB", memory_mb);
@@ -995,7 +732,7 @@ mod tests {
             .collect();
         let layout2 = StoreLayout::new(2, targets2, NUM_TARGETS_2 as u64 * 1000, 0);
         let build_time2 = start.elapsed();
-        
+
         println!("  Build time:      {:?}", build_time2);
         println!("  Table size:      {} slots", layout2.lookup_table_size());
         println!("  Active targets:  {}", layout2.active_target_count());
@@ -1068,20 +805,40 @@ mod tests {
         println!("  ┌────────────────────────┬────────────┬──────────┐");
         println!("  │ Category               │    Count   │  Ratio   │");
         println!("  ├────────────────────────┼────────────┼──────────┤");
-        println!("  │ Unchanged              │ {:>10} │ {:>6.2}%  │", unchanged_count, unchanged_ratio);
-        println!("  │ Moved to new target    │ {:>10} │ {:>6.2}%  │", moved_to_new_target, moved_to_new_ratio);
-        println!("  │ Moved between old      │ {:>10} │ {:>6.2}%  │", moved_between_old_targets, moved_between_old_ratio);
-        println!("  │ Total moved            │ {:>10} │ {:>6.2}%  │", total_moved, total_moved_ratio);
+        println!(
+            "  │ Unchanged              │ {:>10} │ {:>6.2}%  │",
+            unchanged_count, unchanged_ratio
+        );
+        println!(
+            "  │ Moved to new target    │ {:>10} │ {:>6.2}%  │",
+            moved_to_new_target, moved_to_new_ratio
+        );
+        println!(
+            "  │ Moved between old      │ {:>10} │ {:>6.2}%  │",
+            moved_between_old_targets, moved_between_old_ratio
+        );
+        println!(
+            "  │ Total moved            │ {:>10} │ {:>6.2}%  │",
+            total_moved, total_moved_ratio
+        );
         println!("  └────────────────────────┴────────────┴──────────┘");
 
         println!("\nComparison with Theoretical Ideal:");
         println!("  ┌────────────────────────┬──────────┬──────────┬──────────┐");
         println!("  │ Metric                 │  Ideal   │  Actual  │ Deviation│");
         println!("  ├────────────────────────┼──────────┼──────────┼──────────┤");
-        println!("  │ Unchanged ratio        │ {:>6.2}%  │ {:>6.2}%  │ {:>+6.2}%  │", 
-            ideal_unchanged_ratio, unchanged_ratio, unchanged_ratio - ideal_unchanged_ratio);
-        println!("  │ Move ratio             │ {:>6.4}% │ {:>6.2}%  │ {:>5.1}x   │", 
-            ideal_move_ratio, total_moved_ratio, total_moved_ratio / ideal_move_ratio);
+        println!(
+            "  │ Unchanged ratio        │ {:>6.2}%  │ {:>6.2}%  │ {:>+6.2}%  │",
+            ideal_unchanged_ratio,
+            unchanged_ratio,
+            unchanged_ratio - ideal_unchanged_ratio
+        );
+        println!(
+            "  │ Move ratio             │ {:>6.4}% │ {:>6.2}%  │ {:>5.1}x   │",
+            ideal_move_ratio,
+            total_moved_ratio,
+            total_moved_ratio / ideal_move_ratio
+        );
         println!("  └────────────────────────┴──────────┴──────────┴──────────┘");
 
         // ============================================================
@@ -1092,7 +849,7 @@ mod tests {
         println!("└─────────────────────────────────────────────────────────────┘");
 
         const BENCH_ITERATIONS: usize = 5_000_000;
-        
+
         // Warmup
         for i in 0u64..10000 {
             let obj_id = ObjId {
@@ -1129,18 +886,42 @@ mod tests {
         println!("║                         SUMMARY                              ║");
         println!("╠══════════════════════════════════════════════════════════════╣");
         println!("║ Build Performance:                                           ║");
-        println!("║   Layout1 ({:>5} targets): {:>10?}                       ║", NUM_TARGETS_1, build_time1);
-        println!("║   Layout2 ({:>5} targets): {:>10?}                       ║", NUM_TARGETS_2, build_time2);
-        println!("║   Memory per layout:       {:.2} MB                           ║", memory_mb);
+        println!(
+            "║   Layout1 ({:>5} targets): {:>10?}                       ║",
+            NUM_TARGETS_1, build_time1
+        );
+        println!(
+            "║   Layout2 ({:>5} targets): {:>10?}                       ║",
+            NUM_TARGETS_2, build_time2
+        );
+        println!(
+            "║   Memory per layout:       {:.2} MB                           ║",
+            memory_mb
+        );
         println!("╠══════════════════════════════════════════════════════════════╣");
         println!("║ Redistribution (Maglev Consistent Hashing):                  ║");
-        println!("║   Unchanged:      {:>6.2}% (ideal: {:>6.2}%)                  ║", unchanged_ratio, ideal_unchanged_ratio);
-        println!("║   Total moved:    {:>6.2}% (ideal: {:>6.4}%)                 ║", total_moved_ratio, ideal_move_ratio);
-        println!("║   Deviation:      {:.1}x from theoretical minimum             ║", total_moved_ratio / ideal_move_ratio);
+        println!(
+            "║   Unchanged:      {:>6.2}% (ideal: {:>6.2}%)                  ║",
+            unchanged_ratio, ideal_unchanged_ratio
+        );
+        println!(
+            "║   Total moved:    {:>6.2}% (ideal: {:>6.4}%)                 ║",
+            total_moved_ratio, ideal_move_ratio
+        );
+        println!(
+            "║   Deviation:      {:.1}x from theoretical minimum             ║",
+            total_moved_ratio / ideal_move_ratio
+        );
         println!("╠══════════════════════════════════════════════════════════════╣");
         println!("║ Select Performance:                                          ║");
-        println!("║   Throughput:     {:.2} M ops/sec                            ║", ops_per_sec / 1_000_000.0);
-        println!("║   Latency:        {:.1} ns/op                                 ║", ns_per_op);
+        println!(
+            "║   Throughput:     {:.2} M ops/sec                            ║",
+            ops_per_sec / 1_000_000.0
+        );
+        println!(
+            "║   Latency:        {:.1} ns/op                                 ║",
+            ns_per_op
+        );
         println!("╚══════════════════════════════════════════════════════════════╝");
 
         // Assertions
@@ -1152,7 +933,10 @@ mod tests {
             "Expected >98% unchanged, got {:.2}%",
             unchanged_ratio
         );
-        println!("  ✓ Unchanged ratio check passed ({:.2}% > 98%)", unchanged_ratio);
+        println!(
+            "  ✓ Unchanged ratio check passed ({:.2}% > 98%)",
+            unchanged_ratio
+        );
 
         // 2. Total movement should be reasonable (< 5x theoretical for Maglev)
         // Maglev has some overhead due to slot conflicts
@@ -1162,7 +946,11 @@ mod tests {
             total_moved_ratio,
             ideal_move_ratio * 10.0
         );
-        println!("  ✓ Total movement check passed ({:.2}% < {:.2}%)", total_moved_ratio, ideal_move_ratio * 10.0);
+        println!(
+            "  ✓ Total movement check passed ({:.2}% < {:.2}%)",
+            total_moved_ratio,
+            ideal_move_ratio * 10.0
+        );
 
         // 3. Movement between old targets should be minimal
         assert!(
@@ -1170,7 +958,10 @@ mod tests {
             "Too much movement between old targets: {:.2}%",
             moved_between_old_ratio
         );
-        println!("  ✓ Inter-old-target movement check passed ({:.2}% < 1%)", moved_between_old_ratio);
+        println!(
+            "  ✓ Inter-old-target movement check passed ({:.2}% < 1%)",
+            moved_between_old_ratio
+        );
 
         // 4. Select performance should be fast (> 1M ops/sec)
         assert!(
@@ -1178,14 +969,17 @@ mod tests {
             "Select performance too slow: {:.0} ops/sec",
             ops_per_sec
         );
-        println!("  ✓ Performance check passed ({:.2}M > 1M ops/sec)", ops_per_sec / 1_000_000.0);
+        println!(
+            "  ✓ Performance check passed ({:.2}M > 1M ops/sec)",
+            ops_per_sec / 1_000_000.0
+        );
 
         println!("\n✅ All assertions passed!");
     }
 
     /// Small-scale redistribution test: 100 -> 101 targets
     /// Tests data migration when adding a single node to a 100-node cluster
-    /// 
+    ///
     /// With Maglev consistent hashing:
     /// - Adding 1 node to N nodes should only move ~1/(N+1) of data
     /// - For N=100, expected move ratio ≈ 1/101 ≈ 0.99%
@@ -1198,7 +992,10 @@ mod tests {
         const NUM_TARGETS_2: usize = 101;
         const NUM_OBJ_IDS: usize = 100_000;
 
-        println!("\n=== Maglev Small Scale Redistribution Test: {} -> {} targets ===", NUM_TARGETS_1, NUM_TARGETS_2);
+        println!(
+            "\n=== Maglev Small Scale Redistribution Test: {} -> {} targets ===",
+            NUM_TARGETS_1, NUM_TARGETS_2
+        );
         println!("Test ObjIds: {}", NUM_OBJ_IDS);
 
         // Create layout1 with 100 uniform store targets (weight = 1)
@@ -1215,7 +1012,11 @@ mod tests {
             })
             .collect();
         let layout1 = StoreLayout::new(1, targets1, NUM_TARGETS_1 as u64 * 1000, 0);
-        println!("Layout1 created in {:?}, lookup table size: {}", start.elapsed(), layout1.lookup_table_size());
+        println!(
+            "Layout1 created in {:?}, lookup table size: {}",
+            start.elapsed(),
+            layout1.lookup_table_size()
+        );
 
         // Create layout2 with 101 uniform store targets (add one new target)
         let start = Instant::now();
@@ -1231,7 +1032,11 @@ mod tests {
             })
             .collect();
         let layout2 = StoreLayout::new(2, targets2, NUM_TARGETS_2 as u64 * 1000, 0);
-        println!("Layout2 created in {:?}, lookup table size: {}", start.elapsed(), layout2.lookup_table_size());
+        println!(
+            "Layout2 created in {:?}, lookup table size: {}",
+            start.elapsed(),
+            layout2.lookup_table_size()
+        );
 
         // Test redistribution
         let start = Instant::now();
@@ -1295,15 +1100,33 @@ mod tests {
         println!("Test completed in {:?}", test_duration);
         println!();
         println!("Distribution changes:");
-        println!("  Unchanged:              {:>10} ({:.2}%)", unchanged_count, unchanged_ratio);
-        println!("  Moved to new target:    {:>10} ({:.2}%)", moved_to_new_target, moved_to_new_ratio);
-        println!("  Moved between old:      {:>10} ({:.2}%)", moved_between_old_targets, moved_between_old_ratio);
-        println!("  Total moved:            {:>10} ({:.2}%)", total_moved, total_moved_ratio);
+        println!(
+            "  Unchanged:              {:>10} ({:.2}%)",
+            unchanged_count, unchanged_ratio
+        );
+        println!(
+            "  Moved to new target:    {:>10} ({:.2}%)",
+            moved_to_new_target, moved_to_new_ratio
+        );
+        println!(
+            "  Moved between old:      {:>10} ({:.2}%)",
+            moved_between_old_targets, moved_between_old_ratio
+        );
+        println!(
+            "  Total moved:            {:>10} ({:.2}%)",
+            total_moved, total_moved_ratio
+        );
         println!();
         println!("Analysis (Maglev Consistent Hashing):");
-        println!("  Ideal unchanged ratio ({}/{}): {:.2}%", NUM_TARGETS_1, NUM_TARGETS_2, ideal_unchanged_ratio);
+        println!(
+            "  Ideal unchanged ratio ({}/{}): {:.2}%",
+            NUM_TARGETS_1, NUM_TARGETS_2, ideal_unchanged_ratio
+        );
         println!("  Actual unchanged ratio:        {:.2}%", unchanged_ratio);
-        println!("  Ideal move ratio (1/{}):       {:.2}%", NUM_TARGETS_2, ideal_move_ratio);
+        println!(
+            "  Ideal move ratio (1/{}):       {:.2}%",
+            NUM_TARGETS_2, ideal_move_ratio
+        );
         println!("  Actual total move ratio:       {:.2}%", total_moved_ratio);
 
         // Assertions - verify Maglev consistent hashing properties
@@ -1392,167 +1215,5 @@ mod tests {
         println!("  Duration: {:?}", duration);
         println!("  Throughput: {:.0} ops/sec", ops_per_sec);
         println!("  Latency: {:.1} ns/op", ns_per_op);
-    }
-    
-    // ========== StoreLayoutMgr Tests ==========
-    
-    fn create_layout_with_epoch(epoch: u64, targets: Vec<StoreTarget>) -> StoreLayout {
-        StoreLayout::new(epoch, targets, 10000, 1000)
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_basic() {
-        let mgr = StoreLayoutMgr::new();
-        
-        // Initially empty
-        assert_eq!(mgr.version_count().await, 0);
-        assert!(mgr.current_layout().await.is_none());
-        assert!(mgr.current_epoch().await.is_none());
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_add_versions() {
-        let mgr = StoreLayoutMgr::new();
-        
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-        
-        assert_eq!(mgr.version_count().await, 1);
-        assert_eq!(mgr.current_epoch().await, Some(1));
-        
-        // Add newer version
-        let targets2 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-        ];
-        let layout2 = create_layout_with_epoch(2, targets2);
-        mgr.add_layout(layout2).await;
-        
-        assert_eq!(mgr.version_count().await, 2);
-        assert_eq!(mgr.current_epoch().await, Some(2));
-        
-        // Add even newer version
-        let targets3 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-            create_test_target("store3", 1, true, false),
-        ];
-        let layout3 = create_layout_with_epoch(3, targets3);
-        mgr.add_layout(layout3).await;
-        
-        assert_eq!(mgr.version_count().await, 3);
-        assert_eq!(mgr.current_epoch().await, Some(3));
-        
-        // Adding a 4th version should trim the oldest
-        let targets4 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-            create_test_target("store3", 1, true, false),
-            create_test_target("store4", 1, true, false),
-        ];
-        let layout4 = create_layout_with_epoch(4, targets4);
-        mgr.add_layout(layout4).await;
-        
-        assert_eq!(mgr.version_count().await, 3); // Still 3, oldest trimmed
-        assert_eq!(mgr.current_epoch().await, Some(4));
-        
-        // Verify version 1 is gone
-        assert!(mgr.get_layout(1).await.is_none());
-        assert!(mgr.get_layout(2).await.is_some());
-        assert!(mgr.get_layout(3).await.is_some());
-        assert!(mgr.get_layout(4).await.is_some());
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_version_ordering() {
-        let mgr = StoreLayoutMgr::new();
-        
-        // Add versions out of order
-        let targets2 = vec![create_test_target("store1", 1, true, false)];
-        let layout2 = create_layout_with_epoch(2, targets2);
-        mgr.add_layout(layout2).await;
-        
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-        
-        let targets3 = vec![create_test_target("store1", 1, true, false)];
-        let layout3 = create_layout_with_epoch(3, targets3);
-        mgr.add_layout(layout3).await;
-        
-        // Current should be the newest (epoch 3)
-        assert_eq!(mgr.current_epoch().await, Some(3));
-        
-        // Versions should be ordered newest first
-        let versions = mgr.all_versions().await;
-        assert_eq!(versions.len(), 3);
-        assert_eq!(versions[0].epoch, 3);
-        assert_eq!(versions[1].epoch, 2);
-        assert_eq!(versions[2].epoch, 1);
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_compact() {
-        let mgr = StoreLayoutMgr::new();
-        
-        for epoch in 1..=3 {
-            let targets = vec![create_test_target("store1", 1, true, false)];
-            let layout = create_layout_with_epoch(epoch, targets);
-            mgr.add_layout(layout).await;
-        }
-        
-        assert_eq!(mgr.version_count().await, 3);
-        
-        mgr.compact().await;
-        
-        assert_eq!(mgr.version_count().await, 1);
-        assert_eq!(mgr.current_epoch().await, Some(3));
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_custom_max_versions() {
-        let mgr = StoreLayoutMgr::with_max_versions(2);
-        
-        for epoch in 1..=5 {
-            let targets = vec![create_test_target("store1", 1, true, false)];
-            let layout = create_layout_with_epoch(epoch, targets);
-            mgr.add_layout(layout).await;
-        }
-        
-        // Should only keep 2 versions
-        assert_eq!(mgr.version_count().await, 2);
-        assert_eq!(mgr.current_epoch().await, Some(5));
-        
-        // Only epochs 4 and 5 should exist
-        assert!(mgr.get_layout(3).await.is_none());
-        assert!(mgr.get_layout(4).await.is_some());
-        assert!(mgr.get_layout(5).await.is_some());
-    }
-    
-    #[tokio::test]
-    async fn test_store_layout_mgr_replace_same_epoch() {
-        let mgr = StoreLayoutMgr::new();
-        
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-        
-        assert_eq!(mgr.version_count().await, 1);
-        
-        // Add layout with same epoch should replace
-        let targets1_updated = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-        ];
-        let layout1_updated = create_layout_with_epoch(1, targets1_updated);
-        mgr.add_layout(layout1_updated).await;
-        
-        // Should still be 1 version, not 2
-        assert_eq!(mgr.version_count().await, 1);
-        
-        // The updated layout should have 2 targets
-        let current = mgr.current_layout().await.unwrap();
-        assert_eq!(current.targets.len(), 2);
     }
 }

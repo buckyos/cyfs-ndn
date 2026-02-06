@@ -256,3 +256,101 @@ impl StoreMode {
         }
     }
 }
+
+
+/// NDM path representation
+#[derive(Debug, Clone)]
+pub struct NdmPath(pub String);
+
+impl NdmPath {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self(path.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Split path into parent and name components
+    pub fn split_parent_name(&self) -> Option<(NdmPath, String)> {
+        let path = self.0.trim_end_matches('/');
+        if path.is_empty() || path == "/" {
+            return None;
+        }
+        let last_slash = path.rfind('/')?;
+        let parent = if last_slash == 0 {
+            "/".to_string()
+        } else {
+            path[..last_slash].to_string()
+        };
+        let name = path[last_slash + 1..].to_string();
+        if name.is_empty() {
+            None
+        } else {
+            Some((NdmPath(parent), name))
+        }
+    }
+
+    pub fn is_root(&self) -> bool {
+        let s = self.0.trim_end_matches('/');
+        s.is_empty() || s == "/"
+    }
+}
+
+fn is_descendant_path(potential_child: &String, potential_parent: &String) -> bool {
+    let child = potential_child.as_str().trim_end_matches('/');
+    let parent = potential_parent.as_str().trim_end_matches('/');
+
+    if child.len() <= parent.len() {
+        return false;
+    }
+
+    child.starts_with(parent)
+        && (child.as_bytes().get(parent.len()) == Some(&b'/') || parent == "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ndm_path_split() {
+        let path = NdmPath::new("/foo/bar/baz");
+        let (parent, name) = path.split_parent_name().unwrap();
+        assert_eq!(parent.as_str(), "/foo/bar");
+        assert_eq!(name, "baz");
+
+        let root_child = NdmPath::new("/foo");
+        let (parent, name) = root_child.split_parent_name().unwrap();
+        assert_eq!(parent.as_str(), "/");
+        assert_eq!(name, "foo");
+
+        let root = NdmPath::new("/");
+        assert!(root.split_parent_name().is_none());
+        assert!(root.is_root());
+    }
+
+    #[test]
+    fn test_is_descendant_path() {
+        assert!(is_descendant_path(
+            &"/a/b/c".to_string(),
+            &"/a/b".to_string()
+        ));
+        assert!(is_descendant_path(
+            &"/a/b/c".to_string(),
+            &"/a".to_string()
+        ));
+        assert!(is_descendant_path(
+            &"/a/b".to_string(),
+            &"/".to_string()
+        ));
+        assert!(!is_descendant_path(
+            &"/a/b".to_string(),
+            &"/a/b".to_string()
+        ));
+        assert!(!is_descendant_path(
+            &"/a/bc".to_string(),
+            &"/a/b".to_string()
+        ));
+    }
+}

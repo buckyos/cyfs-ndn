@@ -2,7 +2,10 @@ mod fb_service;
 mod local_filebuffer;
 mod buffer_db;
 
-pub use fb_service::{FileBufferService, NdmPath, SessionId, WriteLease};
+pub use fb_service::{
+    FileBufferRead, FileBufferSeekReader, FileBufferSeekWriter, FileBufferService, FileBufferWrite,
+    NdmPath, SessionId, WriteLease,
+};
 pub use local_filebuffer::{FileBufferRecord, LocalFileBufferService};
 use ndn_lib::ChunkId;
 

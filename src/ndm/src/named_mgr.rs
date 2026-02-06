@@ -4,16 +4,17 @@
 //! a unified file/directory namespace with overlay semantics.
 
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use fs_buffer::{FileBufferService, SessionId};
-use named_store::NamedLocalStore;
-use ndn_lib::{ChunkId, DirObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, SimpleMapItem};
+use serde::{Serialize, Deserialize};
+use fs_buffer::{FileBufferSeekWriter, FileBufferService};
+use named_store::{ChunkStoreState, NamedStoreMgr};
+use ndn_lib::{ChunkId, DirObject, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR, SimpleMapItem,NdmPath};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
-    DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, NodeKind, NodeRecord, NodeState,
-    ObjStat, StoreLayoutMgr,
+    DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, MoveOptions, NodeKind, NodeRecord,
+    NodeState, ObjStat,
 };
 
 // ------------------------------
@@ -23,44 +24,6 @@ use crate::{
 /// Instance identifier for a NamedDataMgr
 pub type NdmInstanceId = String;
 
-/// NDM path representation
-#[derive(Debug, Clone)]
-pub struct NdmPath(pub String);
-
-impl NdmPath {
-    pub fn new(path: impl Into<String>) -> Self {
-        Self(path.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Split path into parent and name components
-    pub fn split_parent_name(&self) -> Option<(NdmPath, String)> {
-        let path = self.0.trim_end_matches('/');
-        if path.is_empty() || path == "/" {
-            return None;
-        }
-        let last_slash = path.rfind('/')?;
-        let parent = if last_slash == 0 {
-            "/".to_string()
-        } else {
-            path[..last_slash].to_string()
-        };
-        let name = path[last_slash + 1..].to_string();
-        if name.is_empty() {
-            None
-        } else {
-            Some((NdmPath(parent), name))
-        }
-    }
-
-    pub fn is_root(&self) -> bool {
-        let s = self.0.trim_end_matches('/');
-        s.is_empty() || s == "/"
-    }
-}
 
 /// Path statistics
 #[derive(Debug, Clone)]
@@ -107,15 +70,6 @@ pub type InnerPath = String;
 // ------------------------------
 // Move-related types
 // ------------------------------
-
-#[derive(Clone, Copy, Default)]
-struct MoveOptions {
-    /// Whether to overwrite destination if destination is visible in Upper layer.
-    overwrite_upper: bool,
-    /// If true: also check destination Base (merged view no-clobber).
-    /// This requires Base materialized, otherwise NEED_PULL.
-    strict_check_base: bool,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObjectKind {
@@ -179,7 +133,7 @@ pub struct StoreTarget {
 }
 
 //Open write flags
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpenWriteFlag {
     /// Append to existing file (file must exist)
     /// Returns error if file not found
@@ -201,14 +155,15 @@ pub enum OpenWriteFlag {
 
 // ------------------------------
 // NamedDataMgr Implementation
+// NamedDataMgr是NDM的Client，一定会在进程内使用
+// NamedDataMgr 整合来自各个组件的返回，构建FileSystem 数据视图
 // ------------------------------
 
 pub struct NamedDataMgr {
     pub instance: NdmInstanceId,
 
     fsmeta: Arc<FsMetaClient>,
-    store: Arc<tokio::sync::Mutex<NamedLocalStore>>,
-    buffer: Arc<dyn FileBufferService>,
+    fsbuffer: Arc<dyn FileBufferService>,
     fetcher: Option<Arc<dyn NdnFetcher>>,
 
     /// Default commit policy
@@ -219,14 +174,13 @@ pub struct NamedDataMgr {
     
     /// Optional store layout manager for multi-version store fallback
     /// When set, get_object operations will try multiple layout versions
-    layout_mgr: Option<Arc<StoreLayoutMgr>>,
+    layout_mgr: Option<Arc<NamedStoreMgr>>,
 }
 
 impl NamedDataMgr {
     pub fn new(
         instance: NdmInstanceId,
         fsmeta: Arc<FsMetaClient>,
-        store: Arc<tokio::sync::Mutex<NamedLocalStore>>,
         buffer: Arc<dyn FileBufferService>,
         fetcher: Option<Arc<dyn NdnFetcher>>,
         default_commit_policy: CommitPolicy,
@@ -234,8 +188,7 @@ impl NamedDataMgr {
         Self {
             instance,
             fsmeta,
-            store,
-            buffer,
+            fsbuffer: buffer,
             fetcher,
             default_commit_policy,
             bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
@@ -247,17 +200,15 @@ impl NamedDataMgr {
     pub fn with_layout_mgr(
         instance: NdmInstanceId,
         fsmeta: Arc<FsMetaClient>,
-        store: Arc<tokio::sync::Mutex<NamedLocalStore>>,
         buffer: Arc<dyn FileBufferService>,
         fetcher: Option<Arc<dyn NdnFetcher>>,
         default_commit_policy: CommitPolicy,
-        layout_mgr: Arc<StoreLayoutMgr>,
+        layout_mgr: Arc<NamedStoreMgr>,
     ) -> Self {
         Self {
             instance,
             fsmeta,
-            store,
-            buffer,
+            fsbuffer: buffer,
             fetcher,
             default_commit_policy,
             bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
@@ -266,26 +217,20 @@ impl NamedDataMgr {
     }
     
     /// Set the store layout manager
-    pub fn set_layout_mgr(&mut self, layout_mgr: Arc<StoreLayoutMgr>) {
+    pub fn set_layout_mgr(&mut self, layout_mgr: Arc<NamedStoreMgr>) {
         self.layout_mgr = Some(layout_mgr);
     }
     
     /// Get the store layout manager if set
-    pub fn layout_mgr(&self) -> Option<&Arc<StoreLayoutMgr>> {
+    pub fn layout_mgr(&self) -> Option<&Arc<NamedStoreMgr>> {
         self.layout_mgr.as_ref()
     }
 
-    // ========== Path Resolution ==========
-
-    /// Resolve a path to its inode, creating directory inodes as needed
-    async fn resolve_path(&self, path: &NdmPath) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
-        self.fsmeta.resolve_path(path).await
-    }
 
     // ========== Basic Operations ==========
 
     pub async fn stat(&self, path: &NdmPath) -> NdnResult<PathStat> {
-        let resolved = self.resolve_path(path).await?;
+        let resolved = self.fsmeta.resolve_path(path).await?;
         match resolved {
             Some((inode_id, node)) => {
                 let kind = match node.kind {
@@ -322,61 +267,15 @@ impl NamedDataMgr {
     // ========== Write Operations ==========
 
     pub async fn set_file(&self, path: &NdmPath, obj_id: ObjId) -> NdnResult<()> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let parent = self.ensure_dir_inode(&parent_path).await?;
-
-        // Upsert dentry
-        self.fsmeta
-            .upsert_dentry(parent, name, DentryTarget::ObjId(obj_id.clone()), None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-        // Bump ref count
-        let _ = self
-            .fsmeta
-            .obj_stat_bump(obj_id, 1, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to bump ref count: {}", e)))?;
-
-        Ok(())
+        self.fsmeta.set_file(path, obj_id).await
     }
 
     pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let parent = self.ensure_dir_inode(&parent_path).await?;
-
-        self.fsmeta
-            .upsert_dentry(parent, name, DentryTarget::ObjId(dir_obj_id.clone()), None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-        // TODO: update ref_count for dir and its children
-
-        Ok(())
+        self.fsmeta.set_dir(path, dir_obj_id).await
     }
 
     pub async fn delete(&self, path: &NdmPath) -> NdnResult<()> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let resolved = self.resolve_path(&parent_path).await?;
-        let (parent_id, _parent_node) =
-            resolved.ok_or_else(|| NdnError::NotFound("parent not found".to_string()))?;
-
-        // Set tombstone instead of deleting (overlay semantics)
-        self.fsmeta
-            .set_tombstone(parent_id, name, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to set tombstone: {}", e)))?;
-
-        Ok(())
+        self.fsmeta.delete(path).await
     }
 
     pub async fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
@@ -384,96 +283,36 @@ impl NamedDataMgr {
             .await
     }
 
-    pub async fn copy_path(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        // Get source stat
-        let src_stat = self.stat(src).await?;
-        if src_stat.kind == PathKind::NotFound {
-            return Err(NdnError::NotFound(format!("source {} not found", src.as_str())));
-        }
+    //创建软链接，目标必须是文件或者目录，不能是符号链接
+    //LINK: link_path -> target
+    pub async fn make_link(&self,link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        self.fsmeta.make_link(target, link_path).await
+    }
 
-        // If source has an ObjId, just bind it to target
-        if let Some(obj_id) = src_stat.obj_id {
-            if src_stat.kind == PathKind::File {
-                self.set_file(target, obj_id).await?;
-            } else {
-                self.set_dir(target, obj_id).await?;
-            }
-            return Ok(());
-        }
-
-        // Source is a working file without committed ObjId
-        Err(NdnError::InvalidState(
-            "source must be committed to copy".to_string(),
+    pub async fn copy_file(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        let _ = (src, target);
+        Err(NdnError::Unsupported(
+            "copy_file not implemented".to_string(),
         ))
     }
 
+    pub async fn copy_dir(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        //这是一个复杂的函数，需要复制大量的inode，做成fs-meta的任务可能会导致性能问题，这里要考虑如何阶段性的实现：
+        // fsmeta上有复制任务管理器
+        // 先copy到一个目录然后rename到target?
+        unimplemented!()
+    }
+
+
+    //快照的逻辑是copy_dir的特殊情况，复制后把target设置为readonly,并很快会触发物化流程冻结
+    pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        unimplemented!()
+    }
+
+
     // ========== Directory Operations ==========
-
     pub async fn create_dir(&self, path: &NdmPath) -> NdnResult<()> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let parent_id = self.ensure_dir_inode(&parent_path).await?;
-
-        // Check if already exists
-        let existing = self
-            .fsmeta
-            .get_dentry(parent_id, name.clone(), None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-        if let Some(d) = existing {
-            if !matches!(d.target, DentryTarget::Tombstone) {
-                return Err(NdnError::AlreadyExists(format!(
-                    "path {} already exists",
-                    path.as_str()
-                )));
-            }
-        }
-
-        // Create directory inode
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
-
-        let new_node = NodeRecord {
-            inode_id: 0, // Will be assigned by alloc
-            kind: NodeKind::Dir,
-            read_only: false,
-            base_obj_id: None,
-            state: NodeState::DirNormal,
-            rev: Some(0),
-            meta: None,
-            lease_client_session: None,
-            lease_seq: None,
-            lease_expire_at: None,
-        };
-
-        let new_id = self
-            .fsmeta
-            .alloc_inode(new_node, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
-
-        self.fsmeta
-            .upsert_dentry(
-                parent_id,
-                name,
-                DentryTarget::IndexNodeId(new_id),
-                Some(txid.clone()),
-            )
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-        self.fsmeta
-            .commit(Some(txid))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
-
-        Ok(())
+        self.fsmeta.create_dir(path).await
     }
 
     pub async fn list(
@@ -482,7 +321,7 @@ impl NamedDataMgr {
         _pos: u32,
         _page_size: u32,
     ) -> NdnResult<Vec<(String, PathStat)>> {
-        let resolved = self.resolve_path(path).await?;
+        let resolved = self.fsmeta.resolve_path(path).await?;
         let (dir_id, dir_node) =
             resolved.ok_or_else(|| NdnError::NotFound("path not found".to_string()))?;
 
@@ -568,18 +407,18 @@ impl NamedDataMgr {
                 match state {
                     NodeState::Working(ws) => {
                         // Open reader from buffer
-                        let fb = self.buffer.get_buffer(&ws.fb_handle).await?;
+                        let fb = self.fsbuffer.get_buffer(&ws.fb_handle).await?;
                         let reader = self
-                            .buffer
+                            .fsbuffer
                             .open_reader(&fb, std::io::SeekFrom::Start(0))
                             .await?;
                         // Get file size from metadata or estimate
                         return Ok((Box::new(reader), 0)); // TODO: get actual size
                     }
                     NodeState::Cooling(cs) => {
-                        let fb = self.buffer.get_buffer(&cs.fb_handle).await?;
+                        let fb = self.fsbuffer.get_buffer(&cs.fb_handle).await?;
                         let reader = self
-                            .buffer
+                            .fsbuffer
                             .open_reader(&fb, std::io::SeekFrom::Start(0))
                             .await?;
                         return Ok((Box::new(reader), 0));
@@ -597,6 +436,7 @@ impl NamedDataMgr {
         Err(NdnError::NotFound("no readable content".to_string()))
     }
 
+    //move to store_layout_mgr
     pub async fn open_reader_by_id(
         &self,
         obj_id: &ObjId,
@@ -606,8 +446,10 @@ impl NamedDataMgr {
         // Check if object is a chunk
         if obj_id.is_chunk() {
             let chunk_id = ChunkId::from_obj_id(obj_id);
-            let store = self.store.lock().await;
-            let (reader, size) = store.open_chunk_reader_impl(&chunk_id, 0, false).await?;
+            let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+                NdnError::NotFound("store layout manager not configured".to_string())
+            })?;
+            let (reader, size) = layout_mgr.open_chunk_reader(&chunk_id, 0, false).await?;
             return Ok((Box::new(reader), size));
         }
 
@@ -615,11 +457,6 @@ impl NamedDataMgr {
         Err(NdnError::Unsupported(
             "non-chunk object reading not implemented".to_string(),
         ))
-    }
-
-    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<Vec<u8>> {
-        let obj = self.get_object_impl(obj_id).await?;
-        Ok(serde_json::to_vec(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
     }
 
     pub async fn get_object_by_path(&self, path: &NdmPath) -> NdnResult<String> {
@@ -632,7 +469,7 @@ impl NamedDataMgr {
             .obj_id
             .ok_or_else(|| NdnError::NotFound("no object bound to path".to_string()))?;
 
-        let obj = self.get_object_impl(&obj_id).await?;
+        let obj = self.get_object(&obj_id).await?;
         Ok(serde_json::to_string(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
     }
     
@@ -645,15 +482,20 @@ impl NamedDataMgr {
     /// 
     /// If layout_mgr is not set:
     /// - Use the default store directly
-    async fn get_object_impl(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
         // If layout manager is set, use multi-version fallback
         if let Some(layout_mgr) = &self.layout_mgr {
             return layout_mgr.get_object(obj_id).await;
         }
-        
-        // Otherwise, use the default store directly
-        let store = self.store.lock().await;
-        store.get_object_impl(obj_id, None).await
+
+        Err(NdnError::NotFound(
+            "store layout manager not configured".to_string(),
+        ))
+    }
+
+    /// Load existing file chunks from base object for append operations
+    async fn load_file_chunklist(&self, _obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
+        Ok(Vec::new())
     }
 
     // ========== Write Operations (File) ==========
@@ -663,472 +505,88 @@ impl NamedDataMgr {
         path: &NdmPath,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
-    ) -> NdnResult<String> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let parent_id = self.ensure_dir_inode(&parent_path).await?;
-
-        // Check parent is not read-only
-        let parent_node = self
-            .fsmeta
-            .get_inode(parent_id, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get parent inode: {}", e)))?
-            .ok_or_else(|| NdnError::NotFound("parent not found".to_string()))?;
-
-        if parent_node.read_only {
-            return Err(NdnError::PermissionDenied("parent is read-only".to_string()));
-        }
-
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
-
-        // Helper macro for rollback on error
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.fsmeta.rollback(Some(txid.clone())).await;
-                return Err($err);
-            }};
-        }
-
-        // Check existing dentry
-        let dentry = self
-            .fsmeta
-            .get_dentry(parent_id, name.clone(), Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-        // Determine if file exists
-        let file_exists = matches!(
-            &dentry,
-            Some(DentryRecord { target: DentryTarget::IndexNodeId(_), .. })
-                | Some(DentryRecord { target: DentryTarget::ObjId(_), .. })
-        );
-
-        // Validate flag against file existence
-        match flag {
-            OpenWriteFlag::Append | OpenWriteFlag::ContinueWrite => {
-                if !file_exists {
-                    rollback_and_err!(NdnError::NotFound(format!(
-                        "file not found for {:?}: {}",
-                        flag, path.0
-                    )));
-                }
-            }
-            OpenWriteFlag::CreateExclusive => {
-                if file_exists {
-                    rollback_and_err!(NdnError::AlreadyExists(format!(
-                        "file already exists: {}",
-                        path.0
-                    )));
-                }
-            }
-            OpenWriteFlag::CreateOrTruncate | OpenWriteFlag::CreateOrAppend => {
-                // Both cases are allowed regardless of file existence
-            }
-        }
-
-        // Resolve or create file_id based on dentry and flag
-        let (file_id, existing_base_obj, existing_state) = match dentry {
-            None | Some(DentryRecord { target: DentryTarget::Tombstone, .. }) => {
-                // File doesn't exist - create new inode
-                // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
-                let new_node = NodeRecord {
-                    inode_id: 0,
-                    kind: NodeKind::File,
-                    read_only: false,
-                    base_obj_id: None,
-                    state: NodeState::DirNormal,
-                    rev: None,
-                    meta: None,
-                    lease_client_session: None,
-                    lease_seq: None,
-                    lease_expire_at: None,
-                };
-
-                let fid = self
-                    .fsmeta
-                    .alloc_inode(new_node, Some(txid.clone()))
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
-
-                self.fsmeta
-                    .upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                    )
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-                (fid, None, NodeState::DirNormal)
-            }
-            Some(DentryRecord { target: DentryTarget::IndexNodeId(fid), .. }) => {
-                // Existing inode - get current state
-                let node = self
-                    .fsmeta
-                    .get_inode(fid, Some(txid.clone()))
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
-                    .ok_or_else(|| NdnError::NotFound("inode not found".to_string()))?;
-
-                // Validate state based on flag
-                match (&flag, &node.state) {
-                    // ContinueWrite: allow Working or Cooling state
-                    (OpenWriteFlag::ContinueWrite, NodeState::Working(_))
-                    | (OpenWriteFlag::ContinueWrite, NodeState::Cooling(_)) => {
-                        // OK - will resume the existing buffer
-                    }
-                    // For other flags, Working state is not allowed (file busy)
-                    (_, NodeState::Working(_)) => {
-                        rollback_and_err!(NdnError::InvalidState(
-                            "file is already being written".to_string()
-                        ));
-                    }
-                    // ContinueWrite requires Working or Cooling state
-                    (OpenWriteFlag::ContinueWrite, _) => {
-                        rollback_and_err!(NdnError::InvalidState(format!(
-                            "ContinueWrite requires Working or Cooling state, current: {:?}",
-                            node.state
-                        )));
-                    }
-                    // All other combinations are OK
-                    _ => {}
-                }
-
-                (fid, node.base_obj_id.clone(), node.state.clone())
-            }
-            Some(DentryRecord { target: DentryTarget::ObjId(oid), .. }) => {
-                // Dentry points to ObjId directly - materialize inode
-                let new_node = NodeRecord {
-                    inode_id: 0,
-                    kind: NodeKind::File,
-                    read_only: false,
-                    base_obj_id: Some(oid.clone()),
-                    state: NodeState::DirNormal,
-                    rev: None,
-                    meta: None,
-                    lease_client_session: None,
-                    lease_seq: None,
-                    lease_expire_at: None,
-                };
-
-                let fid = self
-                    .fsmeta
-                    .alloc_inode(new_node, Some(txid.clone()))
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
-
-                self.fsmeta
-                    .upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                    )
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-                (fid, Some(oid), NodeState::DirNormal)
-            }
-        };
-
-        // Determine write mode based on flag and existing state
-        let (should_truncate, existing_chunks, resume_handle) = match flag {
-            OpenWriteFlag::CreateExclusive | OpenWriteFlag::CreateOrTruncate => {
-                // Fresh start - no existing data
-                (true, vec![], None)
-            }
-            OpenWriteFlag::Append | OpenWriteFlag::CreateOrAppend => {
-                // Append mode - need to load existing chunks if file has content
-                let chunks = if let Some(ref base_oid) = existing_base_obj {
-                    self.load_file_chunks(base_oid).await.unwrap_or_default()
-                } else {
-                    vec![]
-                };
-                (false, chunks, None)
-            }
-            OpenWriteFlag::ContinueWrite => {
-                // Resume existing write session
-                match existing_state {
-                    NodeState::Working(ws) => {
-                        // File is still in Working state - reuse existing buffer
-                        (false, vec![], Some(ws.fb_handle))
-                    }
-                    NodeState::Cooling(cs) => {
-                        // File is in Cooling state - reopen the buffer
-                        (false, vec![], Some(cs.fb_handle))
-                    }
-                    _ => {
-                        // Should not reach here due to earlier validation
-                        rollback_and_err!(NdnError::InvalidState(
-                            "unexpected state for ContinueWrite".to_string()
-                        ));
-                    }
-                }
-            }
-        };
-
-        // Handle ContinueWrite with existing buffer
-        if let Some(handle) = resume_handle {
-            // For ContinueWrite, verify the buffer exists and can be resumed
-            let _fb = self
-                .buffer
-                .get_buffer(&handle)
-                .await
-                .map_err(|_| NdnError::InvalidState(format!(
-                    "buffer {} not found for ContinueWrite, may have been cleaned up",
-                    handle
-                )))?;
-
-            // Re-acquire lease
-            let session = SessionId(format!("{}:{}", self.instance, file_id));
-            let lease_seq = self
-                .fsmeta
-                .acquire_file_lease(file_id, session.clone(), std::time::Duration::from_secs(300))
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to acquire lease: {}", e)))?;
-
-            // Update inode state to Working with the existing buffer handle
-            let working_state = NodeState::Working(crate::FileWorkingState {
-                fb_handle: handle.clone(),
-                last_write_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            });
-
-            self.fsmeta
-                .update_inode_state(file_id, working_state, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to update inode state: {}", e)))?;
-
-            self.fsmeta
-                .commit(Some(txid))
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
-
-            // Note: The buffer's lease info may need to be updated separately
-            // if FileBufferService supports lease renewal. For now, we assume
-            // the buffer is still valid for continued writes.
-            let _ = (session, lease_seq); // Suppress unused warnings
-
-            return Ok(handle);
-        }
-
-        // Acquire lease for new/truncated/append writes
-        let session = SessionId(format!("{}:{}", self.instance, file_id));
-        let lease_seq = self
-            .fsmeta
-            .acquire_file_lease(file_id, session.clone(), std::time::Duration::from_secs(300))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to acquire lease: {}", e)))?;
-
-        // Allocate buffer
-        let lease = fs_buffer::WriteLease {
-            session: session.clone(),
-            session_seq: lease_seq,
-            expires_at: 0,
-        };
-
-        let fb = self
-            .buffer
-            .alloc_buffer(
-                &fs_buffer::NdmPath(path.0.clone()),
-                file_id,
-                existing_chunks,
-                &lease,
-                expected_size,
-            )
-            .await?;
-
-        // Update inode state to Working
-        let working_state = NodeState::Working(crate::FileWorkingState {
-            fb_handle: fb.handle_id.clone(),
-            last_write_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        });
-
-        // If truncating, clear base_obj_id by updating the inode
-        if should_truncate && existing_base_obj.is_some() {
-            // Get current inode and clear base_obj_id
-            let mut node = self
-                .fsmeta
-                .get_inode(file_id, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get inode for truncate: {}", e)))?
-                .ok_or_else(|| NdnError::NotFound("inode not found for truncate".to_string()))?;
-            
-            node.base_obj_id = None;
-            self.fsmeta
-                .set_inode(node, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to clear base obj: {}", e)))?;
-        }
-
-        self.fsmeta
-            .update_inode_state(file_id, working_state, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to update inode state: {}", e)))?;
-
-        self.fsmeta
-            .commit(Some(txid))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
-
-        Ok(fb.handle_id)
-    }
-
-    /// Load existing file chunks from base object for append operations
-    async fn load_file_chunks(&self, obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
-        let store = self.store.lock().await;
-        let file_obj_json = store
-            .get_object_impl(obj_id, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get file object: {}", e)))?;
+    ) -> NdnResult<(FileBufferSeekWriter, IndexNodeId)> {
+        let file_handle_id = self.fsmeta.open_file_writer(path, flag, expected_size).await?;
+        let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await?;
         
-        // Extract chunk list from file object JSON
-        // Expected format: { "chunks": ["sha256:xxx", "sha256:yyy", ...] }
-        if let Some(chunks_arr) = file_obj_json.get("chunks").and_then(|v| v.as_array()) {
-            let mut chunks = Vec::with_capacity(chunks_arr.len());
-            for chunk_val in chunks_arr {
-                if let Some(chunk_str) = chunk_val.as_str() {
-                    let chunk_id = ChunkId::new(chunk_str)
-                        .map_err(|e| NdnError::Internal(format!("invalid chunk id: {}", e)))?;
-                    chunks.push(chunk_id);
-                }
-            }
-            Ok(chunks)
-        } else {
-            // File has no chunks (empty file or different format)
-            Ok(vec![])
-        }
+        let writer = self.fsbuffer.open_writer(&file_handle, std::io::SeekFrom::Start(0)).await?;
+        Ok((writer, file_handle.file_inode_id))
     }
+
 
     pub async fn append(&self, path: &NdmPath, data: &[u8]) -> NdnResult<()> {
-        let handle_id = self.open_file_writer(path, OpenWriteFlag::CreateOrAppend, Some(data.len() as u64)).await?;
-        let fb = self.buffer.get_buffer(&handle_id).await?;
-        self.buffer.append(&fb, data).await?;
-        self.buffer.close(&fb).await?;
+        let file_handle_id = self.fsmeta.open_file_writer(path, OpenWriteFlag::CreateOrAppend, None).await?;
+        let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await?;
+        let mut writer = self
+            .fsbuffer
+            .open_writer(&file_handle, std::io::SeekFrom::End(0))
+            .await?;
+        writer.write_all(data).await?;
+        writer.flush().await?;
+        self.fsmeta.close_file_writer(file_handle.file_inode_id).await?;
         Ok(())
     }
 
-    pub async fn flush(&self, handle_id: &str) -> NdnResult<()> {
-        let fb = self.buffer.get_buffer(handle_id).await?;
-        self.buffer.flush(&fb).await
+    pub async fn close_file(&self, file_inode_id: IndexNodeId) -> NdnResult<()> {
+        self.fsmeta.close_file_writer(file_inode_id).await
     }
 
-    pub async fn close_file(&self, handle_id: &str) -> NdnResult<()> {
-        let fb = self.buffer.get_buffer(handle_id).await?;
-        self.buffer.flush(&fb).await?;
+    // ========== Pull Operations,need more think ==========
 
-        // Update inode state to Cooling
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+    // pub async fn pull(&self, path: &NdmPath, ctx: PullContext) -> NdnResult<()> {
+    //     let stat = self.stat(path).await?;
+    //     if let Some(obj_id) = stat.obj_id {
+    //         self.pull_by_objid(obj_id, ctx).await
+    //     } else {
+    //         Err(NdnError::NotFound("no object to pull".to_string()))
+    //     }
+    // }
 
-        let cooling_state = NodeState::Cooling(crate::FileCoolingState {
-            fb_handle: handle_id.to_string(),
-            closed_at: now,
-        });
+    // pub async fn pull_by_objid(&self, obj_id: ObjId, _ctx: PullContext) -> NdnResult<()> {
+    //     let fetcher = self
+    //         .fetcher
+    //         .as_ref()
+    //         .ok_or_else(|| NdnError::InvalidState("fetcher not configured".to_string()))?;
 
-        self.fsmeta
-            .update_inode_state(fb.file_inode_id, cooling_state, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to update inode state: {}", e)))?;
+    //     fetcher.schedule_pull_obj(&obj_id).await
+    // }
 
-        // Release lease
-        let session = SessionId(format!("{}:{}", self.instance, fb.file_inode_id));
-        let _ = self
-            .fsmeta
-            .release_file_lease(fb.file_inode_id, session, 0)
-            .await;
+    // pub async fn pull_chunk(&self, chunk_id: ChunkId, _ctx: PullContext) -> NdnResult<()> {
+    //     let fetcher = self
+    //         .fetcher
+    //         .as_ref()
+    //         .ok_or_else(|| NdnError::InvalidState("fetcher not configured".to_string()))?;
 
-        Ok(())
-    }
-
-    pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        let src_stat = self.stat(src).await?;
-
-        if src_stat.kind == PathKind::NotFound {
-            return Err(NdnError::NotFound(format!("source {} not found", src.as_str())));
-        }
-
-        // Check not working
-        if let Some(state) = &src_stat.state {
-            if matches!(state, NodeState::Working(_) | NodeState::Cooling(_)) {
-                return Err(NdnError::InvalidState(
-                    "source must be committed to snapshot".to_string(),
-                ));
-            }
-        }
-
-        // Copy the binding
-        self.copy_path(src, target).await
-    }
-
-    // ========== Pull Operations ==========
-
-    pub async fn pull(&self, path: &NdmPath, ctx: PullContext) -> NdnResult<()> {
-        let stat = self.stat(path).await?;
-        if let Some(obj_id) = stat.obj_id {
-            self.pull_by_objid(obj_id, ctx).await
-        } else {
-            Err(NdnError::NotFound("no object to pull".to_string()))
-        }
-    }
-
-    pub async fn pull_by_objid(&self, obj_id: ObjId, _ctx: PullContext) -> NdnResult<()> {
-        let fetcher = self
-            .fetcher
-            .as_ref()
-            .ok_or_else(|| NdnError::InvalidState("fetcher not configured".to_string()))?;
-
-        fetcher.schedule_pull_obj(&obj_id).await
-    }
-
-    pub async fn pull_chunk(&self, chunk_id: ChunkId, _ctx: PullContext) -> NdnResult<()> {
-        let fetcher = self
-            .fetcher
-            .as_ref()
-            .ok_or_else(|| NdnError::InvalidState("fetcher not configured".to_string()))?;
-
-        fetcher.schedule_pull_chunk(&chunk_id).await
-    }
+    //     fetcher.schedule_pull_chunk(&chunk_id).await
+    // }
 
     // ========== Eviction ==========
 
     pub async fn erase_obj_by_id(&self, obj_id: &ObjId) -> NdnResult<()> {
-        // This only removes physical data, not the path binding
-        // Implementation depends on store interface
-        let _store = self.store.lock().await;
-        // TODO: store.erase_object_data(obj_id)
-        log::warn!("erase_obj_by_id not fully implemented for {}", obj_id);
-        Ok(())
+        let _ = obj_id;
+        Err(NdnError::Unsupported(
+            "erase_obj_by_id not implemented".to_string(),
+        ))
     }
 
-    // ========== Chunk Operations (for ndn_router compatibility) ==========
+    // ========== Chunk Operations (for ndn_router , call to store_layout_mgr) ==========
 
     pub async fn have_chunk(&self, chunk_id: &ChunkId) -> NdnResult<bool> {
-        let store = self.store.lock().await;
-        Ok(store.have_chunk_impl(chunk_id).await)
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
+        let (state, _, _) = layout_mgr.query_chunk_state(chunk_id).await?;
+        Ok(state.can_open_reader())
     }
 
     pub async fn query_chunk_state(
         &self,
         chunk_id: &ChunkId,
-    ) -> NdnResult<(named_store::ChunkState, u64, String)> {
-        let store = self.store.lock().await;
-        store.query_chunk_state_impl(chunk_id).await
+    ) -> NdnResult<(named_store::ChunkStoreState, u64, String)> {
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
+        layout_mgr.query_chunk_state(chunk_id).await
     }
 
     pub async fn open_chunk_reader(
@@ -1137,8 +595,10 @@ impl NamedDataMgr {
         offset: u64,
         _opts: ReadOptions,
     ) -> NdnResult<(ndn_lib::ChunkReader, u64)> {
-        let store = self.store.lock().await;
-        store.open_chunk_reader_impl(chunk_id, offset, false).await
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
+        layout_mgr.open_chunk_reader(chunk_id, offset, false).await
     }
 
     // ========== Admin Operations ==========
@@ -1150,236 +610,19 @@ impl NamedDataMgr {
         ))
     }
 
+
+
+    // ========== Helper Methods ==========
+    // 手工物化一个目录，把目录的objid设置为path的objid，并设置为readonly
     pub async fn publish_dir(&self, path: &NdmPath) -> NdnResult<ObjId> {
-        let resolved = self.resolve_path(path).await?;
-        let (dir_id, dir_node) =
-            resolved.ok_or_else(|| NdnError::NotFound("path not found".to_string()))?;
-
-        if dir_node.kind != NodeKind::Dir {
-            return Err(NdnError::InvalidParam("path is not a directory".to_string()));
-        }
-
-        // If already committed, return existing ObjId
-        if let Some(obj_id) = dir_node.base_obj_id {
-            return Ok(obj_id);
-        }
-
-        // TODO: implement directory materialization (cacl_dir logic)
+        let _ = path;
         Err(NdnError::Unsupported(
-            "directory materialization not fully implemented".to_string(),
+            "publish_dir not implemented".to_string(),
         ))
     }
 
-    // ========== Helper Methods ==========
 
-    /// Ensure directory inode exists at path, creating parent directories as needed.
-    /// Uses iterative approach to avoid async recursion.
-    /// 
-    /// This method handles the case where the path passes through a DirObject:
-    /// - When a dentry points to ObjId (DirObject) instead of IndexNodeId
-    /// - It materializes the directory by creating inode with base_obj_id pointing to the DirObject
-    async fn ensure_dir_inode(&self, path: &NdmPath) -> NdnResult<IndexNodeId> {
-        if path.is_root() {
-            return self.fsmeta.root_dir().await.map_err(|e| {
-                NdnError::Internal(format!("failed to get root dir: {}", e))
-            });
-        }
-
-        // Try to resolve existing path first
-        match self.resolve_path(path).await {
-            Ok(Some((id, node))) => {
-                if node.kind != NodeKind::Dir {
-                    return Err(NdnError::InvalidParam(format!(
-                        "{} is not a directory",
-                        path.as_str()
-                    )));
-                }
-                return Ok(id);
-            }
-            Ok(None) => {
-                // Path doesn't exist, will create it below
-            }
-            Err(e) => {
-                // Check if this is a "requires materialization" error
-                let err_msg = e.to_string();
-                if !err_msg.contains("requires materialization") {
-                    return Err(e);
-                }
-                // Path passes through DirObject, need to materialize
-            }
-        }
-
-        // Resolve path with materialization support
-        // Walk through the path components, materializing DirObjects as needed
-        let components: Vec<&str> = path
-            .as_str()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let root_id = self.fsmeta.root_dir().await.map_err(|e| {
-            NdnError::Internal(format!("failed to get root dir: {}", e))
-        })?;
-
-        let mut current_id = root_id;
-
-        for (i, component) in components.iter().enumerate() {
-            let dentry = self
-                .fsmeta
-                .get_dentry(current_id, component.to_string(), None)
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-            match dentry {
-                Some(d) => match d.target {
-                    DentryTarget::IndexNodeId(id) => {
-                        // Already an inode, verify it's a directory
-                        let node = self
-                            .fsmeta
-                            .get_inode(id, None)
-                            .await
-                            .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
-                            .ok_or_else(|| NdnError::NotFound("inode not found".to_string()))?;
-                        
-                        if node.kind != NodeKind::Dir {
-                            return Err(NdnError::InvalidParam(format!(
-                                "{} is not a directory",
-                                components[..=i].join("/")
-                            )));
-                        }
-                        current_id = id;
-                    }
-                    DentryTarget::ObjId(obj_id) => {
-                        // Dentry points to a DirObject - need to materialize
-                        // Verify it's a directory object
-                        if obj_id.obj_type != OBJ_TYPE_DIR {
-                            return Err(NdnError::InvalidParam(format!(
-                                "path component {} points to non-directory object",
-                                component
-                            )));
-                        }
-
-                        // Materialize: create inode with base_obj_id pointing to this DirObject
-                        let new_id = self
-                            .materialize_dir_from_obj(current_id, component.to_string(), &obj_id)
-                            .await?;
-                        current_id = new_id;
-                    }
-                    DentryTarget::Tombstone => {
-                        // Tombstone - need to create new directory
-                        let remaining_path = format!("/{}", components[..=i].join("/"));
-                        self.create_dir_internal(&NdmPath::new(&remaining_path)).await?;
-                        
-                        // Get the newly created inode
-                        let new_dentry = self
-                            .fsmeta
-                            .get_dentry(current_id, component.to_string(), None)
-                            .await
-                            .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?
-                            .ok_or_else(|| NdnError::Internal("failed to create directory".to_string()))?;
-                        
-                        if let DentryTarget::IndexNodeId(id) = new_dentry.target {
-                            current_id = id;
-                        } else {
-                            return Err(NdnError::Internal("unexpected dentry target after creation".to_string()));
-                        }
-                    }
-                },
-                None => {
-                    // Directory doesn't exist - create it
-                    let remaining_path = format!("/{}", components[..=i].join("/"));
-                    self.create_dir_internal(&NdmPath::new(&remaining_path)).await?;
-                    
-                    // Get the newly created inode
-                    let new_dentry = self
-                        .fsmeta
-                        .get_dentry(current_id, component.to_string(), None)
-                        .await
-                        .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?
-                        .ok_or_else(|| NdnError::Internal("failed to create directory".to_string()))?;
-                    
-                    if let DentryTarget::IndexNodeId(id) = new_dentry.target {
-                        current_id = id;
-                    } else {
-                        return Err(NdnError::Internal("unexpected dentry target after creation".to_string()));
-                    }
-                }
-            }
-        }
-
-        Ok(current_id)
-    }
-
-    /// Materialize a directory from a DirObject.
-    /// Creates a new inode with base_obj_id pointing to the DirObject,
-    /// and updates the dentry to point to the new inode.
-    async fn materialize_dir_from_obj(
-        &self,
-        parent_id: IndexNodeId,
-        name: String,
-        dir_obj_id: &ObjId,
-    ) -> NdnResult<IndexNodeId> {
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
-
-        // Helper macro for rollback on error (similar to open_file_writer)
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.fsmeta.rollback(Some(txid.clone())).await;
-                return Err($err);
-            }};
-        }
-
-        // Create new directory inode with base_obj_id pointing to the DirObject
-        let new_node = NodeRecord {
-            inode_id: 0,
-            kind: NodeKind::Dir,
-            read_only: false,
-            base_obj_id: Some(dir_obj_id.clone()),
-            state: NodeState::DirOverlay, // Overlay mode: upper layer changes on top of base DirObject
-            rev: Some(0),
-            meta: None,
-            lease_client_session: None,
-            lease_seq: None,
-            lease_expire_at: None,
-        };
-
-        let new_id = match self
-            .fsmeta
-            .alloc_inode(new_node, Some(txid.clone()))
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                rollback_and_err!(NdnError::Internal(format!("failed to alloc inode: {}", e)));
-            }
-        };
-
-        // Update dentry to point to the new inode
-        if let Err(e) = self
-            .fsmeta
-            .upsert_dentry(
-                parent_id,
-                name,
-                DentryTarget::IndexNodeId(new_id),
-                Some(txid.clone()),
-            )
-            .await
-        {
-            rollback_and_err!(NdnError::Internal(format!("failed to upsert dentry: {}", e)));
-        }
-
-        self.fsmeta
-            .commit(Some(txid))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
-
-        Ok(new_id)
-    }
-
+    //  move to store_layout_mgr
     /// Lookup a child entry in a DirObject by inner_path.
     /// Returns the ObjId if the child exists and is a directory.
     #[allow(dead_code)]
@@ -1388,13 +631,14 @@ impl NamedDataMgr {
         dir_obj_id: &ObjId,
         child_name: &str,
     ) -> NdnResult<Option<ObjId>> {
-        // Get the DirObject from store
-        let store = self.store.lock().await;
-        let obj_json = store
-            .get_object_impl(dir_obj_id, None)
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
+
+        let obj_json = layout_mgr
+            .get_object(dir_obj_id)
             .await
             .map_err(|e| NdnError::Internal(format!("failed to get DirObject: {}", e)))?;
-        drop(store);
 
         // Parse as DirObject
         let dir_obj: DirObject = serde_json::from_value(obj_json)
@@ -1434,77 +678,7 @@ impl NamedDataMgr {
         }
     }
 
-    /// Internal directory creation that doesn't recursively call ensure_dir_inode.
-    /// Assumes parent directory already exists.
-    async fn create_dir_internal(&self, path: &NdmPath) -> NdnResult<()> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| NdnError::InvalidParam("invalid path".to_string()))?;
-
-        let parent_id = if parent_path.is_root() {
-            self.fsmeta.root_dir().await.map_err(|e| {
-                NdnError::Internal(format!("failed to get root dir: {}", e))
-            })?
-        } else {
-            let resolved = self.resolve_path(&parent_path).await?;
-            resolved
-                .map(|(id, _)| id)
-                .ok_or_else(|| NdnError::Internal("parent directory not found".to_string()))?
-        };
-
-        // Check if already exists
-        let existing = self
-            .fsmeta
-            .get_dentry(parent_id, name.clone(), None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-        if let Some(d) = existing {
-            if !matches!(d.target, DentryTarget::Tombstone) {
-                // Already exists, nothing to do
-                return Ok(());
-            }
-        }
-
-        // Create directory inode
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to begin txn: {}", e)))?;
-
-        let new_node = NodeRecord {
-            inode_id: 0,
-            kind: NodeKind::Dir,
-            read_only: false,
-            base_obj_id: None,
-            state: NodeState::DirNormal,
-            rev: None,
-            meta: None,
-            lease_client_session: None,
-            lease_seq: None,
-            lease_expire_at: None,
-        };
-
-        let new_id = self
-            .fsmeta
-            .alloc_inode(new_node, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to alloc inode: {}", e)))?;
-
-        // Link dentry via upsert_dentry
-        self.fsmeta
-            .upsert_dentry(parent_id, name.clone(), DentryTarget::IndexNodeId(new_id), Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to upsert dentry: {}", e)))?;
-
-        self.fsmeta
-            .commit(Some(txid))
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to commit: {}", e)))?;
-
-        Ok(())
-    }
+    
 
     async fn move_path_with_opts(
         &self,
@@ -1512,289 +686,11 @@ impl NamedDataMgr {
         new_path: &NdmPath,
         opts: MoveOptions,
     ) -> NdnResult<()> {
-        // Normalize and validate
-        if old_path.is_root() {
-            return Err(NdnError::InvalidParam("invalid name".to_string()));
-        }
-
-        let old_normalized = old_path.as_str().trim_end_matches('/');
-        let new_normalized = new_path.as_str().trim_end_matches('/');
-
-        if old_normalized == new_normalized {
-            return Ok(()); // No-op
-        }
-
-        // Parse paths
-        let (src_parent_path, src_name) = old_path
-            .split_parent_name()
-            .ok_or(NdnError::InvalidParam("invalid name".to_string()))?;
-        let (dst_parent_path, dst_name) = new_path
-            .split_parent_name()
-            .ok_or(NdnError::InvalidParam("invalid name".to_string()))?;
-
-        // Validate names
-        if src_name.is_empty() || dst_name.is_empty() {
-            return Err(NdnError::InvalidParam("invalid name".to_string()));
-        }
-
-        // Ensure parent directories exist
-        let src_parent = self.ensure_dir_inode(&src_parent_path).await?;
-        let dst_parent = self.ensure_dir_inode(&dst_parent_path).await?;
-
-        // Get parent nodes
-        let src_dir = self
-            .fsmeta
-            .get_inode(src_parent, None)
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?
-            .ok_or(NdnError::NotFound("not found".to_string()))?;
-        let dst_dir = self
-            .fsmeta
-            .get_inode(dst_parent, None)
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?
-            .ok_or(NdnError::NotFound("not found".to_string()))?;
-
-        if src_dir.kind != NodeKind::Dir || dst_dir.kind != NodeKind::Dir {
-            return Err(NdnError::NotFound("not found".to_string()));
-        }
-
-        if src_dir.read_only || dst_dir.read_only {
-            return Err(NdnError::PermissionDenied("read only".to_string()));
-        }
-
-        let src_rev0 = src_dir.rev.unwrap_or(0);
-        let dst_rev0 = dst_dir.rev.unwrap_or(0);
-
-        // Build move plan
-        let source = self
-            .plan_move_source(src_parent, &src_name, &src_dir, src_rev0)
-            .await?;
-
-        // Cycle prevention for directories
-        if is_dir_like(&source) {
-            if is_descendant_path(new_path, old_path) {
-                return Err(NdnError::InvalidParam("invalid name".to_string()));
-            }
-        }
-
-        // Check destination conflict
-        self.check_dest_conflict_pre(dst_parent, &dst_name, &dst_dir, opts)
-            .await?;
-
-        // Build plan
-        let plan = MovePlan {
-            src_parent,
-            src_name: src_name.clone(),
-            dst_parent,
-            dst_name: dst_name.clone(),
-            src_rev0,
-            dst_rev0,
-            source,
-        };
-
-        // Apply in transaction
-        self.apply_move_plan_txn(plan, opts).await
+       self.fsmeta.move_path_with_opts(old_path, new_path, opts).await
     }
-
-    async fn check_dest_conflict_pre(
-        &self,
-        dst_parent: IndexNodeId,
-        dst_name: &str,
-        dst_dir_node: &NodeRecord,
-        opts: MoveOptions,
-    ) -> Result<(), NdnError> {
-        // Check upper layer
-        let dentry = self
-            .fsmeta
-            .get_dentry(dst_parent, dst_name.to_string(), None)
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        if let Some(d) = dentry {
-            match d.target {
-                DentryTarget::Tombstone => { /* treat as not-exists */ }
-                DentryTarget::IndexNodeId(_) | DentryTarget::ObjId(_) => {
-                    if !opts.overwrite_upper {
-                        return Err(NdnError::AlreadyExists("already exists".to_string()));
-                    }
-                }
-            }
-        }
-
-        if !opts.strict_check_base {
-            return Ok(());
-        }
-
-        // Check base if strict mode
-        let base = match &dst_dir_node.base_obj_id {
-            None => return Ok(()),
-            Some(oid) => oid.clone(),
-        };
-
-        let store = self.store.lock().await;
-        let is_materialized = store.is_object_exist(&base).await?;
-        if !is_materialized {
-            return Err(NdnError::NotFound("need pull".to_string()));
-        }
-
-        // TODO: check children in base DirObject
-        // For now, allow the move
-        Ok(())
-    }
-
-    async fn plan_move_source(
-        &self,
-        src_parent: IndexNodeId,
-        src_name: &str,
-        src_dir_node: &NodeRecord,
-        src_rev0: u64,
-    ) -> Result<MoveSource, NdnError> {
-        // Check upper first
-        let dentry = self
-            .fsmeta
-            .get_dentry(src_parent, src_name.to_string(), None)
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        if let Some(d) = dentry {
-            return match d.target {
-                DentryTarget::Tombstone => Err(NdnError::NotFound("not found".to_string())),
-                DentryTarget::IndexNodeId(fid) => {
-                    let inode = self
-                        .fsmeta
-                        .get_inode(fid, None)
-                        .await
-                        .map_err(|e| NdnError::Internal(e.to_string()))?
-                        .ok_or(NdnError::NotFound("not found".to_string()))?;
-                    let kind_hint = match inode.kind {
-                        NodeKind::Dir => ObjectKind::Dir,
-                        NodeKind::File => ObjectKind::File,
-                        NodeKind::Object => ObjectKind::Unknown,
-                    };
-                    Ok(MoveSource::Upper {
-                        target: DentryTarget::IndexNodeId(fid),
-                        kind_hint,
-                    })
-                }
-                DentryTarget::ObjId(oid) => Ok(MoveSource::Upper {
-                    target: DentryTarget::ObjId(oid),
-                    kind_hint: ObjectKind::Unknown,
-                }),
-            };
-        }
-
-        // Upper miss => check base
-        let base0 = src_dir_node.base_obj_id.clone();
-        let base_oid = base0.clone().ok_or(NdnError::NotFound("not found".to_string()))?;
-
-        let store = self.store.lock().await;
-        let is_materialized = store.is_object_exist(&base_oid).await?;
-        if !is_materialized {
-            return Err(NdnError::NotFound("need pull".to_string()));
-        }
-
-        // TODO: look up child in base DirObject
-        // For now, return NotFound
-        Err(NdnError::NotFound("not found".to_string()))
-    }
-
-    async fn apply_move_plan_txn(
-        &self,
-        plan: MovePlan,
-        _opts: MoveOptions,
-    ) -> NdnResult<()> {
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        // Verify revisions haven't changed (OCC)
-        let src_dir = self
-            .fsmeta
-            .get_inode(plan.src_parent, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?
-            .ok_or(NdnError::NotFound("not found".to_string()))?;
-
-        let dst_dir = self
-            .fsmeta
-            .get_inode(plan.dst_parent, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?
-            .ok_or(NdnError::NotFound("not found".to_string()))?;
-
-        if src_dir.rev.unwrap_or(0) != plan.src_rev0
-            || dst_dir.rev.unwrap_or(0) != plan.dst_rev0
-        {
-            let _ = self.fsmeta.rollback(Some(txid)).await;
-            return Err(NdnError::InvalidState("conflict".to_string()));
-        }
-
-        // Set tombstone at source
-        self.fsmeta
-            .set_tombstone(plan.src_parent, plan.src_name, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        // Upsert dentry at destination
-        let target = match plan.source {
-            MoveSource::Upper { target, .. } => target,
-            MoveSource::Base { obj_id, .. } => DentryTarget::ObjId(obj_id),
-        };
-
-        self.fsmeta
-            .upsert_dentry(plan.dst_parent, plan.dst_name, target, Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        // Bump revisions
-        if plan.src_parent == plan.dst_parent {
-            self.fsmeta
-                .bump_dir_rev(plan.src_parent, plan.src_rev0, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(e.to_string()))?;
-        } else {
-            self.fsmeta
-                .bump_dir_rev(plan.src_parent, plan.src_rev0, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(e.to_string()))?;
-            self.fsmeta
-                .bump_dir_rev(plan.dst_parent, plan.dst_rev0, Some(txid.clone()))
-                .await
-                .map_err(|e| NdnError::Internal(e.to_string()))?;
-        }
-
-        self.fsmeta
-            .commit(Some(txid))
-            .await
-            .map_err(|e| NdnError::Internal(e.to_string()))?;
-
-        Ok(())
-    }
+  
 }
 
-// ========== Helper Functions ==========
-
-fn is_dir_like(src: &MoveSource) -> bool {
-    match src {
-        MoveSource::Upper { kind_hint, .. } => *kind_hint == ObjectKind::Dir,
-        MoveSource::Base { kind, .. } => *kind == ObjectKind::Dir,
-    }
-}
-
-fn is_descendant_path(potential_child: &NdmPath, potential_parent: &NdmPath) -> bool {
-    let child = potential_child.as_str().trim_end_matches('/');
-    let parent = potential_parent.as_str().trim_end_matches('/');
-
-    if child.len() <= parent.len() {
-        return false;
-    }
-
-    child.starts_with(parent)
-        && (child.as_bytes().get(parent.len()) == Some(&b'/') || parent == "/")
-}
 
 // ========== Background Manager ==========
 
@@ -1843,51 +739,5 @@ impl NamedDataMgr {
         let mut map = NAMED_DATA_MGR_MAP.lock().await;
         map.insert(mgr_id.to_string(), mgr_ref.clone());
         Ok(mgr_ref)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_ndm_path_split() {
-        let path = NdmPath::new("/foo/bar/baz");
-        let (parent, name) = path.split_parent_name().unwrap();
-        assert_eq!(parent.as_str(), "/foo/bar");
-        assert_eq!(name, "baz");
-
-        let root_child = NdmPath::new("/foo");
-        let (parent, name) = root_child.split_parent_name().unwrap();
-        assert_eq!(parent.as_str(), "/");
-        assert_eq!(name, "foo");
-
-        let root = NdmPath::new("/");
-        assert!(root.split_parent_name().is_none());
-        assert!(root.is_root());
-    }
-
-    #[test]
-    fn test_is_descendant_path() {
-        assert!(is_descendant_path(
-            &NdmPath::new("/a/b/c"),
-            &NdmPath::new("/a/b")
-        ));
-        assert!(is_descendant_path(
-            &NdmPath::new("/a/b/c"),
-            &NdmPath::new("/a")
-        ));
-        assert!(is_descendant_path(
-            &NdmPath::new("/a/b"),
-            &NdmPath::new("/")
-        ));
-        assert!(!is_descendant_path(
-            &NdmPath::new("/a/b"),
-            &NdmPath::new("/a/b")
-        ));
-        assert!(!is_descendant_path(
-            &NdmPath::new("/a/bc"),
-            &NdmPath::new("/a/b")
-        ));
     }
 }

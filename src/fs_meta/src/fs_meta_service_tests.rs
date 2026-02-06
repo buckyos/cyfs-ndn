@@ -6,6 +6,7 @@ mod tests {
     use ndm::{
         ClientSessionId, DentryTarget, FsMetaHandler, IndexNodeId, NodeKind, NodeRecord, NodeState,
     };
+    use ndn_lib::NdmPath;
     use ndn_lib::ObjId;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -1081,7 +1082,7 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx.clone())
+            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx.clone())
             .await
             .unwrap();
         assert_eq!(resolved.unwrap().0, c.inode_id);
@@ -1100,7 +1101,7 @@ mod tests {
         .unwrap();
 
         let resolved2 = svc
-            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx)
+            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());
@@ -1150,7 +1151,7 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx.clone())
+            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx.clone())
             .await
             .unwrap();
         assert_eq!(resolved.unwrap().0, c.inode_id);
@@ -1174,7 +1175,7 @@ mod tests {
 
         // After commit, the cached /a/b/* entries must be invalidated.
         let resolved2 = svc
-            .handle_resolve_path(&ndm::NdmPath::new("/a/b/c"), ctx)
+            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());

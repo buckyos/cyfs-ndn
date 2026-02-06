@@ -6,8 +6,25 @@ coding场景，build过程大量创建小文件，使用后批量删除
 照片管理场景，查看多年前的照片
 
 ## 创建临时小文件
+```
+ndm.open_file_writer:
+  fb_handle = fsmeta.open_file_writer("parent_dir/filename")? 
+  base_reader= open_reader(store_layout.get_obj(fb_buffer.base_obj_id))?
+  fb_buffer_instance = fb_service.open(fb_handle.id)?
+  return new FileBufferWrite(fb_buffer_instance,base_reader)
+ndm.close_file_writer:
+  fsmeta.close(fb_handle)
 
-### fb_handle = fsmeta.open_file_writer("parent_dir","filename") 
+...
+
+real_writer = ndm.open_file_writer()
+real_writer.write(data)
+drop(real_writer)
+ndm.close_file_writer(real_writer)
+
+```
+
+### fb_handle_id = fsmeta.open_file_writer("parent_dir","filename") 
 
 > meta看来的树结构 `inode -> inode -> DirObject / DirObject / DirObject(Parent) / filename`
 
@@ -58,6 +75,25 @@ coding场景，build过程大量创建小文件，使用后批量删除
 
 ## 小文件被另一个应用读取
 
+```
+ndm.open_file_reader:
+  file_resp = fsmeta.open_file_reader("parent_dir/filename")
+  if file_resp.is_filebuffer() {
+      base_reader= open_reader(store_layout.get_obj(file_resp.fb_buffer.base_obj_id))?
+      fb_buffer_instance = fb_service.open_reader(fb_handle.id)?
+      return new FileBufferReader(fb_buffer_instance,base_reader)
+  } else {
+    return store_layout.open_reader(file_resp.objid,file_resp.inner_path)
+  }
+
+...
+reader = ndm.open_file_reader("parent_dir/filename")
+data = reader.read_to_end()
+drop(reader)
+
+
+```
+
 ### fb_handle = fsmeta.open_reader("parent_dir/filename")
 
 > meta看来的树结构 `inode -> inode -> inode_base_dir -> inode_base_dir -> inode_base_dir (Parent) / filename`
@@ -88,8 +124,14 @@ fb = fb_service.open_reader(fb_handle)
 
 ## build结束，通过list得到所有的小文件
 
-fs_meta.list("parent_dir_path")
-
+```
+dir_result = fsmeta.open_dir("parent/")
+dentries = fs_meta.list(dir_result.inode)
+if dir_result.base_dir_obj_id {
+  dentries.merge(store_layout.get_obj(dir_result.base_dir_obj_id ).children)
+}
+return dentries
+```
 > meta看来的树结构 `inode -> inode -> inode -> inode -> inode (Parent)
 
 parent_node是一个有BaseDirObject的DirNode
@@ -103,9 +145,10 @@ parent_node是一个有BaseDirObject的DirNode
 
 总计 [metadb.read 1,metadb.select 1]
 
-## 删除parent_dir
+## 删除parent_dir : fsmeta.remove_dir(parent_dir)
 
 > meta看来的树结构 `inode -> inode -> inode_base_dir -> inode_base_dir -> inode_base_dir (Parent)`
+
 
 - 从路径得到parent_parent_dir的inode_id，查询次数和路径的深度有关，但有cache可以让这个过程变成一次数据库查询 [metadb.read 1]
 - 通过parent_parent_dir_inode,得到parent_parent_dir_node [metadb.read 1]
@@ -116,6 +159,13 @@ parent_node是一个有BaseDirObject的DirNode
 ## 场景二、浏览家庭照片库
 
 path: /home/lzc/photos/2016/香港旅游
+
+```
+dir_result = fsmeta.open_dir("/home/lzc/photos/2016/香港旅游")
+if dir_result.is_dir_object () {
+  //物化分支，后续list不需要再和fsmeta通信
+} 
+```
 
 因为照片库里的照片，很多早就已经物化，因此
 
