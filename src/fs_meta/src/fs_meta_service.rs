@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::path_resolve_cache::PathResolveCache;
+use crate::background::BackgroundMgr;
 
 const NODE_STATE_DIR_NORMAL: i64 = 0;
 const NODE_STATE_DIR_OVERLAY: i64 = 1;

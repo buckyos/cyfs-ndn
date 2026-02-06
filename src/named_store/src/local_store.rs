@@ -220,6 +220,11 @@ impl NamedLocalStore {
             .set_object(obj_id, obj_id.obj_type.as_str(), obj_data)
     }
 
+    pub async fn remove_object_impl(&self, obj_id: &ObjId) -> NdnResult<()> {
+        self.ensure_writable()?;
+        self.db.remove_object(obj_id)
+    }
+
     async fn get_chunk_item_impl(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
         self.db.get_chunk_item(chunk_id)
     }
@@ -571,6 +576,34 @@ impl NamedLocalStore {
         chunk_item.update_time = current_unix_ts();
         self.db.set_chunk_item(&chunk_item)?;
         Ok(())
+    }
+
+    pub async fn remove_chunk_impl(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+        self.ensure_writable()?;
+
+        let final_path = self.get_chunk_final_path(chunk_id);
+        if let Err(err) = fs::remove_file(&final_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(NdnError::IoError(err.to_string()));
+            }
+        }
+
+        let tmp_path = self.get_chunk_tmp_path(chunk_id);
+        if let Err(err) = fs::remove_file(&tmp_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(NdnError::IoError(err.to_string()));
+            }
+        }
+
+        if let Some(cache_path) = self.get_cache_mmap_path(chunk_id) {
+            if let Err(err) = fs::remove_file(&cache_path).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(NdnError::IoError(err.to_string()));
+                }
+            }
+        }
+
+        self.db.remove_chunk(chunk_id)
     }
 
     pub async fn add_chunk_by_link_to_local_file_impl(

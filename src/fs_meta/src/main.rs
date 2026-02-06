@@ -3,6 +3,7 @@
 
 pub mod fs_meta_service;
 
+mod background;
 mod path_resolve_cache;
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use crate::{
     ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalStore, ObjectState, StoreLayout,
 };
 use ndn_lib::{ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult, ObjId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -335,6 +335,36 @@ impl NamedStoreMgr {
         store_guard.put_object_impl(obj_id, obj_data).await
     }
 
+    /// Remove object from all possible layout targets (best-effort)
+    pub async fn remove_object(&self, obj_id: &ObjId) -> NdnResult<()> {
+        let versions = self.versions.read().await;
+        let stores = self.stores.read().await;
+
+        if versions.is_empty() {
+            return Ok(());
+        }
+
+        let mut tried_stores: HashSet<String> = HashSet::new();
+        for version in versions.iter() {
+            let target = match version.layout.select_primary_target(obj_id) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            if tried_stores.contains(&target.store_id) {
+                continue;
+            }
+            tried_stores.insert(target.store_id.clone());
+
+            if let Some(store) = stores.get(&target.store_id) {
+                let store_guard = store.lock().await;
+                let _ = store_guard.remove_object_impl(obj_id).await;
+            }
+        }
+
+        Ok(())
+    }
+
     // ==================== Chunk State Operations ====================
 
     /// Check if chunk exists (tries all layout versions)
@@ -485,6 +515,37 @@ impl NamedStoreMgr {
                 chunk_id.to_string()
             ))
         }))
+    }
+
+    /// Remove chunk from all possible layout targets (best-effort)
+    pub async fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+        let obj_id = chunk_id.to_obj_id();
+        let versions = self.versions.read().await;
+        let stores = self.stores.read().await;
+
+        if versions.is_empty() {
+            return Ok(());
+        }
+
+        let mut tried_stores: HashSet<String> = HashSet::new();
+        for version in versions.iter() {
+            let target = match version.layout.select_primary_target(&obj_id) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            if tried_stores.contains(&target.store_id) {
+                continue;
+            }
+            tried_stores.insert(target.store_id.clone());
+
+            if let Some(store) = stores.get(&target.store_id) {
+                let store_guard = store.lock().await;
+                let _ = store_guard.remove_chunk_impl(chunk_id).await;
+            }
+        }
+
+        Ok(())
     }
 
     /// Open store chunk reader (tries all layout versions)

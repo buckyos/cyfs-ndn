@@ -4,15 +4,21 @@
 //! a unified file/directory namespace with overlay semantics.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use fs_buffer::{FileBufferSeekWriter, FileBufferService};
-use named_store::{ChunkStoreState, NamedStoreMgr};
+use named_store::{
+    NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout,
+    StoreTarget as LayoutStoreTarget,
+};
 use ndn_lib::{
-    ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, SimpleMapItem, OBJ_TYPE_DIR,
+    ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId, SimpleChunkList,
+    SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, MoveOptions, NodeKind, NodeRecord,
@@ -66,6 +72,55 @@ pub struct ReadOptions {
 
 /// Inner path for accessing content within an object
 pub type InnerPath = String;
+
+// ------------------------------
+// Composite Readers
+// ------------------------------
+
+struct ConcatChunkReader {
+    readers: Vec<ndn_lib::ChunkReader>,
+    current: usize,
+}
+
+impl ConcatChunkReader {
+    fn new(readers: Vec<ndn_lib::ChunkReader>) -> Self {
+        Self { readers, current: 0 }
+    }
+}
+
+impl AsyncRead for ConcatChunkReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            let this = self.as_mut().get_mut();
+            if this.current >= this.readers.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let before = buf.filled().len();
+            let reader = this
+                .readers
+                .get_mut(this.current)
+                .expect("reader index");
+            let mut pinned = Pin::new(reader);
+            match pinned.as_mut().poll_read(cx, buf) {
+                Poll::Ready(Ok(())) => {
+                    let after = buf.filled().len();
+                    if after > before {
+                        return Poll::Ready(Ok(()));
+                    }
+                    this.current += 1;
+                    continue;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
 
 // ------------------------------
 // Move-related types
@@ -230,29 +285,92 @@ impl NamedDataMgr {
 
     pub async fn stat(&self, path: &NdmPath) -> NdnResult<PathStat> {
         let resolved = self.fsmeta.resolve_path(path).await?;
-        match resolved {
-            Some((inode_id, node)) => {
-                let kind = match node.kind {
-                    NodeKind::File => PathKind::File,
-                    NodeKind::Dir => PathKind::Dir,
-                    NodeKind::Object => PathKind::File, // Objects are file-like
-                };
-                Ok(PathStat {
-                    kind,
-                    size: None, // TODO: get size from state
-                    obj_id: node.base_obj_id.clone(),
-                    inode_id: Some(inode_id),
-                    state: Some(node.state),
-                })
-            }
-            None => Ok(PathStat {
+        if let Some((inode_id, node)) = resolved {
+            let kind = match node.kind {
+                NodeKind::File => PathKind::File,
+                NodeKind::Dir => PathKind::Dir,
+                NodeKind::Object => PathKind::File,
+            };
+
+            let obj_id = Self::node_obj_id(&node).or_else(|| node.base_obj_id.clone());
+            let size = if let Some(ref id) = obj_id {
+                self.obj_size_from_obj_id(id).await
+            } else {
+                None
+            };
+
+            return Ok(PathStat {
+                kind,
+                size,
+                obj_id,
+                inode_id: Some(inode_id),
+                state: Some(node.state),
+            });
+        }
+
+        if path.is_root() {
+            return Ok(PathStat {
                 kind: PathKind::NotFound,
                 size: None,
                 obj_id: None,
                 inode_id: None,
                 state: None,
-            }),
+            });
         }
+
+        if let Some((parent_path, name)) = path.split_parent_name() {
+            if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
+                let dentry = self
+                    .fsmeta
+                    .get_dentry(parent_id, name, None)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
+
+                if let Some(dentry) = dentry {
+                    match dentry.target {
+                        DentryTarget::ObjId(obj_id) => return self.path_stat_from_obj_id(obj_id).await,
+                        DentryTarget::IndexNodeId(id) => {
+                            if let Some(node) = self
+                                .fsmeta
+                                .get_inode(id, None)
+                                .await
+                                .map_err(|e| {
+                                    NdnError::Internal(format!("failed to get inode: {}", e))
+                                })?
+                            {
+                                let kind = match node.kind {
+                                    NodeKind::File => PathKind::File,
+                                    NodeKind::Dir => PathKind::Dir,
+                                    NodeKind::Object => PathKind::File,
+                                };
+                                let obj_id = Self::node_obj_id(&node);
+                                let size = if let Some(ref id) = obj_id {
+                                    self.obj_size_from_obj_id(id).await
+                                } else {
+                                    None
+                                };
+                                return Ok(PathStat {
+                                    kind,
+                                    size,
+                                    obj_id,
+                                    inode_id: Some(id),
+                                    state: Some(node.state),
+                                });
+                            }
+                        }
+                        DentryTarget::Tombstone => {}
+                    }
+                }
+            }
+        }
+
+        Ok(PathStat {
+            kind: PathKind::NotFound,
+            size: None,
+            obj_id: None,
+            inode_id: None,
+            state: None,
+        })
     }
 
     pub async fn stat_by_objid(&self, obj_id: &ObjId) -> NdnResult<ObjStat> {
@@ -287,26 +405,34 @@ impl NamedDataMgr {
     //创建软链接，目标必须是文件或者目录，不能是符号链接
     //LINK: link_path -> target
     pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        self.fsmeta.make_link(target, link_path).await
+        self.fsmeta.make_link(link_path, target).await
     }
 
     pub async fn copy_file(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        let _ = (src, target);
-        Err(NdnError::Unsupported(
-            "copy_file not implemented".to_string(),
-        ))
+        let stat = self.stat(src).await?;
+        if stat.kind != PathKind::File {
+            return Err(NdnError::InvalidParam("source is not a file".to_string()));
+        }
+        let obj_id = stat
+            .obj_id
+            .ok_or_else(|| NdnError::InvalidState("source file not published".to_string()))?;
+        self.set_file(target, obj_id).await
     }
 
     pub async fn copy_dir(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        //这是一个复杂的函数，需要复制大量的inode，做成fs-meta的任务可能会导致性能问题，这里要考虑如何阶段性的实现：
-        // fsmeta上有复制任务管理器
-        // 先copy到一个目录然后rename到target?
-        unimplemented!()
+        let stat = self.stat(src).await?;
+        if stat.kind != PathKind::Dir {
+            return Err(NdnError::InvalidParam("source is not a directory".to_string()));
+        }
+        let obj_id = stat
+            .obj_id
+            .ok_or_else(|| NdnError::InvalidState("source directory not published".to_string()))?;
+        self.set_dir(target, obj_id).await
     }
 
     //快照的逻辑是copy_dir的特殊情况，复制后把target设置为readonly,并很快会触发物化流程冻结
     pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        unimplemented!()
+        self.copy_dir(src, target).await
     }
 
     // ========== Directory Operations ==========
@@ -317,75 +443,143 @@ impl NamedDataMgr {
     pub async fn list(
         &self,
         path: &NdmPath,
-        _pos: u32,
-        _page_size: u32,
+        pos: u32,
+        page_size: u32,
     ) -> NdnResult<Vec<(String, PathStat)>> {
         let resolved = self.fsmeta.resolve_path(path).await?;
-        let (dir_id, dir_node) =
-            resolved.ok_or_else(|| NdnError::NotFound("path not found".to_string()))?;
-
-        if dir_node.kind != NodeKind::Dir {
-            return Err(NdnError::InvalidParam(
-                "path is not a directory".to_string(),
-            ));
-        }
-
-        // List dentries from upper layer
-        let dentries = self
-            .fsmeta
-            .list_dentries(dir_id, None)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to list dentries: {}", e)))?;
-
-        let mut results = Vec::new();
-
-        for dentry in dentries {
-            if matches!(dentry.target, DentryTarget::Tombstone) {
-                continue;
+        if let Some((dir_id, dir_node)) = resolved {
+            if dir_node.kind != NodeKind::Dir {
+                return Err(NdnError::InvalidParam(
+                    "path is not a directory".to_string(),
+                ));
             }
 
-            let child_stat = match &dentry.target {
-                DentryTarget::IndexNodeId(id) => {
-                    let node =
-                        self.fsmeta.get_inode(*id, None).await.map_err(|e| {
-                            NdnError::Internal(format!("failed to get inode: {}", e))
-                        })?;
+            let dentries = self
+                .fsmeta
+                .list_dentries(dir_id, None)
+                .await
+                .map_err(|e| NdnError::Internal(format!("failed to list dentries: {}", e)))?;
 
-                    match node {
-                        Some(n) => PathStat {
-                            kind: match n.kind {
-                                NodeKind::File => PathKind::File,
-                                NodeKind::Dir => PathKind::Dir,
-                                NodeKind::Object => PathKind::File,
-                            },
-                            size: None,
-                            obj_id: n.base_obj_id,
-                            inode_id: Some(*id),
-                            state: Some(n.state),
-                        },
-                        None => continue,
-                    }
-                }
-                DentryTarget::ObjId(obj_id) => {
-                    // TODO: determine kind from object metadata
-                    PathStat {
-                        kind: PathKind::File, // Assume file for now
-                        size: None,
-                        obj_id: Some(obj_id.clone()),
-                        inode_id: None,
-                        state: None,
-                    }
-                }
-                DentryTarget::Tombstone => continue,
-            };
+            let mut upper_map: HashMap<String, DentryRecord> = HashMap::new();
+            for dentry in dentries {
+                upper_map.insert(dentry.name.clone(), dentry);
+            }
 
-            results.push((dentry.name, child_stat));
+            let mut results: HashMap<String, PathStat> = HashMap::new();
+
+            if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
+                let dir_obj = self.load_dir_object(&base_obj_id).await?;
+                for (name, item) in dir_obj.iter() {
+                    if let Some(upper) = upper_map.get(name) {
+                        if matches!(upper.target, DentryTarget::Tombstone) {
+                            continue;
+                        }
+                        continue;
+                    }
+                    let child_stat = self.path_stat_from_simple_map_item(item).await?;
+                    results.insert(name.clone(), child_stat);
+                }
+            }
+
+            for (name, dentry) in upper_map {
+                if matches!(dentry.target, DentryTarget::Tombstone) {
+                    continue;
+                }
+
+                let child_stat = match dentry.target {
+                    DentryTarget::IndexNodeId(id) => {
+                        let node = self
+                            .fsmeta
+                            .get_inode(id, None)
+                            .await
+                            .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
+
+                        match node {
+                            Some(n) => {
+                                let kind = match n.kind {
+                                    NodeKind::File => PathKind::File,
+                                    NodeKind::Dir => PathKind::Dir,
+                                    NodeKind::Object => PathKind::File,
+                                };
+                                let obj_id = Self::node_obj_id(&n);
+                                let size = if let Some(ref id) = obj_id {
+                                    self.obj_size_from_obj_id(id).await
+                                } else {
+                                    None
+                                };
+                                PathStat {
+                                    kind,
+                                    size,
+                                    obj_id,
+                                    inode_id: Some(id),
+                                    state: Some(n.state),
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                    DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
+                    DentryTarget::Tombstone => continue,
+                };
+
+                results.insert(name, child_stat);
+            }
+
+            let mut out: Vec<(String, PathStat)> = results.into_iter().collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+
+            if page_size > 0 {
+                let start = pos as usize;
+                if start >= out.len() {
+                    return Ok(Vec::new());
+                }
+                let end = (start + page_size as usize).min(out.len());
+                return Ok(out[start..end].to_vec());
+            }
+
+            return Ok(out);
         }
 
-        // TODO: merge with base directory if present
-        // TODO: implement pagination
+        if let Some((parent_path, name)) = path.split_parent_name() {
+            if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
+                let dentry = self
+                    .fsmeta
+                    .get_dentry(parent_id, name, None)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
 
-        Ok(results)
+                if let Some(dentry) = dentry {
+                    match dentry.target {
+                        DentryTarget::ObjId(obj_id) => {
+                            if obj_id.obj_type != OBJ_TYPE_DIR {
+                                return Err(NdnError::InvalidParam(
+                                    "path is not a directory".to_string(),
+                                ));
+                            }
+                            let dir_obj = self.load_dir_object(&obj_id).await?;
+                            let mut out = Vec::new();
+                            for (entry_name, item) in dir_obj.iter() {
+                                let child_stat = self.path_stat_from_simple_map_item(item).await?;
+                                out.push((entry_name.clone(), child_stat));
+                            }
+                            out.sort_by(|a, b| a.0.cmp(&b.0));
+                            if page_size > 0 {
+                                let start = pos as usize;
+                                if start >= out.len() {
+                                    return Ok(Vec::new());
+                                }
+                                let end = (start + page_size as usize).min(out.len());
+                                return Ok(out[start..end].to_vec());
+                            }
+                            return Ok(out);
+                        }
+                        DentryTarget::IndexNodeId(_) | DentryTarget::Tombstone => {}
+                    }
+                }
+            }
+        }
+
+        Err(NdnError::NotFound("path not found".to_string()))
     }
 
     // ========== Read Operations ==========
@@ -395,50 +589,21 @@ impl NamedDataMgr {
         path: &NdmPath,
         _opts: ReadOptions,
     ) -> NdnResult<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, u64)> {
-        let stat = self.stat(path).await?;
-
-        if stat.kind == PathKind::NotFound {
-            return Err(NdnError::NotFound(format!(
-                "path {} not found",
-                path.as_str()
-            )));
-        }
-
-        // If there's an inode with working state, use buffer
-        if let Some(_inode_id) = stat.inode_id {
-            if let Some(state) = &stat.state {
-                match state {
-                    NodeState::Working(ws) => {
-                        // Open reader from buffer
-                        let fb = self.fsbuffer.get_buffer(&ws.fb_handle).await?;
-                        let reader = self
-                            .fsbuffer
-                            .open_reader(&fb, std::io::SeekFrom::Start(0))
-                            .await?;
-                        // Get file size from metadata or estimate
-                        return Ok((Box::new(reader), 0)); // TODO: get actual size
-                    }
-                    NodeState::Cooling(cs) => {
-                        let fb = self.fsbuffer.get_buffer(&cs.fb_handle).await?;
-                        let reader = self
-                            .fsbuffer
-                            .open_reader(&fb, std::io::SeekFrom::Start(0))
-                            .await?;
-                        return Ok((Box::new(reader), 0));
-                    }
-                    _ => {}
-                }
+        let resp = self.fsmeta.open_file_reader(path).await?;
+        match resp {
+            crate::OpenFileReaderResp::FileBufferId(handle_id) => {
+                let fb = self.fsbuffer.get_buffer(&handle_id).await?;
+                let reader = self
+                    .fsbuffer
+                    .open_reader(&fb, std::io::SeekFrom::Start(0))
+                    .await?;
+                Ok((Box::new(reader), 0))
+            }
+            crate::OpenFileReaderResp::Object(obj_id, inner_path) => {
+                self.open_reader_by_id(&obj_id, inner_path.as_ref(), ReadOptions::default())
+                    .await
             }
         }
-
-        // Fall back to committed object
-        if let Some(obj_id) = stat.obj_id {
-            return self
-                .open_reader_by_id(&obj_id, None, ReadOptions::default())
-                .await;
-        }
-
-        Err(NdnError::NotFound("no readable content".to_string()))
     }
 
     //move to store_layout_mgr
@@ -448,7 +613,6 @@ impl NamedDataMgr {
         _inner_path: Option<&InnerPath>,
         _opts: ReadOptions,
     ) -> NdnResult<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, u64)> {
-        // Check if object is a chunk
         if obj_id.is_chunk() {
             let chunk_id = ChunkId::from_obj_id(obj_id);
             let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
@@ -458,7 +622,48 @@ impl NamedDataMgr {
             return Ok((Box::new(reader), size));
         }
 
-        // TODO: handle other object types (FileObject, DirObject, etc.)
+        if obj_id.obj_type == OBJ_TYPE_FILE {
+            let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+                NdnError::NotFound("store layout manager not configured".to_string())
+            })?;
+            let file_obj = self.load_file_object(obj_id).await?;
+            let content_id = ObjId::new(file_obj.content.as_str())?;
+
+            if content_id.is_chunk() {
+                let chunk_id = ChunkId::from_obj_id(&content_id);
+                let (reader, size) = layout_mgr.open_chunk_reader(&chunk_id, 0, false).await?;
+                let size = if file_obj.size > 0 { file_obj.size } else { size };
+                return Ok((Box::new(reader), size));
+            }
+
+            if content_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+                let chunk_list = self.load_chunk_list(&content_id).await?;
+                let mut readers = Vec::with_capacity(chunk_list.body.len());
+                for chunk_id in chunk_list.body.iter() {
+                    let (reader, _) = layout_mgr.open_chunk_reader(chunk_id, 0, false).await?;
+                    readers.push(reader);
+                }
+                let size = if file_obj.size > 0 {
+                    file_obj.size
+                } else {
+                    chunk_list.total_size
+                };
+                let reader = ConcatChunkReader::new(readers);
+                return Ok((Box::new(reader), size));
+            }
+
+            return Err(NdnError::Unsupported(format!(
+                "unsupported file content type: {}",
+                content_id.obj_type
+            )));
+        }
+
+        if obj_id.obj_type == OBJ_TYPE_DIR {
+            return Err(NdnError::InvalidParam(
+                "directory object is not readable".to_string(),
+            ));
+        }
+
         Err(NdnError::Unsupported(
             "non-chunk object reading not implemented".to_string(),
         ))
@@ -501,8 +706,152 @@ impl NamedDataMgr {
         ))
     }
 
+    async fn load_dir_object(&self, obj_id: &ObjId) -> NdnResult<DirObject> {
+        let obj_json = self.get_object(obj_id).await?;
+        serde_json::from_value(obj_json)
+            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))
+    }
+
+    async fn load_file_object(&self, obj_id: &ObjId) -> NdnResult<FileObject> {
+        let obj_json = self.get_object(obj_id).await?;
+        serde_json::from_value(obj_json)
+            .map_err(|e| NdnError::Internal(format!("failed to parse FileObject: {}", e)))
+    }
+
+    async fn load_chunk_list(&self, obj_id: &ObjId) -> NdnResult<SimpleChunkList> {
+        let obj_json = self.get_object(obj_id).await?;
+        SimpleChunkList::from_json_value(obj_json)
+            .map_err(|e| NdnError::Internal(format!("failed to parse chunk list: {}", e)))
+    }
+
+    fn obj_kind_from_obj_id(obj_id: &ObjId) -> ObjectKind {
+        if obj_id.obj_type == OBJ_TYPE_DIR {
+            ObjectKind::Dir
+        } else if obj_id.obj_type == OBJ_TYPE_FILE {
+            ObjectKind::File
+        } else {
+            ObjectKind::Unknown
+        }
+    }
+
+    async fn obj_size_from_obj_id(&self, obj_id: &ObjId) -> Option<u64> {
+        match Self::obj_kind_from_obj_id(obj_id) {
+            ObjectKind::File => self.load_file_object(obj_id).await.ok().map(|f| f.size),
+            ObjectKind::Dir => self.load_dir_object(obj_id).await.ok().map(|d| d.total_size),
+            ObjectKind::Unknown => None,
+        }
+    }
+
+    async fn path_stat_from_obj_id(&self, obj_id: ObjId) -> NdnResult<PathStat> {
+        let kind = match Self::obj_kind_from_obj_id(&obj_id) {
+            ObjectKind::Dir => PathKind::Dir,
+            ObjectKind::File => PathKind::File,
+            ObjectKind::Unknown => PathKind::File,
+        };
+        let size = self.obj_size_from_obj_id(&obj_id).await;
+        Ok(PathStat {
+            kind,
+            size,
+            obj_id: Some(obj_id),
+            inode_id: None,
+            state: None,
+        })
+    }
+
+    async fn path_stat_from_simple_map_item(
+        &self,
+        item: &SimpleMapItem,
+    ) -> NdnResult<PathStat> {
+        let (obj_id, _) = item.get_obj_id()?;
+        let kind = match Self::obj_kind_from_obj_id(&obj_id) {
+            ObjectKind::Dir => PathKind::Dir,
+            ObjectKind::File => PathKind::File,
+            ObjectKind::Unknown => PathKind::File,
+        };
+
+        let size = match item {
+            SimpleMapItem::Object(obj_type, _) => {
+                if obj_type == OBJ_TYPE_FILE {
+                    let file_obj: FileObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
+                        NdnError::Internal(format!("failed to parse FileObject: {}", e))
+                    })?;
+                    Some(file_obj.size)
+                } else if obj_type == OBJ_TYPE_DIR {
+                    let dir_obj: DirObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
+                        NdnError::Internal(format!("failed to parse DirObject: {}", e))
+                    })?;
+                    Some(dir_obj.total_size)
+                } else {
+                    None
+                }
+            }
+            SimpleMapItem::ObjectJwt(obj_type, _) => {
+                if obj_type == OBJ_TYPE_FILE {
+                    let file_obj: FileObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
+                        NdnError::Internal(format!("failed to parse FileObject: {}", e))
+                    })?;
+                    Some(file_obj.size)
+                } else if obj_type == OBJ_TYPE_DIR {
+                    let dir_obj: DirObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
+                        NdnError::Internal(format!("failed to parse DirObject: {}", e))
+                    })?;
+                    Some(dir_obj.total_size)
+                } else {
+                    None
+                }
+            }
+            SimpleMapItem::ObjId(_) => self.obj_size_from_obj_id(&obj_id).await,
+        };
+
+        Ok(PathStat {
+            kind,
+            size,
+            obj_id: Some(obj_id),
+            inode_id: None,
+            state: None,
+        })
+    }
+
+    fn node_obj_id(node: &NodeRecord) -> Option<ObjId> {
+        match &node.state {
+            NodeState::Linked(ls) => Some(ls.obj_id.clone()),
+            NodeState::Finalized(fs) => Some(fs.obj_id.clone()),
+            _ => node.base_obj_id.clone(),
+        }
+    }
+
     /// Load existing file chunks from base object for append operations
-    async fn load_file_chunklist(&self, _obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
+    async fn load_file_chunklist(&self, obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
+        let Some(_layout_mgr) = self.layout_mgr.as_ref() else {
+            return Ok(Vec::new());
+        };
+
+        let file_obj = match self.load_file_object(obj_id).await {
+            Ok(obj) => obj,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        if file_obj.content.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let content_id = match ObjId::new(file_obj.content.as_str()) {
+            Ok(id) => id,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        if content_id.is_chunk() {
+            return Ok(vec![ChunkId::from_obj_id(&content_id)]);
+        }
+
+        if content_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+            let chunk_list = match self.load_chunk_list(&content_id).await {
+                Ok(list) => list,
+                Err(_) => return Ok(Vec::new()),
+            };
+            return Ok(chunk_list.body);
+        }
+
         Ok(Vec::new())
     }
 
@@ -581,10 +930,19 @@ impl NamedDataMgr {
     // ========== Eviction ==========
 
     pub async fn erase_obj_by_id(&self, obj_id: &ObjId) -> NdnResult<()> {
-        let _ = obj_id;
-        Err(NdnError::Unsupported(
-            "erase_obj_by_id not implemented".to_string(),
-        ))
+        let layout_mgr = self
+            .layout_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+
+        if obj_id.is_chunk() {
+            let chunk_id = ChunkId::from_obj_id(obj_id);
+            layout_mgr.remove_chunk(&chunk_id).await?;
+            return Ok(());
+        }
+
+        layout_mgr.remove_object(obj_id).await?;
+        Ok(())
     }
 
     // ========== Chunk Operations (for ndn_router , call to store_layout_mgr) ==========
@@ -625,19 +983,196 @@ impl NamedDataMgr {
     // ========== Admin Operations ==========
 
     pub async fn expand_capacity(&self, _new_target: StoreTarget) -> NdnResult<u64> {
-        // TODO: implement store layout expansion
-        Err(NdnError::Unsupported(
-            "expand_capacity not implemented".to_string(),
-        ))
+        let layout_mgr = self
+            .layout_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+
+        let store_path = std::path::PathBuf::from(_new_target.path.clone());
+        let store = NamedLocalStore::from_config(
+            Some(_new_target.store_id.clone()),
+            store_path,
+            NamedLocalConfig::default(),
+        )
+        .await?;
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+        layout_mgr.register_store(store_ref).await;
+
+        let current = layout_mgr.current_layout().await;
+        let mut targets = current.as_ref().map(|l| l.targets.clone()).unwrap_or_default();
+
+        if !targets
+            .iter()
+            .any(|t| t.store_id == _new_target.store_id)
+        {
+            targets.push(LayoutStoreTarget {
+                store_id: _new_target.store_id.clone(),
+                device_did: None,
+                capacity: None,
+                used: None,
+                readonly: false,
+                enabled: true,
+                weight: 1,
+            });
+        }
+
+        let epoch = current.as_ref().map(|l| l.epoch + 1).unwrap_or(1);
+        let total_capacity = current.as_ref().map(|l| l.total_capacity).unwrap_or(0);
+        let total_used = current.as_ref().map(|l| l.total_used).unwrap_or(0);
+        let layout = StoreLayout::new(epoch, targets, total_capacity, total_used);
+        layout_mgr.add_layout(layout).await;
+        Ok(epoch)
     }
 
     // ========== Helper Methods ==========
     // 手工物化一个目录，把目录的objid设置为path的objid，并设置为readonly
     pub async fn publish_dir(&self, path: &NdmPath) -> NdnResult<ObjId> {
-        let _ = path;
-        Err(NdnError::Unsupported(
-            "publish_dir not implemented".to_string(),
-        ))
+        let layout_mgr = self
+            .layout_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+
+        let resolved = self.fsmeta.resolve_path(path).await?;
+        let (dir_id, _) =
+            resolved.ok_or_else(|| NdnError::NotFound("path not found".to_string()))?;
+
+        let txid = self
+            .fsmeta
+            .begin_txn()
+            .await
+            .map_err(|e| NdnError::Internal(format!("begin_txn failed: {}", e)))?;
+
+        let mut node = match self
+            .fsmeta
+            .get_inode(dir_id, Some(txid.clone()))
+            .await
+            .map_err(|e| NdnError::Internal(format!("get_inode failed: {}", e)))?
+        {
+            Some(node) => node,
+            None => {
+                let _ = self.fsmeta.rollback(Some(txid.clone())).await;
+                return Err(NdnError::NotFound("inode not found".to_string()));
+            }
+        };
+
+        if node.kind != NodeKind::Dir {
+            let _ = self.fsmeta.rollback(Some(txid.clone())).await;
+            return Err(NdnError::InvalidParam("path is not a directory".to_string()));
+        }
+
+        let rev0 = node.rev.unwrap_or(0);
+
+        let upper_dentries = self
+            .fsmeta
+            .list_dentries(dir_id, Some(txid.clone()))
+            .await
+            .map_err(|e| NdnError::Internal(format!("list_dentries failed: {}", e)))?;
+
+        let mut upper_map: HashMap<String, DentryRecord> = HashMap::new();
+        for dentry in upper_dentries.iter() {
+            upper_map.insert(dentry.name.clone(), dentry.clone());
+        }
+
+        let mut entries: HashMap<String, ObjId> = HashMap::new();
+
+        if let Some(base_obj_id) = node.base_obj_id.clone() {
+            let dir_obj = self.load_dir_object(&base_obj_id).await?;
+            for (name, item) in dir_obj.iter() {
+                if let Some(upper) = upper_map.get(name) {
+                    if matches!(upper.target, DentryTarget::Tombstone) {
+                        continue;
+                    }
+                    continue;
+                }
+                let (obj_id, _) = item.get_obj_id()?;
+                entries.insert(name.clone(), obj_id);
+            }
+        }
+
+        for (name, dentry) in upper_map {
+            if matches!(dentry.target, DentryTarget::Tombstone) {
+                continue;
+            }
+            let obj_id = match dentry.target {
+                DentryTarget::ObjId(obj_id) => obj_id,
+                DentryTarget::IndexNodeId(inode_id) => {
+                    let child = self
+                        .fsmeta
+                        .get_inode(inode_id, Some(txid.clone()))
+                        .await
+                        .map_err(|e| NdnError::Internal(format!("get_inode failed: {}", e)))?;
+                    let child = match child {
+                        Some(c) => c,
+                        None => {
+                            let _ = self.fsmeta.rollback(Some(txid.clone())).await;
+                            return Err(NdnError::NotFound("child inode not found".to_string()));
+                        }
+                    };
+                    Self::node_obj_id(&child).ok_or_else(|| {
+                        NdnError::InvalidState(format!(
+                            "child {} not published",
+                            dentry.name
+                        ))
+                    })?
+                }
+                DentryTarget::Tombstone => continue,
+            };
+            entries.insert(name, obj_id);
+        }
+
+        let mut dir_obj = DirObject::new(None);
+        for (name, obj_id) in entries.iter() {
+            let kind = Self::obj_kind_from_obj_id(obj_id);
+            match kind {
+                ObjectKind::File => {
+                    let file_obj = self.load_file_object(obj_id).await?;
+                    dir_obj.file_count += 1;
+                    dir_obj.file_size += file_obj.size;
+                    dir_obj.total_size += file_obj.size;
+                }
+                ObjectKind::Dir => {
+                    let sub_dir = self.load_dir_object(obj_id).await?;
+                    dir_obj.total_size += sub_dir.total_size;
+                }
+                ObjectKind::Unknown => {}
+            }
+
+            dir_obj
+                .object_map
+                .insert(name.clone(), SimpleMapItem::ObjId(obj_id.clone()));
+        }
+
+        let (dir_obj_id, dir_obj_str) = dir_obj.gen_obj_id()?;
+        layout_mgr.put_object(&dir_obj_id, &dir_obj_str).await?;
+
+        let new_rev = self
+            .fsmeta
+            .bump_dir_rev(dir_id, rev0, Some(txid.clone()))
+            .await
+            .map_err(|e| NdnError::Internal(format!("bump_dir_rev failed: {}", e)))?;
+
+        node.base_obj_id = Some(dir_obj_id.clone());
+        node.state = NodeState::DirOverlay;
+        node.rev = Some(new_rev);
+
+        self.fsmeta
+            .set_inode(node, Some(txid.clone()))
+            .await
+            .map_err(|e| NdnError::Internal(format!("set_inode failed: {}", e)))?;
+
+        for dentry in upper_dentries.iter() {
+            self.fsmeta
+                .remove_dentry_row(dir_id, dentry.name.clone(), Some(txid.clone()))
+                .await
+                .map_err(|e| NdnError::Internal(format!("remove_dentry failed: {}", e)))?;
+        }
+
+        self.fsmeta
+            .commit(Some(txid.clone()))
+            .await
+            .map_err(|e| NdnError::Internal(format!("commit failed: {}", e)))?;
+
+        Ok(dir_obj_id)
     }
 
     //  move to store_layout_mgr
@@ -707,6 +1242,431 @@ impl NamedDataMgr {
         self.fsmeta
             .move_path_with_opts(old_path, new_path, opts)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use fs_buffer::{
+        FileBufferRecord, FileBufferSeekReader, FileBufferSeekWriter, FileBufferService, NdmPath,
+        SessionId, WriteLease,
+    };
+    use krpc::{RPCContext, RPCErrors};
+    use ndn_lib::{ChunkHasher, ObjId};
+    use named_store::ObjectState;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::AsyncWriteExt;
+
+    struct DummyFsMeta;
+
+    #[async_trait]
+    impl FsMetaHandler for DummyFsMeta {
+        async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
+            Ok(0)
+        }
+
+        async fn handle_resolve_path(
+            &self,
+            _path: &ndn_lib::NdmPath,
+            _ctx: RPCContext,
+        ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
+            Ok(None)
+        }
+
+        async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {
+            Ok("tx".to_string())
+        }
+
+        async fn handle_get_inode(
+            &self,
+            _id: IndexNodeId,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<Option<NodeRecord>, RPCErrors> {
+            Ok(None)
+        }
+
+        async fn handle_set_inode(
+            &self,
+            _node: NodeRecord,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_update_inode_state(
+            &self,
+            _node_id: IndexNodeId,
+            _new_state: NodeState,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_alloc_inode(
+            &self,
+            _node: NodeRecord,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<IndexNodeId, RPCErrors> {
+            Ok(0)
+        }
+
+        async fn handle_get_dentry(
+            &self,
+            _parent: IndexNodeId,
+            _name: String,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<Option<DentryRecord>, RPCErrors> {
+            Ok(None)
+        }
+
+        async fn handle_list_dentries(
+            &self,
+            _parent: IndexNodeId,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<Vec<DentryRecord>, RPCErrors> {
+            Ok(Vec::new())
+        }
+
+        async fn handle_upsert_dentry(
+            &self,
+            _parent: IndexNodeId,
+            _name: String,
+            _target: DentryTarget,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_remove_dentry_row(
+            &self,
+            _parent: IndexNodeId,
+            _name: String,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_set_tombstone(
+            &self,
+            _parent: IndexNodeId,
+            _name: String,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_bump_dir_rev(
+            &self,
+            _dir: IndexNodeId,
+            _expected_rev: u64,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<u64, RPCErrors> {
+            Ok(0)
+        }
+
+        async fn handle_commit(&self, _txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_rollback(&self, _txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_acquire_file_lease(
+            &self,
+            _node_id: IndexNodeId,
+            _session: SessionId,
+            _ttl: std::time::Duration,
+            _ctx: RPCContext,
+        ) -> Result<u64, RPCErrors> {
+            Ok(0)
+        }
+
+        async fn handle_renew_file_lease(
+            &self,
+            _node_id: IndexNodeId,
+            _session: SessionId,
+            _lease_seq: u64,
+            _ttl: std::time::Duration,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_release_file_lease(
+            &self,
+            _node_id: IndexNodeId,
+            _session: SessionId,
+            _lease_seq: u64,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_obj_stat_get(
+            &self,
+            _obj_id: ObjId,
+            _ctx: RPCContext,
+        ) -> Result<Option<ObjStat>, RPCErrors> {
+            Ok(None)
+        }
+
+        async fn handle_obj_stat_bump(
+            &self,
+            _obj_id: ObjId,
+            _delta: i64,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<u64, RPCErrors> {
+            Ok(0)
+        }
+
+        async fn handle_obj_stat_list_zero(
+            &self,
+            _older_than_ts: u64,
+            _limit: u32,
+            _ctx: RPCContext,
+        ) -> Result<Vec<ObjId>, RPCErrors> {
+            Ok(Vec::new())
+        }
+
+        async fn handle_obj_stat_delete_if_zero(
+            &self,
+            _obj_id: ObjId,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<bool, RPCErrors> {
+            Ok(false)
+        }
+
+        async fn handle_set_file(
+            &self,
+            _path: &ndn_lib::NdmPath,
+            _obj_id: ObjId,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            Ok(String::new())
+        }
+
+        async fn handle_set_dir(
+            &self,
+            _path: &ndn_lib::NdmPath,
+            _dir_obj_id: ObjId,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            Ok(String::new())
+        }
+
+        async fn handle_delete(&self, _path: &ndn_lib::NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_move_path_with_opts(
+            &self,
+            _old_path: &ndn_lib::NdmPath,
+            _new_path: &ndn_lib::NdmPath,
+            _opts: MoveOptions,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_make_link(
+            &self,
+            _link_path: &ndn_lib::NdmPath,
+            _target: &ndn_lib::NdmPath,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_create_dir(&self, _path: &ndn_lib::NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_open_file_writer(
+            &self,
+            _path: &ndn_lib::NdmPath,
+            _flag: OpenWriteFlag,
+            _expected_size: Option<u64>,
+            _ctx: RPCContext,
+        ) -> Result<String, RPCErrors> {
+            Err(RPCErrors::ReasonError("not supported".to_string()))
+        }
+
+        async fn handle_close_file_writer(
+            &self,
+            _file_inode_id: IndexNodeId,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            Ok(())
+        }
+
+        async fn handle_open_file_reader(
+            &self,
+            _path: ndn_lib::NdmPath,
+            _ctx: RPCContext,
+        ) -> Result<OpenFileReaderResp, RPCErrors> {
+            Err(RPCErrors::ReasonError("not supported".to_string()))
+        }
+    }
+
+    struct DummyBuffer;
+
+    #[async_trait]
+    impl FileBufferService for DummyBuffer {
+        async fn alloc_buffer(
+            &self,
+            _path: &NdmPath,
+            _file_inode_id: u64,
+            _base_chunk_list: Vec<ChunkId>,
+            _lease: &WriteLease,
+            _expected_size: Option<u64>,
+        ) -> NdnResult<FileBufferRecord> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn get_buffer(&self, _handle_id: &str) -> NdnResult<FileBufferRecord> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn open_reader(
+            &self,
+            _fb: &FileBufferRecord,
+            _seek_from: std::io::SeekFrom,
+        ) -> NdnResult<FileBufferSeekReader> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn open_writer(
+            &self,
+            _fb: &FileBufferRecord,
+            _seek_from: std::io::SeekFrom,
+        ) -> NdnResult<FileBufferSeekWriter> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn flush(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn close(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn append(&self, _fb: &FileBufferRecord, _data: &[u8]) -> NdnResult<()> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn cacl_name(&self, _fb: &FileBufferRecord) -> NdnResult<ObjId> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+
+        async fn remove(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
+            Err(NdnError::Unsupported("dummy".to_string()))
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}", prefix, nanos))
+    }
+
+    #[tokio::test]
+    async fn test_erase_obj_by_id_removes_object_and_chunk() {
+        let store_dir = unique_temp_dir("ndm_erase_test");
+        tokio::fs::create_dir_all(&store_dir).await.unwrap();
+
+        let store = NamedLocalStore::from_config(
+            Some("test-store".to_string()),
+            store_dir.clone(),
+            NamedLocalConfig::default(),
+        )
+        .await
+        .unwrap();
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+
+        let layout_mgr = Arc::new(NamedStoreMgr::new());
+        layout_mgr.register_store(store_ref).await;
+
+        let layout = StoreLayout::new(
+            1,
+            vec![LayoutStoreTarget {
+                store_id: "test-store".to_string(),
+                device_did: None,
+                capacity: None,
+                used: None,
+                readonly: false,
+                enabled: true,
+                weight: 1,
+            }],
+            0,
+            0,
+        );
+        layout_mgr.add_layout(layout).await;
+
+        let fsmeta = Arc::new(FsMetaClient::new_in_process(Box::new(DummyFsMeta)));
+        let buffer = Arc::new(DummyBuffer);
+        let ndm = NamedDataMgr::with_layout_mgr(
+            "test".to_string(),
+            fsmeta,
+            buffer,
+            None,
+            CommitPolicy::default(),
+            layout_mgr.clone(),
+        );
+
+        let file_obj = FileObject::new("file".to_string(), 3, "sha256:00".to_string());
+        let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
+        layout_mgr
+            .put_object(&file_obj_id, &file_obj_str)
+            .await
+            .unwrap();
+
+        let obj_state = layout_mgr.query_object_by_id(&file_obj_id).await.unwrap();
+        assert!(matches!(obj_state, ObjectState::Object(_)));
+
+        ndm.erase_obj_by_id(&file_obj_id).await.unwrap();
+        let obj_state = layout_mgr.query_object_by_id(&file_obj_id).await.unwrap();
+        assert!(matches!(obj_state, ObjectState::NotExist));
+
+        let data = b"hello chunk";
+        let chunk_id = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(data)
+            .unwrap();
+        let (mut writer, _) = layout_mgr
+            .open_chunk_writer(&chunk_id, data.len() as u64, 0)
+            .await
+            .unwrap();
+        writer.write_all(data).await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+        layout_mgr.complete_chunk_writer(&chunk_id).await.unwrap();
+
+        let (state, _, _) = layout_mgr.query_chunk_state(&chunk_id).await.unwrap();
+        assert!(state.can_open_reader());
+
+        ndm.erase_obj_by_id(&chunk_id.to_obj_id()).await.unwrap();
+        let (state, _, _) = layout_mgr.query_chunk_state(&chunk_id).await.unwrap();
+        assert!(matches!(state, named_store::ChunkStoreState::NotExist));
+
+        let _ = tokio::fs::remove_dir_all(&store_dir).await;
     }
 }
 
