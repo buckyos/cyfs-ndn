@@ -101,11 +101,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fetched = svc
-            .handle_get_inode(100, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(100, None, ctx).await.unwrap().unwrap();
         assert_eq!(fetched.inode_id, 100);
         assert_eq!(fetched.kind, NodeKind::Dir);
         assert!(!fetched.read_only);
@@ -127,11 +123,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fetched = svc
-            .handle_get_inode(101, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(101, None, ctx).await.unwrap().unwrap();
         assert!(fetched.read_only);
     }
 
@@ -163,11 +155,7 @@ mod tests {
             .unwrap();
         assert_eq!(id, 200);
 
-        let fetched = svc
-            .handle_get_inode(200, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(200, None, ctx).await.unwrap().unwrap();
         assert_eq!(fetched.inode_id, 200);
     }
 
@@ -190,11 +178,7 @@ mod tests {
             .await
             .unwrap();
 
-        let fetched = svc
-            .handle_get_inode(300, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(300, None, ctx).await.unwrap().unwrap();
         match fetched.state {
             NodeState::Cooling(s) => {
                 assert_eq!(s.fb_handle, "fb-001");
@@ -695,11 +679,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stat = svc
-            .handle_obj_stat_get(obj_id, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap().unwrap();
         assert_eq!(stat.ref_count, 3);
         assert!(stat.zero_since.is_none());
     }
@@ -727,11 +707,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stat = svc
-            .handle_obj_stat_get(obj_id, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap().unwrap();
         assert_eq!(stat.ref_count, 0);
         assert!(stat.zero_since.is_some());
     }
@@ -758,10 +734,7 @@ mod tests {
             .unwrap()
             .as_secs()
             + 10; // future timestamp to include all
-        let zeros = svc
-            .handle_obj_stat_list_zero(now, 10, ctx)
-            .await
-            .unwrap();
+        let zeros = svc.handle_obj_stat_list_zero(now, 10, ctx).await.unwrap();
         assert_eq!(zeros.len(), 3);
     }
 
@@ -842,11 +815,7 @@ mod tests {
 
         svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
 
-        let fetched = svc
-            .handle_get_inode(900, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(900, None, ctx).await.unwrap().unwrap();
         match fetched.state {
             NodeState::Linked(s) => {
                 assert_eq!(s.obj_id, obj_id);
@@ -883,11 +852,7 @@ mod tests {
 
         svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
 
-        let fetched = svc
-            .handle_get_inode(901, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(901, None, ctx).await.unwrap().unwrap();
         assert!(fetched.read_only);
         match fetched.state {
             NodeState::Finalized(s) => {
@@ -924,11 +889,7 @@ mod tests {
 
         svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
 
-        let fetched = svc
-            .handle_get_inode(902, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(902, None, ctx).await.unwrap().unwrap();
         assert!(fetched.meta.is_some());
         let fetched_meta = fetched.meta.unwrap();
         assert_eq!(fetched_meta["owner"], "user1");
@@ -958,11 +919,7 @@ mod tests {
 
         svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
 
-        let fetched = svc
-            .handle_get_inode(903, None, ctx)
-            .await
-            .unwrap()
-            .unwrap();
+        let fetched = svc.handle_get_inode(903, None, ctx).await.unwrap().unwrap();
         assert_eq!(
             fetched.lease_client_session,
             Some(ClientSessionId("session-x".to_string()))
@@ -1048,9 +1005,15 @@ mod tests {
         let a = create_dir_node(10);
         let b1 = create_dir_node(11);
         let c = create_dir_node(12);
-        svc.handle_set_inode(a.clone(), None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(b1.clone(), None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(c.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(a.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone())
+            .await
+            .unwrap();
 
         svc.handle_upsert_dentry(
             root,
@@ -1089,7 +1052,9 @@ mod tests {
 
         // Change edge /a/b -> new inode, should invalidate /a/b/* cache entries.
         let b2 = create_dir_node(20);
-        svc.handle_set_inode(b2.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(b2.clone(), None, ctx.clone())
+            .await
+            .unwrap();
         svc.handle_upsert_dentry(
             a.inode_id,
             "b".to_string(),
@@ -1117,9 +1082,15 @@ mod tests {
         let a = create_dir_node(30);
         let b1 = create_dir_node(31);
         let c = create_dir_node(32);
-        svc.handle_set_inode(a.clone(), None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(b1.clone(), None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(c.clone(), None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(a.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone())
+            .await
+            .unwrap();
 
         svc.handle_upsert_dentry(
             root,

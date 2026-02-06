@@ -1,6 +1,6 @@
+mod buffer_db;
 mod fb_service;
 mod local_filebuffer;
-mod buffer_db;
 
 pub use fb_service::{
     FileBufferRead, FileBufferSeekReader, FileBufferSeekWriter, FileBufferService, FileBufferWrite,

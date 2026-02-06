@@ -1,37 +1,36 @@
 #![allow(unused, dead_code)]
 
+mod action_obj;
+mod base_content;
 mod chunk;
+mod cyfs_http;
+mod dirobj;
+mod fileobj;
+mod hash;
 mod object;
 mod relation_obj;
-mod action_obj;
-mod cyfs_http;
-mod fileobj;
-mod dirobj;
-mod hash;
 mod simple_object_map;
-mod base_content;
 //mod example;
 
-pub use object::*;
-pub use chunk::*;
 pub use base_content::*;
-pub use relation_obj::*;
+pub use chunk::*;
 pub use cyfs_http::*;
-pub use fileobj::*;
 pub use dirobj::*;
+pub use fileobj::*;
 pub use hash::*;
+pub use object::*;
+pub use relation_obj::*;
 pub use simple_object_map::*;
 
-
-use std::path::PathBuf;
 use reqwest::StatusCode;
-use thiserror::Error;
-use std::pin::Pin;
 use std::future::Future;
 use std::ops::Range;
+use std::path::PathBuf;
+use std::pin::Pin;
+use thiserror::Error;
 use tokio::fs::OpenOptions;
-use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, AsyncReadExt, AsyncSeekExt};
-use tokio::io::{SeekFrom, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{BufReader, BufWriter, SeekFrom};
 
 #[macro_use]
 extern crate log;
@@ -82,7 +81,7 @@ pub enum NdnError {
 }
 
 impl NdnError {
-    pub fn from_http_status(code: StatusCode,info:String) -> Self {
+    pub fn from_http_status(code: StatusCode, info: String) -> Self {
         match code {
             StatusCode::NOT_FOUND => NdnError::NotFound(info),
             StatusCode::INTERNAL_SERVER_ERROR => NdnError::Internal(info),
@@ -95,7 +94,6 @@ impl NdnError {
     }
 }
 
-
 pub type NdnResult<T> = std::result::Result<T, NdnError>;
 
 impl From<std::io::Error> for NdnError {
@@ -103,7 +101,6 @@ impl From<std::io::Error> for NdnError {
         NdnError::IoError(err.to_string())
     }
 }
-
 
 pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
@@ -132,13 +129,13 @@ pub const OBJ_TYPE_PKG: &str = "pkg"; // package
 pub const RELATION_TYPE_SAME: &str = "same";
 pub const RELATION_TYPE_PART_OF: &str = "part_of";
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub enum NdnAction {
     PreFile,
-    FileOK(ObjId,u64),
-    ChunkOK(ChunkId,u64),
+    FileOK(ObjId, u64),
+    ChunkOK(ChunkId, u64),
     PreDir,
-    DirOK(ObjId,u64),
+    DirOK(ObjId, u64),
     Skip(u64),
 }
 
@@ -146,19 +143,21 @@ impl ToString for NdnAction {
     fn to_string(&self) -> String {
         match self {
             NdnAction::PreFile => "PreFile".to_string(),
-            NdnAction::FileOK(obj_id,size) => format!("FileOK {} ({})",obj_id.to_string(),size),
-            NdnAction::ChunkOK(chunk_id,size) => format!("ChunkOK {} ({})",chunk_id.to_string(),size),
+            NdnAction::FileOK(obj_id, size) => format!("FileOK {} ({})", obj_id.to_string(), size),
+            NdnAction::ChunkOK(chunk_id, size) => {
+                format!("ChunkOK {} ({})", chunk_id.to_string(), size)
+            }
             NdnAction::PreDir => "PreDir".to_string(),
-            NdnAction::DirOK(obj_id,size) => format!("DirOK {} ({})",obj_id.to_string(),size),
-            NdnAction::Skip(size) => format!("Skip:{}",size),
+            NdnAction::DirOK(obj_id, size) => format!("DirOK {} ({})", obj_id.to_string(), size),
+            NdnAction::Skip(size) => format!("Skip:{}", size),
         }
     }
 }
 
 pub enum ProgressCallbackResult {
-    Continue,//default, continue to the next item
-    Skip,//skip the current item
-    Stop,//stop the process
+    Continue, //default, continue to the next item
+    Skip,     //skip the current item
+    Stop,     //stop the process
 }
 
 impl ProgressCallbackResult {
@@ -178,13 +177,19 @@ impl ProgressCallbackResult {
     }
 }
 // PullProgressCallback(inner_path, action), return true if continue, false if stop
-pub type NdnProgressCallback = Box<dyn FnMut(String, NdnAction) -> Pin<Box<dyn Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>> + Send>;
+pub type NdnProgressCallback = Box<
+    dyn FnMut(
+            String,
+            NdnAction,
+        )
+            -> Pin<Box<dyn Future<Output = NdnResult<ProgressCallbackResult>> + Send + 'static>>
+        + Send,
+>;
 
-
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum StoreMode {
     //local file path and range, store in local file or named mgr?
-    LocalFile(PathBuf,Range<u64>,bool),
+    LocalFile(PathBuf, Range<u64>, bool),
     StoreInNamedMgr,
     NoStore,
 }
@@ -202,17 +207,20 @@ impl StoreMode {
 
     pub fn is_store_to_local(&self) -> bool {
         match self {
-            StoreMode::LocalFile(_,_,_) => true,
+            StoreMode::LocalFile(_, _, _) => true,
             StoreMode::StoreInNamedMgr => false,
             StoreMode::NoStore => false,
         }
     }
 
-    pub fn gen_sub_store_mode(&self,sub_item_name:&String)->Self {
+    pub fn gen_sub_store_mode(&self, sub_item_name: &String) -> Self {
         match self {
-            StoreMode::LocalFile(local_path,range,need_pull_to_named_mgr) => {
-                StoreMode::LocalFile(local_path.clone().join(sub_item_name), 
-                0..0, *need_pull_to_named_mgr)
+            StoreMode::LocalFile(local_path, range, need_pull_to_named_mgr) => {
+                StoreMode::LocalFile(
+                    local_path.clone().join(sub_item_name),
+                    0..0,
+                    *need_pull_to_named_mgr,
+                )
             }
             _ => self.clone(),
         }
@@ -220,7 +228,7 @@ impl StoreMode {
 
     pub fn need_store_to_named_mgr(&self) -> bool {
         match self {
-            StoreMode::LocalFile(_,_,need_pull_to_named_mgr) => *need_pull_to_named_mgr,
+            StoreMode::LocalFile(_, _, need_pull_to_named_mgr) => *need_pull_to_named_mgr,
             StoreMode::StoreInNamedMgr => true,
             StoreMode::NoStore => false,
         }
@@ -228,10 +236,11 @@ impl StoreMode {
 
     pub async fn open_local_writer(&self) -> NdnResult<ChunkWriter> {
         match self {
-            StoreMode::LocalFile(local_file_path,range,_) => {
+            StoreMode::LocalFile(local_file_path, range, _) => {
                 if let Some(parent) = local_file_path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| NdnError::IoError(format!("Failed to create directory: {}", e)))?;
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        NdnError::IoError(format!("Failed to create directory: {}", e))
+                    })?;
                 }
 
                 let mut local_file = OpenOptions::new()
@@ -256,7 +265,6 @@ impl StoreMode {
         }
     }
 }
-
 
 /// NDM path representation
 #[derive(Debug, Clone)]
@@ -336,14 +344,8 @@ mod tests {
             &"/a/b/c".to_string(),
             &"/a/b".to_string()
         ));
-        assert!(is_descendant_path(
-            &"/a/b/c".to_string(),
-            &"/a".to_string()
-        ));
-        assert!(is_descendant_path(
-            &"/a/b".to_string(),
-            &"/".to_string()
-        ));
+        assert!(is_descendant_path(&"/a/b/c".to_string(), &"/a".to_string()));
+        assert!(is_descendant_path(&"/a/b".to_string(), &"/".to_string()));
         assert!(!is_descendant_path(
             &"/a/b".to_string(),
             &"/a/b".to_string()

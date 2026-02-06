@@ -1,10 +1,9 @@
-
 /// ------------------------------
 /// FsMeta: Inode/Dentry Model (Strategy B)
 /// ------------------------------
 use fs_buffer::SessionId;
-use krpc::{kRPC, RPCErrors, RPCHandler, RPCContext,RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::{NdnError, NdnResult, ObjId, NdmPath};
+use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
+use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -14,12 +13,11 @@ use crate::OpenWriteFlag;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientSessionId(pub String);
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
-    File,//File,Can finalized to FileObject
-    Dir,//Dir,Can finalized to DirObject
-    Object,//Other Object,immutable object
+    File,   //File,Can finalized to FileObject
+    Dir,    //Dir,Can finalized to DirObject
+    Object, //Other Object,immutable object
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,7 +34,7 @@ pub struct FileCoolingState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileLinkedState {
-    pub obj_id: ObjId, 
+    pub obj_id: ObjId,
     pub qcid: ObjId,
     pub filebuffer_id: String,
     pub linked_at: u64,
@@ -78,11 +76,11 @@ pub struct NodeRecord {
     pub inode_id: IndexNodeId,
     pub kind: NodeKind,
     pub read_only: bool,
-    pub base_obj_id: Option<ObjId>,    // committed base snapshot (file or dir)
+    pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)
     pub state: NodeState,
-    pub rev: Option<u64>,              // only for dirs
+    pub rev: Option<u64>, // only for dirs
     // metas:
-    pub meta:Option<Value>,
+    pub meta: Option<Value>,
 
     // leases:
     pub lease_client_session: Option<ClientSessionId>,
@@ -105,8 +103,6 @@ pub struct DentryRecord {
     pub target: DentryTarget,
     pub mtime: Option<u64>,
 }
-
-
 
 // /// ------------------------------
 // /// FsMeta Service original Traits
@@ -160,7 +156,7 @@ pub struct DentryRecord {
 /// FsMeta kRPC Protocol
 /// ------------------------------
 pub enum OpenFileReaderResp {
-    Object(ObjId,Option<String>),
+    Object(ObjId, Option<String>),
     FileBufferId(String),
 }
 
@@ -274,9 +270,10 @@ impl FsMetaUpdateInodeStateReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaUpdateInodeStateReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse FsMetaUpdateInodeStateReq: {}",
+                e
+            ))
         })
     }
 }
@@ -361,9 +358,7 @@ impl FsMetaUpsertDentryReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaUpsertDentryReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaUpsertDentryReq: {}", e))
         })
     }
 }
@@ -382,9 +377,7 @@ impl FsMetaRemoveDentryRowReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaRemoveDentryRowReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRemoveDentryRowReq: {}", e))
         })
     }
 }
@@ -442,8 +435,9 @@ impl FsMetaCommitReq {
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
-        serde_json::from_value(value)
-            .map_err(|e| RPCErrors::ParseRequestError(format!("Failed to parse FsMetaCommitReq: {}", e)))
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaCommitReq: {}", e))
+        })
     }
 }
 
@@ -458,8 +452,9 @@ impl FsMetaRollbackReq {
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
-        serde_json::from_value(value)
-            .map_err(|e| RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRollbackReq: {}", e)))
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRollbackReq: {}", e))
+        })
     }
 }
 
@@ -472,14 +467,19 @@ pub struct FsMetaAcquireFileLeaseReq {
 
 impl FsMetaAcquireFileLeaseReq {
     pub fn new(node_id: IndexNodeId, session: SessionId, ttl: Duration) -> Self {
-        Self { node_id, session, ttl }
+        Self {
+            node_id,
+            session,
+            ttl,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaAcquireFileLeaseReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse FsMetaAcquireFileLeaseReq: {}",
+                e
+            ))
         })
     }
 }
@@ -504,9 +504,7 @@ impl FsMetaRenewFileLeaseReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaRenewFileLeaseReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRenewFileLeaseReq: {}", e))
         })
     }
 }
@@ -529,9 +527,10 @@ impl FsMetaReleaseFileLeaseReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaReleaseFileLeaseReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse FsMetaReleaseFileLeaseReq: {}",
+                e
+            ))
         })
     }
 }
@@ -562,7 +561,11 @@ pub struct FsMetaObjStatBumpReq {
 
 impl FsMetaObjStatBumpReq {
     pub fn new(obj_id: ObjId, delta: i64, txid: Option<String>) -> Self {
-        Self { obj_id, delta, txid }
+        Self {
+            obj_id,
+            delta,
+            txid,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
@@ -580,7 +583,10 @@ pub struct FsMetaObjStatListZeroReq {
 
 impl FsMetaObjStatListZeroReq {
     pub fn new(older_than_ts: u64, limit: u32) -> Self {
-        Self { older_than_ts, limit }
+        Self {
+            older_than_ts,
+            limit,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
@@ -603,9 +609,10 @@ impl FsMetaObjStatDeleteIfZeroReq {
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaObjStatDeleteIfZeroReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!(
+                "Failed to parse FsMetaObjStatDeleteIfZeroReq: {}",
+                e
+            ))
         })
     }
 }
@@ -619,14 +626,16 @@ pub struct FsMetaOpenFileWriterReq {
 
 impl FsMetaOpenFileWriterReq {
     pub fn new(path: String, flag: OpenWriteFlag, expected_size: Option<u64>) -> Self {
-        Self { path, flag, expected_size }
+        Self {
+            path,
+            flag,
+            expected_size,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(
-                format!("Failed to parse FsMetaOpenFileWriterReq: {}", e),
-            )
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaOpenFileWriterReq: {}", e))
         })
     }
 }
@@ -657,13 +666,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaRootDirReq::new();
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("root_dir", req_json).await?;
-                result
-                    .as_u64()
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected u64 result".to_string()))
+                result.as_u64().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected u64 result".to_string())
+                })
             }
         }
     }
@@ -679,8 +689,9 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaResolvePathReq::new(path.as_str().to_string());
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| NdnError::Internal(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    NdnError::Internal(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client
                     .call("resolve_path", req_json)
@@ -704,14 +715,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaBeginTxnReq::new();
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("begin_txn", req_json).await?;
-                result
-                    .as_str()
-                    .map(|v| v.to_string())
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected String result".to_string()))
+                result.as_str().map(|v| v.to_string()).ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected String result".to_string())
+                })
             }
         }
     }
@@ -728,8 +739,9 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaGetInodeReq::new(id, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("get_inode", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
@@ -742,11 +754,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn set_inode(
-        &self,
-        node: NodeRecord,
-        txid: Option<String>,
-    ) -> Result<(), RPCErrors> {
+    pub async fn set_inode(&self, node: NodeRecord, txid: Option<String>) -> Result<(), RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -754,12 +762,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaSetInodeReq::new(node, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("set_inode", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -779,12 +789,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaUpdateInodeStateReq::new(node_id, new_state, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("update_inode_state", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -801,13 +813,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaAllocInodeReq::new(node, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("alloc_inode", req_json).await?;
-                result
-                    .as_u64()
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected u64 result".to_string()))
+                result.as_u64().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected u64 result".to_string())
+                })
             }
         }
     }
@@ -825,8 +838,9 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaGetDentryReq::new(parent, name, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("get_dentry", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
@@ -851,12 +865,16 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaListDentriesReq::new(parent, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("list_dentries", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
-                    RPCErrors::ParserResponseError(format!("Expected Vec<DentryRecord> result: {}", e))
+                    RPCErrors::ParserResponseError(format!(
+                        "Expected Vec<DentryRecord> result: {}",
+                        e
+                    ))
                 })
             }
         }
@@ -878,12 +896,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaUpsertDentryReq::new(parent, name, target, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("upsert_dentry", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -903,12 +923,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaRemoveDentryRowReq::new(parent, name, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("remove_dentry_row", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -926,12 +948,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaSetTombstoneReq::new(parent, name, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("set_tombstone", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -945,17 +969,20 @@ impl FsMetaClient {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
-                handler.handle_bump_dir_rev(dir, expected_rev, txid, ctx).await
+                handler
+                    .handle_bump_dir_rev(dir, expected_rev, txid, ctx)
+                    .await
             }
             Self::KRPC(client) => {
                 let req = FsMetaBumpDirRevReq::new(dir, expected_rev, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("bump_dir_rev", req_json).await?;
-                result
-                    .as_u64()
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected u64 result".to_string()))
+                result.as_u64().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected u64 result".to_string())
+                })
             }
         }
     }
@@ -968,12 +995,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaCommitReq::new(txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("commit", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -986,12 +1015,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaRollbackReq::new(txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("rollback", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -1005,16 +1036,20 @@ impl FsMetaClient {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
-                handler.handle_acquire_file_lease(node_id, session, ttl, ctx).await
+                handler
+                    .handle_acquire_file_lease(node_id, session, ttl, ctx)
+                    .await
             }
             Self::KRPC(client) => {
                 let req = FsMetaAcquireFileLeaseReq::new(node_id, session, ttl);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("acquire_file_lease", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected LeaseFence result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected LeaseFence result: {}", e))
+                })
             }
         }
     }
@@ -1035,12 +1070,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaRenewFileLeaseReq::new(node_id, session, lease_seq, ttl);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("renew_file_lease", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -1060,12 +1097,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaReleaseFileLeaseReq::new(node_id, session, lease_seq);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("release_file_lease", req_json).await?;
-                serde_json::from_value(result)
-                    .map_err(|e| RPCErrors::ParserResponseError(format!("Expected () result: {}", e)))
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
             }
         }
     }
@@ -1078,12 +1117,16 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaObjStatGetReq::new(obj_id);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("obj_stat_get", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
-                    RPCErrors::ParserResponseError(format!("Expected Option<ObjStat> result: {}", e))
+                    RPCErrors::ParserResponseError(format!(
+                        "Expected Option<ObjStat> result: {}",
+                        e
+                    ))
                 })
             }
         }
@@ -1102,13 +1145,14 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaObjStatBumpReq::new(obj_id, delta, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("obj_stat_bump", req_json).await?;
-                result
-                    .as_u64()
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected u64 result".to_string()))
+                result.as_u64().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected u64 result".to_string())
+                })
             }
         }
     }
@@ -1127,8 +1171,9 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaObjStatListZeroReq::new(older_than_ts, limit);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("obj_stat_list_zero", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
@@ -1146,17 +1191,20 @@ impl FsMetaClient {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
-                handler.handle_obj_stat_delete_if_zero(obj_id, txid, ctx).await
+                handler
+                    .handle_obj_stat_delete_if_zero(obj_id, txid, ctx)
+                    .await
             }
             Self::KRPC(client) => {
                 let req = FsMetaObjStatDeleteIfZeroReq::new(obj_id, txid);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| RPCErrors::ReasonError(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client.call("obj_stat_delete_if_zero", req_json).await?;
-                result
-                    .as_bool()
-                    .ok_or_else(|| RPCErrors::ParserResponseError("Expected bool result".to_string()))
+                result.as_bool().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected bool result".to_string())
+                })
             }
         }
     }
@@ -1177,13 +1225,16 @@ impl FsMetaClient {
             }
             Self::KRPC(client) => {
                 let req = FsMetaOpenFileWriterReq::new(path.0.clone(), flag, expected_size);
-                let req_json = serde_json::to_value(&req)
-                    .map_err(|e| NdnError::Internal(format!("Failed to serialize request: {}", e)))?;
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    NdnError::Internal(format!("Failed to serialize request: {}", e))
+                })?;
 
                 let result = client
                     .call("open_file_writer", req_json)
                     .await
-                    .map_err(|e| NdnError::Internal(format!("open_file_writer rpc failed: {}", e)))?;
+                    .map_err(|e| {
+                        NdnError::Internal(format!("open_file_writer rpc failed: {}", e))
+                    })?;
                 result
                     .as_str()
                     .map(|s| s.to_string())
@@ -1324,7 +1375,11 @@ impl FsMetaClient {
 #[async_trait::async_trait]
 pub trait FsMetaHandler: Send + Sync {
     async fn handle_root_dir(&self, ctx: RPCContext) -> Result<IndexNodeId, RPCErrors>;
-    async fn handle_resolve_path(&self, path: &NdmPath,ctx:RPCContext) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> ;
+    async fn handle_resolve_path(
+        &self,
+        path: &NdmPath,
+        ctx: RPCContext,
+    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>>;
     async fn handle_begin_txn(&self, ctx: RPCContext) -> Result<String, RPCErrors>;
     async fn handle_get_inode(
         &self,
@@ -1394,7 +1449,8 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
     async fn handle_commit(&self, txid: Option<String>, ctx: RPCContext) -> Result<(), RPCErrors>;
-    async fn handle_rollback(&self, txid: Option<String>, ctx: RPCContext) -> Result<(), RPCErrors>;
+    async fn handle_rollback(&self, txid: Option<String>, ctx: RPCContext)
+        -> Result<(), RPCErrors>;
     async fn handle_acquire_file_lease(
         &self,
         node_id: IndexNodeId,
@@ -1443,11 +1499,21 @@ pub trait FsMetaHandler: Send + Sync {
     ) -> Result<bool, RPCErrors>;
 
     //下面向是业务的高阶接口(减少调用fsmeta rpc的次数)
-    async fn handle_set_file(&self, path: &NdmPath, obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors>;
+    async fn handle_set_file(
+        &self,
+        path: &NdmPath,
+        obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors>;
 
-    async fn handle_set_dir(&self, path: &NdmPath, dir_obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors>;
+    async fn handle_set_dir(
+        &self,
+        path: &NdmPath,
+        dir_obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors>;
 
-    async fn handle_delete(&self,path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
+    async fn handle_delete(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors>;
 
     async fn handle_move_path_with_opts(
         &self,
@@ -1457,10 +1523,14 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_make_link(&self,link_path: &NdmPath, target: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
+    async fn handle_make_link(
+        &self,
+        link_path: &NdmPath,
+        target: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
 
-    async fn handle_create_dir(&self, path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>;
-
+    async fn handle_create_dir(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors>;
 
     //return FileHandleId,which is a unique identifier for the file buffer
     async fn handle_open_file_writer(
@@ -1483,8 +1553,6 @@ pub trait FsMetaHandler: Send + Sync {
         path: NdmPath,
         ctx: RPCContext,
     ) -> Result<OpenFileReaderResp, RPCErrors>;
-
-
 }
 
 pub struct FsMetaServerHandler<T: FsMetaHandler>(pub T);
@@ -1515,11 +1583,10 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
             "resolve_path" => {
                 let req = FsMetaResolvePathReq::from_json(req.params)?;
                 let path = NdmPath::new(req.path);
-                let result = self
-                    .0
-                    .handle_resolve_path(&path, ctx)
-                    .await
-                    .map_err(|e| RPCErrors::ReasonError(format!("resolve_path failed: {}", e)))?;
+                let result =
+                    self.0.handle_resolve_path(&path, ctx).await.map_err(|e| {
+                        RPCErrors::ReasonError(format!("resolve_path failed: {}", e))
+                    })?;
                 RPCResult::Success(serde_json::json!(result))
             }
             "begin_txn" => {
@@ -1560,7 +1627,10 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
             }
             "list_dentries" => {
                 let req = FsMetaListDentriesReq::from_json(req.params)?;
-                let result = self.0.handle_list_dentries(req.parent, req.txid, ctx).await?;
+                let result = self
+                    .0
+                    .handle_list_dentries(req.parent, req.txid, ctx)
+                    .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
             "upsert_dentry" => {
@@ -1744,11 +1814,8 @@ mod tests {
                 return Ok(node.map(|n| (root_id, n)));
             }
 
-            let components: Vec<&str> = path
-                .as_str()
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .collect();
+            let components: Vec<&str> =
+                path.as_str().split('/').filter(|s| !s.is_empty()).collect();
 
             let mut current_id = root_id;
 
@@ -1812,7 +1879,11 @@ mod tests {
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
-            self.state.lock().unwrap().inodes.insert(node.inode_id, node);
+            self.state
+                .lock()
+                .unwrap()
+                .inodes
+                .insert(node.inode_id, node);
             Ok(())
         }
 
@@ -1907,11 +1978,7 @@ mod tests {
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
-            self.state
-                .lock()
-                .unwrap()
-                .dentries
-                .remove(&(parent, name));
+            self.state.lock().unwrap().dentries.remove(&(parent, name));
             Ok(())
         }
 
@@ -2032,11 +2099,17 @@ mod tests {
             });
             let next = entry.ref_count as i64 + delta;
             if next < 0 {
-                return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
+                return Err(RPCErrors::ReasonError(
+                    "ref_count would be negative".to_string(),
+                ));
             }
             entry.ref_count = next as u64;
             entry.updated_at = now;
-            entry.zero_since = if entry.ref_count == 0 { Some(now) } else { None };
+            entry.zero_since = if entry.ref_count == 0 {
+                Some(now)
+            } else {
+                None
+            };
             Ok(entry.ref_count)
         }
 
@@ -2177,9 +2250,7 @@ mod tests {
     fn start_mock_server(handler: FsMetaServerHandler<MockHandler>) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let addr = listener.local_addr().expect("server addr");
-        listener
-            .set_nonblocking(true)
-            .expect("set nonblocking");
+        listener.set_nonblocking(true).expect("set nonblocking");
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown.clone();
         let handle = thread::spawn(move || {
@@ -2255,7 +2326,8 @@ mod tests {
             }
         }
 
-        let end = header_end.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "bad http"))?;
+        let end =
+            header_end.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "bad http"))?;
         Ok(buf[end..end + content_len].to_vec())
     }
 
@@ -2347,7 +2419,12 @@ mod tests {
         assert_eq!(fence, 1);
 
         client
-            .renew_file_lease(9, SessionId("s1".to_string()), fence, Duration::from_secs(30))
+            .renew_file_lease(
+                9,
+                SessionId("s1".to_string()),
+                fence,
+                Duration::from_secs(30),
+            )
             .await
             .unwrap();
         client
@@ -2369,7 +2446,10 @@ mod tests {
         let stat = client.obj_stat_get(obj_id.clone()).await.unwrap().unwrap();
         assert_eq!(stat.ref_count, 1);
 
-        let count = client.obj_stat_bump(obj_id.clone(), -1, None).await.unwrap();
+        let count = client
+            .obj_stat_bump(obj_id.clone(), -1, None)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
 
         let zeros = client.obj_stat_list_zero(u64::MAX, 10).await.unwrap();

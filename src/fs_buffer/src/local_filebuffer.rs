@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::fs::File as StdFile;
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::fs::FileExt as StdFileExt;
 #[cfg(windows)]
@@ -110,7 +110,6 @@ impl Default for FileBufferBaseReader {
     }
 }
 
-
 /// Serializable part of FileBufferRecord for persistence
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FileBufferRecordMeta {
@@ -163,7 +162,6 @@ impl FileBufferRecord {
     }
 }
 
-
 impl Default for DirtyChunkLayout {
     fn default() -> Self {
         Self {
@@ -205,8 +203,6 @@ impl DirtyChunkLayout {
     }
 }
 
-
-
 pub struct LocalFileBufferService {
     // 管理本地 buffer 的数据结构
     base_dir: PathBuf,
@@ -223,7 +219,7 @@ impl LocalFileBufferService {
         let buffer_dir = base_dir.join(BUFFER_DIR_NAME);
         let db_path = base_dir.join(BUFFER_DB_FILE);
         let db = Arc::new(LocalFileBufferDB::new(db_path).unwrap());
-        
+
         // Load existing records from database into memory index
         let records = match db.load_all() {
             Ok(loaded) => {
@@ -235,11 +231,14 @@ impl LocalFileBufferService {
                 RwLock::new(map)
             }
             Err(e) => {
-                warn!("LocalFileBufferService: failed to load records from db: {}", e);
+                warn!(
+                    "LocalFileBufferService: failed to load records from db: {}",
+                    e
+                );
                 RwLock::new(HashMap::new())
             }
         };
-        
+
         Self {
             base_dir,
             buffer_dir,
@@ -252,9 +251,12 @@ impl LocalFileBufferService {
 
     /// Get a record from the in-memory index
     fn get_record(&self, handle_id: &str) -> NdnResult<Arc<RwLock<FileBufferRecord>>> {
-        let records = self.records.read()
+        let records = self
+            .records
+            .read()
             .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
-        records.get(handle_id)
+        records
+            .get(handle_id)
             .cloned()
             .ok_or_else(|| NdnError::NotFound(format!("buffer not found: {}", handle_id)))
     }
@@ -263,7 +265,9 @@ impl LocalFileBufferService {
     fn insert_record(&self, record: FileBufferRecord) -> NdnResult<Arc<RwLock<FileBufferRecord>>> {
         let handle_id = record.handle_id.clone();
         let arc_record = Arc::new(RwLock::new(record));
-        let mut records = self.records.write()
+        let mut records = self
+            .records
+            .write()
             .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
         records.insert(handle_id, arc_record.clone());
         Ok(arc_record)
@@ -271,7 +275,9 @@ impl LocalFileBufferService {
 
     /// Remove a record from the in-memory index
     fn remove_record(&self, handle_id: &str) -> NdnResult<()> {
-        let mut records = self.records.write()
+        let mut records = self
+            .records
+            .write()
             .map_err(|_| NdnError::InvalidState("records index poisoned".to_string()))?;
         records.remove(handle_id);
         Ok(())
@@ -380,19 +386,25 @@ impl LocalFileBufferService {
 
     fn ensure_writable(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         if fb.read_only {
-            return Err(NdnError::PermissionDenied("file buffer is read-only".to_string()));
+            return Err(NdnError::PermissionDenied(
+                "file buffer is read-only".to_string(),
+            ));
         }
         Ok(())
     }
-
 }
-
-
 
 #[async_trait]
 impl FileBufferService for LocalFileBufferService {
     //这个函数通常由fs-meta service调用
-    async fn alloc_buffer(&self, _path: &NdmPath, file_inode_id: u64, base_chunk_list:Vec<ChunkId>, _lease: &WriteLease, expected_size: Option<u64>) -> NdnResult<FileBufferRecord> {
+    async fn alloc_buffer(
+        &self,
+        _path: &NdmPath,
+        file_inode_id: u64,
+        base_chunk_list: Vec<ChunkId>,
+        _lease: &WriteLease,
+        expected_size: Option<u64>,
+    ) -> NdnResult<FileBufferRecord> {
         if self.size_limit > 0 {
             if let Some(expect) = expected_size {
                 let mut used = self.size_used.write().unwrap();
@@ -451,7 +463,8 @@ impl FileBufferService for LocalFileBufferService {
         // Return a copy from the index
         let arc_record = self.get_record(&handle_id)?;
         let result = {
-            let guard = arc_record.read()
+            let guard = arc_record
+                .read()
                 .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
             FileBufferRecord {
                 handle_id: guard.handle_id.clone(),
@@ -467,7 +480,8 @@ impl FileBufferService for LocalFileBufferService {
     async fn get_buffer(&self, handle_id: &str) -> NdnResult<FileBufferRecord> {
         // First try in-memory index
         if let Ok(arc_record) = self.get_record(handle_id) {
-            let guard = arc_record.read()
+            let guard = arc_record
+                .read()
                 .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
             return Ok(FileBufferRecord {
                 handle_id: guard.handle_id.clone(),
@@ -484,13 +498,14 @@ impl FileBufferService for LocalFileBufferService {
         let record = tokio::task::spawn_blocking(move || db.get_buffer(&handle_id_owned))
             .await
             .map_err(|e| NdnError::IoError(format!("get buffer join error: {}", e)))??;
-        
+
         // Insert into memory index
         self.insert_record(record)?;
-        
+
         // Return from index
         let arc_record = self.get_record(handle_id)?;
-        let guard = arc_record.read()
+        let guard = arc_record
+            .read()
             .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
         Ok(FileBufferRecord {
             handle_id: guard.handle_id.clone(),
@@ -512,7 +527,7 @@ impl FileBufferService for LocalFileBufferService {
                 "BaseChunkList overlay not implemented".to_string(),
             ));
         }
-        //打开BaseReader 
+        //打开BaseReader
         //打开本地文件，如果有BaseReader,那么本地文件是一个“差异Chunk文件",只包含修改过的Chunk
         //根据BaseReader和本地文件，构造LocalFileBufferSeekReader
 
@@ -541,7 +556,7 @@ impl FileBufferService for LocalFileBufferService {
             ));
         }
         // 伪代码：
-        // 打开BaseReader 
+        // 打开BaseReader
         // 用只读模式打开本地文件，如果有BaseReader,那么本地文件是一个“空洞文件"
         // 根据BaseReader和本地文件，构造LocalFileBufferSeekWriter
         self.ensure_writable(fb)?;
@@ -572,7 +587,11 @@ impl FileBufferService for LocalFileBufferService {
         // 如果没有BaseReader，直接 fsync 本地文件
         // 如果有BaseReader，刷新 dirty chunk 到磁盘，并更新必要的元数据
         let file_path = self.buffer_path(fb);
-        let file = OpenOptions::new().read(true).write(true).open(file_path).await?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file_path)
+            .await?;
         file.sync_all().await?;
         if let Ok(layout) = fb.dirty_layout.read() {
             self.persist_layout_async(fb.handle_id.clone(), layout.order.clone());
@@ -635,8 +654,6 @@ impl FileBufferService for LocalFileBufferService {
         ))
     }
 
-
-
     // /// Finalize：把数据从 buffer node 推到 NamedStore internal（IO 密集型）
     // async fn move_to_store(&self, fb: &FileBufferHandle, store: &dyn NamedStore) -> NdnResult<()> {
     //     // 伪代码：
@@ -677,7 +694,7 @@ impl FileBufferService for LocalFileBufferService {
     async fn remove(&self, fb: &FileBufferRecord) -> NdnResult<()> {
         // Remove from in-memory index first
         self.remove_record(&fb.handle_id)?;
-        
+
         // Delete the local buffer file
         let file_path = self.buffer_path(fb);
         if let Ok(meta) = fs::metadata(&file_path).await {
@@ -690,7 +707,7 @@ impl FileBufferService for LocalFileBufferService {
                 return Err(NdnError::IoError(format!("remove file failed: {}", e)));
             }
         }
-        
+
         // Remove from database
         let handle_id = fb.handle_id.clone();
         let db = self.db.clone();
@@ -1141,8 +1158,7 @@ impl LocalFileBufferSeekWriter {
                                 state.write_handle = None;
                                 match join_result {
                                     Ok(Ok(())) => {
-                                        self.inner_pos =
-                                            state.slot_start + state.write_len as u64;
+                                        self.inner_pos = state.slot_start + state.write_len as u64;
                                         self.prefill = None;
                                         return Poll::Ready(Ok(()));
                                     }
@@ -1352,7 +1368,8 @@ impl AsyncWrite for LocalFileBufferSeekWriter {
 
             let data = target_buf.to_vec();
             let file = this.inner_std.clone();
-            let handle = tokio::task::spawn_blocking(move || write_at_once(&file, &data, desired_pos));
+            let handle =
+                tokio::task::spawn_blocking(move || write_at_once(&file, &data, desired_pos));
             let mut pending = PendingPwrite {
                 desired_pos,
                 handle,
@@ -1435,18 +1452,12 @@ mod tests {
             .await
             .unwrap();
 
-        let mut writer = service
-            .open_writer(&fb, SeekFrom::Start(0))
-            .await
-            .unwrap();
+        let mut writer = service.open_writer(&fb, SeekFrom::Start(0)).await.unwrap();
         writer.write_all(b"hello").await.unwrap();
         writer.flush().await.unwrap();
         drop(writer);
 
-        let mut reader = service
-            .open_reader(&fb, SeekFrom::Start(0))
-            .await
-            .unwrap();
+        let mut reader = service.open_reader(&fb, SeekFrom::Start(0)).await.unwrap();
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.unwrap();
         assert_eq!(buf, b"hello");
@@ -1708,7 +1719,7 @@ mod tests {
         writer.write_all(&vec![0xffu8; 512]).await.unwrap();
         writer.flush().await.unwrap();
         drop(writer);
-        
+
         println!("writer completed!");
 
         let inner_file = tokio::fs::File::open(&file_path).await.unwrap();
@@ -1727,7 +1738,6 @@ mod tests {
         let mut buf = vec![0u8; 256];
         reader.read_exact(&mut buf).await.unwrap();
         assert!(buf.iter().all(|b| *b == 0));
-        
 
         reader
             .seek(SeekFrom::Start(2 * CHUNK_NORMAL_SIZE))

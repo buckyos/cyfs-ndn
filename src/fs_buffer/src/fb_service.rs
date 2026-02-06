@@ -23,7 +23,6 @@ pub struct NdmPath(pub String);
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub String);
 
-
 #[derive(Debug, Clone)]
 pub struct WriteLease {
     pub session: SessionId,
@@ -34,11 +33,26 @@ pub struct WriteLease {
 #[async_trait]
 pub trait FileBufferService: Send + Sync {
     //这个函数通常由fs-meta service调用
-    async fn alloc_buffer(&self, path: &NdmPath, file_inode_id: u64, base_chunk_list:Vec<ChunkId>, lease: &WriteLease, expected_size: Option<u64>) -> NdnResult<FileBufferRecord>;
+    async fn alloc_buffer(
+        &self,
+        path: &NdmPath,
+        file_inode_id: u64,
+        base_chunk_list: Vec<ChunkId>,
+        lease: &WriteLease,
+        expected_size: Option<u64>,
+    ) -> NdnResult<FileBufferRecord>;
     async fn get_buffer(&self, handle_id: &str) -> NdnResult<FileBufferRecord>;
-    
-    async fn open_reader(&self, fb: &FileBufferRecord, seek_from: SeekFrom) -> NdnResult<FileBufferSeekReader>;
-    async fn open_writer(&self, fb: &FileBufferRecord, seek_from: SeekFrom) -> NdnResult<FileBufferSeekWriter>;
+
+    async fn open_reader(
+        &self,
+        fb: &FileBufferRecord,
+        seek_from: SeekFrom,
+    ) -> NdnResult<FileBufferSeekReader>;
+    async fn open_writer(
+        &self,
+        fb: &FileBufferRecord,
+        seek_from: SeekFrom,
+    ) -> NdnResult<FileBufferSeekWriter>;
     async fn flush(&self, fb: &FileBufferRecord) -> NdnResult<()>;
     async fn close(&self, fb: &FileBufferRecord) -> NdnResult<()>;
     async fn append(&self, fb: &FileBufferRecord, data: &[u8]) -> NdnResult<()>;

@@ -390,7 +390,6 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
-
     // ==================== Basic Put and Get Tests ====================
 
     #[test]
@@ -505,7 +504,10 @@ mod tests {
         // All should return appropriate prefixes from deepest
         assert_eq!(cache.get_ids_for_path(&["a"]), Some(vec![1, 2]));
         assert_eq!(cache.get_ids_for_path(&["a", "b"]), Some(vec![1, 2, 3]));
-        assert_eq!(cache.get_ids_for_path(&["a", "b", "c"]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "b", "c"]),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     #[test]
@@ -518,7 +520,10 @@ mod tests {
         // Query intermediate paths should use deepest value
         assert_eq!(cache.get_ids_for_path(&["a"]), Some(vec![1, 2]));
         assert_eq!(cache.get_ids_for_path(&["a", "b"]), Some(vec![1, 2, 3]));
-        assert_eq!(cache.get_ids_for_path(&["a", "b", "c"]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "b", "c"]),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     // ==================== Multiple Branches Tests ====================
@@ -743,7 +748,10 @@ mod tests {
 
         // Both should work - deeper still accessible via tree structure
         assert_eq!(cache.get_ids_for_path(&["a"]), Some(vec![1, 2]));
-        assert_eq!(cache.get_ids_for_path(&["a", "b", "c"]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "b", "c"]),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     // ==================== Special Characters and Edge Cases ====================
@@ -767,7 +775,10 @@ mod tests {
 
         cache.put_ids_for_path(components(&["文件夹", "文件"]), vec![1, 2, 3]);
 
-        assert_eq!(cache.get_ids_for_path(&["文件夹", "文件"]), Some(vec![1, 2, 3]));
+        assert_eq!(
+            cache.get_ids_for_path(&["文件夹", "文件"]),
+            Some(vec![1, 2, 3])
+        );
         assert_eq!(cache.get_ids_for_path(&["文件夹"]), Some(vec![1, 2]));
     }
 
@@ -778,7 +789,10 @@ mod tests {
         // Empty string as a component (unusual but should work)
         cache.put_ids_for_path(components(&["a", "", "b"]), vec![1, 2, 3, 4]);
 
-        assert_eq!(cache.get_ids_for_path(&["a", "", "b"]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "", "b"]),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     #[test]
@@ -815,7 +829,10 @@ mod tests {
 
         // Now ["a", "short"] should be the deepest
         assert_eq!(cache.get_ids_for_path(&["a"]), Some(vec![1, 2]));
-        assert_eq!(cache.get_ids_for_path(&["a", "short"]), Some(vec![1, 2, 10]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "short"]),
+            Some(vec![1, 2, 10])
+        );
     }
 
     #[test]
@@ -855,7 +872,12 @@ mod tests {
             if i % 2 == 0 {
                 assert_eq!(result, None, "item{} should be invalidated", i);
             } else {
-                assert_eq!(result, Some(vec![1, i as u64 + 10]), "item{} should exist", i);
+                assert_eq!(
+                    result,
+                    Some(vec![1, i as u64 + 10]),
+                    "item{} should exist",
+                    i
+                );
             }
         }
     }
@@ -878,7 +900,10 @@ mod tests {
         cache.put_ids_for_path(components(&["a", "b", "c"]), vec![1, 20, 30, 40]);
 
         // Should work with new IDs
-        assert_eq!(cache.get_ids_for_path(&["a", "b", "c"]), Some(vec![1, 20, 30, 40]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "b", "c"]),
+            Some(vec![1, 20, 30, 40])
+        );
     }
 
     // ==================== Return Value Truncation Tests ====================
@@ -897,7 +922,10 @@ mod tests {
         assert_eq!(cache.get_ids_for_path(&["a", "b"]), Some(vec![1, 2, 3]));
 
         // Query for ["a", "b", "c"] should return [1, 2, 3, 4] (4 elements)
-        assert_eq!(cache.get_ids_for_path(&["a", "b", "c"]), Some(vec![1, 2, 3, 4]));
+        assert_eq!(
+            cache.get_ids_for_path(&["a", "b", "c"]),
+            Some(vec![1, 2, 3, 4])
+        );
     }
 
     #[test]
@@ -952,11 +980,13 @@ mod tests {
 
         // Query various depths
         for d in 1..=depth {
-            let path: Vec<&str> = (0..d).map(|i| {
-                // Create static strings for the test
-                let s: &'static str = Box::leak(format!("level{}", i).into_boxed_str());
-                s
-            }).collect();
+            let path: Vec<&str> = (0..d)
+                .map(|i| {
+                    // Create static strings for the test
+                    let s: &'static str = Box::leak(format!("level{}", i).into_boxed_str());
+                    s
+                })
+                .collect();
             let expected: Vec<IndexNodeId> = (1..=d as u64 + 1).collect();
             assert_eq!(cache.get_ids_for_path(&path), Some(expected));
         }
@@ -1105,7 +1135,7 @@ mod tests {
         // Insert e - should evict a (entry_id=6, now oldest after the get refreshes)
         cache.put_ids_for_path(components(&["e"]), vec![1, 6]);
 
-        assert_eq!(cache.get_ids_for_path(&["a"]), None);  // a was evicted, not c
+        assert_eq!(cache.get_ids_for_path(&["a"]), None); // a was evicted, not c
         assert_eq!(cache.get_ids_for_path(&["c"]), Some(vec![1, 4]));
         assert_eq!(cache.get_ids_for_path(&["d"]), Some(vec![1, 5]));
         assert_eq!(cache.get_ids_for_path(&["e"]), Some(vec![1, 6]));
@@ -1161,7 +1191,12 @@ mod tests {
         // Only the last 10 should remain (items 90-99)
         for i in 0..90u64 {
             let name = format!("item{}", i);
-            assert_eq!(cache.get_ids_for_path(&[&name]), None, "item{} should be evicted", i);
+            assert_eq!(
+                cache.get_ids_for_path(&[&name]),
+                None,
+                "item{} should be evicted",
+                i
+            );
         }
         for i in 90..100u64 {
             let name = format!("item{}", i);
@@ -1244,7 +1279,7 @@ mod tests {
         // The implementation evicts when count >= max_entries, so:
         // - First put: is_new_entry=true, count=0, max=0, 0>=0 is true, evict (nothing), then add
         // This means with capacity 0, every put tries to evict first
-        
+
         // Let's verify the behavior
         assert_eq!(cache.len(), 1);
 

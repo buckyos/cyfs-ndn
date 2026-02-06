@@ -2,12 +2,11 @@ use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
 use log::{info, warn};
 use ndm::{
-    ClientSessionId, DentryRecord, DentryTarget, IndexNodeId, MoveOptions, NdmInstanceId, NodeKind,
-    NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
-    FsMetaHandler,
+    ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, IndexNodeId, MoveOptions,
+    NdmInstanceId, NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
-use ndn_lib::{ChunkId, NdnError, NdnResult, ObjId, NdmPath, OBJ_TYPE_DIR};
-use rusqlite::{params, Connection, OptionalExtension, OpenFlags};
+use ndn_lib::{ChunkId, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -106,7 +105,10 @@ impl FSMetaService {
         Self::new_with_timeout(db_path, TXN_TIMEOUT_SECS)
     }
 
-    pub fn new_with_timeout(db_path: impl Into<String>, txn_timeout_secs: u64) -> Result<Self, RPCErrors> {
+    pub fn new_with_timeout(
+        db_path: impl Into<String>,
+        txn_timeout_secs: u64,
+    ) -> Result<Self, RPCErrors> {
         let db_path = db_path.into();
         let conn = Connection::open_with_flags(
             &db_path,
@@ -114,7 +116,7 @@ impl FSMetaService {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )
-            .map_err(|e| RPCErrors::ReasonError(format!("open db failed: {}", e)))?;
+        .map_err(|e| RPCErrors::ReasonError(format!("open db failed: {}", e)))?;
         Self::init_connection(&conn)?;
         Self::create_schema(&conn)?;
         let root_inode = Self::ensure_root_dir(&conn)?;
@@ -139,7 +141,11 @@ impl FSMetaService {
     }
 
     /// Set instance and buffer for high-level file operations (open_file_writer, etc.)
-    pub fn with_buffer(mut self, instance: NdmInstanceId, buffer: Arc<dyn FileBufferService>) -> Self {
+    pub fn with_buffer(
+        mut self,
+        instance: NdmInstanceId,
+        buffer: Arc<dyn FileBufferService>,
+    ) -> Self {
         self.instance = Some(instance);
         self.buffer = Some(buffer);
         self
@@ -151,7 +157,8 @@ impl FSMetaService {
         timeout_secs: u64,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(TXN_CLEANUP_INTERVAL_SECS));
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(TXN_CLEANUP_INTERVAL_SECS));
             loop {
                 interval.tick().await;
 
@@ -170,7 +177,11 @@ impl FSMetaService {
                     let stale: Vec<String> = txns_guard
                         .iter()
                         .filter(|(_, entry)| {
-                            let last_used = entry.last_used_at.lock().map(|g| *g).unwrap_or(entry.created_at);
+                            let last_used = entry
+                                .last_used_at
+                                .lock()
+                                .map(|g| *g)
+                                .unwrap_or(entry.created_at);
                             now.duration_since(last_used) > timeout
                         })
                         .map(|(txid, _)| txid.clone())
@@ -178,9 +189,7 @@ impl FSMetaService {
 
                     stale
                         .into_iter()
-                        .filter_map(|txid| {
-                            txns_guard.remove(&txid).map(|entry| (txid, entry))
-                        })
+                        .filter_map(|txid| txns_guard.remove(&txid).map(|entry| (txid, entry)))
                         .collect()
                 };
 
@@ -193,7 +202,10 @@ impl FSMetaService {
                     let wait_start = Instant::now();
                     while entry.in_flight.load(Ordering::SeqCst) > 0 {
                         if wait_start.elapsed() > Duration::from_secs(5) {
-                            warn!("txn cleanup: timeout waiting for in-flight ops for txid={}", txid);
+                            warn!(
+                                "txn cleanup: timeout waiting for in-flight ops for txid={}",
+                                txid
+                            );
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -209,9 +221,15 @@ impl FSMetaService {
                     .await;
 
                     if let Err(e) = result {
-                        warn!("txn cleanup: rollback task failed for txid={}: {}", txid_clone, e);
+                        warn!(
+                            "txn cleanup: rollback task failed for txid={}: {}",
+                            txid_clone, e
+                        );
                     } else {
-                        info!("txn cleanup: rolled back stale transaction txid={}", txid_clone);
+                        info!(
+                            "txn cleanup: rolled back stale transaction txid={}",
+                            txid_clone
+                        );
                     }
                 }
             }
@@ -339,7 +357,9 @@ impl FSMetaService {
 
     /// Get connection and entry for a transaction
     fn get_txn_entry(&self, txid: &str) -> Result<TxnEntry, RPCErrors> {
-        let txns = self.txns.lock()
+        let txns = self
+            .txns
+            .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
         let entry = txns
             .get(txid)
@@ -373,7 +393,8 @@ impl FSMetaService {
             let in_flight = entry.in_flight.clone();
 
             let result = tokio::task::spawn_blocking(move || {
-                let conn_guard = conn.lock()
+                let conn_guard = conn
+                    .lock()
                     .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
                 let result = f(&conn_guard);
                 drop(conn_guard);
@@ -388,7 +409,8 @@ impl FSMetaService {
         } else {
             let conn = self.conn.clone();
             tokio::task::spawn_blocking(move || {
-                let conn_guard = conn.lock()
+                let conn_guard = conn
+                    .lock()
                     .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
                 f(&conn_guard)
             })
@@ -404,7 +426,7 @@ impl FSMetaService {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
         )
-            .map_err(|e| RPCErrors::ReasonError(format!("open txn db failed: {}", e)))?;
+        .map_err(|e| RPCErrors::ReasonError(format!("open txn db failed: {}", e)))?;
         Self::init_connection(&conn)?;
         // Use BEGIN IMMEDIATE to acquire write lock early, avoiding mid-transaction SQLITE_BUSY
         conn.execute_batch("BEGIN IMMEDIATE")
@@ -513,9 +535,10 @@ impl FSMetaService {
             None => None,
         };
         let meta = match meta_json {
-            Some(text) => Some(serde_json::from_str::<Value>(&text).map_err(|e| {
-                RPCErrors::ReasonError(format!("invalid meta json: {}", e))
-            })?),
+            Some(text) => Some(
+                serde_json::from_str::<Value>(&text)
+                    .map_err(|e| RPCErrors::ReasonError(format!("invalid meta json: {}", e)))?,
+            ),
             None => None,
         };
 
@@ -600,7 +623,7 @@ impl FSMetaService {
         Ok(())
     }
 
-       /// Materialize a directory from a DirObject.
+    /// Materialize a directory from a DirObject.
     /// Creates a new inode with base_obj_id pointing to the DirObject,
     /// and updates the dentry to point to the new inode.
     async fn materialize_dir_from_obj(
@@ -640,7 +663,10 @@ impl FSMetaService {
         {
             Ok(id) => id,
             Err(e) => {
-                rollback_and_err!(RPCErrors::ReasonError(format!("failed to alloc inode: {}", e)));
+                rollback_and_err!(RPCErrors::ReasonError(format!(
+                    "failed to alloc inode: {}",
+                    e
+                )));
             }
         };
 
@@ -655,7 +681,10 @@ impl FSMetaService {
             )
             .await
         {
-            rollback_and_err!(RPCErrors::ReasonError(format!("failed to upsert dentry: {}", e)));
+            rollback_and_err!(RPCErrors::ReasonError(format!(
+                "failed to upsert dentry: {}",
+                e
+            )));
         }
 
         self.handle_commit(Some(txid), ctx)
@@ -712,7 +741,7 @@ impl FSMetaService {
     }
     /// Ensure directory inode exists at path, creating parent directories as needed.
     /// Uses iterative approach to avoid async recursion.
-    /// 
+    ///
     /// This method handles the case where the path passes through a DirObject:
     /// - When a dentry points to ObjId (DirObject) instead of IndexNodeId
     /// - It materializes the directory by creating inode with base_obj_id pointing to the DirObject
@@ -745,11 +774,7 @@ impl FSMetaService {
 
         // Resolve path with materialization support
         // Walk through the path components, materializing DirObjects as needed
-        let components: Vec<&str> = path
-            .as_str()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let components: Vec<&str> = path.as_str().split('/').filter(|s| !s.is_empty()).collect();
 
         let root_id = self.root_inode;
 
@@ -768,7 +793,7 @@ impl FSMetaService {
                             .handle_get_inode(id, None, ctx.clone())
                             .await?
                             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
-                        
+
                         if node.kind != NodeKind::Dir {
                             return Err(RPCErrors::ReasonError(format!(
                                 "{} is not a directory",
@@ -799,7 +824,7 @@ impl FSMetaService {
                         let remaining_path = format!("/{}", components[..=i].join("/"));
                         self.create_dir_internal(&NdmPath::new(&remaining_path))
                             .await?;
-                        
+
                         // Get the newly created inode
                         let new_dentry = self
                             .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
@@ -807,7 +832,7 @@ impl FSMetaService {
                             .ok_or_else(|| {
                                 RPCErrors::ReasonError("failed to create directory".to_string())
                             })?;
-                        
+
                         if let DentryTarget::IndexNodeId(id) = new_dentry.target {
                             current_id = id;
                         } else {
@@ -822,7 +847,7 @@ impl FSMetaService {
                     let remaining_path = format!("/{}", components[..=i].join("/"));
                     self.create_dir_internal(&NdmPath::new(&remaining_path))
                         .await?;
-                    
+
                     // Get the newly created inode
                     let new_dentry = self
                         .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
@@ -830,7 +855,7 @@ impl FSMetaService {
                         .ok_or_else(|| {
                             RPCErrors::ReasonError("failed to create directory".to_string())
                         })?;
-                    
+
                     if let DentryTarget::IndexNodeId(id) = new_dentry.target {
                         current_id = id;
                     } else {
@@ -871,16 +896,19 @@ impl FSMetaService {
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
-        if src_dir.rev.unwrap_or(0) != plan.src_rev0
-            || dst_dir.rev.unwrap_or(0) != plan.dst_rev0
-        {
+        if src_dir.rev.unwrap_or(0) != plan.src_rev0 || dst_dir.rev.unwrap_or(0) != plan.dst_rev0 {
             let _ = self.handle_rollback(Some(txid), ctx.clone()).await;
             return Err(RPCErrors::ReasonError("conflict".to_string()));
         }
 
         // Set tombstone at source
-        self.handle_set_tombstone(plan.src_parent, plan.src_name, Some(txid.clone()), ctx.clone())
-            .await?;
+        self.handle_set_tombstone(
+            plan.src_parent,
+            plan.src_name,
+            Some(txid.clone()),
+            ctx.clone(),
+        )
+        .await?;
 
         // Upsert dentry at destination
         let target = match plan.source {
@@ -899,13 +927,28 @@ impl FSMetaService {
 
         // Bump revisions
         if plan.src_parent == plan.dst_parent {
-            self.handle_bump_dir_rev(plan.src_parent, plan.src_rev0, Some(txid.clone()), ctx.clone())
-                .await?;
+            self.handle_bump_dir_rev(
+                plan.src_parent,
+                plan.src_rev0,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await?;
         } else {
-            self.handle_bump_dir_rev(plan.src_parent, plan.src_rev0, Some(txid.clone()), ctx.clone())
-                .await?;
-            self.handle_bump_dir_rev(plan.dst_parent, plan.dst_rev0, Some(txid.clone()), ctx.clone())
-                .await?;
+            self.handle_bump_dir_rev(
+                plan.src_parent,
+                plan.src_rev0,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await?;
+            self.handle_bump_dir_rev(
+                plan.dst_parent,
+                plan.dst_rev0,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await?;
         }
 
         self.handle_commit(Some(txid), ctx).await?;
@@ -986,11 +1029,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             return Ok(node.map(|n| (root_id, n)));
         }
 
-        let components: Vec<&str> = path
-            .as_str()
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let components: Vec<&str> = path.as_str().split('/').filter(|s| !s.is_empty()).collect();
 
         let cached_ids = self
             .resolve_path_cache
@@ -1028,12 +1067,9 @@ impl ndm::FsMetaHandler for FSMetaService {
                     DentryTarget::IndexNodeId(id) => {
                         ids.push(id);
                         if is_last {
-                            let node = self
-                                .handle_get_inode(id, None, ctx.clone())
-                                .await
-                                .map_err(|e| {
-                                    NdnError::Internal(format!("failed to get inode: {}", e))
-                                })?;
+                            let node = self.handle_get_inode(id, None, ctx.clone()).await.map_err(
+                                |e| NdnError::Internal(format!("failed to get inode: {}", e)),
+                            )?;
                             if node.is_some() {
                                 if let Ok(mut cache) = self.resolve_path_cache.write() {
                                     let comps: Vec<String> =
@@ -1085,7 +1121,8 @@ impl ndm::FsMetaHandler for FSMetaService {
             touched_edges: Arc::new(Mutex::new(HashSet::new())),
         };
 
-        self.txns.lock()
+        self.txns
+            .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
             .insert(txid.clone(), entry);
         Ok(txid)
@@ -1432,15 +1469,16 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
-        let result = self.with_conn(txid.as_deref(), move |conn| {
-            conn.execute(
-                "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
-                params![parent as i64, name],
-            )
-            .map_err(map_db_err)?;
-            Ok(())
-        })
-        .await;
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                conn.execute(
+                    "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                    params![parent as i64, name],
+                )
+                .map_err(map_db_err)?;
+                Ok(())
+            })
+            .await;
 
         result?;
 
@@ -1487,25 +1525,25 @@ impl ndm::FsMetaHandler for FSMetaService {
                 )
                 .map_err(map_db_err)?;
             if updated == 0 {
-                return Err(RPCErrors::ReasonError("rev mismatch or inode not found".to_string()));
+                return Err(RPCErrors::ReasonError(
+                    "rev mismatch or inode not found".to_string(),
+                ));
             }
             Ok(expected_rev + 1)
         })
         .await
     }
 
-    async fn handle_commit(
-        &self,
-        txid: Option<String>,
-        _ctx: RPCContext,
-    ) -> Result<(), RPCErrors> {
+    async fn handle_commit(&self, txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
         let Some(txid) = txid else {
             return Ok(());
         };
 
         // Step 1: Mark as closing (but don't remove yet)
         let entry = {
-            let txns = self.txns.lock()
+            let txns = self
+                .txns
+                .lock()
                 .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
             let entry = txns
                 .get(&txid)
@@ -1513,7 +1551,9 @@ impl ndm::FsMetaHandler for FSMetaService {
 
             // Mark as closing - new operations will be rejected
             if entry.closing.swap(true, Ordering::SeqCst) {
-                return Err(RPCErrors::ReasonError("transaction already closing".to_string()));
+                return Err(RPCErrors::ReasonError(
+                    "transaction already closing".to_string(),
+                ));
             }
             entry.clone()
         };
@@ -1523,7 +1563,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         while entry.in_flight.load(Ordering::SeqCst) > 0 {
             if wait_start.elapsed() > Duration::from_secs(30) {
                 // Timeout - still try to commit but warn
-                warn!("commit: timeout waiting for in-flight ops for txid={}", txid);
+                warn!(
+                    "commit: timeout waiting for in-flight ops for txid={}",
+                    txid
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1532,16 +1575,19 @@ impl ndm::FsMetaHandler for FSMetaService {
         // Step 3: Execute COMMIT
         let conn = entry.conn.clone();
         let commit_result = tokio::task::spawn_blocking(move || {
-            let conn_guard = conn.lock()
+            let conn_guard = conn
+                .lock()
                 .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
-            conn_guard.execute_batch("COMMIT")
+            conn_guard
+                .execute_batch("COMMIT")
                 .map_err(|e| RPCErrors::ReasonError(format!("commit failed: {}", e)))
         })
         .await
         .map_err(|e| RPCErrors::ReasonError(format!("commit join failed: {}", e)))??;
 
         // Step 4: Remove from map only after successful commit
-        self.txns.lock()
+        self.txns
+            .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
             .remove(&txid);
 
@@ -1575,7 +1621,9 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         // Step 1: Mark as closing (but don't remove yet)
         let entry = {
-            let txns = self.txns.lock()
+            let txns = self
+                .txns
+                .lock()
                 .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
             let entry = txns
                 .get(&txid)
@@ -1583,7 +1631,9 @@ impl ndm::FsMetaHandler for FSMetaService {
 
             // Mark as closing - new operations will be rejected
             if entry.closing.swap(true, Ordering::SeqCst) {
-                return Err(RPCErrors::ReasonError("transaction already closing".to_string()));
+                return Err(RPCErrors::ReasonError(
+                    "transaction already closing".to_string(),
+                ));
             }
             entry.clone()
         };
@@ -1592,7 +1642,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         let wait_start = Instant::now();
         while entry.in_flight.load(Ordering::SeqCst) > 0 {
             if wait_start.elapsed() > Duration::from_secs(30) {
-                warn!("rollback: timeout waiting for in-flight ops for txid={}", txid);
+                warn!(
+                    "rollback: timeout waiting for in-flight ops for txid={}",
+                    txid
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1601,16 +1654,19 @@ impl ndm::FsMetaHandler for FSMetaService {
         // Step 3: Execute ROLLBACK
         let conn = entry.conn.clone();
         let rollback_result = tokio::task::spawn_blocking(move || {
-            let conn_guard = conn.lock()
+            let conn_guard = conn
+                .lock()
                 .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
-            conn_guard.execute_batch("ROLLBACK")
+            conn_guard
+                .execute_batch("ROLLBACK")
                 .map_err(|e| RPCErrors::ReasonError(format!("rollback failed: {}", e)))
         })
         .await
         .map_err(|e| RPCErrors::ReasonError(format!("rollback join failed: {}", e)))??;
 
         // Step 4: Remove from map only after successful rollback
-        self.txns.lock()
+        self.txns
+            .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
             .remove(&txid);
 
@@ -1861,7 +1917,9 @@ impl ndm::FsMetaHandler for FSMetaService {
 
                 if updated == 0 {
                     // Either record doesn't exist or would become negative
-                    return Err(RPCErrors::ReasonError("ref_count would be negative".to_string()));
+                    return Err(RPCErrors::ReasonError(
+                        "ref_count would be negative".to_string(),
+                    ));
                 }
             }
 
@@ -1927,7 +1985,12 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     //----------------------------------高阶业务操作----------------------------------
 
-    async fn handle_set_file(&self, path: &NdmPath, obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors> {
+    async fn handle_set_file(
+        &self,
+        path: &NdmPath,
+        obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -1945,14 +2008,17 @@ impl ndm::FsMetaHandler for FSMetaService {
         .await?;
 
         // Bump ref count
-        let _ = self
-            .handle_obj_stat_bump(obj_id, 1, None, ctx)
-            .await?;
+        let _ = self.handle_obj_stat_bump(obj_id, 1, None, ctx).await?;
 
         Ok(String::new())
     }
 
-    async fn handle_set_dir(&self, path: &NdmPath, dir_obj_id: ObjId,ctx: RPCContext) -> Result<String, RPCErrors> {
+    async fn handle_set_dir(
+        &self,
+        path: &NdmPath,
+        dir_obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -1973,7 +2039,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(String::new())
     }
 
-    async fn handle_delete(&self,path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors>{
+    async fn handle_delete(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -1999,7 +2065,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-         // Normalize and validate
+        // Normalize and validate
         if old_path.is_root() {
             return Err(RPCErrors::ReasonError("invalid name".to_string()));
         }
@@ -2080,7 +2146,12 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.apply_move_plan_txn(plan, opts, ctx).await
     }
 
-    async fn handle_make_link(&self,link_path: &NdmPath, target: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors> {
+    async fn handle_make_link(
+        &self,
+        link_path: &NdmPath,
+        target: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
         if link_path.is_root() {
             return Err(RPCErrors::ReasonError("invalid link path".to_string()));
         }
@@ -2096,7 +2167,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("target parent not found".to_string()))?;
 
         if target_parent.1.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError("target parent is not a directory".to_string()));
+            return Err(RPCErrors::ReasonError(
+                "target parent is not a directory".to_string(),
+            ));
         }
 
         let target_dentry = self
@@ -2113,7 +2186,10 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .handle_get_inode(id, None, ctx.clone())
                     .await?
                     .ok_or_else(|| RPCErrors::ReasonError("target inode not found".to_string()))?;
-                if inode.kind == NodeKind::Dir || inode.kind == NodeKind::File || inode.kind == NodeKind::Object {
+                if inode.kind == NodeKind::Dir
+                    || inode.kind == NodeKind::File
+                    || inode.kind == NodeKind::Object
+                {
                     DentryTarget::IndexNodeId(id)
                 } else {
                     return Err(RPCErrors::ReasonError("invalid target type".to_string()));
@@ -2144,7 +2220,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_create_dir(&self, path: &NdmPath,ctx: RPCContext) -> Result<(), RPCErrors> {
+    async fn handle_create_dir(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -2207,9 +2283,13 @@ impl ndm::FsMetaHandler for FSMetaService {
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
         // Ensure buffer and instance are configured
-        let buffer = self.buffer.as_ref()
+        let buffer = self
+            .buffer
+            .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("buffer service not configured".to_string()))?;
-        let instance = self.instance.as_ref()
+        let instance = self
+            .instance
+            .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("instance not configured".to_string()))?;
 
         let (parent_path, name) = path
@@ -2246,8 +2326,13 @@ impl ndm::FsMetaHandler for FSMetaService {
         // Determine if file exists
         let file_exists = matches!(
             &dentry,
-            Some(DentryRecord { target: DentryTarget::IndexNodeId(_), .. })
-                | Some(DentryRecord { target: DentryTarget::ObjId(_), .. })
+            Some(DentryRecord {
+                target: DentryTarget::IndexNodeId(_),
+                ..
+            }) | Some(DentryRecord {
+                target: DentryTarget::ObjId(_),
+                ..
+            })
         );
 
         // Validate flag against file existence
@@ -2275,7 +2360,11 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         // Resolve or create file_id based on dentry and flag
         let (file_id, existing_base_obj, existing_state) = match dentry {
-            None | Some(DentryRecord { target: DentryTarget::Tombstone, .. }) => {
+            None
+            | Some(DentryRecord {
+                target: DentryTarget::Tombstone,
+                ..
+            }) => {
                 // File doesn't exist - create new inode
                 // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
                 let new_node = NodeRecord {
@@ -2306,7 +2395,10 @@ impl ndm::FsMetaHandler for FSMetaService {
 
                 (fid, None, NodeState::DirNormal)
             }
-            Some(DentryRecord { target: DentryTarget::IndexNodeId(fid), .. }) => {
+            Some(DentryRecord {
+                target: DentryTarget::IndexNodeId(fid),
+                ..
+            }) => {
                 // Existing inode - get current state
                 let node = self
                     .handle_get_inode(fid, Some(txid.clone()), ctx.clone())
@@ -2339,7 +2431,10 @@ impl ndm::FsMetaHandler for FSMetaService {
 
                 (fid, node.base_obj_id.clone(), node.state.clone())
             }
-            Some(DentryRecord { target: DentryTarget::ObjId(oid), .. }) => {
+            Some(DentryRecord {
+                target: DentryTarget::ObjId(oid),
+                ..
+            }) => {
                 // Dentry points to ObjId directly - materialize inode
                 let new_node = NodeRecord {
                     inode_id: 0,
@@ -2410,18 +2505,22 @@ impl ndm::FsMetaHandler for FSMetaService {
         // Handle ContinueWrite with existing buffer
         if let Some(handle) = resume_handle {
             // For ContinueWrite, verify the buffer exists and can be resumed
-            let _fb = buffer
-                .get_buffer(&handle)
-                .await
-                .map_err(|_| RPCErrors::ReasonError(format!(
+            let _fb = buffer.get_buffer(&handle).await.map_err(|_| {
+                RPCErrors::ReasonError(format!(
                     "buffer {} not found for ContinueWrite, may have been cleaned up",
                     handle
-                )))?;
+                ))
+            })?;
 
             // Re-acquire lease
             let session = SessionId(format!("{}:{}", instance, file_id));
             let lease_seq = self
-                .handle_acquire_file_lease(file_id, session.clone(), Duration::from_secs(300), ctx.clone())
+                .handle_acquire_file_lease(
+                    file_id,
+                    session.clone(),
+                    Duration::from_secs(300),
+                    ctx.clone(),
+                )
                 .await?;
 
             // Update inode state to Working with the existing buffer handle
@@ -2449,7 +2548,12 @@ impl ndm::FsMetaHandler for FSMetaService {
         // Acquire lease for new/truncated/append writes
         let session = SessionId(format!("{}:{}", instance, file_id));
         let lease_seq = self
-            .handle_acquire_file_lease(file_id, session.clone(), Duration::from_secs(300), ctx.clone())
+            .handle_acquire_file_lease(
+                file_id,
+                session.clone(),
+                Duration::from_secs(300),
+                ctx.clone(),
+            )
             .await?;
 
         // Allocate buffer
@@ -2485,10 +2589,13 @@ impl ndm::FsMetaHandler for FSMetaService {
             let mut node = self
                 .handle_get_inode(file_id, Some(txid.clone()), ctx.clone())
                 .await?
-                .ok_or_else(|| RPCErrors::ReasonError("inode not found for truncate".to_string()))?;
-            
+                .ok_or_else(|| {
+                    RPCErrors::ReasonError("inode not found for truncate".to_string())
+                })?;
+
             node.base_obj_id = None;
-            self.handle_set_inode(node, Some(txid.clone()), ctx.clone()).await?;
+            self.handle_set_inode(node, Some(txid.clone()), ctx.clone())
+                .await?;
         }
 
         self.handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
@@ -2549,8 +2656,13 @@ impl ndm::FsMetaHandler for FSMetaService {
             closed_at: now,
         });
 
-        self.handle_update_inode_state(file_inode_id, cooling_state, Some(txid.clone()), ctx.clone())
-            .await?;
+        self.handle_update_inode_state(
+            file_inode_id,
+            cooling_state,
+            Some(txid.clone()),
+            ctx.clone(),
+        )
+        .await?;
 
         self.handle_commit(Some(txid), ctx.clone()).await?;
 
@@ -2584,7 +2696,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
 
         if parent.1.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
+            ));
         }
 
         let dentry = self
@@ -2705,15 +2819,15 @@ fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
     let mtime: Option<i64> = row.get(5).map_err(map_db_err)?;
     let target = match target_type {
         DENTRY_TARGET_INODE => DentryTarget::IndexNodeId(
-            target_inode_id.ok_or_else(|| {
-                RPCErrors::ReasonError("missing target_inode_id".to_string())
-            })? as IndexNodeId,
+            target_inode_id
+                .ok_or_else(|| RPCErrors::ReasonError("missing target_inode_id".to_string()))?
+                as IndexNodeId,
         ),
-        DENTRY_TARGET_OBJ => DentryTarget::ObjId(obj_id_from_blob(
-            target_obj_id.ok_or_else(|| {
+        DENTRY_TARGET_OBJ => {
+            DentryTarget::ObjId(obj_id_from_blob(target_obj_id.ok_or_else(|| {
                 RPCErrors::ReasonError("missing target_obj_id".to_string())
-            })?,
-        )?),
+            })?)?)
+        }
         DENTRY_TARGET_TOMBSTONE => DentryTarget::Tombstone,
         _ => return Err(RPCErrors::ReasonError("invalid dentry target".to_string())),
     };

@@ -1,8 +1,10 @@
-
-use std::{collections::HashMap, ops::Range};
+use crate::{
+    build_named_object_by_json, ChunkId, NdnError, NdnResult, ObjId, OBJ_TYPE_RELATION,
+    RELATION_TYPE_PART_OF, RELATION_TYPE_SAME,
+};
 use buckyos_kit::buckyos_get_unix_timestamp;
-use serde::{Serialize,Deserialize};
-use crate::{build_named_object_by_json, ChunkId, NdnError, NdnResult, ObjId, OBJ_TYPE_RELATION, RELATION_TYPE_PART_OF, RELATION_TYPE_SAME};
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, ops::Range};
 
 /*
 
@@ -24,13 +26,11 @@ use crate::{build_named_object_by_json, ChunkId, NdnError, NdnResult, ObjId, OBJ
 */
 
 ////////////////////////////////////////////////////
-#[derive(Debug, Clone,Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ObjectLinkData {
-    SameAs(ObjId),//Same ， src object is same as target object
-    PartOf(ObjId,Range<u64>), //Object Id + Range
+    SameAs(ObjId),             //Same ， src object is same as target object
+    PartOf(ObjId, Range<u64>), //Object Id + Range
 }
-
-
 
 #[derive(Serialize, Deserialize)]
 pub struct RelationObject {
@@ -39,10 +39,10 @@ pub struct RelationObject {
     pub target: ObjId,
     #[serde(flatten)]
     pub body: HashMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none",default)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub iat: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none",default)]
-    pub exp: Option<u64>   
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub exp: Option<u64>,
 }
 
 impl RelationObject {
@@ -58,15 +58,14 @@ impl RelationObject {
                     exp: None,
                 };
             }
-            ObjectLinkData::PartOf(chunk_id,range) => 
-            {
+            ObjectLinkData::PartOf(chunk_id, range) => {
                 let mut body = HashMap::new();
 
                 let range_value = serde_json::json!({
-                    "start": range.start,   
+                    "start": range.start,
                     "end": range.end,
                 });
-                body.insert("range".to_string(),range_value);
+                body.insert("range".to_string(), range_value);
 
                 return Self {
                     source,
@@ -80,7 +79,7 @@ impl RelationObject {
         }
     }
 
-    pub fn get_link_data(self)->NdnResult<ObjectLinkData> {
+    pub fn get_link_data(self) -> NdnResult<ObjectLinkData> {
         match self.relation.as_str() {
             RELATION_TYPE_SAME => {
                 return Ok(ObjectLinkData::SameAs(self.target));
@@ -91,26 +90,41 @@ impl RelationObject {
                 let start = range.get("start");
                 let end = range.get("end");
                 if start.is_none() || end.is_none() {
-                    return Err(NdnError::InvalidLink(format!("invalid range:{}",range.to_string())));
+                    return Err(NdnError::InvalidLink(format!(
+                        "invalid range:{}",
+                        range.to_string()
+                    )));
                 }
                 let start = start.unwrap().as_u64();
                 let end = end.unwrap().as_u64();
                 if start.is_none() || end.is_none() {
-                    return Err(NdnError::InvalidLink(format!("invalid range:{}",range.to_string())));
+                    return Err(NdnError::InvalidLink(format!(
+                        "invalid range:{}",
+                        range.to_string()
+                    )));
                 }
-                return Ok(ObjectLinkData::PartOf(self.target,Range{start:start.unwrap(),end:end.unwrap()}));
-                
-            },
-            _ => return Err(NdnError::InvalidLink(format!("invalid relation:{}",self.relation))),
+                return Ok(ObjectLinkData::PartOf(
+                    self.target,
+                    Range {
+                        start: start.unwrap(),
+                        end: end.unwrap(),
+                    },
+                ));
+            }
+            _ => {
+                return Err(NdnError::InvalidLink(format!(
+                    "invalid relation:{}",
+                    self.relation
+                )))
+            }
         }
     }
 
-    pub fn gen_obj_id(&self)->(ObjId,String) {
+    pub fn gen_obj_id(&self) -> (ObjId, String) {
         let obj_value = serde_json::to_value(self).unwrap();
-        return build_named_object_by_json(OBJ_TYPE_RELATION,&obj_value);
+        return build_named_object_by_json(OBJ_TYPE_RELATION, &obj_value);
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -119,24 +133,39 @@ mod tests {
     #[test]
     fn test_relation_object() {
         let link_data1 = ObjectLinkData::SameAs(ObjId::new("test:1234").unwrap());
-        let relation_object = RelationObject::create_by_link_data(ObjId::new("test:1234").unwrap(),link_data1.clone());
-        let (obj_id,obj_str) = relation_object.gen_obj_id();
-        println!("robj_id {}",obj_id.to_string());
-        assert_eq!(obj_id.to_string(),"cyrel:e0ad5f3b656a883de323e4c6e7999207ce3026d3fa5dcb47518d2caeb4d92aa0");
-        println!("robj_str {}",obj_str);
+        let relation_object = RelationObject::create_by_link_data(
+            ObjId::new("test:1234").unwrap(),
+            link_data1.clone(),
+        );
+        let (obj_id, obj_str) = relation_object.gen_obj_id();
+        println!("robj_id {}", obj_id.to_string());
+        assert_eq!(
+            obj_id.to_string(),
+            "cyrel:e0ad5f3b656a883de323e4c6e7999207ce3026d3fa5dcb47518d2caeb4d92aa0"
+        );
+        println!("robj_str {}", obj_str);
         let link_data = relation_object.get_link_data().unwrap();
-        println!("link_data {:?}",&link_data);
-        assert_eq!(link_data,link_data1);
+        println!("link_data {:?}", &link_data);
+        assert_eq!(link_data, link_data1);
 
-        let link_data2 = ObjectLinkData::PartOf(ObjId::new("test:1234").unwrap(),Range{start:0,end:100});
-        let relation_object2 = RelationObject::create_by_link_data(ObjId::new("test:1234").unwrap(),link_data2.clone());
-        let (obj_id2,obj_str2) = relation_object2.gen_obj_id();
-        println!("robj_id2 {}",obj_id2.to_string());
-        assert_eq!(obj_id2.to_string(),"cyrel:cf2ff05aaa9165e9c7fb2bc642cea5a02b730d9f0415f907fc9d4a6bad66bca9");
-        println!("robj_str2 {}",obj_str2);
+        let link_data2 = ObjectLinkData::PartOf(
+            ObjId::new("test:1234").unwrap(),
+            Range { start: 0, end: 100 },
+        );
+        let relation_object2 = RelationObject::create_by_link_data(
+            ObjId::new("test:1234").unwrap(),
+            link_data2.clone(),
+        );
+        let (obj_id2, obj_str2) = relation_object2.gen_obj_id();
+        println!("robj_id2 {}", obj_id2.to_string());
+        assert_eq!(
+            obj_id2.to_string(),
+            "cyrel:cf2ff05aaa9165e9c7fb2bc642cea5a02b730d9f0415f907fc9d4a6bad66bca9"
+        );
+        println!("robj_str2 {}", obj_str2);
         let link_data3 = relation_object2.get_link_data().unwrap();
-        println!("link_data3 {:?}",&link_data2);
-        assert_eq!(link_data3,link_data2);
+        println!("link_data3 {:?}", &link_data2);
+        assert_eq!(link_data3, link_data2);
     }
 
     // #[test]

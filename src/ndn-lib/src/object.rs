@@ -78,7 +78,7 @@ impl ObjId {
     pub fn is_chunk_list(&self) -> bool {
         self.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE
     }
-    
+
     pub fn is_json(&self) -> bool {
         if self.is_chunk() || self.is_container() {
             return false;
@@ -120,10 +120,10 @@ impl ObjId {
         let hex_str = hex::encode(self.obj_hash.clone());
         format!("{}:{}", self.obj_type, hex_str)
     }
-   
-    pub fn to_filename(&self)->String {
+
+    pub fn to_filename(&self) -> String {
         let hex_str = hex::encode(self.obj_hash.clone());
-        format!("{}.{}",hex_str,self.obj_type)
+        format!("{}.{}", hex_str, self.obj_type)
     }
 
     pub fn to_base32(&self) -> String {
@@ -290,16 +290,12 @@ pub fn build_named_object_by_json(
     (obj_id, json_str)
 }
 
-pub fn build_named_object_by_jwt(
-    obj_type: &str,
-    jwt_str: &str
-) -> NdnResult<(ObjId, String)> {
+pub fn build_named_object_by_jwt(obj_type: &str, jwt_str: &str) -> NdnResult<(ObjId, String)> {
     let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
         .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
     let (obj_id, json_str) = build_named_object_by_json(obj_type, &claims);
     Ok((obj_id, json_str))
 }
-
 
 pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bool {
     let (obj_id2, json_str) = build_named_object_by_json(obj_id.obj_type.as_str(), json_value);
@@ -311,9 +307,12 @@ pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bo
 
 pub fn verify_named_object_from_str(obj_id: &ObjId, obj_str: &str) -> NdnResult<serde_json::Value> {
     let obj_json = serde_json::from_str(obj_str)
-        .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
-    if !verify_named_object(obj_id, &obj_json)  {
-        return Err(NdnError::InvalidId(format!("verify named object failed:{}",obj_str)));
+        .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string())))?;
+    if !verify_named_object(obj_id, &obj_json) {
+        return Err(NdnError::InvalidId(format!(
+            "verify named object failed:{}",
+            obj_str
+        )));
     }
     Ok(obj_json)
 }
@@ -329,11 +328,11 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
     return Ok(true);
 }
 
-
 pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
     if obj_str.find("{").is_some() {
-        let obj_json = serde_json::from_str(obj_str)
-            .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
+        let obj_json = serde_json::from_str(obj_str).map_err(|e| {
+            NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string()))
+        })?;
         return Ok(obj_json);
     } else {
         let claims = name_lib::decode_jwt_claim_without_verify(obj_str)
@@ -341,7 +340,6 @@ pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Va
         return Ok(claims);
     }
 }
-
 
 pub fn named_obj_str_to_jwt(
     obj_json_str: &String,

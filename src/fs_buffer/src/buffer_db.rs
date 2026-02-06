@@ -44,11 +44,13 @@ impl LocalFileBufferDB {
         let meta = record.to_meta();
         let meta_json = serde_json::to_string(&meta)
             .map_err(|e| NdnError::InvalidParam(format!("serialize meta failed: {}", e)))?;
-        let order = record.dirty_layout.read()
+        let order = record
+            .dirty_layout
+            .read()
             .map_err(|_| NdnError::InvalidState("dirty layout poisoned".to_string()))?;
         let order_json = serde_json::to_string(&order.order)
             .map_err(|e| NdnError::InvalidParam(format!("serialize order failed: {}", e)))?;
-        
+
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO file_buffers (handle_id, dirty_order, meta_json, created_at, updated_at)
@@ -71,11 +73,11 @@ impl LocalFileBufferDB {
         let mut stmt = conn
             .prepare("SELECT meta_json, dirty_order FROM file_buffers WHERE handle_id = ?1")
             .map_err(|e| NdnError::DbError(format!("prepare failed: {}", e)))?;
-        
+
         let row = stmt.query_row(params![handle_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         });
-        
+
         match row {
             Ok((meta_json, order_json)) => {
                 let meta: FileBufferRecordMeta = serde_json::from_str(&meta_json)
@@ -84,9 +86,10 @@ impl LocalFileBufferDB {
                     .map_err(|e| NdnError::DecodeError(format!("decode order failed: {}", e)))?;
                 Ok(FileBufferRecord::from_meta_with_layout(meta, order))
             }
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Err(NdnError::NotFound(format!("buffer not found: {}", handle_id)))
-            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(NdnError::NotFound(format!(
+                "buffer not found: {}",
+                handle_id
+            ))),
             Err(e) => Err(NdnError::DbError(format!("query failed: {}", e))),
         }
     }
@@ -97,10 +100,11 @@ impl LocalFileBufferDB {
         let mut stmt = conn
             .prepare("SELECT handle_id FROM file_buffers")
             .map_err(|e| NdnError::DbError(format!("prepare failed: {}", e)))?;
-        
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))
+
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(|e| NdnError::DbError(format!("query failed: {}", e)))?;
-        
+
         let mut handles = Vec::new();
         for handle in rows {
             handles.push(handle.map_err(|e| NdnError::DbError(format!("read row failed: {}", e)))?);
@@ -114,14 +118,17 @@ impl LocalFileBufferDB {
         let mut stmt = conn
             .prepare("SELECT meta_json, dirty_order FROM file_buffers")
             .map_err(|e| NdnError::DbError(format!("prepare failed: {}", e)))?;
-        
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).map_err(|e| NdnError::DbError(format!("query failed: {}", e)))?;
-        
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| NdnError::DbError(format!("query failed: {}", e)))?;
+
         let mut records = Vec::new();
         for row in rows {
-            let (meta_json, order_json) = row.map_err(|e| NdnError::DbError(format!("read row failed: {}", e)))?;
+            let (meta_json, order_json) =
+                row.map_err(|e| NdnError::DbError(format!("read row failed: {}", e)))?;
             let meta: FileBufferRecordMeta = serde_json::from_str(&meta_json)
                 .map_err(|e| NdnError::DecodeError(format!("decode meta failed: {}", e)))?;
             let order: Vec<u32> = serde_json::from_str(&order_json)
@@ -134,9 +141,7 @@ impl LocalFileBufferDB {
     pub fn get_dirty_order(&self, handle_id: &str) -> NdnResult<Option<Vec<u32>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT dirty_order FROM file_buffers WHERE handle_id = ?1",
-            )
+            .prepare("SELECT dirty_order FROM file_buffers WHERE handle_id = ?1")
             .map_err(|e| NdnError::DbError(format!("prepare failed: {}", e)))?;
         let row = stmt.query_row(params![handle_id], |row| row.get::<_, String>(0));
         match row {
@@ -151,16 +156,12 @@ impl LocalFileBufferDB {
     }
 
     pub fn set_dirty_order(&self, handle_id: &str, order: &[u32]) -> NdnResult<()> {
-        let order_json = serde_json::to_string(order)
-            .map_err(|e| NdnError::InvalidParam(e.to_string()))?;
+        let order_json =
+            serde_json::to_string(order).map_err(|e| NdnError::InvalidParam(e.to_string()))?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE file_buffers SET dirty_order = ?1, updated_at = ?2 WHERE handle_id = ?3",
-            params![
-                order_json,
-                unix_timestamp() as i64,
-                handle_id,
-            ],
+            params![order_json, unix_timestamp() as i64, handle_id,],
         )
         .map_err(|e| NdnError::DbError(format!("update dirty_order failed: {}", e)))?;
         Ok(())
@@ -203,7 +204,7 @@ mod tests {
 
         let handle_id = "fb-test-1";
         let order = vec![3u32, 1u32, 7u32];
-        
+
         // First add a buffer record
         let record = make_test_record(handle_id, order.clone());
         db.add_buffer(&record).unwrap();
@@ -233,14 +234,14 @@ mod tests {
         let handle_id = "fb-test-2";
         let order = vec![1u32, 2u32, 3u32];
         let record = make_test_record(handle_id, order.clone());
-        
+
         db.add_buffer(&record).unwrap();
-        
+
         let loaded = db.get_buffer(handle_id).unwrap();
         assert_eq!(loaded.handle_id, handle_id);
         assert_eq!(loaded.file_inode_id, 12345);
         assert!(!loaded.read_only);
-        
+
         let loaded_order = loaded.dirty_layout.read().unwrap().order.clone();
         assert_eq!(loaded_order, order);
     }
@@ -253,13 +254,13 @@ mod tests {
 
         let record1 = make_test_record("fb-a", vec![1, 2]);
         let record2 = make_test_record("fb-b", vec![3, 4, 5]);
-        
+
         db.add_buffer(&record1).unwrap();
         db.add_buffer(&record2).unwrap();
-        
+
         let all = db.load_all().unwrap();
         assert_eq!(all.len(), 2);
-        
+
         let ids: Vec<&str> = all.iter().map(|r| r.handle_id.as_str()).collect();
         assert!(ids.contains(&"fb-a"));
         assert!(ids.contains(&"fb-b"));
