@@ -2,7 +2,7 @@
 resolver = "2"
 
 members = [
-    #"./package-lib",
+    "./package-lib",
     "./ndn-lib",
     "./named_store",
     "./fs_buffer",

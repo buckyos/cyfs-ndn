@@ -32,6 +32,7 @@ async-fd-lock = "*"
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 tokio-tar = "*"
 ndn-lib = { path = "../ndn-lib" }
+named_store = { path = "../named_store" }
 name-lib = { workspace = true }
 buckyos-kit = { workspace = true }
 [dev-dependencies]

@@ -142,6 +142,7 @@ use tokio_tar::Archive;
 use async_fd_lock::{LockRead, LockWrite};
 use async_fd_lock::RwLockWriteGuard;
 use ndn_lib::*;
+use named_store::NamedStoreMgr;
 
 use crate::error::*;
 use crate::meta::*;
@@ -387,7 +388,7 @@ impl PackageEnv {
     
 
     //检查pkg的依赖是否都已经在本机就绪，注意本操作并不会修改env
-    pub async fn check_pkg_ready(meta_index_db: &PathBuf, pkg_id: &str, named_mgr_id: Option<&str>,miss_chunk_list: &mut Vec<ChunkId>) -> PkgResult<()> {
+    pub async fn check_pkg_ready(meta_index_db: &PathBuf, pkg_id: &str, store_mgr: &NamedStoreMgr,miss_chunk_list: &mut Vec<ChunkId>) -> PkgResult<()> {
         let meta_db = MetaIndexDb::new(meta_index_db.clone(),true)?;
         let meta_info = meta_db.get_pkg_meta(pkg_id)?;
         if meta_info.is_none() {
@@ -400,24 +401,15 @@ impl PackageEnv {
         let (meta_obj_id,pkg_meta) = meta_info.unwrap();
         // 检查chunk是否存在
         if !pkg_meta.content.is_empty() {
-            // TODO: 实现chunk存在性检查
             let chunk_id_str = pkg_meta.content.clone();
             info!("check chunk {} exist", chunk_id_str);
-            let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(named_mgr_id).await;
-            if named_mgr.is_none() {
-                return Err(PkgError::FileNotFoundError(
-                    "Named data mgr not found".to_owned(),
-                ));
-            }
-            let named_mgr = named_mgr.unwrap();
-            let named_mgr = named_mgr.lock().await;
             let chunk_id = ChunkId::new(&chunk_id_str)
                 .map_err(|e| PkgError::ParseError(
                     pkg_id.to_owned(),
                     format!("Invalid chunk id: {}", e),
                 ))?;
 
-            let is_chunk_exist = named_mgr.have_chunk_impl(&chunk_id).await;
+            let is_chunk_exist = store_mgr.have_chunk(&chunk_id).await;
             if !is_chunk_exist {
                 miss_chunk_list.push(chunk_id);
             }
