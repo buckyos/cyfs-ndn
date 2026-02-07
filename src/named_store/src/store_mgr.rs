@@ -15,12 +15,104 @@ use crate::{
     SimpleChunkListReader, StoreLayout,
 };
 use ndn_lib::{
-    ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError, NdnResult, OBJ_TYPE_FILE, ObjId, SimpleChunkList, extract_objid_by_path, load_named_obj, load_named_object_from_obj_str
+    extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkReader,
+    ChunkWriter, DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
 };
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+
+const DEFAULT_RESOLVE_NEXT_OBJ_CACHE_MAX_ENTRIES: usize = 10000;
+type ResolveNextObjCacheEntryId = u64;
+
+#[derive(Clone, Hash, Eq, PartialEq)]
+struct ResolveNextObjCacheKey {
+    obj_id: ObjId,
+    path: String,
+}
+
+#[derive(Clone)]
+struct ResolveNextObjCacheValue {
+    next_obj_id: ObjId,
+    next_path: Option<String>,
+    next_obj_str: Option<String>,
+}
+
+struct ResolveNextObjCacheEntry {
+    value: ResolveNextObjCacheValue,
+    entry_id: ResolveNextObjCacheEntryId,
+}
+
+struct ResolveNextObjCache {
+    entries: HashMap<ResolveNextObjCacheKey, ResolveNextObjCacheEntry>,
+    lru_order: BTreeMap<ResolveNextObjCacheEntryId, ResolveNextObjCacheKey>,
+    next_entry_id: ResolveNextObjCacheEntryId,
+    max_entries: usize,
+}
+
+impl ResolveNextObjCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru_order: BTreeMap::new(),
+            next_entry_id: 0,
+            max_entries,
+        }
+    }
+
+    fn get(&mut self, obj_id: &ObjId, path: &str) -> Option<ResolveNextObjCacheValue> {
+        let key = ResolveNextObjCacheKey {
+            obj_id: obj_id.clone(),
+            path: path.to_string(),
+        };
+
+        let entry = self.entries.get_mut(&key)?;
+        self.lru_order.remove(&entry.entry_id);
+
+        let new_entry_id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        self.lru_order.insert(new_entry_id, key);
+        entry.entry_id = new_entry_id;
+
+        Some(entry.value.clone())
+    }
+
+    fn put(&mut self, obj_id: &ObjId, path: &str, value: ResolveNextObjCacheValue) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        let key = ResolveNextObjCacheKey {
+            obj_id: obj_id.clone(),
+            path: path.to_string(),
+        };
+
+        if let Some(old) = self.entries.remove(&key) {
+            self.lru_order.remove(&old.entry_id);
+        }
+
+        let entry_id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
+        self.lru_order.insert(entry_id, key.clone());
+        self.entries
+            .insert(key, ResolveNextObjCacheEntry { value, entry_id });
+
+        while self.entries.len() > self.max_entries {
+            let Some((oldest_entry_id, oldest_key)) = self
+                .lru_order
+                .iter()
+                .next()
+                .map(|(id, key)| (*id, key.clone()))
+            else {
+                break;
+            };
+
+            self.lru_order.remove(&oldest_entry_id);
+            self.entries.remove(&oldest_key);
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct NamedStoreMgr {
@@ -33,6 +125,9 @@ pub struct NamedStoreMgr {
 
     /// Maximum number of layout versions to keep
     max_versions: usize,
+
+    /// Cache for resolve_next_obj results by (obj_id, inner_path).
+    resolve_next_obj_cache: Arc<Mutex<ResolveNextObjCache>>,
 }
 
 impl NamedStoreMgr {
@@ -42,6 +137,9 @@ impl NamedStoreMgr {
             versions: Arc::new(RwLock::new(Vec::new())),
             stores: Arc::new(RwLock::new(HashMap::new())),
             max_versions: 3,
+            resolve_next_obj_cache: Arc::new(Mutex::new(ResolveNextObjCache::new(
+                DEFAULT_RESOLVE_NEXT_OBJ_CACHE_MAX_ENTRIES,
+            ))),
         }
     }
 
@@ -51,6 +149,9 @@ impl NamedStoreMgr {
             versions: Arc::new(RwLock::new(Vec::new())),
             stores: Arc::new(RwLock::new(HashMap::new())),
             max_versions: max_versions.max(1),
+            resolve_next_obj_cache: Arc::new(Mutex::new(ResolveNextObjCache::new(
+                DEFAULT_RESOLVE_NEXT_OBJ_CACHE_MAX_ENTRIES,
+            ))),
         }
     }
 
@@ -197,6 +298,42 @@ impl NamedStoreMgr {
                 obj_id
             ))
         }))
+    }
+
+    pub async fn open_object(
+        &self,
+        obj_id: &ObjId,
+        inner_path: Option<String>,
+    ) -> NdnResult<String> {
+        let mut current_obj_id = obj_id.clone();
+        let mut current_path = Self::normalize_inner_path(inner_path);
+        let mut current_obj_str: Option<String> = None;
+
+        loop {
+            if current_obj_id.is_chunk() {
+                return Err(NdnError::InvalidObjType(format!(
+                    "{} is chunk",
+                    current_obj_id.to_string()
+                )));
+            }
+
+            let obj_str = match current_obj_str.take() {
+                Some(obj_str) => obj_str,
+                None => self.get_object(&current_obj_id).await?,
+            };
+
+            if current_path.is_none() {
+                return Ok(obj_str);
+            }
+
+            let path = current_path.as_ref().unwrap().as_str();
+            let (next_obj_id, next_path, next_obj_str) = self
+                .resolve_next_obj_cached(&current_obj_id, obj_str.as_str(), path)
+                .await?;
+            current_obj_id = next_obj_id;
+            current_path = next_path;
+            current_obj_str = next_obj_str;
+        }
     }
 
     /// Select primary store for a new object (uses current layout)
@@ -494,71 +631,94 @@ impl NamedStoreMgr {
         Ok((Box::pin(reader), total_size))
     }
 
+    async fn open_chunklist_reader_by_obj_str(
+        &self,
+        chunklist_json: &str,
+        offset: u64,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        let vec_chunk_id: Vec<ChunkId> = load_named_obj(chunklist_json)?;
+        let chunk_list = SimpleChunkList::from_chunk_list(vec_chunk_id)?;
+        let total_size = chunk_list.total_size;
+        let reader = SimpleChunkListReader::new(
+            Arc::new(self.clone()),
+            chunk_list,
+            std::io::SeekFrom::Start(offset),
+        )
+        .await?;
+        Ok((Box::pin(reader), total_size))
+    }
+
     /// Open a generic reader by object id and optional inner path.
     pub async fn open_reader(
         &self,
         obj_id: &ObjId,
-        inner_obj_path: Option<String>,
+        inner_path: Option<String>,
     ) -> NdnResult<(ChunkReader, u64)> {
         let mut current_obj_id = obj_id.clone();
-        let mut current_inner_path = inner_obj_path;
-        let mut size_override: Option<u64> = None;
+        let mut current_path = Self::normalize_inner_path(inner_path);
+        let mut current_obj_str: Option<String> = None;
 
         loop {
-            if current_obj_id.is_dir_object() {
-                unimplemented!()
+            if current_path.is_none() {
+                if current_obj_id.is_chunk() {
+                    let chunk_id = ChunkId::from_obj_id(&current_obj_id);
+                    return self.open_chunk_reader(&chunk_id, 0).await;
+                }
+
+                if current_obj_id.is_chunk_list() {
+                    if let Some(obj_str) = current_obj_str.take() {
+                        return self
+                            .open_chunklist_reader_by_obj_str(obj_str.as_str(), 0)
+                            .await;
+                    }
+                    return self.open_chunklist_reader(&current_obj_id, 0).await;
+                }
+
+                if current_obj_id.is_file_object() {
+                    let obj_str = match current_obj_str.take() {
+                        Some(obj_str) => obj_str,
+                        None => self.get_object(&current_obj_id).await?,
+                    };
+                    let file_obj: FileObject = load_named_obj(obj_str.as_str())?;
+                    let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+                    if content_obj_id.is_chunk() {
+                        let chunk_id = ChunkId::from_obj_id(&content_obj_id);
+                        return self.open_chunk_reader(&chunk_id, 0).await;
+                    }
+                    if content_obj_id.is_chunk_list() {
+                        return self.open_chunklist_reader(&content_obj_id, 0).await;
+                    }
+                    return Err(NdnError::InvalidObjType(format!(
+                        "file object content {} is not chunk or chunklist",
+                        content_obj_id.to_string()
+                    )));
+                }
+
+                return Err(NdnError::InvalidObjType(format!(
+                    "{} does not support open_reader",
+                    current_obj_id.to_string()
+                )));
             }
 
             if current_obj_id.is_chunk() {
-                if current_inner_path.is_some() {
-                    return Err(NdnError::InvalidObjType(format!(
-                        "{} is chunk, no inner_obj_path",
-                        current_obj_id.to_string()
-                    )));
-                }
-
-                let chunk_id = ChunkId::from_obj_id(&current_obj_id);
-                let (reader, size) = self.open_chunk_reader(&chunk_id, 0).await?;
-                return Ok((reader, size_override.unwrap_or(size)));
-            }
-
-            if current_obj_id.is_chunk_list() {
-                if current_inner_path.is_some() {
-                    return Err(NdnError::InvalidObjType(format!(
-                        "{} is chunklist, no inner_obj_path",
-                        current_obj_id.to_string()
-                    )));
-                }
-
-                let (reader, size) = self.open_chunklist_reader(&current_obj_id, 0).await?;
-                return Ok((reader, size_override.unwrap_or(size)));
-            }
-
-            if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
-                let obj_json = self.get_object(&current_obj_id).await?;
-                let file_obj: FileObject = load_named_obj(obj_json.as_str())?;
-                if file_obj.content.is_empty() {
-                    return Err(NdnError::InvalidData(format!(
-                        "file {} content is empty",
-                        current_obj_id.to_string()
-                    )));
-                }
-                if file_obj.size > 0 {
-                    size_override = Some(file_obj.size);
-                }
-                current_obj_id = ObjId::new(file_obj.content.as_str())?;
-                continue;
-            }
-
-            let inner_path = current_inner_path.take().ok_or_else(|| {
-                NdnError::InvalidObjType(format!(
-                    "{} is object, can't open reader without inner_obj_path",
+                return Err(NdnError::InvalidParam(format!(
+                    "chunk {} does not support inner path",
                     current_obj_id.to_string()
-                ))
-            })?;
-            let obj_json_str = self.get_object(&current_obj_id).await?;
-            let obj_json: Value = load_named_object_from_obj_str(obj_json_str.as_str())?;
-            current_obj_id = extract_objid_by_path(&obj_json, inner_path.as_str())?;
+                )));
+            }
+
+            let obj_str = match current_obj_str.take() {
+                Some(obj_str) => obj_str,
+                None => self.get_object(&current_obj_id).await?,
+            };
+
+            let path = current_path.as_ref().unwrap().as_str();
+            let (next_obj_id, next_path, next_obj_str) = self
+                .resolve_next_obj_cached(&current_obj_id, obj_str.as_str(), path)
+                .await?;
+            current_obj_id = next_obj_id;
+            current_path = next_path;
+            current_obj_str = next_obj_str;
         }
     }
 
@@ -795,6 +955,108 @@ impl NamedStoreMgr {
             ))),
         }
     }
+
+    fn normalize_inner_path(inner_path: Option<String>) -> Option<String> {
+        let path = match inner_path {
+            Some(path) => path.trim().to_string(),
+            None => return None,
+        };
+        if path.is_empty() || path == "/" {
+            return None;
+        }
+        if path.starts_with('/') {
+            Some(path)
+        } else {
+            Some(format!("/{}", path))
+        }
+    }
+
+    fn split_first_segment(path: &str) -> NdnResult<(String, Option<String>)> {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return Err(NdnError::InvalidParam("empty inner path".to_string()));
+        }
+        let first = segments[0].to_string();
+        let rest = if segments.len() > 1 {
+            Some(format!("/{}", segments[1..].join("/")))
+        } else {
+            None
+        };
+        Ok((first, rest))
+    }
+
+    async fn resolve_next_obj_cached(
+        &self,
+        obj_id: &ObjId,
+        obj_str: &str,
+        path: &str,
+    ) -> NdnResult<(ObjId, Option<String>, Option<String>)> {
+        if let Some(cached) = {
+            let mut cache = self.resolve_next_obj_cache.lock().await;
+            cache.get(obj_id, path)
+        } {
+            return Ok((cached.next_obj_id, cached.next_path, cached.next_obj_str));
+        }
+
+        let (next_obj_id, next_path, next_obj_str) = Self::resolve_next_obj(obj_id, obj_str, path)?;
+
+        let cache_value = ResolveNextObjCacheValue {
+            next_obj_id: next_obj_id.clone(),
+            next_path: next_path.clone(),
+            next_obj_str: next_obj_str.clone(),
+        };
+        let mut cache = self.resolve_next_obj_cache.lock().await;
+        cache.put(obj_id, path, cache_value);
+
+        Ok((next_obj_id, next_path, next_obj_str))
+    }
+
+    fn resolve_next_obj(
+        obj_id: &ObjId,
+        obj_str: &str,
+        path: &str,
+    ) -> NdnResult<(ObjId, Option<String>, Option<String>)> {
+        if obj_id.is_dir_object() {
+            let dir_obj: DirObject = load_named_obj(obj_str)?;
+            let (segment, rest_path) = Self::split_first_segment(path)?;
+            let item = dir_obj
+                .get(&segment)
+                .ok_or_else(|| NdnError::NotFound(format!("path not found: {}", segment)))?;
+            match item {
+                SimpleMapItem::ObjId(next_obj_id) => Ok((next_obj_id.clone(), rest_path, None)),
+                SimpleMapItem::Object(_, _) | SimpleMapItem::ObjectJwt(_, _) => {
+                    let (next_obj_id, next_obj_str) = item.get_obj_id()?;
+                    Ok((next_obj_id, rest_path, Some(next_obj_str)))
+                }
+            }
+        } else if obj_id.is_chunk_list() {
+            //只消费1级
+            unimplemented!()
+        } else {
+            let obj_json = load_named_object_from_obj_str(obj_str)?;
+            let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if segments.is_empty() {
+                return Err(NdnError::InvalidParam("empty inner path".to_string()));
+            }
+            let mut last_err: Option<NdnError> = None;
+            for i in (1..=segments.len()).rev() {
+                let candidate = format!("/{}", segments[0..i].join("/"));
+                match extract_objid_by_path(&obj_json, candidate.as_str()) {
+                    Ok(next_obj_id) => {
+                        let rest_path = if i < segments.len() {
+                            Some(format!("/{}", segments[i..].join("/")))
+                        } else {
+                            None
+                        };
+                        return Ok((next_obj_id, rest_path, None));
+                    }
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            Err(last_err
+                .unwrap_or_else(|| NdnError::NotFound(format!("objid path not found: {}", path))))
+        }
+    }
 }
 
 impl Default for NamedStoreMgr {
@@ -804,184 +1066,5 @@ impl Default for NamedStoreMgr {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::StoreTarget;
-
-    fn create_test_target(
-        store_id: &str,
-        weight: u32,
-        enabled: bool,
-        readonly: bool,
-    ) -> StoreTarget {
-        StoreTarget {
-            store_id: store_id.to_string(),
-            device_did: None,
-            capacity: Some(1000),
-            used: Some(100),
-            readonly,
-            enabled,
-            weight,
-        }
-    }
-
-    fn create_layout_with_epoch(epoch: u64, targets: Vec<StoreTarget>) -> StoreLayout {
-        StoreLayout::new(epoch, targets, 10000, 1000)
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_basic() {
-        let mgr = NamedStoreMgr::new();
-
-        // Initially empty
-        assert_eq!(mgr.version_count().await, 0);
-        assert!(mgr.current_layout().await.is_none());
-        assert!(mgr.current_epoch().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_add_versions() {
-        let mgr = NamedStoreMgr::new();
-
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-
-        assert_eq!(mgr.version_count().await, 1);
-        assert_eq!(mgr.current_epoch().await, Some(1));
-
-        // Add newer version
-        let targets2 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-        ];
-        let layout2 = create_layout_with_epoch(2, targets2);
-        mgr.add_layout(layout2).await;
-
-        assert_eq!(mgr.version_count().await, 2);
-        assert_eq!(mgr.current_epoch().await, Some(2));
-
-        // Add even newer version
-        let targets3 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-            create_test_target("store3", 1, true, false),
-        ];
-        let layout3 = create_layout_with_epoch(3, targets3);
-        mgr.add_layout(layout3).await;
-
-        assert_eq!(mgr.version_count().await, 3);
-        assert_eq!(mgr.current_epoch().await, Some(3));
-
-        // Adding a 4th version should trim the oldest
-        let targets4 = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-            create_test_target("store3", 1, true, false),
-            create_test_target("store4", 1, true, false),
-        ];
-        let layout4 = create_layout_with_epoch(4, targets4);
-        mgr.add_layout(layout4).await;
-
-        assert_eq!(mgr.version_count().await, 3); // Still 3, oldest trimmed
-        assert_eq!(mgr.current_epoch().await, Some(4));
-
-        // Verify version 1 is gone
-        assert!(mgr.get_layout(1).await.is_none());
-        assert!(mgr.get_layout(2).await.is_some());
-        assert!(mgr.get_layout(3).await.is_some());
-        assert!(mgr.get_layout(4).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_version_ordering() {
-        let mgr = NamedStoreMgr::new();
-
-        // Add versions out of order
-        let targets2 = vec![create_test_target("store1", 1, true, false)];
-        let layout2 = create_layout_with_epoch(2, targets2);
-        mgr.add_layout(layout2).await;
-
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-
-        let targets3 = vec![create_test_target("store1", 1, true, false)];
-        let layout3 = create_layout_with_epoch(3, targets3);
-        mgr.add_layout(layout3).await;
-
-        // Current should be the newest (epoch 3)
-        assert_eq!(mgr.current_epoch().await, Some(3));
-
-        // Versions should be ordered newest first
-        let versions = mgr.all_versions().await;
-        assert_eq!(versions.len(), 3);
-        assert_eq!(versions[0].epoch, 3);
-        assert_eq!(versions[1].epoch, 2);
-        assert_eq!(versions[2].epoch, 1);
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_compact() {
-        let mgr = NamedStoreMgr::new();
-
-        for epoch in 1..=3 {
-            let targets = vec![create_test_target("store1", 1, true, false)];
-            let layout = create_layout_with_epoch(epoch, targets);
-            mgr.add_layout(layout).await;
-        }
-
-        assert_eq!(mgr.version_count().await, 3);
-
-        mgr.compact().await;
-
-        assert_eq!(mgr.version_count().await, 1);
-        assert_eq!(mgr.current_epoch().await, Some(3));
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_custom_max_versions() {
-        let mgr = NamedStoreMgr::with_max_versions(2);
-
-        for epoch in 1..=5 {
-            let targets = vec![create_test_target("store1", 1, true, false)];
-            let layout = create_layout_with_epoch(epoch, targets);
-            mgr.add_layout(layout).await;
-        }
-
-        // Should only keep 2 versions
-        assert_eq!(mgr.version_count().await, 2);
-        assert_eq!(mgr.current_epoch().await, Some(5));
-
-        // Only epochs 4 and 5 should exist
-        assert!(mgr.get_layout(3).await.is_none());
-        assert!(mgr.get_layout(4).await.is_some());
-        assert!(mgr.get_layout(5).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_store_layout_mgr_replace_same_epoch() {
-        let mgr = NamedStoreMgr::new();
-
-        let targets1 = vec![create_test_target("store1", 1, true, false)];
-        let layout1 = create_layout_with_epoch(1, targets1);
-        mgr.add_layout(layout1).await;
-
-        assert_eq!(mgr.version_count().await, 1);
-
-        // Add layout with same epoch should replace
-        let targets1_updated = vec![
-            create_test_target("store1", 1, true, false),
-            create_test_target("store2", 1, true, false),
-        ];
-        let layout1_updated = create_layout_with_epoch(1, targets1_updated);
-        mgr.add_layout(layout1_updated).await;
-
-        // Should still be 1 version, not 2
-        assert_eq!(mgr.version_count().await, 1);
-
-        // The updated layout should have 2 targets
-        let current = mgr.current_layout().await.unwrap();
-        assert_eq!(current.targets.len(), 2);
-    }
-}
+#[path = "test_store_mgr.rs"]
+mod test_store_mgr;

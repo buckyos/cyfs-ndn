@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fs_buffer::{FileBufferSeekWriter, FileBufferService};
+use log::warn;
 use named_store::{
     NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget as LayoutStoreTarget,
 };
@@ -439,6 +440,11 @@ impl NamedDataMgr {
     pub async fn start_list(&self, path: &NdmPath) -> NdnResult<u64> {
         if let Some((dir_id, dir_node)) = self.fsmeta.resolve_path(path).await? {
             if dir_node.kind != NodeKind::Dir {
+                warn!(
+                    "NamedDataMgr::start_list: path is not a directory, path={}, kind={:?}",
+                    path.as_str(),
+                    dir_node.kind
+                );
                 return Err(NdnError::InvalidParam(
                     "path is not a directory".to_string(),
                 ));
@@ -448,7 +454,15 @@ impl NamedDataMgr {
                 .fsmeta
                 .start_list(dir_id, None)
                 .await
-                .map_err(|e| NdnError::Internal(format!("start_list failed: {}", e)))?;
+                .map_err(|e| {
+                    warn!(
+                        "NamedDataMgr::start_list: start_list failed, path={}, dir_id={}, err={}",
+                        path.as_str(),
+                        dir_id,
+                        e
+                    );
+                    NdnError::Internal(format!("start_list failed: {}", e))
+                })?;
 
             let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
             let mut local_entries: Option<BTreeMap<String, PathStat>> = None;
@@ -456,7 +470,21 @@ impl NamedDataMgr {
                 let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await {
                     Ok(entries) => entries,
                     Err(e) => {
-                        let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                        warn!(
+                            "NamedDataMgr::start_list: list_next failed, path={}, dir_id={}, err={}",
+                            path.as_str(),
+                            dir_id,
+                            e
+                        );
+                        if let Err(stop_err) =
+                            self.fsmeta.stop_list(fsmeta_list_session_id).await
+                        {
+                            warn!(
+                                "NamedDataMgr::start_list: stop_list failed after list_next error, session_id={}, err={}",
+                                fsmeta_list_session_id,
+                                stop_err
+                            );
+                        }
                         return Err(NdnError::Internal(format!("list_next failed: {}", e)));
                     }
                 };
@@ -529,9 +557,19 @@ impl NamedDataMgr {
     ) -> NdnResult<Vec<(String, PathStat)>> {
         let passthrough_fsmeta_session = {
             let mut sessions = self.list_sessions.lock().await;
-            let session = sessions.get_mut(&list_session_id).ok_or_else(|| {
-                NdnError::NotFound(format!("list session {} not found", list_session_id))
-            })?;
+            let session = match sessions.get_mut(&list_session_id) {
+                Some(session) => session,
+                None => {
+                    warn!(
+                        "NamedDataMgr::list_next: list session not found, list_session_id={}",
+                        list_session_id
+                    );
+                    return Err(NdnError::NotFound(format!(
+                        "list session {} not found",
+                        list_session_id
+                    )));
+                }
+            };
 
             if let Some(entries) = session.entries.as_ref() {
                 let out = Self::page_from_ordered_map(entries, &mut session.cursor, page_size);
@@ -539,6 +577,10 @@ impl NamedDataMgr {
             }
 
             session.fsmeta_list_session_id.ok_or_else(|| {
+                warn!(
+                    "NamedDataMgr::list_next: missing fsmeta session, list_session_id={}",
+                    list_session_id
+                );
                 NdnError::InvalidState(format!(
                     "list session {} missing fsmeta session",
                     list_session_id
@@ -561,7 +603,14 @@ impl NamedDataMgr {
     ) -> NdnResult<BTreeMap<String, PathStat>> {
         let mut merged: BTreeMap<String, PathStat> = BTreeMap::new();
         if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
-            let dir_obj = self.load_dir_object(&base_obj_id).await?;
+            let dir_obj = self.load_dir_object(&base_obj_id).await.map_err(|e| {
+                warn!(
+                    "NamedDataMgr::build_merged_dir_entries: load base dir object failed, base_obj_id={}, err={}",
+                    base_obj_id.to_string(),
+                    e
+                );
+                e
+            })?;
             for (name, item) in dir_obj.iter() {
                 if let Some(upper) = upper_entries.get(name) {
                     if matches!(upper.target, DentryTarget::Tombstone) {
@@ -717,6 +766,10 @@ impl NamedDataMgr {
             }
             crate::OpenFileReaderResp::Object(obj_id, inner_path) => {
                 let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+                    warn!(
+                        "NamedDataMgr::open_reader: store layout manager not configured, obj_id={}",
+                        obj_id.to_string()
+                    );
                     NdnError::NotFound("store layout manager not configured".to_string())
                 })?;
                 let (reader, size) = layout_mgr.open_reader(&obj_id, inner_path).await?;
@@ -758,6 +811,10 @@ impl NamedDataMgr {
             return layout_mgr.get_object(obj_id).await;
         }
 
+        warn!(
+            "NamedDataMgr::get_object: store layout manager not configured, obj_id={}",
+            obj_id.to_string()
+        );
         Err(NdnError::NotFound(
             "store layout manager not configured".to_string(),
         ))
@@ -1135,12 +1192,22 @@ impl NamedDataMgr {
         {
             Some(node) => node,
             None => {
+                warn!(
+                    "NamedDataMgr::publish_dir: inode not found, path={}, dir_id={}",
+                    path.as_str(),
+                    dir_id
+                );
                 let _ = self.fsmeta.rollback(Some(txid.clone())).await;
                 return Err(NdnError::NotFound("inode not found".to_string()));
             }
         };
 
         if node.kind != NodeKind::Dir {
+            warn!(
+                "NamedDataMgr::publish_dir: path is not a directory, path={}, kind={:?}",
+                path.as_str(),
+                node.kind
+            );
             let _ = self.fsmeta.rollback(Some(txid.clone())).await;
             return Err(NdnError::InvalidParam(
                 "path is not a directory".to_string(),
@@ -1191,6 +1258,11 @@ impl NamedDataMgr {
                     let child = match child {
                         Some(c) => c,
                         None => {
+                            warn!(
+                                "NamedDataMgr::publish_dir: child inode not found, name={}, inode_id={}",
+                                dentry.name,
+                                inode_id
+                            );
                             let _ = self.fsmeta.rollback(Some(txid.clone())).await;
                             return Err(NdnError::NotFound("child inode not found".to_string()));
                         }

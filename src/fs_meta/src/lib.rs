@@ -10,7 +10,3 @@ mod path_resolve_cache;
 #[cfg(test)]
 mod fs_meta_service_tests;
 
-fn main() {
-    // TODO: implement main entry point
-    println!("fs_meta service");
-}
