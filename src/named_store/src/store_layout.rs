@@ -1,7 +1,6 @@
 //store layout从fsmeta下载后，完全保存在本地，select target操作不需要与fsmeta交互
-use crate::NamedLocalStore;
 use name_lib::DID;
-use ndn_lib::{NdnResult, ObjId};
+use ndn_lib::ObjId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -299,35 +298,6 @@ impl StoreLayout {
     }
 }
 
-// ------------------------------
-// NamedStoreMgr - Multi-version store layout manager
-// ------------------------------
-
-/// Trait for store provider that can get objects by ObjId
-#[async_trait::async_trait]
-pub trait StoreProvider: Send + Sync {
-    async fn get_object_impl(
-        &self,
-        obj_id: &ObjId,
-        txid: Option<String>,
-    ) -> NdnResult<serde_json::Value>;
-    fn store_id(&self) -> &str;
-}
-
-#[async_trait::async_trait]
-impl StoreProvider for NamedLocalStore {
-    async fn get_object_impl(
-        &self,
-        obj_id: &ObjId,
-        txid: Option<String>,
-    ) -> NdnResult<serde_json::Value> {
-        self.get_object(obj_id, txid).await
-    }
-
-    fn store_id(&self) -> &str {
-        self.store_id()
-    }
-}
 
 /// Version info for a store layout
 #[derive(Debug, Clone)]

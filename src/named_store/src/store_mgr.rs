@@ -15,8 +15,7 @@ use crate::{
     SimpleChunkListReader, StoreLayout,
 };
 use ndn_lib::{
-    ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList,
-    OBJ_TYPE_FILE,
+    ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError, NdnResult, OBJ_TYPE_FILE, ObjId, SimpleChunkList, extract_objid_by_path, load_named_obj, load_named_object_from_obj_str
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -133,7 +132,7 @@ impl NamedStoreMgr {
     ///    d. If found, return success
     ///    e. If NotFound, continue to next layout version
     /// 2. If all layouts exhausted, return NotFound
-    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<String> {
         let versions = self.versions.read().await;
         let stores = self.stores.read().await;
 
@@ -173,7 +172,7 @@ impl NamedStoreMgr {
 
             // Try to get object from this store
             let store_guard = store.lock().await;
-            match store_guard.get_object(obj_id, None).await {
+            match store_guard.get_object(obj_id).await {
                 Ok(obj) => return Ok(obj),
                 Err(NdnError::NotFound(_)) => {
                     // NotFound in this store, try next layout version
@@ -481,8 +480,8 @@ impl NamedStoreMgr {
         }
 
         let chunklist_json = self.get_object(chunklist_id).await?;
-        let chunk_list = SimpleChunkList::from_json_value(chunklist_json)
-            .map_err(|e| NdnError::DecodeError(format!("parse chunklist failed: {}", e)))?;
+        let vec_chunk_id: Vec<ChunkId> = load_named_obj(chunklist_json.as_str())?;
+        let chunk_list = SimpleChunkList::from_chunk_list(vec_chunk_id)?;
 
         let total_size = chunk_list.total_size;
         let reader = SimpleChunkListReader::new(
@@ -537,8 +536,7 @@ impl NamedStoreMgr {
 
             if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
                 let obj_json = self.get_object(&current_obj_id).await?;
-                let file_obj: FileObject = serde_json::from_value(obj_json)
-                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
+                let file_obj: FileObject = load_named_obj(obj_json.as_str())?;
                 if file_obj.content.is_empty() {
                     return Err(NdnError::InvalidData(format!(
                         "file {} content is empty",
@@ -558,9 +556,9 @@ impl NamedStoreMgr {
                     current_obj_id.to_string()
                 ))
             })?;
-            let obj_json = self.get_object(&current_obj_id).await?;
-            let path_to = Self::extract_json_by_path(&obj_json, inner_path.as_str())?;
-            current_obj_id = Self::value_to_obj_id(&path_to)?;
+            let obj_json_str = self.get_object(&current_obj_id).await?;
+            let obj_json: Value = load_named_object_from_obj_str(obj_json_str.as_str())?;
+            current_obj_id = extract_objid_by_path(&obj_json, inner_path.as_str())?;
         }
     }
 
@@ -796,36 +794,6 @@ impl NamedStoreMgr {
                 value
             ))),
         }
-    }
-
-    //TODO:ndn-lib里有通用函数？
-    fn extract_json_by_path(value: &Value, path: &str) -> NdnResult<Value> {
-        let mut current = value;
-        for segment in path.split('/') {
-            if segment.is_empty() {
-                continue;
-            }
-            current = match current {
-                Value::Object(map) => map
-                    .get(segment)
-                    .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?,
-                Value::Array(list) => {
-                    let index: usize = segment.parse().map_err(|_| {
-                        NdnError::InvalidParam(format!("invalid array index: {}", segment))
-                    })?;
-                    list.get(index).ok_or_else(|| {
-                        NdnError::NotFound(format!("inner path not found: {}", path))
-                    })?
-                }
-                _ => {
-                    return Err(NdnError::NotFound(format!(
-                        "inner path not found: {}",
-                        path
-                    )))
-                }
-            };
-        }
-        Ok(current.clone())
     }
 }
 

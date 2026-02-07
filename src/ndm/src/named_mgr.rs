@@ -14,8 +14,7 @@ use named_store::{
     NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
-    ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId, SimpleChunkList,
-    SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, SimpleChunkList, SimpleMapItem, load_named_obj
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -700,7 +699,6 @@ impl NamedDataMgr {
     }
 
     // ========== Read Operations ==========
-
     pub async fn open_reader(
         &self,
         path: &NdmPath,
@@ -754,7 +752,7 @@ impl NamedDataMgr {
     ///
     /// If layout_mgr is not set:
     /// - Use the default store directly
-    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
+    async fn get_object(&self, obj_id: &ObjId) -> NdnResult<String> {
         // If layout manager is set, use multi-version fallback
         if let Some(layout_mgr) = &self.layout_mgr {
             return layout_mgr.get_object(obj_id).await;
@@ -769,21 +767,22 @@ impl NamedDataMgr {
         if !obj_id.is_dir_object() {
             return Err(NdnError::InvalidObjType("must be dirobject".to_string()));
         }
-        let obj_json = self.get_object(obj_id).await?;
-        serde_json::from_value(obj_json)
-            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))
+        let obj_str = self.get_object(obj_id).await?;
+        load_named_obj(obj_str.as_str())
     }
 
     async fn load_file_object(&self, obj_id: &ObjId) -> NdnResult<FileObject> {
-        let obj_json = self.get_object(obj_id).await?;
-        serde_json::from_value(obj_json)
-            .map_err(|e| NdnError::Internal(format!("failed to parse FileObject: {}", e)))
+        if !obj_id.is_file_object() {
+            return Err(NdnError::InvalidObjType("must be fileobject".to_string()));
+        }
+        let obj_str = self.get_object(obj_id).await?;
+        load_named_obj(obj_str.as_str())
     }
 
     async fn load_chunk_list(&self, obj_id: &ObjId) -> NdnResult<SimpleChunkList> {
-        let obj_json = self.get_object(obj_id).await?;
-        SimpleChunkList::from_json_value(obj_json)
-            .map_err(|e| NdnError::Internal(format!("failed to parse chunk list: {}", e)))
+        let obj_str = self.get_object(obj_id).await?;
+        let chunk_list: Vec<ChunkId> = load_named_obj(obj_str.as_str())?;
+        SimpleChunkList::from_chunk_list(chunk_list)
     }
 
     fn obj_kind_from_obj_id(obj_id: &ObjId) -> ObjectKind {

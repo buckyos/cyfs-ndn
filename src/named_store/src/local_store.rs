@@ -3,8 +3,9 @@ use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
     caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError,
-    NdnResult, ObjId, OBJ_TYPE_FILE,
+    NdnResult, ObjId, OBJ_TYPE_FILE,extract_objid_by_path
 };
+use buckyos_kit::get_by_json_path;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -182,11 +183,11 @@ impl NamedLocalStore {
         Ok(ObjectState::NotExist)
     }
 
+    // 直接寻址得到对象内容，返回String是为了兼容JWT
     pub async fn get_object(
         &self,
         obj_id: &ObjId,
-        inner_obj_path: Option<String>,
-    ) -> NdnResult<Value> {
+    ) -> NdnResult<String> {
         if obj_id.is_chunk() {
             return Err(NdnError::InvalidObjType(obj_id.to_string()));
         }
@@ -199,14 +200,7 @@ impl NamedLocalStore {
             }
         })?;
 
-        let json_value: Value =
-            serde_json::from_str(&obj_str).map_err(|e| NdnError::DecodeError(e.to_string()))?;
-
-        if let Some(inner_path) = inner_obj_path {
-            self.extract_json_by_path(&json_value, inner_path.as_str())
-        } else {
-            Ok(json_value)
-        }
+        return Ok(obj_str);
     }
 
     pub async fn put_object(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
@@ -253,74 +247,14 @@ impl NamedLocalStore {
             Ok((ChunkStoreState::NotExist, 0, String::new()))
         }
     }
-
-    pub async fn open_reader(
-        &self,
-        obj_id: &ObjId,
-        inner_obj_path: Option<String>,
-    ) -> NdnResult<(ChunkReader, u64)> {
-        let mut current_obj_id = obj_id.clone();
-        let mut current_inner_path = inner_obj_path;
-        let mut size_override: Option<u64> = None;
-
-        loop {
-            if current_obj_id.is_chunk() {
-                if current_inner_path.is_some() {
-                    return Err(NdnError::InvalidObjType(format!(
-                        "{} is chunk, no inner_obj_path",
-                        current_obj_id
-                    )));
-                }
-                let chunk_id = ChunkId::from_obj_id(&current_obj_id);
-                let (reader, size) = self.open_chunk_reader(&chunk_id, 0).await?;
-                return Ok((reader, size_override.unwrap_or(size)));
-            }
-
-            if current_obj_id.is_chunk_list() {
-                return Err(NdnError::Unsupported(format!(
-                    "open chunklist in local store is not supported, use NamedStoreMgr::open_chunklist_reader: {}",
-                    current_obj_id
-                )));
-            }
-
-            if current_obj_id.obj_type == OBJ_TYPE_FILE && current_inner_path.is_none() {
-                let obj_json = self.get_object(&current_obj_id, None).await?;
-                let file_obj: FileObject = serde_json::from_value(obj_json)
-                    .map_err(|e| NdnError::DecodeError(e.to_string()))?;
-                if file_obj.content.is_empty() {
-                    return Err(NdnError::InvalidData(format!(
-                        "file {} content is empty",
-                        current_obj_id
-                    )));
-                }
-                if file_obj.size > 0 {
-                    size_override = Some(file_obj.size);
-                }
-                current_obj_id = ObjId::new(file_obj.content.as_str())?;
-                continue;
-            }
-
-            let inner_path = current_inner_path.take().ok_or_else(|| {
-                NdnError::InvalidObjType(format!(
-                    "{} is object, can't open reader without inner_obj_path",
-                    current_obj_id
-                ))
-            })?;
-
-            let (_obj_type, obj_str) = self.db.get_object(&current_obj_id).map_err(|e| {
-                if e.is_not_found() {
-                    NdnError::NotFound(current_obj_id.to_string())
-                } else {
-                    e
-                }
-            })?;
-
-            let json_value: Value =
-                serde_json::from_str(&obj_str).map_err(|e| NdnError::DecodeError(e.to_string()))?;
-            let path_to = self.extract_json_by_path(&json_value, inner_path.as_str())?;
-            current_obj_id = Self::value_to_obj_id(&path_to)?;
-        }
-    }
+    // 这里不能实现open_reader(间接寻址)
+    // 因为obj_id inner_obj_path指向的对象，可能不在当前store
+    // pub async fn open_reader(
+    //     &self,
+    //     obj_id: &ObjId,
+    //     inner_obj_path: Option<String>,
+    // ) -> NdnResult<(ChunkReader, u64)> {
+    // }
 
     pub async fn open_chunk_reader(
         &self,
@@ -750,34 +684,7 @@ impl NamedLocalStore {
         }
     }
 
-    fn extract_json_by_path(&self, value: &Value, path: &str) -> NdnResult<Value> {
-        let mut current = value;
-        for segment in path.split('/') {
-            if segment.is_empty() {
-                continue;
-            }
-            current = match current {
-                Value::Object(map) => map
-                    .get(segment)
-                    .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?,
-                Value::Array(list) => {
-                    let index: usize = segment.parse().map_err(|_| {
-                        NdnError::InvalidParam(format!("invalid array index: {}", segment))
-                    })?;
-                    list.get(index).ok_or_else(|| {
-                        NdnError::NotFound(format!("inner path not found: {}", path))
-                    })?
-                }
-                _ => {
-                    return Err(NdnError::NotFound(format!(
-                        "inner path not found: {}",
-                        path
-                    )))
-                }
-            };
-        }
-        Ok(current.clone())
-    }
+
 
     async fn verify_local_link(&self, chunk_id: &ChunkId, info: &ChunkLocalInfo) -> NdnResult<()> {
         if info.qcid.is_empty() {
@@ -871,83 +778,6 @@ mod tests {
         assert_eq!(read_back, data);
     }
 
-    #[tokio::test]
-    async fn test_local_store_open_chunklist_reader_unsupported() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
-            .await
-            .unwrap();
-
-        let chunk_a = b"hello ".to_vec();
-        let chunk_b = b"named ".to_vec();
-        let chunk_c = b"store".to_vec();
-
-        let chunk_a_id = calc_chunk_id(&chunk_a);
-        let chunk_b_id = calc_chunk_id(&chunk_b);
-        let chunk_c_id = calc_chunk_id(&chunk_c);
-
-        store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
-        store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
-        store.put_chunk(&chunk_c_id, &chunk_c, true).await.unwrap();
-
-        let chunk_list = SimpleChunkList::from_chunk_list(vec![
-            chunk_a_id.clone(),
-            chunk_b_id.clone(),
-            chunk_c_id.clone(),
-        ])
-        .unwrap();
-        let (chunk_list_id, chunk_list_obj) = chunk_list.gen_obj_id();
-        store
-            .put_object(&chunk_list_id, chunk_list_obj.as_str())
-            .await
-            .unwrap();
-
-        let err = store
-            .open_reader(&chunk_list_id, None)
-            .await
-            .err()
-            .expect("expected unsupported error");
-        assert!(matches!(err, NdnError::Unsupported(_)));
-    }
-
-    #[tokio::test]
-    async fn test_open_reader_via_inner_path_to_chunklist_unsupported() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
-            .await
-            .unwrap();
-
-        let chunk_a = b"aa".to_vec();
-        let chunk_b = b"bb".to_vec();
-
-        let chunk_a_id = calc_chunk_id(&chunk_a);
-        let chunk_b_id = calc_chunk_id(&chunk_b);
-        store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
-        store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
-
-        let chunk_list = SimpleChunkList::from_chunk_list(vec![chunk_a_id, chunk_b_id]).unwrap();
-        let (chunk_list_id, chunk_list_obj) = chunk_list.gen_obj_id();
-        store
-            .put_object(&chunk_list_id, chunk_list_obj.as_str())
-            .await
-            .unwrap();
-
-        let meta = serde_json::json!({
-            "target": chunk_list_id.to_string()
-        });
-        let (meta_obj_id, meta_obj_str) = build_named_object_by_json("meta", &meta);
-        store
-            .put_object(&meta_obj_id, meta_obj_str.as_str())
-            .await
-            .unwrap();
-
-        let err = store
-            .open_reader(&meta_obj_id, Some("/target".to_string()))
-            .await
-            .err()
-            .expect("expected unsupported error");
-        assert!(matches!(err, NdnError::Unsupported(_)));
-    }
 
     #[tokio::test]
     async fn test_local_link_qcid_ok() {
