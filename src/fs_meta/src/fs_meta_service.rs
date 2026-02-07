@@ -3,8 +3,8 @@ use krpc::{RPCContext, RPCErrors};
 use log::{info, warn};
 use ndm::{
     ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry, IndexNodeId,
-    MoveOptions, NdmInstanceId, NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp,
-    OpenWriteFlag,
+    FsMetaResolvePathItem, FsMetaResolvePathResp, MoveOptions, NdmInstanceId, NodeKind,
+    NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
 use ndn_lib::{ChunkId, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::background::BackgroundMgr;
 use crate::list_cache::ListCache;
-use crate::path_resolve_cache::PathResolveCache;
+use crate::path_resolve_cache::{PathResolveCache, PathResolveTerminalValue};
 
 const NODE_STATE_DIR_NORMAL: i64 = 0;
 const NODE_STATE_DIR_OVERLAY: i64 = 1;
@@ -301,7 +301,7 @@ impl FSMetaService {
                     (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
                     (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
                     (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
-                    (target_type = 3 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL)
+                    (target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL)
                 )
             ) WITHOUT ROWID;
 
@@ -336,7 +336,8 @@ impl FSMetaService {
             return Ok(());
         };
 
-        if ddl.contains("target_type = 3") {
+        if ddl.contains("target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL")
+        {
             return Ok(());
         }
 
@@ -355,11 +356,26 @@ impl FSMetaService {
                     (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
                     (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
                     (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
-                    (target_type = 3 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL)
+                    (target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL)
                 )
              ) WITHOUT ROWID;
              INSERT INTO dentries(parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
-                SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                SELECT
+                    parent_inode_id,
+                    name,
+                    target_type,
+                    CASE
+                        WHEN target_type = 3 THEN NULL
+                        ELSE target_inode_id
+                    END AS target_inode_id,
+                    CASE
+                        WHEN target_type = 3 AND target_obj_id IS NULL AND target_inode_id IS NOT NULL
+                            THEN CAST(printf('legacy-inode:%lld', target_inode_id) AS BLOB)
+                        WHEN target_type = 3
+                            THEN target_obj_id
+                        ELSE target_obj_id
+                    END AS target_obj_id,
+                    mtime
                 FROM dentries_old;
              DROP TABLE dentries_old;
              CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
@@ -833,7 +849,7 @@ impl FSMetaService {
 
         // Resolve path with materialization support
         // Walk through the path components, materializing DirObjects as needed
-        let components: Vec<&str> = path.as_str().split('/').filter(|s| !s.is_empty()).collect();
+        let components = path.components();
 
         let root_id = self.root_inode;
 
@@ -1052,8 +1068,8 @@ impl FSMetaService {
                         kind_hint,
                     })
                 }
-                DentryTarget::SymLink(fid) => Ok(MoveSource::Upper {
-                    target: DentryTarget::SymLink(fid),
+                DentryTarget::SymLink(target_path) => Ok(MoveSource::Upper {
+                    target: DentryTarget::SymLink(target_path),
                     kind_hint: ObjectKind::Unknown,
                 }),
                 DentryTarget::ObjId(oid) => Ok(MoveSource::Upper {
@@ -1098,32 +1114,34 @@ impl ndm::FsMetaHandler for FSMetaService {
             return Ok(node.map(|n| (root_id, n)));
         }
 
-        let components: Vec<&str> = path.as_str().split('/').filter(|s| !s.is_empty()).collect();
-
-        let cached_ids = self
+        let components = path.components();
+        let cached_prefix_ids = self
             .resolve_path_cache
             .write()
             .ok()
-            .and_then(|mut cache| cache.get_ids_for_path(&components));
-        if let Some(ids) = cached_ids {
-            let inode_id = ids[components.len()];
-            let node = self
-                .handle_get_inode(inode_id, None, ctx)
+            .and_then(|mut cache| cache.get_longest_prefix_ids_for_path(&components));
+
+        let (mut ids, mut current_id, start_idx) = if let Some(prefix_ids) = cached_prefix_ids {
+            let matched_len = prefix_ids.len().saturating_sub(1);
+            let inode_id = *prefix_ids.last().unwrap_or(&self.root_inode);
+            if matched_len == components.len() {
+                let node = self
+                    .handle_get_inode(inode_id, None, ctx)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
+                return Ok(node.map(|n| (inode_id, n)));
+            }
+            (prefix_ids, inode_id, matched_len)
+        } else {
+            info!("MISS path_resolve_cache,do resovle : {}", path.as_str());
+            let root_id = self
+                .handle_root_dir(ctx.clone())
                 .await
-                .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
-            return Ok(node.map(|n| (inode_id, n)));
-        }
+                .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
+            (vec![root_id], root_id, 0usize)
+        };
 
-        let root_id = self
-            .handle_root_dir(ctx.clone())
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
-
-        let mut ids: Vec<IndexNodeId> = Vec::with_capacity(components.len() + 1);
-        ids.push(root_id);
-        let mut current_id = root_id;
-
-        for (i, component) in components.iter().enumerate() {
+        for (i, component) in components.iter().enumerate().skip(start_idx) {
             let is_last = i == components.len() - 1;
 
             let dentry = self
@@ -1150,7 +1168,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                         }
                         current_id = id;
                     }
-                    DentryTarget::SymLink(_inode_id) => {
+                    DentryTarget::SymLink(_target_path) => {
                         if is_last {
                             return Ok(None);
                         }
@@ -1179,6 +1197,186 @@ impl ndm::FsMetaHandler for FSMetaService {
         }
 
         Ok(None)
+    }
+
+    async fn handle_resolve_path_ex(
+        &self,
+        path: &NdmPath,
+        mut sym_count: u32,
+        ctx: RPCContext,
+    ) -> NdnResult<Option<FsMetaResolvePathResp>> {
+        let root_id = self
+            .handle_root_dir(ctx.clone())
+            .await
+            .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
+
+        let mut components: Vec<String> = path
+            .components()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        loop {
+            if components.is_empty() {
+                let node = self
+                    .handle_get_inode(root_id, None, ctx.clone())
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get root inode: {}", e)))?;
+                return Ok(node.map(|inode| FsMetaResolvePathResp {
+                    item: FsMetaResolvePathItem::Inode {
+                        inode_id: root_id,
+                        inode,
+                    },
+                    inner_path: None,
+                }));
+            }
+
+            let comp_refs: Vec<&str> = components.iter().map(|s| s.as_str()).collect();
+            if let Some(hit) = self
+                .resolve_path_cache
+                .write()
+                .ok()
+                .and_then(|mut cache| cache.get_terminal_for_path(&comp_refs))
+            {
+                let tail = components[hit.matched_len..].to_vec();
+                match hit.value {
+                    PathResolveTerminalValue::ObjId(obj_id) => {
+                        return Ok(Some(FsMetaResolvePathResp {
+                            item: FsMetaResolvePathItem::ObjId(obj_id),
+                            inner_path: join_components(&tail),
+                        }));
+                    }
+                    PathResolveTerminalValue::SymLink(target_path) => {
+                        if sym_count == 0 {
+                            return Ok(Some(FsMetaResolvePathResp {
+                                item: FsMetaResolvePathItem::SymLink(target_path),
+                                inner_path: join_components(&tail),
+                            }));
+                        }
+
+                        sym_count -= 1;
+                        let parent_depth = hit.matched_len.saturating_sub(1);
+                        let parent_prefix = components[..parent_depth].to_vec();
+                        components =
+                            normalize_symlink_target_path(&parent_prefix, &target_path, &tail);
+                        continue;
+                    }
+                }
+            }
+
+            let cached_prefix_ids = self
+                .resolve_path_cache
+                .write()
+                .ok()
+                .and_then(|mut cache| cache.get_longest_prefix_ids_for_path(&comp_refs));
+
+            let (mut ids, mut current_id, start_idx) = if let Some(prefix_ids) = cached_prefix_ids {
+                let matched_len = prefix_ids.len().saturating_sub(1);
+                let inode_id = *prefix_ids.last().unwrap_or(&root_id);
+                (prefix_ids, inode_id, matched_len)
+            } else {
+                (vec![root_id], root_id, 0usize)
+            };
+
+            if start_idx == components.len() {
+                let node = self
+                    .handle_get_inode(current_id, None, ctx.clone())
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
+                return Ok(node.map(|inode| FsMetaResolvePathResp {
+                    item: FsMetaResolvePathItem::Inode {
+                        inode_id: current_id,
+                        inode,
+                    },
+                    inner_path: None,
+                }));
+            }
+
+            let mut restart_with: Option<Vec<String>> = None;
+            for i in start_idx..components.len() {
+                let name = components[i].clone();
+                let is_last = i == components.len() - 1;
+
+                let dentry = self
+                    .handle_get_dentry(current_id, name, None, ctx.clone())
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
+
+                let Some(dentry) = dentry else {
+                    return Ok(None);
+                };
+
+                match dentry.target {
+                    DentryTarget::Tombstone => return Ok(None),
+                    DentryTarget::IndexNodeId(id) => {
+                        ids.push(id);
+                        current_id = id;
+                        if is_last {
+                            let node = self.handle_get_inode(id, None, ctx.clone()).await.map_err(
+                                |e| NdnError::Internal(format!("failed to get inode: {}", e)),
+                            )?;
+                            if let Some(inode) = node {
+                                if let Ok(mut cache) = self.resolve_path_cache.write() {
+                                    cache.put_ids_for_path(components.clone(), ids.clone());
+                                }
+                                return Ok(Some(FsMetaResolvePathResp {
+                                    item: FsMetaResolvePathItem::Inode {
+                                        inode_id: id,
+                                        inode,
+                                    },
+                                    inner_path: None,
+                                }));
+                            }
+                            return Ok(None);
+                        }
+                    }
+                    DentryTarget::ObjId(obj_id) => {
+                        if let Ok(mut cache) = self.resolve_path_cache.write() {
+                            cache.put_terminal_for_path(
+                                components[..=i].to_vec(),
+                                ids.clone(),
+                                PathResolveTerminalValue::ObjId(obj_id.clone()),
+                            );
+                        }
+                        return Ok(Some(FsMetaResolvePathResp {
+                            item: FsMetaResolvePathItem::ObjId(obj_id),
+                            inner_path: join_components(&components[i + 1..]),
+                        }));
+                    }
+                    DentryTarget::SymLink(target_path) => {
+                        if let Ok(mut cache) = self.resolve_path_cache.write() {
+                            cache.put_terminal_for_path(
+                                components[..=i].to_vec(),
+                                ids.clone(),
+                                PathResolveTerminalValue::SymLink(target_path.clone()),
+                            );
+                        }
+                        let tail = components[i + 1..].to_vec();
+                        if sym_count == 0 {
+                            return Ok(Some(FsMetaResolvePathResp {
+                                item: FsMetaResolvePathItem::SymLink(target_path),
+                                inner_path: join_components(&tail),
+                            }));
+                        }
+                        sym_count -= 1;
+                        let parent_prefix = components[..i].to_vec();
+                        restart_with = Some(normalize_symlink_target_path(
+                            &parent_prefix,
+                            &target_path,
+                            &tail,
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(next_components) = restart_with {
+                components = next_components;
+                continue;
+            }
+
+            return Ok(None);
+        }
     }
 
     async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {
@@ -2288,8 +2486,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.apply_move_plan_txn(plan, opts, ctx).await
     }
 
-    //创建软链接(symlink)，目标必须是文件或者目录，不能是符号链接
-    //SYMLINK: link_path -> target
+    // 创建软链接(symlink)，目标保存为路径（可相对路径）
+    // SYMLINK: link_path -> target_path
     async fn handle_make_link(
         &self,
         link_path: &NdmPath,
@@ -2300,56 +2498,10 @@ impl ndm::FsMetaHandler for FSMetaService {
             return Err(RPCErrors::ReasonError("invalid link path".to_string()));
         }
 
-        let (target_parent_path, target_name) = target
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid target path".to_string()))?;
-
-        let target_parent = self
-            .handle_resolve_path(&target_parent_path, ctx.clone())
-            .await
-            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
-            .ok_or_else(|| RPCErrors::ReasonError("target parent not found".to_string()))?;
-
-        if target_parent.1.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError(
-                "target parent is not a directory".to_string(),
-            ));
+        if target.as_str().is_empty() {
+            return Err(RPCErrors::ReasonError("invalid target path".to_string()));
         }
-
-        let target_dentry = self
-            .handle_get_dentry(target_parent.0, target_name.clone(), None, ctx.clone())
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError("target not found".to_string()))?;
-
-        let link_target = match target_dentry.target {
-            DentryTarget::Tombstone => {
-                return Err(RPCErrors::ReasonError("target not found".to_string()));
-            }
-            DentryTarget::SymLink(_) => {
-                return Err(RPCErrors::ReasonError(
-                    "target is a symbolic link".to_string(),
-                ));
-            }
-            DentryTarget::IndexNodeId(id) => {
-                let inode = self
-                    .handle_get_inode(id, None, ctx.clone())
-                    .await?
-                    .ok_or_else(|| RPCErrors::ReasonError("target inode not found".to_string()))?;
-                if inode.kind == NodeKind::Dir
-                    || inode.kind == NodeKind::File
-                    || inode.kind == NodeKind::Object
-                {
-                    DentryTarget::SymLink(id)
-                } else {
-                    return Err(RPCErrors::ReasonError("invalid target type".to_string()));
-                }
-            }
-            DentryTarget::ObjId(_oid) => {
-                return Err(RPCErrors::ReasonError(
-                    "target is not materialized to inode".to_string(),
-                ));
-            }
-        };
+        let link_target = DentryTarget::SymLink(target.as_str().to_string());
 
         let (link_parent_path, link_name) = link_path
             .split_parent_name()
@@ -2873,7 +3025,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         match dentry.target {
             DentryTarget::Tombstone => Err(RPCErrors::ReasonError("path not found".to_string())),
             DentryTarget::ObjId(obj_id) => Ok(OpenFileReaderResp::Object(obj_id, None)),
-            DentryTarget::SymLink(_inode_id) => Err(RPCErrors::ReasonError(
+            DentryTarget::SymLink(_target_path) => Err(RPCErrors::ReasonError(
                 "path is a symbolic link".to_string(),
             )),
             DentryTarget::IndexNodeId(inode_id) => {
@@ -2941,6 +3093,39 @@ fn is_descendant_path(path: &NdmPath, ancestor: &NdmPath) -> bool {
     rest.starts_with('/')
 }
 
+fn join_components(components: &[String]) -> Option<String> {
+    if components.is_empty() {
+        None
+    } else {
+        Some(format!("/{}", components.join("/")))
+    }
+}
+
+fn normalize_symlink_target_path(
+    parent_prefix: &[String],
+    target_path: &str,
+    tail: &[String],
+) -> Vec<String> {
+    let mut out = if target_path.starts_with('/') {
+        Vec::new()
+    } else {
+        parent_prefix.to_vec()
+    };
+
+    for segment in target_path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            _ => out.push(segment.to_string()),
+        }
+    }
+
+    out.extend(tail.iter().cloned());
+    out
+}
+
 fn obj_id_to_blob(obj_id: &ObjId) -> Vec<u8> {
     obj_id.to_bytes()
 }
@@ -2948,6 +3133,15 @@ fn obj_id_to_blob(obj_id: &ObjId) -> Vec<u8> {
 fn obj_id_from_blob(blob: Vec<u8>) -> Result<ObjId, RPCErrors> {
     ObjId::from_bytes(&blob)
         .map_err(|e| RPCErrors::ReasonError(format!("invalid obj_id bytes: {}", e)))
+}
+
+fn symlink_path_to_blob(path: &str) -> Vec<u8> {
+    path.as_bytes().to_vec()
+}
+
+fn symlink_path_from_blob(blob: Vec<u8>) -> Result<String, RPCErrors> {
+    String::from_utf8(blob)
+        .map_err(|e| RPCErrors::ReasonError(format!("invalid symlink path bytes: {}", e)))
 }
 
 fn node_kind_to_int(kind: NodeKind) -> i64 {
@@ -2972,7 +3166,11 @@ fn dentry_target_cols(
 ) -> Result<(i64, Option<i64>, Option<Vec<u8>>), RPCErrors> {
     match target {
         DentryTarget::IndexNodeId(id) => Ok((DENTRY_TARGET_INODE, Some(*id as i64), None)),
-        DentryTarget::SymLink(id) => Ok((DENTRY_TARGET_SYMLINK, Some(*id as i64), None)),
+        DentryTarget::SymLink(path) => Ok((
+            DENTRY_TARGET_SYMLINK,
+            None,
+            Some(symlink_path_to_blob(path)),
+        )),
         DentryTarget::ObjId(obj_id) => Ok((DENTRY_TARGET_OBJ, None, Some(obj_id_to_blob(obj_id)))),
         DentryTarget::Tombstone => Ok((DENTRY_TARGET_TOMBSTONE, None, None)),
     }
@@ -2997,11 +3195,18 @@ fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
             })?)?)
         }
         DENTRY_TARGET_TOMBSTONE => DentryTarget::Tombstone,
-        DENTRY_TARGET_SYMLINK => DentryTarget::SymLink(
-            target_inode_id
-                .ok_or_else(|| RPCErrors::ReasonError("missing target_inode_id".to_string()))?
-                as IndexNodeId,
-        ),
+        DENTRY_TARGET_SYMLINK => {
+            if let Some(blob) = target_obj_id {
+                DentryTarget::SymLink(symlink_path_from_blob(blob)?)
+            } else if let Some(id) = target_inode_id {
+                // Legacy fallback for early symlink-as-inode format.
+                DentryTarget::SymLink(format!("legacy-inode:{}", id))
+            } else {
+                return Err(RPCErrors::ReasonError(
+                    "missing symlink target path".to_string(),
+                ));
+            }
+        }
         _ => return Err(RPCErrors::ReasonError("invalid dentry target".to_string())),
     };
     Ok(DentryRecord {

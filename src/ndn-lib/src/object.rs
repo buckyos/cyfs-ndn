@@ -346,7 +346,6 @@ let fileobj:FileObject = load_obj_from_str(obj_data_str)?;
 let (fileobj_id,obj_body_str2) = fileobj.gen_obj_id()
 */
 
-
 //-------------------------------------------------------------------
 pub fn build_obj_id(obj_type: &str, obj_json_str: &str) -> ObjId {
     let hash_value: Vec<u8> = Sha256::digest(obj_json_str.as_bytes()).to_vec();
@@ -462,8 +461,6 @@ pub fn named_obj_to_jwt(
 
     Ok(jwt_str)
 }
-
-
 
 #[cfg(test)]
 mod tests {

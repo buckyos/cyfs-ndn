@@ -75,9 +75,9 @@ pub enum NodeState {
 pub struct NodeRecord {
     pub inode_id: IndexNodeId,
     pub kind: NodeKind,
+    pub state: NodeState,
     pub read_only: bool,
     pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)
-    pub state: NodeState,
     pub rev: Option<u64>, // only for dirs
     // metas:
     pub meta: Option<Value>,
@@ -92,7 +92,7 @@ pub struct NodeRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DentryTarget {
     IndexNodeId(IndexNodeId),
-    SymLink(IndexNodeId),
+    SymLink(String),
     ObjId(ObjId),
     Tombstone,
 }
@@ -209,6 +209,40 @@ impl FsMetaResolvePathReq {
             RPCErrors::ParseRequestError(format!("Failed to parse FsMetaResolvePathReq: {}", e))
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaResolvePathExReq {
+    pub path: String,
+    pub sym_count: u32,
+}
+
+impl FsMetaResolvePathExReq {
+    pub fn new(path: String, sym_count: u32) -> Self {
+        Self { path, sym_count }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaResolvePathExReq: {}", e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FsMetaResolvePathItem {
+    Inode {
+        inode_id: IndexNodeId,
+        inode: NodeRecord,
+    },
+    ObjId(ObjId),
+    SymLink(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaResolvePathResp {
+    pub item: FsMetaResolvePathItem,
+    pub inner_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +800,36 @@ impl FsMetaClient {
                 serde_json::from_value(result).map_err(|e| {
                     NdnError::Internal(format!(
                         "Expected Option<(IndexNodeId, NodeRecord)> result: {}",
+                        e
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn resolve_path_ex(
+        &self,
+        path: &NdmPath,
+        sym_count: u32,
+    ) -> NdnResult<Option<FsMetaResolvePathResp>> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_resolve_path_ex(path, sym_count, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaResolvePathExReq::new(path.as_str().to_string(), sym_count);
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    NdnError::Internal(format!("Failed to serialize request: {}", e))
+                })?;
+
+                let result = client
+                    .call("resolve_path_ex", req_json)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("resolve_path_ex rpc failed: {}", e)))?;
+                serde_json::from_value(result).map_err(|e| {
+                    NdnError::Internal(format!(
+                        "Expected Option<FsMetaResolvePathResp> result: {}",
                         e
                     ))
                 })
@@ -1519,6 +1583,18 @@ pub trait FsMetaHandler: Send + Sync {
         path: &NdmPath,
         ctx: RPCContext,
     ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>>;
+    async fn handle_resolve_path_ex(
+        &self,
+        path: &NdmPath,
+        _sym_count: u32,
+        ctx: RPCContext,
+    ) -> NdnResult<Option<FsMetaResolvePathResp>> {
+        let resolved = self.handle_resolve_path(path, ctx).await?;
+        Ok(resolved.map(|(inode_id, inode)| FsMetaResolvePathResp {
+            item: FsMetaResolvePathItem::Inode { inode_id, inode },
+            inner_path: None,
+        }))
+    }
     async fn handle_begin_txn(&self, ctx: RPCContext) -> Result<String, RPCErrors>;
     async fn handle_get_inode(
         &self,
@@ -1743,6 +1819,16 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                     self.0.handle_resolve_path(&path, ctx).await.map_err(|e| {
                         RPCErrors::ReasonError(format!("resolve_path failed: {}", e))
                     })?;
+                RPCResult::Success(serde_json::json!(result))
+            }
+            "resolve_path_ex" => {
+                let req = FsMetaResolvePathExReq::from_json(req.params)?;
+                let path = NdmPath::new(req.path);
+                let result = self
+                    .0
+                    .handle_resolve_path_ex(&path, req.sym_count, ctx)
+                    .await
+                    .map_err(|e| RPCErrors::ReasonError(format!("resolve_path_ex failed: {}", e)))?;
                 RPCResult::Success(serde_json::json!(result))
             }
             "begin_txn" => {
@@ -1992,8 +2078,7 @@ mod tests {
                 return Ok(node.map(|n| (root_id, n)));
             }
 
-            let components: Vec<&str> =
-                path.as_str().split('/').filter(|s| !s.is_empty()).collect();
+            let components = path.components();
 
             let mut current_id = root_id;
 
@@ -2014,7 +2099,7 @@ mod tests {
                             }
                             current_id = id;
                         }
-                        DentryTarget::SymLink(_inode_id) => {
+                        DentryTarget::SymLink(_target_path) => {
                             if is_last {
                                 return Ok(None);
                             }

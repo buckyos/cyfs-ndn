@@ -308,8 +308,8 @@ impl NamedDataMgr {
                         DentryTarget::ObjId(obj_id) => {
                             return self.path_stat_from_obj_id(obj_id).await
                         }
-                        DentryTarget::SymLink(id) => {
-                            return Ok(Self::path_stat_from_symlink(id));
+                        DentryTarget::SymLink(target_path) => {
+                            return Ok(Self::path_stat_from_symlink(target_path));
                         }
                         DentryTarget::IndexNodeId(id) => {
                             if let Some(node) =
@@ -390,8 +390,8 @@ impl NamedDataMgr {
             .await
     }
 
-    //创建软链接(symlink)，目标必须是文件或者目录，不能是符号链接
-    //SYMLINK: link_path -> target
+    //创建软链接(symlink)，目标保存为路径（可相对路径）
+    //SYMLINK: link_path -> target_path
     pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         self.fsmeta.make_link(link_path, target).await
     }
@@ -647,7 +647,7 @@ impl NamedDataMgr {
                     };
                     self.path_stat_from_inode_node(id, node).await
                 }
-                DentryTarget::SymLink(id) => Self::path_stat_from_symlink(id),
+                DentryTarget::SymLink(target_path) => Self::path_stat_from_symlink(target_path),
                 DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
                 DentryTarget::Tombstone => continue,
             };
@@ -742,7 +742,7 @@ impl NamedDataMgr {
                     };
                     self.path_stat_from_inode_node(id, node).await
                 }
-                DentryTarget::SymLink(id) => Self::path_stat_from_symlink(id),
+                DentryTarget::SymLink(target_path) => Self::path_stat_from_symlink(target_path),
                 DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
                 DentryTarget::Tombstone => continue,
             };
@@ -891,13 +891,13 @@ impl NamedDataMgr {
         }
     }
 
-    fn path_stat_from_symlink(inode_id: IndexNodeId) -> PathStat {
+    fn path_stat_from_symlink(target_path: String) -> PathStat {
         PathStat {
             kind: PathKind::SymLink,
             size: None,
             obj_id: None,
-            obj_inner_path: None,
-            inode_id: Some(inode_id),
+            obj_inner_path: Some(target_path),
+            inode_id: None,
             state: None,
         }
     }

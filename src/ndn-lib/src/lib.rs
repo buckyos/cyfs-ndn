@@ -279,6 +279,12 @@ impl NdmPath {
         &self.0
     }
 
+    /// Return non-empty path components split by `/`.
+    /// Example: `/a/b/` -> ["a", "b"], `/` -> []
+    pub fn components(&self) -> Vec<&str> {
+        self.0.split('/').filter(|s| !s.is_empty()).collect()
+    }
+
     /// Split path into parent and name components
     pub fn split_parent_name(&self) -> Option<(NdmPath, String)> {
         let path = self.0.trim_end_matches('/');
@@ -317,48 +323,59 @@ fn is_descendant_path(potential_child: &String, potential_parent: &String) -> bo
         && (child.as_bytes().get(parent.len()) == Some(&b'/') || parent == "/")
 }
 
-
 pub enum KnownStandardObject {
-    Dir(DirObject,String),
-    File(FileObject,String),
-    ChunkList(SimpleChunkList,String),
+    Dir(DirObject, String),
+    File(FileObject, String),
+    ChunkList(SimpleChunkList, String),
 }
 
 impl KnownStandardObject {
     pub fn from_obj_data(obj_id: &ObjId, obj_data: &str) -> NdnResult<Self> {
         //TODO:support obj_data is jwt
         let obj_type = obj_id.obj_type.as_str();
-        
+
         match obj_type {
             OBJ_TYPE_DIR => {
-                let dir_obj:DirObject = serde_json::from_str(obj_data).map_err(|e| {
-                    NdnError::InvalidParam(format!("parse dir object from json failed: {}", e.to_string()))
+                let dir_obj: DirObject = serde_json::from_str(obj_data).map_err(|e| {
+                    NdnError::InvalidParam(format!(
+                        "parse dir object from json failed: {}",
+                        e.to_string()
+                    ))
                 })?;
-                return Ok(KnownStandardObject::Dir(dir_obj,obj_data.to_string()));
-            },
+                return Ok(KnownStandardObject::Dir(dir_obj, obj_data.to_string()));
+            }
             OBJ_TYPE_FILE => {
-                let file_obj:FileObject = serde_json::from_str(obj_data).map_err(|e| {
-                    NdnError::InvalidParam(format!("parse file object from json failed: {}", e.to_string()))
+                let file_obj: FileObject = serde_json::from_str(obj_data).map_err(|e| {
+                    NdnError::InvalidParam(format!(
+                        "parse file object from json failed: {}",
+                        e.to_string()
+                    ))
                 })?;
-                return Ok(KnownStandardObject::File(file_obj,obj_data.to_string()));
-            },
+                return Ok(KnownStandardObject::File(file_obj, obj_data.to_string()));
+            }
             OBJ_TYPE_CHUNK_LIST_SIMPLE => {
                 let chunk_list = SimpleChunkList::from_json(obj_data)?;
-                return Ok(KnownStandardObject::ChunkList(chunk_list,obj_data.to_string()));
-            },
+                return Ok(KnownStandardObject::ChunkList(
+                    chunk_list,
+                    obj_data.to_string(),
+                ));
+            }
             _ => {
-                return Err(NdnError::InvalidParam(format!("Unknown object type: {}", obj_type)));
+                return Err(NdnError::InvalidParam(format!(
+                    "Unknown object type: {}",
+                    obj_type
+                )));
             }
         }
     }
-    
+
     //应该返回一个迭代器?
-    pub fn get_child_objs(&self) -> NdnResult< Vec<(ObjId,Option<String>)>> {
+    pub fn get_child_objs(&self) -> NdnResult<Vec<(ObjId, Option<String>)>> {
         match self {
-            KnownStandardObject::Dir(dir_obj,dir_obj_str) => {
+            KnownStandardObject::Dir(dir_obj, dir_obj_str) => {
                 let mut child_objs = Vec::new();
-                for (_sub_name,sub_item) in dir_obj.iter() { 
-                    let (obj_id,obj_str) = sub_item.get_obj_id()?;
+                for (_sub_name, sub_item) in dir_obj.iter() {
+                    let (obj_id, obj_str) = sub_item.get_obj_id()?;
                     if obj_str.len() > 0 {
                         child_objs.push((obj_id, Some(obj_str)));
                     } else {
@@ -366,12 +383,12 @@ impl KnownStandardObject {
                     }
                 }
                 return Ok(child_objs);
-            },
-            KnownStandardObject::File(file_obj,file_obj_str) => {
+            }
+            KnownStandardObject::File(file_obj, file_obj_str) => {
                 let content_id = ObjId::new(file_obj.content.as_str())?;
                 return Ok(vec![(content_id, None)]);
-            },
-            KnownStandardObject::ChunkList(chunk_list,chunk_list_str) => {
+            }
+            KnownStandardObject::ChunkList(chunk_list, chunk_list_str) => {
                 let mut child_objs = Vec::new();
                 for chunk_id in chunk_list.body.iter() {
                     child_objs.push((chunk_id.to_obj_id(), None));
@@ -401,6 +418,12 @@ mod tests {
         let root = NdmPath::new("/");
         assert!(root.split_parent_name().is_none());
         assert!(root.is_root());
+
+        assert_eq!(
+            NdmPath::new("/foo/bar/baz").components(),
+            vec!["foo", "bar", "baz"]
+        );
+        assert_eq!(NdmPath::new("/").components(), Vec::<&str>::new());
     }
 
     #[test]

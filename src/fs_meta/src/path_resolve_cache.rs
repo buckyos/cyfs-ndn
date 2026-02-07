@@ -1,4 +1,5 @@
 use ndm::IndexNodeId;
+use ndn_lib::ObjId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,22 +9,77 @@ const DEFAULT_MAX_ENTRIES: usize = 10000;
 /// Unique identifier for each cached entry, used for LRU tracking.
 type EntryId = u64;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathResolveCacheItemType {
+    InodePath,
+    TerminalObjId,
+    TerminalSymLink,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PathResolveTerminalValue {
+    ObjId(ObjId),
+    SymLink(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PathResolveTerminalHit {
+    pub matched_len: usize,
+    pub value: PathResolveTerminalValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PathResolveCacheValue {
+    InodeIds(Arc<Vec<IndexNodeId>>),
+    Terminal(PathResolveTerminalValue),
+}
+
+impl PathResolveCacheValue {
+    #[cfg(test)]
+    fn item_type(&self) -> PathResolveCacheItemType {
+        match self {
+            Self::InodeIds(_) => PathResolveCacheItemType::InodePath,
+            Self::Terminal(PathResolveTerminalValue::ObjId(_)) => {
+                PathResolveCacheItemType::TerminalObjId
+            }
+            Self::Terminal(PathResolveTerminalValue::SymLink(_)) => {
+                PathResolveCacheItemType::TerminalSymLink
+            }
+        }
+    }
+
+    fn inode_ids(&self) -> Option<Arc<Vec<IndexNodeId>>> {
+        match self {
+            Self::InodeIds(v) => Some(v.clone()),
+            Self::Terminal(_) => None,
+        }
+    }
+
+    fn terminal_value(&self) -> Option<PathResolveTerminalValue> {
+        match self {
+            Self::InodeIds(_) => None,
+            Self::Terminal(v) => Some(v.clone()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PathResolveCacheNode {
     children: HashMap<String, Box<PathResolveCacheNode>>,
     /// Cached value for this exact path.
-    value: Option<Arc<Vec<IndexNodeId>>>,
-    /// Deepest cached value within this subtree (may be at a descendant path).
-    deepest: Option<Arc<Vec<IndexNodeId>>>,
+    value: Option<Arc<PathResolveCacheValue>>,
+    /// Deepest cached inode path within this subtree (may be at a descendant path).
+    deepest_inode: Option<Arc<Vec<IndexNodeId>>>,
     /// Entry ID for LRU tracking (only set if this node has a value).
     entry_id: Option<EntryId>,
 }
 
 impl PathResolveCacheNode {
-    fn recompute_deepest(&mut self) {
-        let mut best = self.value.clone();
+    fn recompute_deepest_inode(&mut self) {
+        let mut best = self.value.as_ref().and_then(|v| v.inode_ids());
         for child in self.children.values() {
-            if let Some(v) = child.deepest.clone() {
+            if let Some(v) = child.deepest_inode.clone() {
                 let better = match &best {
                     Some(cur) => v.len() > cur.len(),
                     None => true,
@@ -33,7 +89,7 @@ impl PathResolveCacheNode {
                 }
             }
         }
-        self.deepest = best;
+        self.deepest_inode = best;
     }
 }
 
@@ -82,6 +138,36 @@ impl PathResolveCache {
         self.entry_count
     }
 
+    fn refresh_lru_for_path(&mut self, components: &[&str], old_entry_id: EntryId) {
+        if let Some(lru_entry) = self.lru_map.remove(&old_entry_id) {
+            let new_entry_id = self.next_entry_id;
+            self.next_entry_id += 1;
+            self.lru_map.insert(new_entry_id, lru_entry);
+
+            let mut node_mut = &mut self.root;
+            for c in components {
+                let Some(next) = node_mut.children.get_mut(*c) else {
+                    return;
+                };
+                node_mut = next.as_mut();
+            }
+            node_mut.entry_id = Some(new_entry_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_item_type_for_path(
+        &self,
+        components: &[&str],
+    ) -> Option<PathResolveCacheItemType> {
+        let mut node = &self.root;
+        for c in components {
+            node = node.children.get(*c)?.as_ref();
+        }
+        let value = node.value.as_ref()?;
+        Some(value.item_type())
+    }
+
     pub(crate) fn get_ids_for_path(&mut self, components: &[&str]) -> Option<Vec<IndexNodeId>> {
         // First, find the node and check if we have a hit.
         let mut node = &self.root as *const PathResolveCacheNode;
@@ -92,29 +178,86 @@ impl PathResolveCache {
         }
 
         let n = unsafe { &*node };
-        let v = n.value.clone().or_else(|| n.deepest.clone())?;
+        let v = n
+            .value
+            .as_ref()
+            .and_then(|v| v.inode_ids())
+            .or_else(|| n.deepest_inode.clone())?;
         if v.len() < components.len() + 1 {
             return None;
         }
 
         // Update LRU: if this node has a value with an entry_id, refresh it.
         if let Some(old_entry_id) = n.entry_id {
-            // Remove old entry and create new one with higher ID (more recent).
-            if let Some(lru_entry) = self.lru_map.remove(&old_entry_id) {
-                let new_entry_id = self.next_entry_id;
-                self.next_entry_id += 1;
-                self.lru_map.insert(new_entry_id, lru_entry);
-
-                // Update the node's entry_id - need mutable access.
-                let mut node_mut = &mut self.root;
-                for c in components {
-                    node_mut = node_mut.children.get_mut(*c).unwrap().as_mut();
-                }
-                node_mut.entry_id = Some(new_entry_id);
-            }
+            self.refresh_lru_for_path(components, old_entry_id);
         }
 
         Some(v[..components.len() + 1].to_vec())
+    }
+
+    pub(crate) fn get_terminal_for_path(
+        &mut self,
+        components: &[&str],
+    ) -> Option<PathResolveTerminalHit> {
+        let mut node = &self.root as *const PathResolveCacheNode;
+        for (i, c) in components.iter().enumerate() {
+            let n = unsafe { &*node };
+            node = n.children.get(*c)?.as_ref();
+            let cur = unsafe { &*node };
+            if let Some(value) = cur.value.as_ref().and_then(|v| v.terminal_value()) {
+                if let Some(old_entry_id) = cur.entry_id {
+                    self.refresh_lru_for_path(&components[..=i], old_entry_id);
+                }
+                return Some(PathResolveTerminalHit {
+                    matched_len: i + 1,
+                    value,
+                });
+            }
+        }
+        None
+    }
+
+    /// Get the longest cached inode-id prefix for a query path.
+    /// Returns ids for the best matched prefix (at least root), if any.
+    pub(crate) fn get_longest_prefix_ids_for_path(
+        &mut self,
+        components: &[&str],
+    ) -> Option<Vec<IndexNodeId>> {
+        let mut node = &self.root;
+        let mut depth = 0usize;
+        let mut best: Option<(usize, Arc<Vec<IndexNodeId>>)> = None;
+
+        if let Some(v) = node
+            .value
+            .as_ref()
+            .and_then(|v| v.inode_ids())
+            .or_else(|| node.deepest_inode.clone())
+        {
+            if !v.is_empty() {
+                best = Some((0, v));
+            }
+        }
+
+        for c in components {
+            let Some(next) = node.children.get(*c) else {
+                break;
+            };
+            node = next.as_ref();
+            depth += 1;
+            if let Some(v) = node
+                .value
+                .as_ref()
+                .and_then(|v| v.inode_ids())
+                .or_else(|| node.deepest_inode.clone())
+            {
+                if v.len() >= depth + 1 {
+                    best = Some((depth, v));
+                }
+            }
+        }
+
+        let (best_depth, v) = best?;
+        Some(v[..best_depth + 1].to_vec())
     }
 
     fn clear_shallow_values_on_path(&mut self, components: &[String]) {
@@ -160,7 +303,7 @@ impl PathResolveCache {
             // Remove root's value.
             self.root.value = None;
             self.root.entry_id = None;
-            self.root.recompute_deepest();
+            self.root.recompute_deepest_inode();
             return;
         }
 
@@ -201,7 +344,7 @@ impl PathResolveCache {
         // Recompute deepest up the path.
         for n in nodes.into_iter().rev() {
             let n = unsafe { &mut *n };
-            n.recompute_deepest();
+            n.recompute_deepest_inode();
         }
     }
 
@@ -230,7 +373,7 @@ impl PathResolveCache {
             self.evict_lru();
         }
 
-        let v = Arc::new(ids);
+        let ids_arc = Arc::new(ids);
 
         // Coverage rule: deeper cache covers shallow ones.
         self.clear_shallow_values_on_path(&components);
@@ -257,8 +400,8 @@ impl PathResolveCache {
             self.entry_count = self.entry_count.saturating_sub(1);
         }
 
-        target_node.value = Some(v.clone());
-        target_node.deepest = Some(v.clone());
+        target_node.value = Some(Arc::new(PathResolveCacheValue::InodeIds(ids_arc.clone())));
+        target_node.deepest_inode = Some(ids_arc.clone());
 
         // Assign new entry ID for LRU tracking.
         let entry_id = self.next_entry_id;
@@ -275,19 +418,94 @@ impl PathResolveCache {
         // Update deepest up the path.
         for n in path_nodes.into_iter().rev() {
             let n = unsafe { &mut *n };
-            let replace = match &n.deepest {
-                Some(cur) => v.len() > cur.len(),
+            let replace = match &n.deepest_inode {
+                Some(cur) => ids_arc.len() > cur.len(),
                 None => true,
             };
             if replace {
-                n.deepest = Some(v.clone());
+                n.deepest_inode = Some(ids_arc.clone());
             }
         }
 
         // Update edge index: (parent_inode, name) -> prefix path components.
         // components[i] corresponds to edge from ids[i] -> ids[i+1].
         for i in 0..components.len() {
-            let parent = v[i];
+            let parent = ids_arc[i];
+            let name = components[i].clone();
+            let prefix = components[..=i].to_vec();
+            self.edge_index.insert((parent, name), prefix);
+        }
+    }
+
+    pub(crate) fn put_terminal_for_path(
+        &mut self,
+        components: Vec<String>,
+        parent_ids: Vec<IndexNodeId>,
+        value: PathResolveTerminalValue,
+    ) {
+        if parent_ids.len() != components.len() {
+            return;
+        }
+
+        let is_new_entry = {
+            let mut node = &self.root;
+            let mut found = true;
+            for c in &components {
+                if let Some(next) = node.children.get(c) {
+                    node = next.as_ref();
+                } else {
+                    found = false;
+                    break;
+                }
+            }
+            !found || node.value.is_none()
+        };
+
+        if is_new_entry && self.entry_count >= self.max_entries {
+            self.evict_lru();
+        }
+
+        self.clear_shallow_values_on_path(&components);
+
+        let mut path_nodes: Vec<*mut PathResolveCacheNode> =
+            Vec::with_capacity(components.len() + 1);
+        let mut node: *mut PathResolveCacheNode = &mut self.root;
+        path_nodes.push(node);
+        for c in &components {
+            let next = unsafe { &mut *node }
+                .children
+                .entry(c.clone())
+                .or_insert_with(|| Box::new(PathResolveCacheNode::default()));
+            node = next.as_mut();
+            path_nodes.push(node);
+        }
+
+        let target_node = unsafe { &mut *node };
+        if let Some(old_entry_id) = target_node.entry_id.take() {
+            self.lru_map.remove(&old_entry_id);
+            self.entry_count = self.entry_count.saturating_sub(1);
+        }
+
+        target_node.value = Some(Arc::new(PathResolveCacheValue::Terminal(value)));
+
+        let entry_id = self.next_entry_id;
+        self.next_entry_id += 1;
+        target_node.entry_id = Some(entry_id);
+        self.lru_map.insert(
+            entry_id,
+            LruEntry {
+                path: components.clone(),
+            },
+        );
+        self.entry_count += 1;
+
+        for n in path_nodes.into_iter().rev() {
+            let n = unsafe { &mut *n };
+            n.recompute_deepest_inode();
+        }
+
+        for i in 0..components.len() {
+            let parent = parent_ids[i];
             let name = components[i].clone();
             let prefix = components[..=i].to_vec();
             self.edge_index.insert((parent, name), prefix);
@@ -351,7 +569,7 @@ impl PathResolveCache {
         // Recompute deepest up the path.
         for n in nodes.into_iter().rev() {
             let n = unsafe { &mut *n };
-            n.recompute_deepest();
+            n.recompute_deepest_inode();
         }
     }
 
@@ -388,6 +606,10 @@ mod tests {
     // Helper to create path components from a slice of &str
     fn components(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn create_obj_id(seed: u8) -> ObjId {
+        ObjId::new_by_raw("file".to_string(), vec![seed; 32])
     }
 
     // ==================== Basic Put and Get Tests ====================
@@ -430,6 +652,78 @@ mod tests {
         let mut cache = PathResolveCache::default();
         let result = cache.get_ids_for_path(&["a"]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_longest_prefix_ids_for_path() {
+        let mut cache = PathResolveCache::default();
+        cache.put_ids_for_path(components(&["a", "b", "c"]), vec![1, 2, 3, 4]);
+
+        // Not exact-hit path can still reuse cached prefix.
+        let prefix = cache.get_longest_prefix_ids_for_path(&["a", "b", "c", "d"]);
+        assert_eq!(prefix, Some(vec![1, 2, 3, 4]));
+
+        // Prefix query returns trimmed ids.
+        let prefix2 = cache.get_longest_prefix_ids_for_path(&["a", "x"]);
+        assert_eq!(prefix2, Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn test_terminal_symlink_hit_and_type() {
+        let mut cache = PathResolveCache::default();
+        cache.put_terminal_for_path(
+            components(&["a", "link"]),
+            vec![1, 2],
+            PathResolveTerminalValue::SymLink("../target".to_string()),
+        );
+
+        let hit = cache
+            .get_terminal_for_path(&["a", "link", "child"])
+            .expect("expected terminal cache hit");
+        assert_eq!(hit.matched_len, 2);
+        assert_eq!(
+            hit.value,
+            PathResolveTerminalValue::SymLink("../target".to_string())
+        );
+        assert_eq!(
+            cache.get_item_type_for_path(&["a", "link"]),
+            Some(PathResolveCacheItemType::TerminalSymLink)
+        );
+    }
+
+    #[test]
+    fn test_terminal_obj_hit_and_type() {
+        let mut cache = PathResolveCache::default();
+        let obj_id = create_obj_id(7);
+        cache.put_terminal_for_path(
+            components(&["a", "obj"]),
+            vec![1, 2],
+            PathResolveTerminalValue::ObjId(obj_id.clone()),
+        );
+
+        let hit = cache
+            .get_terminal_for_path(&["a", "obj", "inner", "p"])
+            .expect("expected terminal cache hit");
+        assert_eq!(hit.matched_len, 2);
+        assert_eq!(hit.value, PathResolveTerminalValue::ObjId(obj_id));
+        assert_eq!(
+            cache.get_item_type_for_path(&["a", "obj"]),
+            Some(PathResolveCacheItemType::TerminalObjId)
+        );
+    }
+
+    #[test]
+    fn test_terminal_entry_invalidate_by_edge() {
+        let mut cache = PathResolveCache::default();
+        cache.put_terminal_for_path(
+            components(&["a", "link"]),
+            vec![1, 2],
+            PathResolveTerminalValue::SymLink("/target".to_string()),
+        );
+        assert!(cache.get_terminal_for_path(&["a", "link"]).is_some());
+
+        cache.invalidate_by_edge(2, "link");
+        assert!(cache.get_terminal_for_path(&["a", "link"]).is_none());
     }
 
     // ==================== IDs Length Validation Tests ====================

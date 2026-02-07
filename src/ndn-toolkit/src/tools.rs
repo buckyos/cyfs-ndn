@@ -1,4 +1,4 @@
-use crate::{CHUNK_NORMAL_SIZE, ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, PackedObjItem, ProgressCallbackResult, SimpleChunkList, StoreMode};
+use crate::{CHUNK_DEFAULT_SIZE, ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, PackedObjItem, ProgressCallbackResult, SimpleChunkList, StoreMode};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;
@@ -140,13 +140,13 @@ pub async fn cacl_file_object(ndn_mgr_id:Option<&str>,
     let file_last_modify_time = file_meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
     
     let mut is_use_chunklist = false;
-    let mut chunk_size = CHUNK_NORMAL_SIZE as u64;
+    let mut chunk_size = CHUNK_DEFAULT_SIZE as u64;
     let mut chunk_list:SimpleChunkList = SimpleChunkList::new();
     let mut chunk_id:ChunkId;
     let mut new_qcid:Option<ChunkId> = None;
     let mut qcid_string = "".to_string();
 
-    if file_size > CHUNK_NORMAL_SIZE as u64 {
+    if file_size > CHUNK_DEFAULT_SIZE as u64 {
         if use_chunklist {
             is_use_chunklist = true;
         } else {

@@ -17,7 +17,7 @@ use fs2::FileExt;
 use log::warn;
 use ndn_lib::{
     ChunkHasher, ChunkId, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList,
-    CHUNK_NORMAL_SIZE,
+    CHUNK_DEFAULT_SIZE,
 };
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf, SeekFrom};
@@ -538,7 +538,7 @@ impl FileBufferService for LocalFileBufferService {
             file,
             None,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
         );
         Ok(Box::pin(reader))
@@ -572,7 +572,7 @@ impl FileBufferService for LocalFileBufferService {
             file,
             inner_std,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
             fb.handle_id.clone(),
             self.db.clone(),
@@ -631,7 +631,7 @@ impl FileBufferService for LocalFileBufferService {
                 .write()
                 .map_err(|_| NdnError::InvalidState("dirty layout poisoned".to_string()))?;
             let mut new_added = false;
-            let chunk_size = CHUNK_NORMAL_SIZE.max(1);
+            let chunk_size = CHUNK_DEFAULT_SIZE.max(1);
             let end = pos.saturating_add(data.len() as u64).saturating_sub(1);
             let start_idx = pos / chunk_size;
             let end_idx = end / chunk_size;
@@ -1477,7 +1477,7 @@ mod tests {
         {
             let mut base_file = tokio::fs::File::create(&base_path).await.unwrap();
             base_file
-                .write_all(&vec![0x5Au8; CHUNK_NORMAL_SIZE as usize])
+                .write_all(&vec![0x5Au8; CHUNK_DEFAULT_SIZE as usize])
                 .await
                 .unwrap();
         }
@@ -1493,14 +1493,14 @@ mod tests {
             file,
             inner_std,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
             fb.handle_id.clone(),
             service.db.clone(),
             true,
             Some(base_reader),
         );
-        let data = vec![0u8; (CHUNK_NORMAL_SIZE as usize) + 10];
+        let data = vec![0u8; (CHUNK_DEFAULT_SIZE as usize) + 10];
         tokio::io::AsyncWriteExt::write_all(&mut writer, &data)
             .await
             .unwrap();
@@ -1532,7 +1532,7 @@ mod tests {
         {
             let mut base_file = tokio::fs::File::create(&base_path).await.unwrap();
             base_file
-                .write_all(&vec![b'x'; CHUNK_NORMAL_SIZE as usize])
+                .write_all(&vec![b'x'; CHUNK_DEFAULT_SIZE as usize])
                 .await
                 .unwrap();
         }
@@ -1548,7 +1548,7 @@ mod tests {
             file,
             inner_std,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
             fb.handle_id.clone(),
             service.db.clone(),
@@ -1568,7 +1568,7 @@ mod tests {
             inner_file,
             Some(base_reader),
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             0,
         );
         let mut buf = [0u8; 3];
@@ -1578,7 +1578,7 @@ mod tests {
         // ensure local file is compact (<= chunk_size)
         let file_path = service.buffer_path(&fb);
         let meta = tokio::fs::metadata(&file_path).await.unwrap();
-        assert!(meta.len() <= CHUNK_NORMAL_SIZE);
+        assert!(meta.len() <= CHUNK_DEFAULT_SIZE);
     }
 
     #[tokio::test]
@@ -1594,10 +1594,10 @@ mod tests {
         let base_path = dir.path().join("base_dirty_clean.bin");
         {
             let mut base_file = tokio::fs::File::create(&base_path).await.unwrap();
-            write_filled(&mut base_file, 0x00, CHUNK_NORMAL_SIZE)
+            write_filled(&mut base_file, 0x00, CHUNK_DEFAULT_SIZE)
                 .await
                 .unwrap();
-            write_filled(&mut base_file, 0x11, CHUNK_NORMAL_SIZE)
+            write_filled(&mut base_file, 0x11, CHUNK_DEFAULT_SIZE)
                 .await
                 .unwrap();
             base_file.flush().await.unwrap();
@@ -1614,7 +1614,7 @@ mod tests {
             file,
             inner_std,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
             fb.handle_id.clone(),
             service.db.clone(),
@@ -1633,12 +1633,12 @@ mod tests {
             inner_file,
             Some(base_reader),
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             0,
         );
 
         reader
-            .seek(SeekFrom::Start(CHUNK_NORMAL_SIZE - 4))
+            .seek(SeekFrom::Start(CHUNK_DEFAULT_SIZE - 4))
             .await
             .unwrap();
         let mut buf = [0u8; 8];
@@ -1671,9 +1671,9 @@ mod tests {
             let mut base_file = tokio::fs::File::create(&base_path).await.unwrap();
             for idx in 0..16u64 {
                 let chunk_len = if idx == 15 {
-                    CHUNK_NORMAL_SIZE - 256
+                    CHUNK_DEFAULT_SIZE - 256
                 } else {
-                    CHUNK_NORMAL_SIZE
+                    CHUNK_DEFAULT_SIZE
                 };
                 write_filled(&mut base_file, idx as u8, chunk_len)
                     .await
@@ -1681,7 +1681,7 @@ mod tests {
             }
             base_file.flush().await.unwrap();
         }
-        let base_size = CHUNK_NORMAL_SIZE * 16 - 256;
+        let base_size = CHUNK_DEFAULT_SIZE * 16 - 256;
 
         let base_reader: FileBufferSeekReader =
             Box::pin(tokio::fs::File::open(&base_path).await.unwrap());
@@ -1694,7 +1694,7 @@ mod tests {
             file,
             inner_std,
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             pos,
             fb.handle_id.clone(),
             service.db.clone(),
@@ -1702,15 +1702,15 @@ mod tests {
             Some(base_reader),
         );
 
-        let chunk_middle = CHUNK_NORMAL_SIZE / 2;
+        let chunk_middle = CHUNK_DEFAULT_SIZE / 2;
         writer
-            .seek(SeekFrom::Start(5 * CHUNK_NORMAL_SIZE + chunk_middle))
+            .seek(SeekFrom::Start(5 * CHUNK_DEFAULT_SIZE + chunk_middle))
             .await
             .unwrap();
         writer.write_all(b"HELLO").await.unwrap();
 
         writer
-            .seek(SeekFrom::Start(2 * CHUNK_NORMAL_SIZE))
+            .seek(SeekFrom::Start(2 * CHUNK_DEFAULT_SIZE))
             .await
             .unwrap();
         writer.write_all(b"WORLD").await.unwrap();
@@ -1729,7 +1729,7 @@ mod tests {
             inner_file,
             Some(base_reader),
             fb.dirty_layout.clone(),
-            CHUNK_NORMAL_SIZE,
+            CHUNK_DEFAULT_SIZE,
             0,
         );
         println!("reader opened!");
@@ -1740,7 +1740,7 @@ mod tests {
         assert!(buf.iter().all(|b| *b == 0));
 
         reader
-            .seek(SeekFrom::Start(2 * CHUNK_NORMAL_SIZE))
+            .seek(SeekFrom::Start(2 * CHUNK_DEFAULT_SIZE))
             .await
             .unwrap();
         let mut buf = [0u8; 5];
@@ -1749,7 +1749,7 @@ mod tests {
         println!("read WORLD ok");
 
         reader
-            .seek(SeekFrom::Start(5 * CHUNK_NORMAL_SIZE + chunk_middle))
+            .seek(SeekFrom::Start(5 * CHUNK_DEFAULT_SIZE + chunk_middle))
             .await
             .unwrap();
         let mut buf = [0u8; 5];

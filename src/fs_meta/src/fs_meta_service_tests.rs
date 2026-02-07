@@ -4,7 +4,8 @@ mod tests {
     use fs_buffer::SessionId;
     use krpc::RPCContext;
     use ndm::{
-        ClientSessionId, DentryTarget, FsMetaHandler, IndexNodeId, NodeKind, NodeRecord, NodeState,
+        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
+        NodeRecord, NodeState,
     };
     use ndn_lib::NdmPath;
     use ndn_lib::ObjId;
@@ -269,7 +270,7 @@ mod tests {
             .unwrap()
             .unwrap();
         match dentry.target {
-            DentryTarget::SymLink(id) => assert_eq!(id, 401),
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "/target_file"),
             _ => panic!("expected SymLink target"),
         }
 
@@ -281,7 +282,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_link_rejects_symlink_target() {
+    async fn test_make_link_accepts_symlink_target_path() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
@@ -308,10 +309,141 @@ mod tests {
         .await
         .unwrap();
 
-        let result = svc
-            .handle_make_link(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
-            .await;
-        assert!(result.is_err());
+        svc.handle_make_link(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
+            .await
+            .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_b".to_string(), None, dummy_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "/link_a"),
+            _ => panic!("expected SymLink target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_make_link_accepts_relative_target_path() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        svc.handle_make_link(&NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
+            .await
+            .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_rel".to_string(), None, dummy_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "../a/b"),
+            _ => panic!("expected SymLink target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_ex_sym_count_zero_returns_symlink_and_tail() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        svc.handle_make_link(&NdmPath::new("/link_a"), &NdmPath::new("/target_a"), ctx.clone())
+            .await
+            .unwrap();
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/link_a/sub/path"), 0, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match resolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "/target_a"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(resolved.inner_path, Some("/sub/path".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_ex_expands_relative_symlink() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_a = create_dir_node(620);
+        let dir_x = create_dir_node(621);
+        let dir_y = create_dir_node(622);
+        let file = create_file_node_working(623, "fb-symlink-rel");
+        svc.handle_set_inode(dir_a, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(dir_x, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(dir_y, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(file, None, ctx.clone()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(620),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            620,
+            "x".to_string(),
+            DentryTarget::IndexNodeId(621),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            620,
+            "y".to_string(),
+            DentryTarget::IndexNodeId(622),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_upsert_dentry(
+            622,
+            "file".to_string(),
+            DentryTarget::IndexNodeId(623),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        svc.handle_make_link(&NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
+            .await
+            .unwrap();
+
+        let unresolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 0, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match unresolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "../y"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(unresolved.inner_path, Some("/file".to_string()));
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 1, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, 623),
+            _ => panic!("expected Inode result"),
+        }
+        assert_eq!(resolved.inner_path, None);
     }
 
     #[tokio::test]
