@@ -4,7 +4,8 @@
 //! a unified file/directory namespace with overlay semantics.
 //!
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -114,8 +115,8 @@ struct MovePlan {
 
 struct NamedListSession {
     fsmeta_list_session_id: Option<u64>,
-    entries: Vec<(String, PathStat)>,
-    pos: usize,
+    entries: Option<BTreeMap<String, PathStat>>,
+    cursor: Option<String>,
 }
 
 // ------------------------------
@@ -435,35 +436,6 @@ impl NamedDataMgr {
         self.fsmeta.create_dir(path).await
     }
 
-    pub async fn list(
-        &self,
-        path: &NdmPath,
-        pos: u32,
-        page_size: u32,
-    ) -> NdnResult<Vec<(String, PathStat)>> {
-        let list_session_id = self.start_list(path).await?;
-        {
-            let mut sessions = self.list_sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&list_session_id) {
-                session.pos = (pos as usize).min(session.entries.len());
-            }
-        }
-
-        let list_result = self.list_next(list_session_id, page_size).await;
-        let stop_result = self.stop_list(list_session_id).await;
-
-        match list_result {
-            Ok(result) => {
-                stop_result?;
-                Ok(result)
-            }
-            Err(e) => {
-                let _ = stop_result;
-                Err(e)
-            }
-        }
-    }
-
     //return list_session_id
     pub async fn start_list(&self, path: &NdmPath) -> NdnResult<u64> {
         if let Some((dir_id, dir_node)) = self.fsmeta.resolve_path(path).await? {
@@ -479,33 +451,37 @@ impl NamedDataMgr {
                 .await
                 .map_err(|e| NdnError::Internal(format!("start_list failed: {}", e)))?;
 
-            let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await {
-                Ok(entries) => entries,
-                Err(e) => {
-                    let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
-                    return Err(NdnError::Internal(format!("list_next failed: {}", e)));
-                }
-            };
-
-            let merged_entries = match self
-                .build_merged_dir_entries(&dir_node, upper_entries)
-                .await
-            {
-                Ok(entries) => entries,
-                Err(e) => {
-                    let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
-                    return Err(e);
-                }
-            };
-
             let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
+            let mut local_entries: Option<BTreeMap<String, PathStat>> = None;
+            if dir_node.base_obj_id.is_some() {
+                let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                        return Err(NdnError::Internal(format!("list_next failed: {}", e)));
+                    }
+                };
+
+                let merged_entries = match self
+                    .build_merged_dir_entries(&dir_node, upper_entries)
+                    .await
+                {
+                    Ok(entries) => entries,
+                    Err(e) => {
+                        let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                        return Err(e);
+                    }
+                };
+                local_entries = Some(merged_entries);
+            }
+
             let mut sessions = self.list_sessions.lock().await;
             sessions.insert(
                 list_session_id,
                 NamedListSession {
                     fsmeta_list_session_id: Some(fsmeta_list_session_id),
-                    entries: merged_entries,
-                    pos: 0,
+                    entries: local_entries,
+                    cursor: None,
                 },
             );
             return Ok(list_session_id);
@@ -518,8 +494,8 @@ impl NamedDataMgr {
                 list_session_id,
                 NamedListSession {
                     fsmeta_list_session_id: None,
-                    entries,
-                    pos: 0,
+                    entries: Some(entries),
+                    cursor: None,
                 },
             );
             return Ok(list_session_id);
@@ -552,40 +528,43 @@ impl NamedDataMgr {
         list_session_id: u64,
         page_size: u32,
     ) -> NdnResult<Vec<(String, PathStat)>> {
-        let mut sessions = self.list_sessions.lock().await;
-        let session = sessions.get_mut(&list_session_id).ok_or_else(|| {
-            NdnError::NotFound(format!("list session {} not found", list_session_id))
-        })?;
+        let passthrough_fsmeta_session = {
+            let mut sessions = self.list_sessions.lock().await;
+            let session = sessions.get_mut(&list_session_id).ok_or_else(|| {
+                NdnError::NotFound(format!("list session {} not found", list_session_id))
+            })?;
 
-        if session.pos >= session.entries.len() {
-            return Ok(Vec::new());
-        }
+            if let Some(entries) = session.entries.as_ref() {
+                let out = Self::page_from_ordered_map(entries, &mut session.cursor, page_size);
+                return Ok(out);
+            }
 
-        let end = if page_size == 0 {
-            session.entries.len()
-        } else {
-            (session.pos + page_size as usize).min(session.entries.len())
+            session.fsmeta_list_session_id.ok_or_else(|| {
+                NdnError::InvalidState(format!(
+                    "list session {} missing fsmeta session",
+                    list_session_id
+                ))
+            })?
         };
-        let out = session.entries[session.pos..end].to_vec();
-        session.pos = end;
-        Ok(out)
+
+        let fsmeta_page = self
+            .fsmeta
+            .list_next(passthrough_fsmeta_session, page_size)
+            .await
+            .map_err(|e| NdnError::Internal(format!("list_next failed: {}", e)))?;
+        self.path_stats_from_fsmeta_entries(fsmeta_page).await
     }
 
     async fn build_merged_dir_entries(
         &self,
         dir_node: &NodeRecord,
-        upper_entries: Vec<FsMetaListEntry>,
-    ) -> NdnResult<Vec<(String, PathStat)>> {
-        let mut upper_map: HashMap<String, FsMetaListEntry> = HashMap::new();
-        for entry in upper_entries {
-            upper_map.insert(entry.name.clone(), entry);
-        }
-
-        let mut merged: HashMap<String, PathStat> = HashMap::new();
+        upper_entries: BTreeMap<String, FsMetaListEntry>,
+    ) -> NdnResult<BTreeMap<String, PathStat>> {
+        let mut merged: BTreeMap<String, PathStat> = BTreeMap::new();
         if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
             let dir_obj = self.load_dir_object(&base_obj_id).await?;
             for (name, item) in dir_obj.iter() {
-                if let Some(upper) = upper_map.get(name) {
+                if let Some(upper) = upper_entries.get(name) {
                     if matches!(upper.target, DentryTarget::Tombstone) {
                         continue;
                     }
@@ -596,9 +575,9 @@ impl NamedDataMgr {
             }
         }
 
-        for entry in upper_map.into_values() {
+        for (name, entry) in upper_entries {
             let FsMetaListEntry {
-                name,
+                name: _,
                 target,
                 inode,
             } = entry;
@@ -627,15 +606,13 @@ impl NamedDataMgr {
             merged.insert(name, child_stat);
         }
 
-        let mut out: Vec<(String, PathStat)> = merged.into_iter().collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(out)
+        Ok(merged)
     }
 
     async fn load_obj_dir_entries(
         &self,
         path: &NdmPath,
-    ) -> NdnResult<Option<Vec<(String, PathStat)>>> {
+    ) -> NdnResult<Option<BTreeMap<String, PathStat>>> {
         if let Some((parent_path, name)) = path.split_parent_name() {
             if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
                 let dentry = self
@@ -653,12 +630,11 @@ impl NamedDataMgr {
                                 ));
                             }
                             let dir_obj = self.load_dir_object(&obj_id).await?;
-                            let mut out = Vec::new();
+                            let mut out = BTreeMap::new();
                             for (entry_name, item) in dir_obj.iter() {
                                 let child_stat = self.path_stat_from_simple_map_item(item).await?;
-                                out.push((entry_name.clone(), child_stat));
+                                out.insert(entry_name.clone(), child_stat);
                             }
-                            out.sort_by(|a, b| a.0.cmp(&b.0));
                             return Ok(Some(out));
                         }
                         DentryTarget::IndexNodeId(_) | DentryTarget::Tombstone => {}
@@ -668,6 +644,59 @@ impl NamedDataMgr {
         }
 
         Ok(None)
+    }
+
+    fn page_from_ordered_map<T: Clone>(
+        entries: &BTreeMap<String, T>,
+        cursor: &mut Option<String>,
+        page_size: u32,
+    ) -> Vec<(String, T)> {
+        let start_bound = match cursor.as_ref() {
+            Some(c) => Bound::Excluded(c.clone()),
+            None => Bound::Unbounded,
+        };
+        let limit = if page_size == 0 {
+            usize::MAX
+        } else {
+            page_size as usize
+        };
+
+        let mut out: Vec<(String, T)> = Vec::new();
+        for (name, value) in entries.range((start_bound, Bound::Unbounded)).take(limit) {
+            out.push((name.clone(), value.clone()));
+        }
+        if let Some((last_name, _)) = out.last() {
+            *cursor = Some(last_name.clone());
+        }
+        out
+    }
+
+    async fn path_stats_from_fsmeta_entries(
+        &self,
+        entries: BTreeMap<String, FsMetaListEntry>,
+    ) -> NdnResult<Vec<(String, PathStat)>> {
+        let mut out = Vec::with_capacity(entries.len());
+        for (name, entry) in entries {
+            let child_stat = match entry.target {
+                DentryTarget::IndexNodeId(id) => {
+                    let node = match entry.inode {
+                        Some(node) => Some(node),
+                        None => self.fsmeta.get_inode(id, None).await.map_err(|e| {
+                            NdnError::Internal(format!("failed to get inode: {}", e))
+                        })?,
+                    };
+                    let node = match node {
+                        Some(node) => node,
+                        None => continue,
+                    };
+                    self.path_stat_from_inode_node(id, node).await
+                }
+                DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
+                DentryTarget::Tombstone => continue,
+            };
+            out.push((name, child_stat));
+        }
+        Ok(out)
     }
 
     // ========== Read Operations ==========

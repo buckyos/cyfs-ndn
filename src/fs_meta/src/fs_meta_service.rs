@@ -9,7 +9,7 @@ use ndm::{
 use ndn_lib::{ChunkId, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1425,7 +1425,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         let dentries = self
             .handle_list_dentries(parent, txid.clone(), ctx.clone())
             .await?;
-        let mut entries = Vec::with_capacity(dentries.len());
+        let mut entries = BTreeMap::new();
         for dentry in dentries {
             let target = dentry.target.clone();
             let inode = match &target {
@@ -1435,13 +1435,15 @@ impl ndm::FsMetaHandler for FSMetaService {
                 }
                 _ => None,
             };
-            entries.push(FsMetaListEntry {
-                name: dentry.name,
-                target,
-                inode,
-            });
+            entries.insert(
+                dentry.name.clone(),
+                FsMetaListEntry {
+                    name: dentry.name,
+                    target,
+                    inode,
+                },
+            );
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
 
         let mut cache = self
             .list_cache
@@ -1455,7 +1457,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         list_session_id: u64,
         page_size: u32,
         _ctx: RPCContext,
-    ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+    ) -> Result<BTreeMap<String, FsMetaListEntry>, RPCErrors> {
         let mut cache = self
             .list_cache
             .lock()

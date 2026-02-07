@@ -306,16 +306,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page1.len(), 2);
-        assert_eq!(page1[0].name, "entry_0");
-        assert_eq!(page1[1].name, "entry_1");
-        assert!(page1.iter().all(|v| v.inode.is_some()));
+        assert_eq!(page1.keys().next().unwrap(), "entry_0");
+        assert_eq!(page1.keys().next_back().unwrap(), "entry_1");
+        assert!(page1.values().all(|v| v.inode.is_some()));
 
         let page2 = svc
             .handle_list_next(list_session_id, 2, ctx.clone())
             .await
             .unwrap();
         assert_eq!(page2.len(), 1);
-        assert_eq!(page2[0].name, "entry_2");
+        assert_eq!(page2.keys().next().unwrap(), "entry_2");
 
         svc.handle_stop_list(list_session_id, ctx.clone())
             .await

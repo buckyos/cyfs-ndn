@@ -1,10 +1,11 @@
 use ndm::FsMetaListEntry;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 
 #[derive(Default)]
 struct ListSession {
-    entries: Vec<FsMetaListEntry>,
-    cursor: usize,
+    entries: BTreeMap<String, FsMetaListEntry>,
+    cursor: Option<String>,
 }
 
 /// In-memory list session cache used by fsmeta start_list/list_next/stop_list.
@@ -27,11 +28,16 @@ impl ListCache {
         }
     }
 
-    pub(crate) fn start_session(&mut self, entries: Vec<FsMetaListEntry>) -> u64 {
+    pub(crate) fn start_session(&mut self, entries: BTreeMap<String, FsMetaListEntry>) -> u64 {
         let session_id = self.next_session_id;
         self.next_session_id = self.next_session_id.saturating_add(1);
-        self.sessions
-            .insert(session_id, ListSession { entries, cursor: 0 });
+        self.sessions.insert(
+            session_id,
+            ListSession {
+                entries,
+                cursor: None,
+            },
+        );
         session_id
     }
 
@@ -39,19 +45,32 @@ impl ListCache {
         &mut self,
         list_session_id: u64,
         page_size: u32,
-    ) -> Option<Vec<FsMetaListEntry>> {
+    ) -> Option<BTreeMap<String, FsMetaListEntry>> {
         let session = self.sessions.get_mut(&list_session_id)?;
-        if session.cursor >= session.entries.len() {
-            return Some(Vec::new());
+
+        let start_bound = match session.cursor.as_ref() {
+            Some(cursor) => Bound::Excluded(cursor.clone()),
+            None => Bound::Unbounded,
+        };
+        let limit = if page_size == 0 {
+            usize::MAX
+        } else {
+            page_size as usize
+        };
+
+        let mut out = BTreeMap::new();
+        for (name, entry) in session
+            .entries
+            .range((start_bound, Bound::Unbounded))
+            .take(limit)
+        {
+            out.insert(name.clone(), entry.clone());
         }
 
-        let end = if page_size == 0 {
-            session.entries.len()
-        } else {
-            (session.cursor + page_size as usize).min(session.entries.len())
-        };
-        let out = session.entries[session.cursor..end].to_vec();
-        session.cursor = end;
+        if let Some((last_name, _)) = out.iter().next_back() {
+            session.cursor = Some(last_name.clone());
+        }
+
         Some(out)
     }
 
@@ -76,20 +95,20 @@ mod tests {
     #[test]
     fn test_list_cache_paging() {
         let mut cache = ListCache::new();
-        let session_id = cache.start_session(vec![
-            sample_entry("a"),
-            sample_entry("b"),
-            sample_entry("c"),
-        ]);
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), sample_entry("a"));
+        entries.insert("b".to_string(), sample_entry("b"));
+        entries.insert("c".to_string(), sample_entry("c"));
+        let session_id = cache.start_session(entries);
 
         let page1 = cache.list_next(session_id, 2).unwrap();
         assert_eq!(page1.len(), 2);
-        assert_eq!(page1[0].name, "a");
-        assert_eq!(page1[1].name, "b");
+        assert_eq!(page1.keys().next().unwrap(), "a");
+        assert_eq!(page1.keys().next_back().unwrap(), "b");
 
         let page2 = cache.list_next(session_id, 2).unwrap();
         assert_eq!(page2.len(), 1);
-        assert_eq!(page2[0].name, "c");
+        assert_eq!(page2.keys().next().unwrap(), "c");
 
         let page3 = cache.list_next(session_id, 2).unwrap();
         assert!(page3.is_empty());
@@ -98,7 +117,9 @@ mod tests {
     #[test]
     fn test_stop_list_cache_session() {
         let mut cache = ListCache::new();
-        let session_id = cache.start_session(vec![sample_entry("x")]);
+        let mut entries = BTreeMap::new();
+        entries.insert("x".to_string(), sample_entry("x"));
+        let session_id = cache.start_session(entries);
         assert!(cache.stop_session(session_id));
         assert!(cache.list_next(session_id, 1).is_none());
     }

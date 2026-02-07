@@ -6,7 +6,7 @@ use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPC
 use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use crate::OpenWriteFlag;
 
@@ -973,7 +973,7 @@ impl FsMetaClient {
         &self,
         list_session_id: u64,
         page_size: u32,
-    ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+    ) -> Result<BTreeMap<String, FsMetaListEntry>, RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -990,7 +990,7 @@ impl FsMetaClient {
                 let result = client.call("list_next", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
                     RPCErrors::ParserResponseError(format!(
-                        "Expected Vec<FsMetaListEntry> result: {}",
+                        "Expected BTreeMap<String, FsMetaListEntry> result: {}",
                         e
                     ))
                 })
@@ -1568,7 +1568,7 @@ pub trait FsMetaHandler: Send + Sync {
         list_session_id: u64,
         page_size: u32,
         ctx: RPCContext,
-    ) -> Result<Vec<FsMetaListEntry>, RPCErrors>;
+    ) -> Result<BTreeMap<String, FsMetaListEntry>, RPCErrors>;
     async fn handle_stop_list(
         &self,
         list_session_id: u64,
@@ -1927,7 +1927,7 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::io::{Read, Write};
     use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1947,7 +1947,7 @@ mod tests {
         inodes: HashMap<IndexNodeId, NodeRecord>,
         dentries: HashMap<(IndexNodeId, String), DentryRecord>,
         next_list_session: u64,
-        list_sessions: HashMap<u64, (Vec<FsMetaListEntry>, usize)>,
+        list_sessions: HashMap<u64, (BTreeMap<String, FsMetaListEntry>, Option<String>)>,
         dir_rev: HashMap<IndexNodeId, u64>,
         lease_seq: HashMap<IndexNodeId, u64>,
         obj_stats: HashMap<ObjId, ObjStat>,
@@ -2133,7 +2133,7 @@ mod tests {
             _ctx: RPCContext,
         ) -> Result<u64, RPCErrors> {
             let mut state = self.state.lock().unwrap();
-            let mut entries = Vec::new();
+            let mut entries = BTreeMap::new();
             for ((p, _), dentry) in state.dentries.iter() {
                 if *p != parent {
                     continue;
@@ -2143,19 +2143,19 @@ mod tests {
                     DentryTarget::IndexNodeId(id) => state.inodes.get(id).cloned(),
                     _ => None,
                 };
-                entries.push(FsMetaListEntry {
-                    name: dentry.name.clone(),
-                    target,
-                    inode,
-                });
+                entries.insert(
+                    dentry.name.clone(),
+                    FsMetaListEntry {
+                        name: dentry.name.clone(),
+                        target,
+                        inode,
+                    },
+                );
             }
-            entries.sort_by(|a, b| a.name.cmp(&b.name));
 
             state.next_list_session += 1;
             let list_session_id = state.next_list_session;
-            state
-                .list_sessions
-                .insert(list_session_id, (entries, 0usize));
+            state.list_sessions.insert(list_session_id, (entries, None));
             Ok(list_session_id)
         }
 
@@ -2164,24 +2164,34 @@ mod tests {
             list_session_id: u64,
             page_size: u32,
             _ctx: RPCContext,
-        ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+        ) -> Result<BTreeMap<String, FsMetaListEntry>, RPCErrors> {
             let mut state = self.state.lock().unwrap();
-            let (entries, pos) = state
+            let (entries, cursor) = state
                 .list_sessions
                 .get_mut(&list_session_id)
                 .ok_or_else(|| RPCErrors::ReasonError("list session not found".to_string()))?;
 
-            if *pos >= entries.len() {
-                return Ok(Vec::new());
+            let start_bound = match cursor.as_ref() {
+                Some(c) => std::ops::Bound::Excluded(c.clone()),
+                None => std::ops::Bound::Unbounded,
+            };
+            let limit = if page_size == 0 {
+                usize::MAX
+            } else {
+                page_size as usize
+            };
+
+            let mut out = BTreeMap::new();
+            for (name, entry) in entries
+                .range((start_bound, std::ops::Bound::Unbounded))
+                .take(limit)
+            {
+                out.insert(name.clone(), entry.clone());
+            }
+            if let Some((last_name, _)) = out.iter().next_back() {
+                *cursor = Some(last_name.clone());
             }
 
-            let end = if page_size == 0 {
-                entries.len()
-            } else {
-                (*pos + page_size as usize).min(entries.len())
-            };
-            let out = entries[*pos..end].to_vec();
-            *pos = end;
             Ok(out)
         }
 
@@ -2657,7 +2667,7 @@ mod tests {
         let list_session_id = client.start_list(7, None).await.unwrap();
         let page1 = client.list_next(list_session_id, 1).await.unwrap();
         assert_eq!(page1.len(), 1);
-        assert_eq!(page1[0].name, "hello");
+        assert_eq!(page1.keys().next().unwrap(), "hello");
         client.stop_list(list_session_id).await.unwrap();
     }
 
