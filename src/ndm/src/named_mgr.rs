@@ -15,7 +15,8 @@ use named_store::{
     NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
-    ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, SimpleChunkList, SimpleMapItem, load_named_obj
+    load_named_obj, ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId,
+    SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -48,6 +49,7 @@ pub enum PathKind {
     File,
     Dir,
     Object,
+    SymLink,
     NotFound,
 }
 
@@ -306,6 +308,9 @@ impl NamedDataMgr {
                         DentryTarget::ObjId(obj_id) => {
                             return self.path_stat_from_obj_id(obj_id).await
                         }
+                        DentryTarget::SymLink(id) => {
+                            return Ok(Self::path_stat_from_symlink(id));
+                        }
                         DentryTarget::IndexNodeId(id) => {
                             if let Some(node) =
                                 self.fsmeta.get_inode(id, None).await.map_err(|e| {
@@ -385,8 +390,8 @@ impl NamedDataMgr {
             .await
     }
 
-    //创建软链接，目标必须是文件或者目录，不能是符号链接
-    //LINK: link_path -> target
+    //创建软链接(symlink)，目标必须是文件或者目录，不能是符号链接
+    //SYMLINK: link_path -> target
     pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         self.fsmeta.make_link(link_path, target).await
     }
@@ -450,11 +455,8 @@ impl NamedDataMgr {
                 ));
             }
 
-            let fsmeta_list_session_id = self
-                .fsmeta
-                .start_list(dir_id, None)
-                .await
-                .map_err(|e| {
+            let fsmeta_list_session_id =
+                self.fsmeta.start_list(dir_id, None).await.map_err(|e| {
                     warn!(
                         "NamedDataMgr::start_list: start_list failed, path={}, dir_id={}, err={}",
                         path.as_str(),
@@ -476,9 +478,7 @@ impl NamedDataMgr {
                             dir_id,
                             e
                         );
-                        if let Err(stop_err) =
-                            self.fsmeta.stop_list(fsmeta_list_session_id).await
-                        {
+                        if let Err(stop_err) = self.fsmeta.stop_list(fsmeta_list_session_id).await {
                             warn!(
                                 "NamedDataMgr::start_list: stop_list failed after list_next error, session_id={}, err={}",
                                 fsmeta_list_session_id,
@@ -647,6 +647,7 @@ impl NamedDataMgr {
                     };
                     self.path_stat_from_inode_node(id, node).await
                 }
+                DentryTarget::SymLink(id) => Self::path_stat_from_symlink(id),
                 DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
                 DentryTarget::Tombstone => continue,
             };
@@ -685,7 +686,9 @@ impl NamedDataMgr {
                             }
                             return Ok(Some(out));
                         }
-                        DentryTarget::IndexNodeId(_) | DentryTarget::Tombstone => {}
+                        DentryTarget::IndexNodeId(_)
+                        | DentryTarget::SymLink(_)
+                        | DentryTarget::Tombstone => {}
                     }
                 }
             }
@@ -739,6 +742,7 @@ impl NamedDataMgr {
                     };
                     self.path_stat_from_inode_node(id, node).await
                 }
+                DentryTarget::SymLink(id) => Self::path_stat_from_symlink(id),
                 DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
                 DentryTarget::Tombstone => continue,
             };
@@ -884,6 +888,17 @@ impl NamedDataMgr {
             obj_inner_path: None,
             inode_id: Some(inode_id),
             state: Some(node.state),
+        }
+    }
+
+    fn path_stat_from_symlink(inode_id: IndexNodeId) -> PathStat {
+        PathStat {
+            kind: PathKind::SymLink,
+            size: None,
+            obj_id: None,
+            obj_inner_path: None,
+            inode_id: Some(inode_id),
+            state: None,
         }
     }
 
@@ -1271,6 +1286,7 @@ impl NamedDataMgr {
                         NdnError::InvalidState(format!("child {} not published", dentry.name))
                     })?
                 }
+                DentryTarget::SymLink(_) => continue,
                 DentryTarget::Tombstone => continue,
             };
             entries.insert(name, obj_id);

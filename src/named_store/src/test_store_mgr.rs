@@ -88,6 +88,54 @@ fn test_resolve_next_obj_cache_lru() {
 }
 
 #[tokio::test]
+async fn test_resolve_next_obj_reuse_cached_subpath() {
+    let mgr = NamedStoreMgr::new();
+
+    let dir1 = DirObject::new(Some("dir1".to_string()));
+    let (dir1_obj_id, dir1_obj_str) = dir1.gen_obj_id().unwrap();
+    let final_obj_id = create_test_obj_id("cyfile", "13");
+
+    {
+        let mut cache = mgr.resolve_next_obj_cache.lock().await;
+        cache.put(
+            &dir1_obj_id,
+            "/dir3/filename",
+            ResolveNextObjCacheValue {
+                next_obj_id: final_obj_id.clone(),
+                next_path: None,
+                next_obj_str: None,
+            },
+        );
+    }
+
+    let mut dir2 = DirObject::new(Some("dir2".to_string()));
+    dir2.object_map.insert(
+        "dir1".to_string(),
+        SimpleMapItem::Object(
+            "cydir".to_string(),
+            serde_json::from_str(dir1_obj_str.as_str()).unwrap(),
+        ),
+    );
+    let dir2_obj_id = create_test_obj_id("cydir", "21");
+    let dir2_obj_str = serde_json::to_string(&dir2).unwrap();
+
+    let resolved = mgr
+        .resolve_next_obj(&dir2_obj_id, dir2_obj_str.as_str(), "/dir1/dir3/filename")
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.0, final_obj_id);
+    assert_eq!(resolved.1, None);
+    assert_eq!(resolved.2, None);
+
+    let nested_hit = {
+        let mut cache = mgr.resolve_next_obj_cache.lock().await;
+        cache.get(&dir2_obj_id, "/dir1/dir3/filename")
+    };
+    assert!(nested_hit.is_some());
+}
+
+#[tokio::test]
 async fn test_store_layout_mgr_basic() {
     let mgr = NamedStoreMgr::new();
 

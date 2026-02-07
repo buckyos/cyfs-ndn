@@ -28,6 +28,7 @@ const NODE_STATE_FINALIZED: i64 = 5;
 const DENTRY_TARGET_INODE: i64 = 0;
 const DENTRY_TARGET_OBJ: i64 = 1;
 const DENTRY_TARGET_TOMBSTONE: i64 = 2;
+const DENTRY_TARGET_SYMLINK: i64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectKind {
@@ -123,6 +124,7 @@ impl FSMetaService {
         .map_err(|e| RPCErrors::ReasonError(format!("open db failed: {}", e)))?;
         Self::init_connection(&conn)?;
         Self::create_schema(&conn)?;
+        Self::migrate_schema(&conn)?;
         let root_inode = Self::ensure_root_dir(&conn)?;
 
         let txns = Arc::new(Mutex::new(HashMap::new()));
@@ -298,7 +300,8 @@ impl FSMetaService {
                 CHECK (
                     (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
                     (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
-                    (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL)
+                    (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
+                    (target_type = 3 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL)
                 )
             ) WITHOUT ROWID;
 
@@ -316,6 +319,55 @@ impl FSMetaService {
             CREATE INDEX IF NOT EXISTS idx_obj_stat_gc ON obj_stat(ref_count, zero_since);",
         )
         .map_err(|e| RPCErrors::ReasonError(format!("create schema failed: {}", e)))?;
+        Ok(())
+    }
+
+    fn migrate_schema(conn: &Connection) -> Result<(), RPCErrors> {
+        let dentry_ddl = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dentries'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| RPCErrors::ReasonError(format!("query schema failed: {}", e)))?;
+
+        let Some(ddl) = dentry_ddl else {
+            return Ok(());
+        };
+
+        if ddl.contains("target_type = 3") {
+            return Ok(());
+        }
+
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE dentries RENAME TO dentries_old;
+             CREATE TABLE dentries (
+                parent_inode_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                target_type INTEGER NOT NULL,
+                target_inode_id INTEGER,
+                target_obj_id BLOB,
+                mtime INTEGER,
+                PRIMARY KEY (parent_inode_id, name),
+                CHECK (
+                    (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
+                    (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
+                    (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
+                    (target_type = 3 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL)
+                )
+             ) WITHOUT ROWID;
+             INSERT INTO dentries(parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
+                SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                FROM dentries_old;
+             DROP TABLE dentries_old;
+             CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
+             CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
+             COMMIT;",
+        )
+        .map_err(|e| RPCErrors::ReasonError(format!("migrate schema failed: {}", e)))?;
+
         Ok(())
     }
 
@@ -725,7 +777,9 @@ impl FSMetaService {
         if let Some(d) = dentry {
             match d.target {
                 DentryTarget::Tombstone => { /* treat as not-exists */ }
-                DentryTarget::IndexNodeId(_) | DentryTarget::ObjId(_) => {
+                DentryTarget::IndexNodeId(_)
+                | DentryTarget::SymLink(_)
+                | DentryTarget::ObjId(_) => {
                     if !opts.overwrite_upper {
                         return Err(RPCErrors::ReasonError("already exists".to_string()));
                     }
@@ -823,6 +877,12 @@ impl FSMetaService {
                             .await
                             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
                         current_id = new_id;
+                    }
+                    DentryTarget::SymLink(_) => {
+                        return Err(RPCErrors::ReasonError(format!(
+                            "{} is not a directory",
+                            components[..=i].join("/")
+                        )));
                     }
                     DentryTarget::Tombstone => {
                         // Tombstone - need to create new directory
@@ -992,6 +1052,10 @@ impl FSMetaService {
                         kind_hint,
                     })
                 }
+                DentryTarget::SymLink(fid) => Ok(MoveSource::Upper {
+                    target: DentryTarget::SymLink(fid),
+                    kind_hint: ObjectKind::Unknown,
+                }),
                 DentryTarget::ObjId(oid) => Ok(MoveSource::Upper {
                     target: DentryTarget::ObjId(oid),
                     kind_hint: ObjectKind::Unknown,
@@ -1085,6 +1149,15 @@ impl ndm::FsMetaHandler for FSMetaService {
                             return Ok(node.map(|n| (id, n)));
                         }
                         current_id = id;
+                    }
+                    DentryTarget::SymLink(_inode_id) => {
+                        if is_last {
+                            return Ok(None);
+                        }
+                        return Err(NdnError::NotFound(format!(
+                            "path {} crosses symbolic link",
+                            path.as_str()
+                        )));
                     }
                     DentryTarget::ObjId(_obj_id) => {
                         if is_last {
@@ -2215,6 +2288,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.apply_move_plan_txn(plan, opts, ctx).await
     }
 
+    //创建软链接(symlink)，目标必须是文件或者目录，不能是符号链接
+    //SYMLINK: link_path -> target
     async fn handle_make_link(
         &self,
         link_path: &NdmPath,
@@ -2250,6 +2325,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             DentryTarget::Tombstone => {
                 return Err(RPCErrors::ReasonError("target not found".to_string()));
             }
+            DentryTarget::SymLink(_) => {
+                return Err(RPCErrors::ReasonError(
+                    "target is a symbolic link".to_string(),
+                ));
+            }
             DentryTarget::IndexNodeId(id) => {
                 let inode = self
                     .handle_get_inode(id, None, ctx.clone())
@@ -2259,12 +2339,16 @@ impl ndm::FsMetaHandler for FSMetaService {
                     || inode.kind == NodeKind::File
                     || inode.kind == NodeKind::Object
                 {
-                    DentryTarget::IndexNodeId(id)
+                    DentryTarget::SymLink(id)
                 } else {
                     return Err(RPCErrors::ReasonError("invalid target type".to_string()));
                 }
             }
-            DentryTarget::ObjId(oid) => DentryTarget::ObjId(oid),
+            DentryTarget::ObjId(_oid) => {
+                return Err(RPCErrors::ReasonError(
+                    "target is not materialized to inode".to_string(),
+                ));
+            }
         };
 
         let (link_parent_path, link_name) = link_path
@@ -2397,6 +2481,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             &dentry,
             Some(DentryRecord {
                 target: DentryTarget::IndexNodeId(_),
+                ..
+            }) | Some(DentryRecord {
+                target: DentryTarget::SymLink(_),
                 ..
             }) | Some(DentryRecord {
                 target: DentryTarget::ObjId(_),
@@ -2532,6 +2619,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                 .await?;
 
                 (fid, Some(oid), NodeState::DirNormal)
+            }
+            Some(DentryRecord {
+                target: DentryTarget::SymLink(_),
+                ..
+            }) => {
+                rollback_and_err!(RPCErrors::ReasonError(
+                    "path is a symbolic link".to_string()
+                ));
             }
         };
 
@@ -2778,6 +2873,9 @@ impl ndm::FsMetaHandler for FSMetaService {
         match dentry.target {
             DentryTarget::Tombstone => Err(RPCErrors::ReasonError("path not found".to_string())),
             DentryTarget::ObjId(obj_id) => Ok(OpenFileReaderResp::Object(obj_id, None)),
+            DentryTarget::SymLink(_inode_id) => Err(RPCErrors::ReasonError(
+                "path is a symbolic link".to_string(),
+            )),
             DentryTarget::IndexNodeId(inode_id) => {
                 let node = self
                     .handle_get_inode(inode_id, None, ctx)
@@ -2874,6 +2972,7 @@ fn dentry_target_cols(
 ) -> Result<(i64, Option<i64>, Option<Vec<u8>>), RPCErrors> {
     match target {
         DentryTarget::IndexNodeId(id) => Ok((DENTRY_TARGET_INODE, Some(*id as i64), None)),
+        DentryTarget::SymLink(id) => Ok((DENTRY_TARGET_SYMLINK, Some(*id as i64), None)),
         DentryTarget::ObjId(obj_id) => Ok((DENTRY_TARGET_OBJ, None, Some(obj_id_to_blob(obj_id)))),
         DentryTarget::Tombstone => Ok((DENTRY_TARGET_TOMBSTONE, None, None)),
     }
@@ -2898,6 +2997,11 @@ fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
             })?)?)
         }
         DENTRY_TARGET_TOMBSTONE => DentryTarget::Tombstone,
+        DENTRY_TARGET_SYMLINK => DentryTarget::SymLink(
+            target_inode_id
+                .ok_or_else(|| RPCErrors::ReasonError("missing target_inode_id".to_string()))?
+                as IndexNodeId,
+        ),
         _ => return Err(RPCErrors::ReasonError("invalid dentry target".to_string())),
     };
     Ok(DentryRecord {

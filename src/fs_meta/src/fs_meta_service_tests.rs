@@ -236,6 +236,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_make_link_creates_symlink_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let target = create_file_node_working(401, "fb-link-target");
+        svc.handle_set_inode(target, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "target_file".to_string(),
+            DentryTarget::IndexNodeId(401),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        svc.handle_make_link(
+            &NdmPath::new("/link_file"),
+            &NdmPath::new("/target_file"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_file".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(id) => assert_eq!(id, 401),
+            _ => panic!("expected SymLink target"),
+        }
+
+        let resolved = svc
+            .handle_resolve_path(&NdmPath::new("/link_file"), ctx)
+            .await
+            .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_make_link_rejects_symlink_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let target = create_file_node_working(402, "fb-link-target-2");
+        svc.handle_set_inode(target, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "target_file_2".to_string(),
+            DentryTarget::IndexNodeId(402),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        svc.handle_make_link(
+            &NdmPath::new("/link_a"),
+            &NdmPath::new("/target_file_2"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let result = svc
+            .handle_make_link(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn test_get_dentry_not_found() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();

@@ -92,6 +92,7 @@ pub struct NodeRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DentryTarget {
     IndexNodeId(IndexNodeId),
+    SymLink(IndexNodeId),
     ObjId(ObjId),
     Tombstone,
 }
@@ -2012,6 +2013,15 @@ mod tests {
                                 return Ok(node.map(|n| (id, n)));
                             }
                             current_id = id;
+                        }
+                        DentryTarget::SymLink(_inode_id) => {
+                            if is_last {
+                                return Ok(None);
+                            }
+                            return Err(NdnError::NotFound(format!(
+                                "path {} crosses symbolic link",
+                                path.as_str()
+                            )));
                         }
                         DentryTarget::ObjId(_obj_id) => {
                             if is_last {

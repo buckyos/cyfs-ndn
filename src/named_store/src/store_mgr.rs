@@ -328,7 +328,7 @@ impl NamedStoreMgr {
 
             let path = current_path.as_ref().unwrap().as_str();
             let (next_obj_id, next_path, next_obj_str) = self
-                .resolve_next_obj_cached(&current_obj_id, obj_str.as_str(), path)
+                .resolve_next_obj(&current_obj_id, obj_str.as_str(), path)
                 .await?;
             current_obj_id = next_obj_id;
             current_path = next_path;
@@ -714,7 +714,7 @@ impl NamedStoreMgr {
 
             let path = current_path.as_ref().unwrap().as_str();
             let (next_obj_id, next_path, next_obj_str) = self
-                .resolve_next_obj_cached(&current_obj_id, obj_str.as_str(), path)
+                .resolve_next_obj(&current_obj_id, obj_str.as_str(), path)
                 .await?;
             current_obj_id = next_obj_id;
             current_path = next_path;
@@ -985,33 +985,84 @@ impl NamedStoreMgr {
         Ok((first, rest))
     }
 
-    async fn resolve_next_obj_cached(
+    async fn resolve_next_obj(
         &self,
         obj_id: &ObjId,
         obj_str: &str,
         path: &str,
     ) -> NdnResult<(ObjId, Option<String>, Option<String>)> {
-        if let Some(cached) = {
+        let mut current_obj_id = obj_id.clone();
+        let mut current_obj_str = obj_str.to_string();
+        let mut current_path = path.to_string();
+        let mut pending_cache_keys: Vec<ResolveNextObjCacheKey> = Vec::new();
+
+        loop {
+            if let Some(cached) = {
+                let mut cache = self.resolve_next_obj_cache.lock().await;
+                cache.get(&current_obj_id, current_path.as_str())
+            } {
+                let resolved = (cached.next_obj_id, cached.next_path, cached.next_obj_str);
+                if !pending_cache_keys.is_empty() {
+                    let mut cache = self.resolve_next_obj_cache.lock().await;
+                    for key in pending_cache_keys {
+                        cache.put(
+                            &key.obj_id,
+                            key.path.as_str(),
+                            ResolveNextObjCacheValue {
+                                next_obj_id: resolved.0.clone(),
+                                next_path: resolved.1.clone(),
+                                next_obj_str: resolved.2.clone(),
+                            },
+                        );
+                    }
+                }
+                return Ok(resolved);
+            }
+
+            if current_obj_id.is_chunk() {
+                return Err(NdnError::InvalidParam(format!(
+                    "chunk {} does not support inner path",
+                    current_obj_id.to_string()
+                )));
+            }
+
+            pending_cache_keys.push(ResolveNextObjCacheKey {
+                obj_id: current_obj_id.clone(),
+                path: current_path.clone(),
+            });
+
+            let (next_obj_id, next_path, next_obj_str) =
+                Self::resolve_next_obj_once(&current_obj_id, current_obj_str.as_str(), current_path.as_str())?;
+
+            if let Some(rest_path) = next_path {
+                let next_obj_str_for_next = match next_obj_str {
+                    Some(next_obj_str) => next_obj_str,
+                    None => self.get_object(&next_obj_id).await?,
+                };
+                current_obj_id = next_obj_id;
+                current_obj_str = next_obj_str_for_next;
+                current_path = rest_path;
+                continue;
+            }
+
+            let resolved = (next_obj_id, None, next_obj_str);
             let mut cache = self.resolve_next_obj_cache.lock().await;
-            cache.get(obj_id, path)
-        } {
-            return Ok((cached.next_obj_id, cached.next_path, cached.next_obj_str));
+            for key in pending_cache_keys {
+                cache.put(
+                    &key.obj_id,
+                    key.path.as_str(),
+                    ResolveNextObjCacheValue {
+                        next_obj_id: resolved.0.clone(),
+                        next_path: resolved.1.clone(),
+                        next_obj_str: resolved.2.clone(),
+                    },
+                );
+            }
+            return Ok(resolved);
         }
-
-        let (next_obj_id, next_path, next_obj_str) = Self::resolve_next_obj(obj_id, obj_str, path)?;
-
-        let cache_value = ResolveNextObjCacheValue {
-            next_obj_id: next_obj_id.clone(),
-            next_path: next_path.clone(),
-            next_obj_str: next_obj_str.clone(),
-        };
-        let mut cache = self.resolve_next_obj_cache.lock().await;
-        cache.put(obj_id, path, cache_value);
-
-        Ok((next_obj_id, next_path, next_obj_str))
     }
 
-    fn resolve_next_obj(
+    fn resolve_next_obj_once(
         obj_id: &ObjId,
         obj_str: &str,
         path: &str,
