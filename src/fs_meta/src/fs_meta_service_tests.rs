@@ -276,6 +276,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_session_cache() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        for i in 0..3 {
+            let child = create_dir_node(550 + i);
+            svc.handle_set_inode(child.clone(), None, ctx.clone())
+                .await
+                .unwrap();
+            svc.handle_upsert_dentry(
+                root,
+                format!("entry_{}", i),
+                DentryTarget::IndexNodeId(550 + i),
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let list_session_id = svc
+            .handle_start_list(root, None, ctx.clone())
+            .await
+            .unwrap();
+        let page1 = svc
+            .handle_list_next(list_session_id, 2, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1[0].name, "entry_0");
+        assert_eq!(page1[1].name, "entry_1");
+        assert!(page1.iter().all(|v| v.inode.is_some()));
+
+        let page2 = svc
+            .handle_list_next(list_session_id, 2, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].name, "entry_2");
+
+        svc.handle_stop_list(list_session_id, ctx.clone())
+            .await
+            .unwrap();
+        let err = svc.handle_list_next(list_session_id, 1, ctx).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
     async fn test_remove_dentry_row() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();

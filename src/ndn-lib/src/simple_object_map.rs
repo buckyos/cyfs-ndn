@@ -7,8 +7,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
-
-
 #[derive(Debug, Clone)]
 pub enum SimpleMapItem {
     //obj type,obj value

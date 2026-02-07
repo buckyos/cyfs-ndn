@@ -886,10 +886,7 @@ async fn open_store_chunk_reader_with_fallback(
     local_mode: bool,
     open_chunk_reader: Option<OpenChunkReader>,
 ) -> NdnResult<ChunkReader> {
-    match named_store_mgr
-        .open_chunk_reader(&chunk_id, offset)
-        .await
-    {
+    match named_store_mgr.open_chunk_reader(&chunk_id, offset).await {
         Ok((reader, _)) => Ok(reader),
         Err(open_err) => {
             if local_mode {

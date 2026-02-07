@@ -5,16 +5,16 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
 use crate::{PackageId, PkgError, PkgResult};
-use name_lib::{DID, EncodedDocument};
+use name_lib::{EncodedDocument, DID};
 
-fn is_zero(value:&u64)->bool {
+fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PackageMeta {
     #[serde(flatten)]
-    pub _base : FileObject,
+    pub _base: FileObject,
 
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,8 +24,7 @@ pub struct PackageMeta {
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     //key = pkg_name,value = version_req_str,like ">1.0.0-alpha"
-    pub deps: HashMap<String, String>,     
-
+    pub deps: HashMap<String, String>,
 }
 
 impl Deref for PackageMeta {
@@ -42,8 +41,13 @@ impl DerefMut for PackageMeta {
 }
 
 impl PackageMeta {
-
-    pub fn new(pkg_name: &str, version: &str, author: &str, owner: &DID, tag: Option<&str>) -> Self {
+    pub fn new(
+        pkg_name: &str,
+        version: &str,
+        author: &str,
+        owner: &DID,
+        tag: Option<&str>,
+    ) -> Self {
         let now = buckyos_kit::buckyos_get_unix_timestamp();
         let exp = now + 3600 * 24 * 30;
         let mut base = FileObject::new(pkg_name.to_string(), 0, String::new());
@@ -64,7 +68,8 @@ impl PackageMeta {
         let pkg_meta_doc = EncodedDocument::from_str(meta_str.to_string())
             .map_err(|e| PkgError::ParseError(meta_str.to_string(), e.to_string()))?;
 
-        let pkg_json = pkg_meta_doc.to_json_value()
+        let pkg_json = pkg_meta_doc
+            .to_json_value()
             .map_err(|e| PkgError::ParseError(meta_str.to_string(), e.to_string()))?;
 
         let meta: PackageMeta = serde_json::from_value(pkg_json)
@@ -86,7 +91,6 @@ impl PackageMeta {
             PackageId::parse(&package_id_str).unwrap()
         }
     }
-
 }
 
 impl NamedObject for PackageMeta {
@@ -96,14 +100,13 @@ impl NamedObject for PackageMeta {
 }
 
 pub struct PackageMetaNode {
-    pub meta_jwt:String,
-    pub pkg_name:String,
-    pub version:String,
-    pub tag:Option<String>,
-    pub author:String,
-    pub author_pk:String,
+    pub meta_jwt: String,
+    pub pkg_name: String,
+    pub version: String,
+    pub tag: Option<String>,
+    pub author: String,
+    pub author_pk: String,
 }
-
 
 mod tests {
     use super::*;
@@ -111,7 +114,7 @@ mod tests {
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
     struct MyPackageMeta {
         #[serde(flatten)]
-        pub _base : PackageMeta,
+        pub _base: PackageMeta,
         pub sub_deps: HashMap<String, String>,
     }
 
@@ -126,7 +129,6 @@ mod tests {
             &mut self._base
         }
     }
-
 
     #[test]
     fn test_package_meta_serde_and_fileobj_compat() {
@@ -146,7 +148,6 @@ mod tests {
         assert_eq!(meta2._base.size, 123);
         assert_eq!(meta2._base.content, "mix256:deadbeef");
         assert_eq!(meta2.deps.get("dep1").map(|s| s.as_str()), Some(">=1.0.0"));
-
 
         // 同一份 JSON 也应当能反序列化成 FileObject（PackageMeta 的额外字段会被忽略）
         let file_obj: FileObject = serde_json::from_str(&json_str).unwrap();
@@ -188,14 +189,22 @@ mod tests {
             .and_then(|v| v.as_object())
             .and_then(|m| m.get("dep2"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| "meta.sub_deps.dep2 missing or not a string").unwrap();
+            .ok_or_else(|| "meta.sub_deps.dep2 missing or not a string")
+            .unwrap();
         assert_eq!(dep2, ">=2.0.0");
-    
+
         let meta4_str = serde_json::to_string_pretty(&meta4).unwrap();
         //println!("meta4_str: {}", meta4_str);
-        
+
         let file_obj4: FileObject = serde_json::from_str(meta4_str.as_str()).unwrap();
-        let dep2 = file_obj4.meta.get("sub_deps").and_then(|v| v.as_object()).and_then(|m| m.get("dep2")).and_then(|v| v.as_str()).ok_or_else(|| "meta.sub_deps.dep2 missing or not a string").unwrap();
+        let dep2 = file_obj4
+            .meta
+            .get("sub_deps")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get("dep2"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "meta.sub_deps.dep2 missing or not a string")
+            .unwrap();
         assert_eq!(dep2, ">=2.0.0");
         let file_obj4_str = serde_json::to_string_pretty(&file_obj4).unwrap();
         println!("file_obj4_str: {}", file_obj4_str);
@@ -205,7 +214,14 @@ mod tests {
         let my_meta4_str = serde_json::to_string_pretty(&my_meta4).unwrap();
         println!("my_meta4_str: {}", my_meta4_str);
         let my_meta4_file_obj: FileObject = serde_json::from_str(my_meta4_str.as_str()).unwrap();
-        let dep2 = my_meta4_file_obj.meta.get("sub_deps").and_then(|v| v.as_object()).and_then(|m| m.get("dep2")).and_then(|v| v.as_str()).ok_or_else(|| "meta.sub_deps.dep2 missing or not a string").unwrap();
+        let dep2 = my_meta4_file_obj
+            .meta
+            .get("sub_deps")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get("dep2"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "meta.sub_deps.dep2 missing or not a string")
+            .unwrap();
         assert_eq!(dep2, ">=2.0.0");
         let my_meta4_file_obj_str = serde_json::to_string_pretty(&my_meta4_file_obj).unwrap();
         println!("my_meta4_file_obj_str: {}", my_meta4_file_obj_str);

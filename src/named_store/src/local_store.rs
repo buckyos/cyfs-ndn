@@ -322,7 +322,6 @@ impl NamedLocalStore {
         }
     }
 
-
     pub async fn open_chunk_reader(
         &self,
         chunk_id: &ChunkId,
@@ -664,9 +663,7 @@ impl NamedLocalStore {
         chunk_size: u64,
         reader: &mut ChunkReader,
     ) -> NdnResult<()> {
-        let mut chunk_writer = self
-            .open_new_chunk_writer(chunk_id, chunk_size)
-            .await?;
+        let mut chunk_writer = self.open_new_chunk_writer(chunk_id, chunk_size).await?;
         let mut limited = reader.take(chunk_size);
         let copy_bytes = tokio::io::copy(&mut limited, &mut chunk_writer).await?;
         if copy_bytes != chunk_size {
@@ -832,7 +829,6 @@ impl NamedLocalStore {
         let prefix = &file_name[0..2.min(file_name.len())];
         self.chunk_dir.join(prefix).join(file_name)
     }
-
 }
 
 fn current_unix_ts() -> u64 {
@@ -845,7 +841,7 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{build_named_object_by_json, ChunkHasher, MIN_QCID_FILE_SIZE, SimpleChunkList};
+    use ndn_lib::{build_named_object_by_json, ChunkHasher, SimpleChunkList, MIN_QCID_FILE_SIZE};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -868,10 +864,7 @@ mod tests {
 
         store.put_chunk(&chunk_id, &data, true).await.unwrap();
 
-        let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0)
-            .await
-            .unwrap();
+        let (mut reader, size) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
         assert_eq!(size, data.len() as u64);
         let mut read_back = Vec::new();
         reader.read_to_end(&mut read_back).await.unwrap();
@@ -989,10 +982,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0)
-            .await
-            .unwrap();
+        let (mut reader, size) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
         assert_eq!(size, data.len() as u64);
         let mut read_back = Vec::new();
         reader.read_to_end(&mut read_back).await.unwrap();
@@ -1108,10 +1098,7 @@ mod tests {
         writer.flush().await.unwrap();
         store.complete_chunk_writer(&chunk_id).await.unwrap();
 
-        let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0)
-            .await
-            .unwrap();
+        let (mut reader, size) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
         assert_eq!(size, chunk_size);
 
         let hasher = ChunkHasher::new(None).unwrap();

@@ -119,7 +119,6 @@ impl RelationObject {
             }
         }
     }
-
 }
 
 impl NamedObject for RelationObject {

@@ -27,7 +27,7 @@ def env.load(pkg_id):
             pkg_strict_dir = get_pkg_strict_dir(pkg_meta)
             if os.exist(pkg_strict_dir)
                 return PkgMediaInfo(pkg_strict_dir)
-        
+
     if not self.strict_mode:
         pkg_dir = get_pkg_dir(pkg_id)
         if pkg_dir:
@@ -69,7 +69,7 @@ def env.check_pkg_ready(pkg_id,need_check_deps):
         for pkg_id in deps:
             if not check_pkg_ready(pkg_id,false):
                 return false
-        
+
         return true
 # 在env中安装pkg
 def env.install_pkg(pkg_id,install_deps)
@@ -89,7 +89,7 @@ def env.install_pkg(pkg_id,install_deps)
     if is_new_task && install_deps:
         for pkg_id in deps:
             env.install_task.insert_sub_task(pkg_id,task_id)
-        
+
     return task_id,is_new_task
 
 # 内部函数，从install_task队列中提取任务执行
@@ -120,36 +120,34 @@ def env.try_update_index_db(new_index_db):
 
 */
 
+use async_trait::async_trait;
+use fs_extra::dir::*;
+use log::*;
 use name_lib::EncodedDocument;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tokio::fs as tokio_fs;
-use tokio::sync::{Mutex as TokioMutex, oneshot};
-use async_trait::async_trait;
-use log::*;
-use fs_extra::dir::*;
+use tokio::sync::{oneshot, Mutex as TokioMutex};
 
 //use std::fs::File;
 //use std::io;
-use tokio::io::AsyncReadExt;
-use tokio::fs::File;
 use async_compression::tokio::bufread::GzipDecoder;
+use async_fd_lock::RwLockWriteGuard;
+use async_fd_lock::{LockRead, LockWrite};
+use named_store::NamedStoreMgr;
+use ndn_lib::*;
+use tokio::fs::File;
+use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
 use tokio_tar::Archive;
-use async_fd_lock::{LockRead, LockWrite};
-use async_fd_lock::RwLockWriteGuard;
-use ndn_lib::*;
-use named_store::NamedStoreMgr;
 
 use crate::error::*;
 use crate::meta::*;
-use crate::package_id::*;
 use crate::meta_index_db::*;
-
-
+use crate::package_id::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageEnvConfig {
@@ -158,12 +156,12 @@ pub struct PackageEnvConfig {
     pub enable_link: bool,
     pub enable_strict_mode: bool,
     pub index_db_path: Option<String>,
-    pub parent: Option<PathBuf>, //parent package env work_dir
-    pub ready_only: bool,//read only env cann't install any new pkgs
+    pub parent: Option<PathBuf>,        //parent package env work_dir
+    pub ready_only: bool,               //read only env cann't install any new pkgs
     pub named_mgr_name: Option<String>, //如果指定了，则使用named_mgr_name作为默认read chunk的named_mgr
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     #[serde(default)]
-    pub installed:HashSet<String>, //pkg_id列表，表示已经安装的pkg
+    pub installed: HashSet<String>, //pkg_id列表，表示已经安装的pkg
 }
 
 impl PackageEnvConfig {
@@ -188,7 +186,6 @@ impl PackageEnvConfig {
         let os_type = "nightly-apple-aarch64";
 
         os_type.to_string()
-   
     }
 }
 
@@ -200,7 +197,7 @@ impl Default for PackageEnvConfig {
             enable_link: true,
             enable_strict_mode: false, //默认是非严格的开发模式
             index_db_path: None,
-            parent: None,   
+            parent: None,
             ready_only: false,
             named_mgr_name: None,
             prefix: Some(os_type.to_string()),
@@ -227,10 +224,8 @@ pub struct PackageEnv {
     pub work_dir: PathBuf,
     pub config: PackageEnvConfig,
     is_dev_mode: bool,
-    lock_db: Arc<TokioMutex<Option<HashMap<String, (String,PackageMeta)>>>>,
+    lock_db: Arc<TokioMutex<Option<HashMap<String, (String, PackageMeta)>>>>,
 }
-
-
 
 impl PackageEnv {
     pub fn new(work_dir: PathBuf) -> Self {
@@ -242,33 +237,49 @@ impl PackageEnv {
             if config.is_ok() {
                 let config = config.unwrap();
                 let config_result = serde_json::from_str(&config);
-                if  config_result.is_ok() {
+                if config_result.is_ok() {
                     env_config = config_result.unwrap();
                     is_dev_mode = false;
                     debug!("pkg_env {} load pkg.cfg.json OK.", work_dir.display());
                     if env_config.parent.is_some() {
                         if env_config.parent.as_ref().unwrap().is_relative() {
-                            let parent_path = format!("{}/{}", work_dir.display(), env_config.parent.as_ref().unwrap().display());
+                            let parent_path = format!(
+                                "{}/{}",
+                                work_dir.display(),
+                                env_config.parent.as_ref().unwrap().display()
+                            );
                             let parent_path = buckyos_kit::normalize_path(&parent_path);
                             let parent_path = PathBuf::from(parent_path);
-                            debug!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
+                            debug!(
+                                "pkg_env {} parent abs path: {}",
+                                work_dir.display(),
+                                parent_path.display()
+                            );
                             env_config.parent = Some(parent_path);
                         } else {
                             let parent_path = env_config.parent.as_ref().unwrap();
-                            debug!("pkg_env {} parent abs path: {}", work_dir.display(), parent_path.display());
+                            debug!(
+                                "pkg_env {} parent abs path: {}",
+                                work_dir.display(),
+                                parent_path.display()
+                            );
                         }
                     }
                 } else {
-                    warn!("pkg_env {} load pkg.cfg.json failed. {}", work_dir.display(),config_result.err().unwrap());
+                    warn!(
+                        "pkg_env {} load pkg.cfg.json failed. {}",
+                        work_dir.display(),
+                        config_result.err().unwrap()
+                    );
                 }
             }
-        } 
-        
+        }
+
         Self {
             work_dir,
             config: env_config,
             is_dev_mode: is_dev_mode,
-            lock_db: Arc::new(TokioMutex::new(None))
+            lock_db: Arc::new(TokioMutex::new(None)),
         }
     }
 
@@ -280,7 +291,7 @@ impl PackageEnv {
         self.config.enable_strict_mode
     }
 
-    pub fn update_config_file(&self,config: &PackageEnvConfig) -> PkgResult<()> {
+    pub fn update_config_file(&self, config: &PackageEnvConfig) -> PkgResult<()> {
         let config_path = self.work_dir.join("pkg.cfg.json");
         if config_path.exists() {
             let config_str = serde_json::to_string(config).unwrap();
@@ -295,30 +306,30 @@ impl PackageEnv {
     }
 
     // 基于env获得pkg的meta信息
-    pub async fn get_pkg_meta(&self, pkg_id: &str) -> PkgResult<(String,PackageMeta)> {
+    pub async fn get_pkg_meta(&self, pkg_id: &str) -> PkgResult<(String, PackageMeta)> {
         // 先检查lock db
         let pkg_id = PackageId::parse(pkg_id)?;
         let pkg_id = self.prefix_pkg_id(&pkg_id);
         let pkg_id_str = pkg_id.to_string();
         if let Some(lock_db) = self.lock_db.lock().await.as_ref() {
-            if let Some((meta_obj_id,meta)) = lock_db.get(&pkg_id_str) {
-                return Ok((meta_obj_id.clone(),meta.clone()));
+            if let Some((meta_obj_id, meta)) = lock_db.get(&pkg_id_str) {
+                return Ok((meta_obj_id.clone(), meta.clone()));
             }
         }
 
         let meta_db_path = self.get_meta_db_path();
         //info!("get meta db from {}", meta_db_path.display());
-        let meta_db = MetaIndexDb::new(meta_db_path,true)?;
-        if let Some((meta_obj_id,pkg_meta)) = meta_db.get_pkg_meta(&pkg_id_str)? {
-             return Ok((meta_obj_id,pkg_meta));
+        let meta_db = MetaIndexDb::new(meta_db_path, true)?;
+        if let Some((meta_obj_id, pkg_meta)) = meta_db.get_pkg_meta(&pkg_id_str)? {
+            return Ok((meta_obj_id, pkg_meta));
         }
 
         if self.config.parent.is_some() {
             let parent_env = PackageEnv::new(self.config.parent.as_ref().unwrap().clone());
-            let (meta_obj_id,pkg_meta) = Box::pin(parent_env.get_pkg_meta(&pkg_id_str)).await?;
-            return Ok((meta_obj_id,pkg_meta));
+            let (meta_obj_id, pkg_meta) = Box::pin(parent_env.get_pkg_meta(&pkg_id_str)).await?;
+            return Ok((meta_obj_id, pkg_meta));
         }
-        
+
         Err(PkgError::LoadError(
             pkg_id_str,
             "Package metadata not found".to_owned(),
@@ -349,9 +360,17 @@ impl PackageEnv {
                             return Ok(media_info);
                         }
                     }
-                    warn!("load strict pkg {} failed:{}", pkg_id_str,error.to_string());
+                    warn!(
+                        "load strict pkg {} failed:{}",
+                        pkg_id_str,
+                        error.to_string()
+                    );
                 } else {
-                    debug!("dev mode env {} : try load pkg: {}", self.work_dir.display(), pkg_id_str);
+                    debug!(
+                        "dev mode env {} : try load pkg: {}",
+                        self.work_dir.display(),
+                        pkg_id_str
+                    );
                     let media_info = self.dev_try_load(pkg_id_str).await;
                     if media_info.is_ok() {
                         return Ok(media_info.unwrap());
@@ -363,33 +382,48 @@ impl PackageEnv {
                             return Ok(media_info);
                         }
                     }
-                    warn!("load dev mode pkg {} failed:{}", pkg_id_str,error.to_string());
+                    warn!(
+                        "load dev mode pkg {} failed:{}",
+                        pkg_id_str,
+                        error.to_string()
+                    );
                 }
-                
+
                 Err(PkgError::LoadError(
                     pkg_id_str.to_owned(),
-                    format!("Package {} metadata not found : {}",pkg_id_str,error.to_string()),
+                    format!(
+                        "Package {} metadata not found : {}",
+                        pkg_id_str,
+                        error.to_string()
+                    ),
                 ))
-
             }
         }
     }
 
-    pub async fn cacl_pkg_deps_metas(&self,pkg_meta: &PackageMeta,deps: &mut HashMap<String,PackageMeta>) -> PkgResult<()> {
+    pub async fn cacl_pkg_deps_metas(
+        &self,
+        pkg_meta: &PackageMeta,
+        deps: &mut HashMap<String, PackageMeta>,
+    ) -> PkgResult<()> {
         for (dep_name, dep_version) in pkg_meta.deps.iter() {
             let dep_id = format!("{}#{}", dep_name, dep_version);
-            let (meta_obj_id,dep_meta) = self.get_pkg_meta(&dep_id).await?;
-            let next_future = Box::pin(self.cacl_pkg_deps_metas(&dep_meta,deps));
+            let (meta_obj_id, dep_meta) = self.get_pkg_meta(&dep_id).await?;
+            let next_future = Box::pin(self.cacl_pkg_deps_metas(&dep_meta, deps));
             let _ = next_future.await?;
-            deps.insert(meta_obj_id,dep_meta);
+            deps.insert(meta_obj_id, dep_meta);
         }
         Ok(())
     }
-    
 
     //检查pkg的依赖是否都已经在本机就绪，注意本操作并不会修改env
-    pub async fn check_pkg_ready(meta_index_db: &PathBuf, pkg_id: &str, store_mgr: &NamedStoreMgr,miss_chunk_list: &mut Vec<ChunkId>) -> PkgResult<()> {
-        let meta_db = MetaIndexDb::new(meta_index_db.clone(),true)?;
+    pub async fn check_pkg_ready(
+        meta_index_db: &PathBuf,
+        pkg_id: &str,
+        store_mgr: &NamedStoreMgr,
+        miss_chunk_list: &mut Vec<ChunkId>,
+    ) -> PkgResult<()> {
+        let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
         let meta_info = meta_db.get_pkg_meta(pkg_id)?;
         if meta_info.is_none() {
             return Err(PkgError::LoadError(
@@ -398,16 +432,14 @@ impl PackageEnv {
             ));
         }
 
-        let (meta_obj_id,pkg_meta) = meta_info.unwrap();
+        let (meta_obj_id, pkg_meta) = meta_info.unwrap();
         // 检查chunk是否存在
         if !pkg_meta.content.is_empty() {
             let chunk_id_str = pkg_meta.content.clone();
             info!("check chunk {} exist", chunk_id_str);
-            let chunk_id = ChunkId::new(&chunk_id_str)
-                .map_err(|e| PkgError::ParseError(
-                    pkg_id.to_owned(),
-                    format!("Invalid chunk id: {}", e),
-                ))?;
+            let chunk_id = ChunkId::new(&chunk_id_str).map_err(|e| {
+                PkgError::ParseError(pkg_id.to_owned(), format!("Invalid chunk id: {}", e))
+            })?;
 
             let is_chunk_exist = store_mgr.have_chunk(&chunk_id).await;
             if !is_chunk_exist {
@@ -428,7 +460,7 @@ impl PackageEnv {
 
         let _lock = self.acquire_lock().await?;
 
-        let mut index_db_path = self.get_meta_db_path();    
+        let mut index_db_path = self.get_meta_db_path();
         let backup_path = index_db_path.with_extension("old");
         if tokio_fs::metadata(&backup_path).await.is_ok() {
             tokio_fs::remove_file(&backup_path).await?;
@@ -437,7 +469,10 @@ impl PackageEnv {
 
         if tokio_fs::metadata(&index_db_path).await.is_ok() {
             let backup_path = index_db_path.with_extension("old");
-            info!("rename old index db: {:?} to {:?}", index_db_path, backup_path);
+            info!(
+                "rename old index db: {:?} to {:?}",
+                index_db_path, backup_path
+            );
             tokio_fs::rename(&index_db_path, &backup_path).await?;
         }
 
@@ -447,8 +482,12 @@ impl PackageEnv {
         Ok(())
     }
 
-
-    async fn install_pkg_impl(&mut self, meta_obj_id: &str,pkg_meta: &PackageMeta,force_install: bool) -> PkgResult<()> {
+    async fn install_pkg_impl(
+        &mut self,
+        meta_obj_id: &str,
+        pkg_meta: &PackageMeta,
+        force_install: bool,
+    ) -> PkgResult<()> {
         let pkg_id = pkg_meta.get_package_id().to_string();
         //检查chunk是否存在
         if !pkg_meta.content.is_empty() {
@@ -494,11 +533,16 @@ impl PackageEnv {
         Ok(())
     }
 
-    pub async fn install_pkg_from_local_file(&mut self, pkg_meta_content: &str,local_file: &Path,is_skip_chunk_check: bool) -> PkgResult<()> {
+    pub async fn install_pkg_from_local_file(
+        &mut self,
+        pkg_meta_content: &str,
+        local_file: &Path,
+        is_skip_chunk_check: bool,
+    ) -> PkgResult<()> {
         //这种安装模式不会检查dep
         //安装后,pkg_meta会写入当前env的meta-index-db中
         //local_file指向的是tar.gz的本地文件路径,用只读方法打开
-        
+
         if self.config.ready_only {
             return Err(PkgError::InstallError(
                 local_file.display().to_string(),
@@ -509,31 +553,50 @@ impl PackageEnv {
         // 获取文件锁
         let _filelock = self.acquire_lock().await?;
         let pkg_meta = PackageMeta::from_str(pkg_meta_content)?;
-        let (meta_obj_id,pkg_meta_str) = pkg_meta.gen_obj_id();
+        let (meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
 
         // 打开本地 tar.gz 文件
-        let file = File::open(local_file).await
-            .map_err(|e| PkgError::FileNotFoundError(
-                format!("Failed to open local file {}: {}", local_file.display(), e),
-            ))?;
+        let file = File::open(local_file).await.map_err(|e| {
+            PkgError::FileNotFoundError(format!(
+                "Failed to open local file {}: {}",
+                local_file.display(),
+                e
+            ))
+        })?;
 
         // 创建 ChunkReader
         let chunk_reader: ChunkReader = Box::pin(file);
-        
+
         // 解压 tar.gz 文件到目标目录
-        self.do_install_pkg_from_data(&pkg_meta, &meta_obj_id, chunk_reader, false).await?;
+        self.do_install_pkg_from_data(&pkg_meta, &meta_obj_id, chunk_reader, false)
+            .await?;
 
         // 将 pkg_meta 写入 meta_index.db
         let meta_db_path = self.get_meta_db_path();
         let meta_db = MetaIndexDb::new(meta_db_path, false)?;
-        
-        // 添加包元数据
-        meta_db.add_pkg_meta(&meta_obj_id.to_string(), &pkg_meta_str, &pkg_meta.author, None)?;
-        
-        // 设置包版本
-        meta_db.set_pkg_version(&pkg_meta.name, &pkg_meta.author, &pkg_meta.version, &meta_obj_id.to_string(), pkg_meta.version_tag.as_deref())?;
 
-        info!("install_pkg_from_local_file: pkg {} installed successfully from {}", pkg_meta.name, local_file.display());
+        // 添加包元数据
+        meta_db.add_pkg_meta(
+            &meta_obj_id.to_string(),
+            &pkg_meta_str,
+            &pkg_meta.author,
+            None,
+        )?;
+
+        // 设置包版本
+        meta_db.set_pkg_version(
+            &pkg_meta.name,
+            &pkg_meta.author,
+            &pkg_meta.version,
+            &meta_obj_id.to_string(),
+            pkg_meta.version_tag.as_deref(),
+        )?;
+
+        info!(
+            "install_pkg_from_local_file: pkg {} installed successfully from {}",
+            pkg_meta.name,
+            local_file.display()
+        );
 
         Ok(())
     }
@@ -544,7 +607,12 @@ impl PackageEnv {
     //安装过程会根据env是否支持符号链接，尝试建立有好的符号链接
     //在parent envinstall pkg成功，会对所有的child env都有影响
     //在child env install pkg成功，对parent env没有影响
-    pub async fn install_pkg(&mut self, pkg_id: &str, install_deps: bool,force_install: bool) -> PkgResult<String> {
+    pub async fn install_pkg(
+        &mut self,
+        pkg_id: &str,
+        install_deps: bool,
+        force_install: bool,
+    ) -> PkgResult<String> {
         if self.config.ready_only {
             return Err(PkgError::InstallError(
                 pkg_id.to_owned(),
@@ -554,7 +622,7 @@ impl PackageEnv {
         // 获取文件锁
         let _filelock = self.acquire_lock().await?;
         //先将必要的chunk下载到named_mgr中,对于单OOD系统，这些chunk可能都已经准备好了
-        let (meta_obj_id,pkg_meta) = self.get_pkg_meta(pkg_id).await?;
+        let (meta_obj_id, pkg_meta) = self.get_pkg_meta(pkg_id).await?;
 
         let will_install_pkg_id = pkg_meta.get_package_id();
         // if self.config.installed.insert(will_install_pkg_id.to_string()) {
@@ -565,36 +633,39 @@ impl PackageEnv {
         if install_deps {
             info!("install deps for pkg {}", pkg_id);
             let mut deps = HashMap::new();
-            self.cacl_pkg_deps_metas(&pkg_meta,&mut deps).await?;
+            self.cacl_pkg_deps_metas(&pkg_meta, &mut deps).await?;
 
             for (dep_meta_obj_id, dep_pkg_meta) in deps.iter() {
-                info!("install dep pkg {}#{}", dep_pkg_meta.name, dep_pkg_meta.version);
-                
-                let install_result = self.install_pkg_impl(dep_meta_obj_id.as_str(), &dep_pkg_meta, force_install).await;
+                info!(
+                    "install dep pkg {}#{}",
+                    dep_pkg_meta.name, dep_pkg_meta.version
+                );
+
+                let install_result = self
+                    .install_pkg_impl(dep_meta_obj_id.as_str(), &dep_pkg_meta, force_install)
+                    .await;
                 match install_result {
-                    Ok(_) => {},
-                    Err(e) => {
-                        match e {
-                            PkgError::PackageAlreadyInstalled(pkg_id) => {
-                                info!("dep pkg {} already installed, skip", pkg_id);
-                                continue;
-                            }
-                            _ => {
-                                return Err(e);
-                            }
+                    Ok(_) => {}
+                    Err(e) => match e {
+                        PkgError::PackageAlreadyInstalled(pkg_id) => {
+                            info!("dep pkg {} already installed, skip", pkg_id);
+                            continue;
                         }
-                    }
+                        _ => {
+                            return Err(e);
+                        }
+                    },
                 }
             }
         }
 
-        
-        self.install_pkg_impl(&meta_obj_id,&pkg_meta,force_install).await?;
-        Ok(meta_obj_id)   
+        self.install_pkg_impl(&meta_obj_id, &pkg_meta, force_install)
+            .await?;
+        Ok(meta_obj_id)
     }
 
-    pub fn is_latest_version(&self,pkg_id: &PackageId) -> PkgResult<bool> {
-        let meta_db = MetaIndexDb::new(self.get_meta_db_path(),true)?;
+    pub fn is_latest_version(&self, pkg_id: &PackageId) -> PkgResult<bool> {
+        let meta_db = MetaIndexDb::new(self.get_meta_db_path(), true)?;
         let is_latest = meta_db.is_latest_version(pkg_id)?;
         if is_latest {
             if self.config.parent.is_some() {
@@ -608,11 +679,17 @@ impl PackageEnv {
         Ok(false)
     }
 
-    async fn do_install_pkg_from_data(&self, pkg_meta: &PackageMeta,meta_obj_id: &ObjId,chunk_reader: ChunkReader,force_install: bool) -> PkgResult<()> {
+    async fn do_install_pkg_from_data(
+        &self,
+        pkg_meta: &PackageMeta,
+        meta_obj_id: &ObjId,
+        chunk_reader: ChunkReader,
+        force_install: bool,
+    ) -> PkgResult<()> {
         //将chunk (这是一个tar.gz文件)解压安装到真实目录 pkgs/pkg_nameA/$meta_obj_id
         //注意处理前缀: 如果包名与当前env前缀相同，那么符号链接里只包含无前缀部分
         //如果是最新版本，建立符号链接 ./pkg_nameA -> pkgs/pkg_nameA/$meta_obj_id/
-        info!("extract pkg {} from chunk",pkg_meta.name.as_str());
+        info!("extract pkg {} from chunk", pkg_meta.name.as_str());
 
         let buf_reader = BufReader::new(chunk_reader);
         let gz_decoder = GzipDecoder::new(buf_reader);
@@ -622,17 +699,21 @@ impl PackageEnv {
             let target_dir = self.work_dir.join(synlink_target.clone());
             if target_dir.exists() {
                 if force_install {
-                    info!("force install pkg {}, remove target dir {}", meta_obj_id, target_dir.display());
+                    info!(
+                        "force install pkg {}, remove target dir {}",
+                        meta_obj_id,
+                        target_dir.display()
+                    );
                     tokio::fs::remove_dir_all(&target_dir).await;
                 } else {
                     return Err(PkgError::PackageAlreadyInstalled(meta_obj_id.to_string()));
-                } 
+                }
             }
 
             tokio::fs::create_dir_all(&target_dir).await?;
-            archive.unpack(&target_dir).await?;     
+            archive.unpack(&target_dir).await?;
         }
-        
+
         let pkg_id = pkg_meta.get_package_id();
         let link_pkg_name;
         if pkg_meta.name.starts_with(self.get_prefix().as_str()) {
@@ -640,11 +721,12 @@ impl PackageEnv {
         } else {
             link_pkg_name = pkg_meta.name.clone();
         }
-        
+
         let friendly_path = if self.is_latest_version(&pkg_id)? {
             self.work_dir.join(format!("./{}", link_pkg_name))
         } else {
-            self.work_dir.join(format!("./{}#{}", link_pkg_name, pkg_meta.version))
+            self.work_dir
+                .join(format!("./{}#{}", link_pkg_name, pkg_meta.version))
         };
 
         if self.config.enable_link {
@@ -661,17 +743,25 @@ impl PackageEnv {
             tokio::fs::symlink(&synlink_target, &friendly_path).await?;
             #[cfg(target_family = "windows")]
             std::os::windows::fs::symlink_dir(&synlink_target, &friendly_path)?;
-            info!("create friendly symlink: {} -> {}", friendly_path.display(), synlink_target.as_str());
+            info!(
+                "create friendly symlink: {} -> {}",
+                friendly_path.display(),
+                synlink_target.as_str()
+            );
         } else {
             if friendly_path.exists() {
                 info!("remove friendly dir: {}", friendly_path.display());
                 tokio::fs::remove_dir_all(&friendly_path).await?;
             }
             tokio::fs::create_dir_all(&friendly_path).await?;
-            archive.unpack(&friendly_path).await?;     
-            info!("extract pkg {} to friendly path {} OK.", pkg_meta.name.as_str(), friendly_path.display());
+            archive.unpack(&friendly_path).await?;
+            info!(
+                "extract pkg {} to friendly path {} OK.",
+                pkg_meta.name.as_str(),
+                friendly_path.display()
+            );
         }
-        
+
         Ok(())
     }
 
@@ -688,11 +778,11 @@ impl PackageEnv {
         let pkg_id = self.prefix_pkg_id(&pkg_id);
         // 在严格模式下，先获取包的元数据以获得准确的物理目录
         let real_pkg_id = pkg_id.to_string();
-        let (meta_obj_id,pkg_meta) = self.get_pkg_meta(&real_pkg_id).await?;
-        
+        let (meta_obj_id, pkg_meta) = self.get_pkg_meta(&real_pkg_id).await?;
+
         // 使用元数据中的信息构建准确的物理路径
-        let pkg_strict_dir = self.get_pkg_strict_dir(&meta_obj_id,&pkg_meta)?;
-        
+        let pkg_strict_dir = self.get_pkg_strict_dir(&meta_obj_id, &pkg_meta)?;
+
         if tokio_fs::metadata(&pkg_strict_dir).await.is_ok() {
             let metadata = tokio_fs::metadata(&pkg_strict_dir).await?;
             let media_type = if metadata.is_dir() {
@@ -700,20 +790,19 @@ impl PackageEnv {
             } else {
                 MediaType::File
             };
-            
+
             return Ok(MediaInfo {
                 pkg_id,
                 full_path: pkg_strict_dir,
                 media_type,
             });
         }
-        
+
         Err(PkgError::LoadError(
             pkg_id_str.to_owned(),
             "pkg not found in strict mode".to_owned(),
         ))
     }
-
 
     async fn dev_try_load(&self, pkg_id_str: &str) -> PkgResult<MediaInfo> {
         let pkg_dirs = self.get_pkg_dir(pkg_id_str)?;
@@ -734,7 +823,6 @@ impl PackageEnv {
         ))
     }
 
-
     fn get_install_dir(&self) -> PathBuf {
         self.work_dir.join("pkgs")
     }
@@ -749,26 +837,33 @@ impl PackageEnv {
         meta_db_path
     }
 
-
-    fn get_pkg_strict_dir(&self, meta_obj_id: &str,pkg_meta: &PackageMeta) -> PkgResult<PathBuf> {
+    fn get_pkg_strict_dir(&self, meta_obj_id: &str, pkg_meta: &PackageMeta) -> PkgResult<PathBuf> {
         let pkg_name = pkg_meta.name.clone();
         let real_obj_id = ObjId::new(meta_obj_id)
-            .map_err(|e| PkgError::ParseError(meta_obj_id.to_string(),e.to_string()))?;
+            .map_err(|e| PkgError::ParseError(meta_obj_id.to_string(), e.to_string()))?;
         //pkgs/pkg_nameA/$meta_obj_id
-        Ok(self.get_install_dir().join(pkg_name).join(real_obj_id.to_filename()))
+        Ok(self
+            .get_install_dir()
+            .join(pkg_name)
+            .join(real_obj_id.to_filename()))
     }
 
     fn get_pkg_dir(&self, pkg_id: &str) -> PkgResult<Vec<PathBuf>> {
         let pkg_id = PackageId::parse(pkg_id)?;
         let pkg_name = pkg_id.name.clone();
         let mut pkg_dirs = Vec::new();
-        
+
         if pkg_id.objid.is_some() {
-            pkg_dirs.push(self.get_install_dir().join("pkgs").join(pkg_name).join(pkg_id.objid.unwrap()));
+            pkg_dirs.push(
+                self.get_install_dir()
+                    .join("pkgs")
+                    .join(pkg_name)
+                    .join(pkg_id.objid.unwrap()),
+            );
         } else {
             if pkg_id.version_exp.is_some() {
-               //TODO: 要考虑如何结合lock文件进行查找
-               pkg_dirs.push(self.get_install_dir().join(pkg_name));
+                //TODO: 要考虑如何结合lock文件进行查找
+                pkg_dirs.push(self.get_install_dir().join(pkg_name));
             } else {
                 pkg_dirs.push(self.work_dir.join(pkg_name));
             }
@@ -779,10 +874,13 @@ impl PackageEnv {
     // 添加一个新的私有方法来管理锁文件
     async fn acquire_lock(&self) -> PkgResult<RwLockWriteGuard<File>> {
         let lock_path = self.work_dir.join("pkgs/env.lock");
-        
+
         // 确保pkgs目录存在
         if let Err(e) = tokio_fs::create_dir_all(self.work_dir.join("pkgs")).await {
-            return Err(PkgError::LockError(format!("Failed to create lock directory: {}", e)));
+            return Err(PkgError::LockError(format!(
+                "Failed to create lock directory: {}",
+                e
+            )));
         }
 
         // 以读写模式打开或创建锁文件
@@ -790,11 +888,13 @@ impl PackageEnv {
             .read(true)
             .write(true)
             .create(true)
-            .open(&lock_path).await
+            .open(&lock_path)
+            .await
             .map_err(|e| PkgError::LockError(format!("Failed to open lock file: {}", e)))?;
-        
-        let lock = file.lock_write().await
-            .map_err(|e| PkgError::LockError(format!("Failed to open lock file: {:?}", lock_path)))?;
+
+        let lock = file.lock_write().await.map_err(|e| {
+            PkgError::LockError(format!("Failed to open lock file: {:?}", lock_path))
+        })?;
         Ok(lock)
     }
 }
@@ -802,29 +902,33 @@ impl PackageEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buckyos_kit::*;
     use name_lib::DID;
     use serde_json::json;
     use tempfile::tempdir;
-    use buckyos_kit::*;
 
     async fn setup_test_env() -> (PackageEnv, tempfile::TempDir) {
-        unsafe { std::env::set_var("BUCKY_LOG", "debug"); }
+        unsafe {
+            std::env::set_var("BUCKY_LOG", "debug");
+        }
         init_logging("test_package_lib", false);
         let temp_dir = tempdir().unwrap();
         let env = PackageEnv::new(temp_dir.path().to_path_buf());
-        
+
         // 创建pkgs目录
-        tokio_fs::create_dir_all(env.get_install_dir()).await.unwrap();
-        
+        tokio_fs::create_dir_all(env.get_install_dir())
+            .await
+            .unwrap();
+
         (env, temp_dir)
     }
 
-
-
     async fn create_test_package(env: &PackageEnv, pkg_name: &str, version: &str) -> PathBuf {
-        let pkg_dir = env.get_install_dir().join(format!("{}#{}", pkg_name, version));
+        let pkg_dir = env
+            .get_install_dir()
+            .join(format!("{}#{}", pkg_name, version));
         tokio_fs::create_dir_all(&pkg_dir).await.unwrap();
-        
+
         // 创建meta文件
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
         let mut meta = PackageMeta::new(pkg_name, version, "test", &owner, Some("test"));
@@ -832,12 +936,14 @@ mod tests {
         //meta.chunk_url = Some("http://test.com".to_string());
         meta._base.size = 100;
         meta._base.content = "test_chunk".to_string();
-        
+
         let meta_path = pkg_dir.join(".pkg.meta");
-        tokio_fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).await.unwrap();
+        tokio_fs::write(&meta_path, serde_json::to_string(&meta).unwrap())
+            .await
+            .unwrap();
 
         //TODO: modify meta_index.db
-        
+
         pkg_dir
     }
     #[tokio::test]
@@ -849,36 +955,38 @@ mod tests {
         println!("config: {:?}", config);
     }
 
-   // #[tokio::test]
+    // #[tokio::test]
     async fn test_load_strictly() {
         let (env, _temp) = setup_test_env().await;
-        
+
         // 创建测试包
         let pkg_dir = create_test_package(&env, "test-pkg", "1.0.0").await;
-        
+
         // 测试严格模式加载
         let media_info = env.load_strictly("test-pkg#1.0.0").await.unwrap();
         assert_eq!(media_info.pkg_id.name, "test-pkg");
-        assert_eq!(media_info.pkg_id.version_exp.as_ref().unwrap().to_string(), "1.0.0".to_string());
+        assert_eq!(
+            media_info.pkg_id.version_exp.as_ref().unwrap().to_string(),
+            "1.0.0".to_string()
+        );
         assert_eq!(media_info.full_path, pkg_dir);
-        
+
         // 测试不存在的包
         assert!(env.load_strictly("not-exist#1.0.0").await.is_err());
     }
 
     //#[tokio::test]
     async fn test_try_load() {
-        
         let (env, _temp) = setup_test_env().await;
-        
+
         // 创建测试包
         let pkg_dir = create_test_package(&env, "test-pkg", "1.0.0").await;
-        
+
         // 测试模糊版本匹配
         let media_info = env.dev_try_load("test-pkg").await.unwrap();
         assert_eq!(media_info.pkg_id.name, "test-pkg");
         assert_eq!(media_info.full_path, pkg_dir);
-         
+
         // 测试不存在的包
         assert!(env.dev_try_load("not-exist#1.0.0").await.is_err());
     }
@@ -886,18 +994,18 @@ mod tests {
     // #[tokio::test]
     // async fn test_install_pkg() {
     //     let (env, _temp) = setup_test_env().await;
-        
+
     //     // 创建测试包及其依赖
     //     create_test_package(&env, "test-pkg", "1.0.0").await;
     //     create_test_package(&env, "dep-pkg", "0.1.0").await;
-        
+
     //     // 测试安装包(不包含依赖)
     //     let task_id = env.install_pkg("test-pkg#1.0.0", false).await.unwrap();
     //     assert_eq!(task_id, "test-pkg#1.0.0");
-        
+
     //     // 等待任务完成
     //     env.wait_task(&task_id).await.unwrap();
-        
+
     //     // 验证任务状态
     //     let tasks = env.install_tasks.lock().await;
     //     let task = tasks.get(&task_id).unwrap();
@@ -908,35 +1016,36 @@ mod tests {
     //#[tokio::test]
     async fn test_get_pkg_meta() {
         let (env, _temp) = setup_test_env().await;
-        
+
         // 创建测试包
         create_test_package(&env, "test-pkg", "1.0.0").await;
-        
+
         // 测试获取meta信息
-        let (meta_obj_id,meta) = env.get_pkg_meta("test-pkg#1.0.0").await.unwrap();
+        let (meta_obj_id, meta) = env.get_pkg_meta("test-pkg#1.0.0").await.unwrap();
         assert_eq!(meta.name, "test-pkg");
         assert_eq!(meta.version, "1.0.0".to_string());
-        
+
         // 测试不存在的包
         assert!(env.get_pkg_meta("not-exist#1.0.0").await.is_err());
     }
 
- 
-
     #[tokio::test]
     async fn test_try_update_index_db() {
         let (env, temp) = setup_test_env().await;
-        
+
         // 创建测试数据库文件
         let new_db_path = temp.path().join("new_index.db");
         tokio_fs::write(&new_db_path, "test data").await.unwrap();
-        
+
         // 测试更新数据库
         env.try_update_index_db(&new_db_path).await.unwrap();
-        
+
         // 验证更新结果
         let db_path = env.work_dir.join("pkgs/meta_index.db");
         assert!(tokio_fs::metadata(&db_path).await.is_ok());
-        assert_eq!(tokio_fs::read_to_string(db_path).await.unwrap(), "test data");
+        assert_eq!(
+            tokio_fs::read_to_string(db_path).await.unwrap(),
+            "test data"
+        );
     }
 }

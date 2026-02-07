@@ -1,6 +1,6 @@
 /*
 表一 pkg_metas，注意pkg-meta里可以保存json字符串,也可保存jwt字符串，author-pk可以为空
-metaobjid,pkg-meta,author,author-pk,update_time, 
+metaobjid,pkg-meta,author,author-pk,update_time,
 
 表二 pkg_versions
 pkgname, version, metaobjid, tag, update_time
@@ -19,22 +19,22 @@ get_all_pkg_versions(pkg_name)
 
 
 修改接口
-add_pkg_meta(metaobjid,pkg-meta,author,author-pk) 
+add_pkg_meta(metaobjid,pkg-meta,author,author-pk)
 set_pkg_version(pkgname,version,metaobjid)
 set_author_info(author_name,author_owner_config,author_zone_config)
 */
 
+use crate::error::*;
+use crate::meta::*;
+use crate::package_id::*;
+use chrono::Utc;
 use log::*;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use semver::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
-use chrono::Utc;
-use semver::*;
-use crate::error::*;
-use crate::meta::*;
-use crate::package_id::*;
 
 #[derive(Debug)]
 pub struct MetaIndexDb {
@@ -42,10 +42,10 @@ pub struct MetaIndexDb {
 }
 
 impl MetaIndexDb {
-    pub fn new(db_path: PathBuf,ready_only:bool) -> PkgResult<Self> {
+    pub fn new(db_path: PathBuf, ready_only: bool) -> PkgResult<Self> {
         // 初始化时可以检查数据库文件是否可访问，并创建必要的表和索引
         let conn = Self::create_connection(&db_path)?;
-        
+
         // 创建 pkg_metas 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pkg_metas (
@@ -107,32 +107,39 @@ impl MetaIndexDb {
 
         // 完成初始化后关闭连接
         drop(conn);
-        
+
         Ok(MetaIndexDb { db_path })
     }
-    
+
     // 创建数据库连接的辅助方法
     fn create_connection(db_path: &PathBuf) -> PkgResult<Connection> {
-        Connection::open_with_flags(db_path, 
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE 
-            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-            | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX
-        ).map_err(|e| PkgError::SqlError(e.to_string()))
+        Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .map_err(|e| PkgError::SqlError(e.to_string()))
     }
 
-    pub fn cacl_pkg_deps_metas(&self,pkg_meta: &PackageMeta,
-        deps: &mut HashMap<String,PackageMeta>) -> PkgResult<()> {
+    pub fn cacl_pkg_deps_metas(
+        &self,
+        pkg_meta: &PackageMeta,
+        deps: &mut HashMap<String, PackageMeta>,
+    ) -> PkgResult<()> {
         for (dep_name, dep_version) in pkg_meta.deps.iter() {
             let dep_id = format!("{}#{}", dep_name, dep_version);
             let pkg_result = self.get_pkg_meta(&dep_id)?;
             if pkg_result.is_some() {
-                let (meta_obj_id,dep_meta) = pkg_result.unwrap();
-                self.cacl_pkg_deps_metas(&dep_meta,deps)?;
-                deps.insert(meta_obj_id,dep_meta);
+                let (meta_obj_id, dep_meta) = pkg_result.unwrap();
+                self.cacl_pkg_deps_metas(&dep_meta, deps)?;
+                deps.insert(meta_obj_id, dep_meta);
             } else {
                 warn!("cacl_pkg_deps_metas:pkg_meta {} not found", dep_id);
-                return Err(PkgError::FileNotFoundError(
-                    format!("cacl_pkg_deps_metas:pkg_meta {} not found", dep_id)));
+                return Err(PkgError::FileNotFoundError(format!(
+                    "cacl_pkg_deps_metas:pkg_meta {} not found",
+                    dep_id
+                )));
             }
         }
         Ok(())
@@ -149,78 +156,106 @@ impl MetaIndexDb {
 
         match &version_exp.version_exp {
             VersionExpType::Version(version) => {
-                //返回指定版本  
-                return self.get_pkg_meta_by_version(package_id.name.as_str(), author, version, version_exp.tag);
+                //返回指定版本
+                return self.get_pkg_meta_by_version(
+                    package_id.name.as_str(),
+                    author,
+                    version,
+                    version_exp.tag,
+                );
             }
             VersionExpType::Req(req) => {
-                return self.get_pkg_meta_by_version_expr(package_id.name.as_str(), author, req, version_exp.tag);
+                return self.get_pkg_meta_by_version_expr(
+                    package_id.name.as_str(),
+                    author,
+                    req,
+                    version_exp.tag,
+                );
             }
             VersionExpType::None => {
                 let req = VersionReq::parse("*").unwrap();
-                return self.get_pkg_meta_by_version_expr(package_id.name.as_str(), author, &req, version_exp.tag);
+                return self.get_pkg_meta_by_version_expr(
+                    package_id.name.as_str(),
+                    author,
+                    &req,
+                    version_exp.tag,
+                );
             }
-        }        
+        }
     }
 
-    pub fn is_latest_version(&self,pkg_id:&PackageId) -> PkgResult<bool> {
+    pub fn is_latest_version(&self, pkg_id: &PackageId) -> PkgResult<bool> {
         let pkg_name = pkg_id.name.as_str();
-        let latest_version = format!("{}#*:latest",pkg_name);
+        let latest_version = format!("{}#*:latest", pkg_name);
         let pkg_meta = self.get_pkg_meta(&latest_version)?;
         if pkg_meta.is_some() {
-            let (_,pkg_meta) = pkg_meta.unwrap();
+            let (_, pkg_meta) = pkg_meta.unwrap();
             let latest_pkg_id = pkg_meta.get_package_id();
-            debug!("pkg_id {} latest_pkg_id {}", pkg_id.to_string(), latest_pkg_id.to_string());
-            return Ok(pkg_id == &latest_pkg_id)
+            debug!(
+                "pkg_id {} latest_pkg_id {}",
+                pkg_id.to_string(),
+                latest_pkg_id.to_string()
+            );
+            return Ok(pkg_id == &latest_pkg_id);
         } else {
             debug!("pkg_id {} latest_pkg_id not found", &pkg_name);
-            let latest_version = format!("{}#*",pkg_name);
+            let latest_version = format!("{}#*", pkg_name);
             let pkg_meta = self.get_pkg_meta(&latest_version)?;
             if pkg_meta.is_some() {
-                let (_,pkg_meta) = pkg_meta.unwrap();
+                let (_, pkg_meta) = pkg_meta.unwrap();
                 let latest_pkg_id = pkg_meta.get_package_id();
-                debug!("pkg_name {} 's latest_pkg_id {}", pkg_name, latest_pkg_id.to_string());
-                return Ok(pkg_id == &latest_pkg_id)
+                debug!(
+                    "pkg_name {} 's latest_pkg_id {}",
+                    pkg_name,
+                    latest_pkg_id.to_string()
+                );
+                return Ok(pkg_id == &latest_pkg_id);
             }
         }
         Ok(false)
     }
 
-    pub fn get_pkg_meta_by_version(&self,pkg_name: &str,author: Option<String>,version: &Version,tag: Option<String>) -> PkgResult<Option<(String, PackageMeta)>> {
+    pub fn get_pkg_meta_by_version(
+        &self,
+        pkg_name: &str,
+        author: Option<String>,
+        version: &Version,
+        tag: Option<String>,
+    ) -> PkgResult<Option<(String, PackageMeta)>> {
         let conn = Self::create_connection(&self.db_path)?;
         // 构建查询条件
         let mut query = String::from(
             "SELECT pv.metaobjid, pm.pkg_meta FROM pkg_versions pv 
             JOIN pkg_metas pm ON pv.metaobjid = pm.metaobjid 
-            WHERE pv.pkg_name = ? AND pv.version = ?"
+            WHERE pv.pkg_name = ? AND pv.version = ?",
         );
-        
+
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(pkg_name.to_string()),
-            Box::new(version.to_string())
+            Box::new(version.to_string()),
         ];
-        
+
         // 如果有作者信息，添加作者条件
         if let Some(author_value) = author {
             query.push_str(" AND pv.author = ?");
             params_vec.push(Box::new(author_value));
         }
-        
+
         // 如果有标签信息，添加标签条件
         if let Some(tag_value) = tag {
             query.push_str(" AND pv.tag = ?");
             params_vec.push(Box::new(tag_value));
         }
-        
+
         // 准备查询语句
-        let mut stmt = conn.prepare(&query)
+        let mut stmt = conn
+            .prepare(&query)
             .map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
         // 转换参数为引用切片
-        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|p| p.as_ref())
-            .collect();
-        
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
         // 执行查询
         let result = stmt.query_row(params_slice.as_slice(), |row| {
             let metaobjid: String = row.get(0)?;
@@ -229,72 +264,91 @@ impl MetaIndexDb {
             if pkg_meta.is_err() {
                 let err_str = pkg_meta.err().unwrap().to_string();
                 error!("parse pkg_meta_str failed: {:?}", err_str);
-                return Err(rusqlite::Error::InvalidColumnType(0, err_str, rusqlite::types::Type::Text));
+                return Err(rusqlite::Error::InvalidColumnType(
+                    0,
+                    err_str,
+                    rusqlite::types::Type::Text,
+                ));
             }
-            
+
             Ok((metaobjid, pkg_meta.unwrap()))
         });
-        
+
         match result {
             Ok(data) => Ok(Some(data)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(PkgError::SqlError(e.to_string()))
+            Err(e) => Err(PkgError::SqlError(e.to_string())),
         }
     }
 
-    pub fn get_pkg_meta_by_version_expr(&self,pkg_name: &str,author: Option<String>,version_req:&VersionReq,tag: Option<String>) -> PkgResult<Option<(String, PackageMeta)>> {
+    pub fn get_pkg_meta_by_version_expr(
+        &self,
+        pkg_name: &str,
+        author: Option<String>,
+        version_req: &VersionReq,
+        tag: Option<String>,
+    ) -> PkgResult<Option<(String, PackageMeta)>> {
         let conn = Self::create_connection(&self.db_path)?;
-        
+
         // 尝试获取版本范围
         let version_exp = VersionExp {
             tag: None,
-            version_exp: VersionExpType::Req(version_req.clone())
+            version_exp: VersionExpType::Req(version_req.clone()),
         };
-        
+
         let versions = match version_exp.to_range_int() {
             Ok((min_version, max_version)) => {
-                debug!("get_pkg_meta_by_version_expr:pkg_name {} min_version {} max_version {}", pkg_name, min_version, max_version);
+                debug!(
+                    "get_pkg_meta_by_version_expr:pkg_name {} min_version {} max_version {}",
+                    pkg_name, min_version, max_version
+                );
                 // 如果能获取版本范围，使用数据库查询加速
-                Self::get_versions_in_range(&conn, pkg_name, min_version, max_version, tag.as_deref())?
-            },
+                Self::get_versions_in_range(
+                    &conn,
+                    pkg_name,
+                    min_version,
+                    max_version,
+                    tag.as_deref(),
+                )?
+            }
             Err(_) => {
                 // 如果不能获取范围，获取所有版本
                 let mut query = String::from(
-                    "SELECT version, metaobjid, tag FROM pkg_versions WHERE pkg_name = ?"
+                    "SELECT version, metaobjid, tag FROM pkg_versions WHERE pkg_name = ?",
                 );
-                
-                let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
-                    Box::new(pkg_name.to_string())
-                ];
-                
+
+                let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+                    vec![Box::new(pkg_name.to_string())];
+
                 if let Some(author_value) = &author {
                     query.push_str(" AND author = ?");
                     params_vec.push(Box::new(author_value.clone()));
                 }
-                
+
                 if let Some(tag_value) = &tag {
                     query.push_str(" AND tag = ?");
                     params_vec.push(Box::new(tag_value.clone()));
                 }
-                
+
                 query.push_str(" ORDER BY version_int DESC");
-                
-                let mut stmt = conn.prepare(&query)
+
+                let mut stmt = conn
+                    .prepare(&query)
                     .map_err(|e| PkgError::SqlError(e.to_string()))?;
-                
-                let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec
-                    .iter()
-                    .map(|p| p.as_ref())
-                    .collect();
-                
-                let rows = stmt.query_map(params_slice.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?
-                    ))
-                }).map_err(|e| PkgError::SqlError(e.to_string()))?;
-                
+
+                let params_slice: Vec<&dyn rusqlite::ToSql> =
+                    params_vec.iter().map(|p| p.as_ref()).collect();
+
+                let rows = stmt
+                    .query_map(params_slice.as_slice(), |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })
+                    .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
                 let mut result = Vec::new();
                 for row in rows {
                     result.push(row.map_err(|e| PkgError::SqlError(e.to_string()))?);
@@ -305,7 +359,11 @@ impl MetaIndexDb {
 
         // 如果没有找到任何版本，直接返回None
         if versions.is_empty() {
-            debug!("get_pkg_meta_by_version_expr:pkg_name {} version_req {} versions is empty", pkg_name, version_req.to_string());
+            debug!(
+                "get_pkg_meta_by_version_expr:pkg_name {} version_req {} versions is empty",
+                pkg_name,
+                version_req.to_string()
+            );
             return Ok(None);
         }
 
@@ -322,7 +380,9 @@ impl MetaIndexDb {
                         }
                         Some((latest_v, _)) => {
                             // 比较版本号，保留较新的版本
-                            if VersionExp::compare_versions(&version, latest_v) == std::cmp::Ordering::Greater {
+                            if VersionExp::compare_versions(&version, latest_v)
+                                == std::cmp::Ordering::Greater
+                            {
                                 latest_version = Some((version.clone(), metaobjid.clone()));
                             }
                         }
@@ -333,11 +393,13 @@ impl MetaIndexDb {
 
         // 如果找到了符合要求的版本，获取其元数据
         if let Some((_, metaobjid)) = latest_version {
-            let pkg_meta: String = conn.query_row(
-                "SELECT pkg_meta FROM pkg_metas WHERE metaobjid = ?",
-                params![metaobjid],
-                |row| row.get(0)
-            ).map_err(|e| PkgError::SqlError(e.to_string()))?;
+            let pkg_meta: String = conn
+                .query_row(
+                    "SELECT pkg_meta FROM pkg_metas WHERE metaobjid = ?",
+                    params![metaobjid],
+                    |row| row.get(0),
+                )
+                .map_err(|e| PkgError::SqlError(e.to_string()))?;
 
             let pkg_meta = PackageMeta::from_str(pkg_meta.as_str())?;
             Ok(Some((metaobjid, pkg_meta)))
@@ -347,16 +409,21 @@ impl MetaIndexDb {
     }
 
     /// 获取meta_index_db中，指定pkg_name的所有版本
-    pub fn list_all_pkg_versions(&self, pkg_name: &str) -> PkgResult<Vec<(String, String, Option<String>)>> {
+    pub fn list_all_pkg_versions(
+        &self,
+        pkg_name: &str,
+    ) -> PkgResult<Vec<(String, String, Option<String>)>> {
         let conn = Self::create_connection(&self.db_path)?;
-        
+
         let mut stmt = conn.prepare(
             "SELECT version, metaobjid, tag FROM pkg_versions WHERE pkg_name = ? ORDER BY update_time DESC"
         ).map_err(|e| PkgError::SqlError(e.to_string()))?;
 
-        let versions = stmt.query_map(params![pkg_name], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        }).map_err(|e| PkgError::SqlError(e.to_string()))?;
+        let versions = stmt
+            .query_map(params![pkg_name], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
 
         let mut result = Vec::new();
         for version in versions {
@@ -367,53 +434,63 @@ impl MetaIndexDb {
     }
 
     /// 获取版本范围,如果有tag，则只返回有tag的版本
-    fn get_versions_in_range(conn:&Connection, pkg_name: &str, min_version:u64, max_version:u64,tag:Option<&str>) -> PkgResult<Vec<(String, String, Option<String>)>> {
+    fn get_versions_in_range(
+        conn: &Connection,
+        pkg_name: &str,
+        min_version: u64,
+        max_version: u64,
+        tag: Option<&str>,
+    ) -> PkgResult<Vec<(String, String, Option<String>)>> {
         let mut query = String::from(
             "SELECT version, metaobjid, tag FROM pkg_versions 
-            WHERE pkg_name = ? AND version_int >= ? AND version_int <= ?"
+            WHERE pkg_name = ? AND version_int >= ? AND version_int <= ?",
         );
-        
+
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![
             Box::new(pkg_name.to_string()),
             Box::new(min_version as i64),
-            Box::new(max_version as i64)
+            Box::new(max_version as i64),
         ];
-        
+
         if let Some(tag_value) = tag {
             query.push_str(" AND tag = ?");
             params_vec.push(Box::new(tag_value.to_string()));
         }
-        
+
         query.push_str(" ORDER BY version_int DESC");
-        
-        let mut stmt = conn.prepare(&query)
+
+        let mut stmt = conn
+            .prepare(&query)
             .map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
-        let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec
-            .iter()
-            .map(|p| p.as_ref())
-            .collect();
-        
-        let versions = stmt.query_map(params_slice.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?
-            ))
-        }).map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
+        let params_slice: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+
+        let versions = stmt
+            .query_map(params_slice.as_slice(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
         let mut result = Vec::new();
         for version in versions {
             result.push(version.map_err(|e| PkgError::SqlError(e.to_string()))?);
         }
-    
+
         Ok(result)
     }
 
     /// 获取作者信息
-    pub fn get_author_info(&self, author_name: &str) -> PkgResult<Option<(String, Option<String>, Option<String>)>> {
+    pub fn get_author_info(
+        &self,
+        author_name: &str,
+    ) -> PkgResult<Option<(String, Option<String>, Option<String>)>> {
         let conn = Self::create_connection(&self.db_path)?;
-        
+
         conn.query_row(
             "SELECT author_name, author_owner_config, author_zone_config FROM author_info WHERE author_name = ?",
             params![author_name],
@@ -422,12 +499,18 @@ impl MetaIndexDb {
     }
 
     /// 添加包元数据
-    pub fn add_pkg_meta(&self, metaobjid: &str, pkg_meta: &str, author: &str, author_pk: Option<String>) -> PkgResult<()> {
+    pub fn add_pkg_meta(
+        &self,
+        metaobjid: &str,
+        pkg_meta: &str,
+        author: &str,
+        author_pk: Option<String>,
+    ) -> PkgResult<()> {
         let conn = Self::create_connection(&self.db_path)?;
-        
+
         let current_time = chrono::Utc::now().timestamp();
         let author_pk = author_pk.unwrap_or_else(|| "".to_string());
-        
+
         conn.execute(
             "INSERT OR REPLACE INTO pkg_metas (metaobjid, pkg_meta, author, author_pk, update_time) VALUES (?, ?, ?, ?, ?)",
             params![metaobjid, pkg_meta, author, author_pk, current_time],
@@ -436,13 +519,18 @@ impl MetaIndexDb {
         Ok(())
     }
 
-    pub fn add_pkg_meta_batch(&self, pkg_meta_map: &HashMap<String,PackageMetaNode>) -> PkgResult<()> {
+    pub fn add_pkg_meta_batch(
+        &self,
+        pkg_meta_map: &HashMap<String, PackageMetaNode>,
+    ) -> PkgResult<()> {
         let mut conn: Connection = Self::create_connection(&self.db_path)?;
         // 开始事务
-        let tx = conn.transaction().map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+        let tx = conn
+            .transaction()
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
         let current_time = chrono::Utc::now().timestamp();
-        
+
         for (metaobjid, meta_node) in pkg_meta_map {
             // 插入包元数据
             tx.execute(
@@ -452,14 +540,18 @@ impl MetaIndexDb {
 
             // 设置包版本
             let version_int = VersionExp::version_to_int(&meta_node.version)?;
-            
+
             // 检查记录是否已存在
-            let exists = tx.query_row(
-                "SELECT 1 FROM pkg_versions WHERE pkg_name = ? AND author = ? AND version = ?",
-                params![meta_node.pkg_name, meta_node.author, meta_node.version],
-                |_| Ok(true)
-            ).optional().map_err(|e| PkgError::SqlError(e.to_string()))?.is_some();
-            
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM pkg_versions WHERE pkg_name = ? AND author = ? AND version = ?",
+                    params![meta_node.pkg_name, meta_node.author, meta_node.version],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(|e| PkgError::SqlError(e.to_string()))?
+                .is_some();
+
             if exists {
                 // 更新现有记录
                 tx.execute(
@@ -474,32 +566,49 @@ impl MetaIndexDb {
                 ).map_err(|e| PkgError::SqlError(e.to_string()))?;
             }
         }
-        
+
         // 提交事务
         tx.commit().map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
         Ok(())
     }
 
     /// 设置包版本的metaobjid
-    pub fn set_pkg_version(&self, pkgname: &str, author: &str, version: &str, metaobjid: &str, tag: Option<&str>) -> PkgResult<()> {
+    pub fn set_pkg_version(
+        &self,
+        pkgname: &str,
+        author: &str,
+        version: &str,
+        metaobjid: &str,
+        tag: Option<&str>,
+    ) -> PkgResult<()> {
         let conn = Self::create_connection(&self.db_path)?;
         let version_exp = VersionExp::from_str(version)?;
         if !version_exp.is_version() {
-            error!("VersionExp is not a version: {} when set pkg {} version", version, pkgname);
-            return Err(PkgError::ParseError(version.to_string(), "VersionExp is not a version".to_string()));
+            error!(
+                "VersionExp is not a version: {} when set pkg {} version",
+                version, pkgname
+            );
+            return Err(PkgError::ParseError(
+                version.to_string(),
+                "VersionExp is not a version".to_string(),
+            ));
         }
-        
+
         let current_time = Utc::now().timestamp();
         let version_int = VersionExp::version_to_int(version)?;
-        
+
         // 检查记录是否已存在
-        let exists = conn.query_row(
-            "SELECT 1 FROM pkg_versions WHERE pkg_name = ? AND author = ? AND version = ?",
-            params![pkgname, author, version],
-            |_| Ok(true)
-        ).optional().map_err(|e| PkgError::SqlError(e.to_string()))?.is_some();
-        
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM pkg_versions WHERE pkg_name = ? AND author = ? AND version = ?",
+                params![pkgname, author, version],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| PkgError::SqlError(e.to_string()))?
+            .is_some();
+
         if exists {
             // 更新现有记录
             conn.execute(
@@ -514,23 +623,31 @@ impl MetaIndexDb {
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
 
-
         Ok(())
     }
 
     /// 设置作者信息
-    pub fn set_author_info(&self, author_name: &str, author_owner_config: Option<&str>, author_zone_config: Option<&str>) -> PkgResult<()> {
+    pub fn set_author_info(
+        &self,
+        author_name: &str,
+        author_owner_config: Option<&str>,
+        author_zone_config: Option<&str>,
+    ) -> PkgResult<()> {
         let conn = Self::create_connection(&self.db_path)?;
         // 检查作者信息是否已存在
-        let exists = conn.query_row(
-            "SELECT 1 FROM author_info WHERE author_name = ?",
-            params![author_name],
-            |_| Ok(true)
-        ).optional().map_err(|e| PkgError::SqlError(e.to_string()))?.is_some();
-        
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM author_info WHERE author_name = ?",
+                params![author_name],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|e| PkgError::SqlError(e.to_string()))?
+            .is_some();
+
         // 获取当前时间戳
         let current_time = Utc::now().timestamp();
-        
+
         if exists {
             // 如果作者信息已存在，则更新记录
             conn.execute(
@@ -543,137 +660,155 @@ impl MetaIndexDb {
                 "INSERT INTO author_info (author_name, author_owner_config, author_zone_config) VALUES (?, ?, ?)",
                 params![author_name, author_owner_config, author_zone_config],
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
-            
+
             return Ok(());
         }
 
         Ok(())
     }
 
-
-
     //将另一个meta_index_db中的全部记录插入当前db
     pub async fn merge_meta_index_db(&self, other_db_path: &PathBuf) -> PkgResult<()> {
-        let other_db = MetaIndexDb::new(other_db_path.clone(),true)?;
+        let other_db = MetaIndexDb::new(other_db_path.clone(), true)?;
         let mut conn = Self::create_connection(&self.db_path)?;
         let mut other_conn = Self::create_connection(&PathBuf::from(other_db_path))?;
-        
+
         // 开始事务
-        let tx = conn.transaction().map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
-        // 1. 合并包元数据表
-        let mut pkg_metas = other_conn.prepare("SELECT metaobjid, pkg_meta, author, author_pk,update_time FROM pkg_metas")
+        let tx = conn
+            .transaction()
             .map_err(|e| PkgError::SqlError(e.to_string()))?;
-            
-        let pkg_meta_rows = pkg_metas.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?
-            ))
-        }).map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
+        // 1. 合并包元数据表
+        let mut pkg_metas = other_conn
+            .prepare("SELECT metaobjid, pkg_meta, author, author_pk,update_time FROM pkg_metas")
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
+        let pkg_meta_rows = pkg_metas
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
         for meta_result in pkg_meta_rows {
-            let (metaobjid, pkg_meta, author, author_pk,update_time) = meta_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
+            let (metaobjid, pkg_meta, author, author_pk, update_time) =
+                meta_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO pkg_metas (metaobjid, pkg_meta, author, author_pk,update_time) VALUES (?, ?, ?, ?, ?)",
                 params![metaobjid, pkg_meta, author, author_pk,update_time]
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
-        
+
         // 2. 合并包版本表
         let mut pkg_versions = other_conn.prepare("SELECT pkg_name, author, version, version_int, metaobjid, tag, update_time FROM pkg_versions")
             .map_err(|e| PkgError::SqlError(e.to_string()))?;
-            
-        let version_rows = pkg_versions.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? as u64,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, i64>(6)?
-            ))
-        }).map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
+        let version_rows = pkg_versions
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
         for version_result in version_rows {
-            let (pkg_name, author, version, version_int, metaobjid, tag, update_time) = version_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
+            let (pkg_name, author, version, version_int, metaobjid, tag, update_time) =
+                version_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO pkg_versions (pkg_name, author, version, version_int, metaobjid, tag, update_time) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![pkg_name, author, version, version_int as i64, metaobjid, tag, update_time]
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
-        
+
         // 3. 合并作者信息表
-        let mut author_infos = other_conn.prepare("SELECT author_name, author_owner_config, author_zone_config FROM author_info")
+        let mut author_infos = other_conn
+            .prepare("SELECT author_name, author_owner_config, author_zone_config FROM author_info")
             .map_err(|e| PkgError::SqlError(e.to_string()))?;
-            
-        let author_rows = author_infos.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?
-            ))
-        }).map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
+        let author_rows = author_infos
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
         for author_result in author_rows {
-            let (author_name, author_owner_config, author_zone_config) = author_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
+            let (author_name, author_owner_config, author_zone_config) =
+                author_result.map_err(|e| PkgError::SqlError(e.to_string()))?;
             tx.execute(
                 "INSERT OR REPLACE INTO author_info (author_name, author_owner_config, author_zone_config) VALUES (?, ?, ?)",
                 params![author_name, author_owner_config, author_zone_config]
             ).map_err(|e| PkgError::SqlError(e.to_string()))?;
         }
-        
+
         // 提交事务
         tx.commit().map_err(|e| PkgError::SqlError(e.to_string()))?;
-        
+
         Ok(())
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use name_lib::DID;
-    use tempfile::tempdir;
-    use std::cmp::Ordering;
     use serde_json::json;
-
+    use std::cmp::Ordering;
+    use tempfile::tempdir;
 
     #[test]
     fn test_meta_db() -> PkgResult<()> {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_meta.db");
-        
-        let meta_db = MetaIndexDb::new(db_path,false)?;
+
+        let meta_db = MetaIndexDb::new(db_path, false)?;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
-        let mut test_pkg_meta = PackageMeta::new("test-pkg", "1.0.1", "author1", &owner, Some("stable"));
+        let mut test_pkg_meta =
+            PackageMeta::new("test-pkg", "1.0.1", "author1", &owner, Some("stable"));
         test_pkg_meta._base.size = 100;
         test_pkg_meta._base.content = "chunk1".to_string();
 
         let test_pkg_meta_str = serde_json::to_string(&test_pkg_meta).unwrap();
-        
+
         // 测试添加包元数据
-        meta_db.add_pkg_meta("meta1", &test_pkg_meta_str, "author1", Some("pk1".to_string()))?;
-        
+        meta_db.add_pkg_meta(
+            "meta1",
+            &test_pkg_meta_str,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
+
         // 测试设置包版本
         meta_db.set_pkg_version("test-pkg", "author1", "1.0.1", "meta1", Some("stable"))?;
-        
+
         // 测试设置作者信息
-        meta_db.set_author_info("author1", Some(r#"{"owner":"test"}"#), Some(r#"{"zone":"test"}"#))?;
-        
+        meta_db.set_author_info(
+            "author1",
+            Some(r#"{"owner":"test"}"#),
+            Some(r#"{"zone":"test"}"#),
+        )?;
+
         // 测试获取包元数据
         let meta = meta_db.get_pkg_meta("test-pkg#1.0.1:stable")?;
         assert!(meta.is_some());
         let (metaobjid, pkg_meta) = meta.unwrap();
         assert_eq!(metaobjid, "meta1");
         //assert_eq!(pkg_meta.to, r#"{"name":"test-pkg"}"#);
-        
+
         // 测试获取作者信息
         let author_info = meta_db.get_author_info("author1")?;
         assert!(author_info.is_some());
@@ -681,7 +816,7 @@ mod tests {
         assert_eq!(name, "author1");
         assert_eq!(owner_config.unwrap(), r#"{"owner":"test"}"#);
         assert_eq!(zone_config.unwrap(), r#"{"zone":"test"}"#);
-        
+
         // 测试获取所有版本
         let versions = meta_db.list_all_pkg_versions("test-pkg")?;
         assert_eq!(versions.len(), 1);
@@ -689,53 +824,88 @@ mod tests {
         assert_eq!(version, "1.0.1");
         assert_eq!(metaobjid, "meta1");
         assert_eq!(tag.as_deref(), Some("stable"));
-        
+
         Ok(())
     }
 
-
-
-
     #[test]
     fn test_version_db_operations() -> PkgResult<()> {
-        unsafe { std::env::set_var("BUCKY_LOG", "debug"); }
+        unsafe {
+            std::env::set_var("BUCKY_LOG", "debug");
+        }
         buckyos_kit::init_logging("package-lib test", false);
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_versions.db");
         info!("db_path:{}", db_path.to_string_lossy());
-        
-        let meta_db = MetaIndexDb::new(db_path,false)?;
+
+        let meta_db = MetaIndexDb::new(db_path, false)?;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
-        let mut test_pkg_meta1 = PackageMeta::new("test-pkg", "1.0.0", "author1", &owner, Some("stable"));
+        let mut test_pkg_meta1 =
+            PackageMeta::new("test-pkg", "1.0.0", "author1", &owner, Some("stable"));
         test_pkg_meta1._base.size = 100;
         test_pkg_meta1._base.content = "chunk1".to_string();
         let test_pkg_meta_str1 = serde_json::to_string(&test_pkg_meta1).unwrap();
-        meta_db.add_pkg_meta("meta1", &test_pkg_meta_str1, "author1", Some("pk1".to_string()))?;
+        meta_db.add_pkg_meta(
+            "meta1",
+            &test_pkg_meta_str1,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
 
-        let mut test_pkg_meta2 = PackageMeta::new("test-pkg","1.1.0","author1",&owner,None);
+        let mut test_pkg_meta2 = PackageMeta::new("test-pkg", "1.1.0", "author1", &owner, None);
         let test_pkg_meta_str2 = serde_json::to_string(&test_pkg_meta2).unwrap();
-        meta_db.add_pkg_meta("meta2", &test_pkg_meta_str2, "author1", Some("pk1".to_string()))?;
+        meta_db.add_pkg_meta(
+            "meta2",
+            &test_pkg_meta_str2,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
 
-        let mut test_pkg_meta3 = PackageMeta::new("test-pkg","1.2.0","author1",&owner,None);
+        let mut test_pkg_meta3 = PackageMeta::new("test-pkg", "1.2.0", "author1", &owner, None);
         let test_pkg_meta_str3 = serde_json::to_string(&test_pkg_meta3).unwrap();
-        meta_db.add_pkg_meta("meta3", &test_pkg_meta_str3, "author1", Some("pk1".to_string()))?;
-        
-        let mut test_pkg_meta4 = PackageMeta::new("test-pkg","2.0.0","author1",&owner,None);
+        meta_db.add_pkg_meta(
+            "meta3",
+            &test_pkg_meta_str3,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
+
+        let mut test_pkg_meta4 = PackageMeta::new("test-pkg", "2.0.0", "author1", &owner, None);
         let test_pkg_meta_str4 = serde_json::to_string(&test_pkg_meta4).unwrap();
-        meta_db.add_pkg_meta("meta4", &test_pkg_meta_str4, "author1", Some("pk1".to_string()))?;
-        
-        let mut test_pkg_meta5 = PackageMeta::new("test-pkg","0.9.0","author1",&owner,None);
+        meta_db.add_pkg_meta(
+            "meta4",
+            &test_pkg_meta_str4,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
+
+        let mut test_pkg_meta5 = PackageMeta::new("test-pkg", "0.9.0", "author1", &owner, None);
         let test_pkg_meta_str5 = serde_json::to_string(&test_pkg_meta5).unwrap();
-        meta_db.add_pkg_meta("meta5", &test_pkg_meta_str5, "author1", Some("pk1".to_string()))?;
+        meta_db.add_pkg_meta(
+            "meta5",
+            &test_pkg_meta_str5,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
 
-        let mut test_pkg_meta6 = PackageMeta::new("test-pkg2","0.4.0","author1",&owner,None);
+        let mut test_pkg_meta6 = PackageMeta::new("test-pkg2", "0.4.0", "author1", &owner, None);
         let test_pkg_meta_str6 = serde_json::to_string(&test_pkg_meta6).unwrap();
-        meta_db.add_pkg_meta("meta6", &test_pkg_meta_str6, "author1", Some("pk1".to_string()))?;
+        meta_db.add_pkg_meta(
+            "meta6",
+            &test_pkg_meta_str6,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
 
-        let mut test_pkg_meta7 = PackageMeta::new("test-pkg2","0.4.0+build250724","author1",&owner,None);
+        let mut test_pkg_meta7 =
+            PackageMeta::new("test-pkg2", "0.4.0+build250724", "author1", &owner, None);
         let test_pkg_meta_str7 = serde_json::to_string(&test_pkg_meta7).unwrap();
-        meta_db.add_pkg_meta("meta7", &test_pkg_meta_str7, "author1", Some("pk1".to_string()))?;
-
+        meta_db.add_pkg_meta(
+            "meta7",
+            &test_pkg_meta_str7,
+            "author1",
+            Some("pk1".to_string()),
+        )?;
 
         // 设置包版本
         meta_db.set_pkg_version("test-pkg", "author1", "1.0.0", "meta1", Some("stable"))?;
@@ -751,7 +921,7 @@ mod tests {
         let latest = latest.unwrap();
         assert!(latest.is_some());
         let (metaobjid, pkg_meta) = latest.unwrap();
-        assert_eq!(metaobjid, "meta7"); 
+        assert_eq!(metaobjid, "meta7");
         assert_eq!(pkg_meta.version, "0.4.0+build250724");
         let pkg_id = PackageId::from_str("test-pkg2#0.4.0+build250724").unwrap();
         let is_latest = meta_db.is_latest_version(&pkg_id)?;
@@ -762,14 +932,14 @@ mod tests {
         let (metaobjid, pkg_meta) = latest.unwrap();
         assert_eq!(metaobjid, "meta4");
         //assert_eq!(pkg_meta, r#"{"name":"test-pkg","version":"2.0.0"}"#);
-        
+
         // 测试获取特定版本
         let v1 = meta_db.get_pkg_meta("test-pkg#1.1.0:stable")?;
         assert!(v1.is_some());
         let (metaobjid, pkg_meta) = v1.unwrap();
         assert_eq!(metaobjid, "meta2");
         //assert_eq!(pkg_meta, r#"{"name":"test-pkg","version":"1.1.0"}"#);
-        
+
         // 测试获取版本范围
         let v1 = meta_db.get_pkg_meta("test-pkg#>=1.0.0, <=1.2.0")?;
         assert!(v1.is_some());
@@ -780,14 +950,13 @@ mod tests {
         assert!(v1.is_some());
         let (metaobjid, pkg_meta) = v1.unwrap();
         assert_eq!(metaobjid, "meta4");
-        
+
         // 测试按标签获取
         let beta_version = meta_db.get_pkg_meta("test-pkg#*:beta")?;
         assert!(beta_version.is_some());
         let (metaobjid, pkg_meta) = beta_version.unwrap();
         assert_eq!(metaobjid, "meta3");
-        
+
         Ok(())
     }
-
 }

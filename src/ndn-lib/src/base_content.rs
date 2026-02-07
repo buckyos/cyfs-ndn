@@ -148,7 +148,6 @@ impl InclusionProof {
             meta: None,
         }
     }
-
 }
 
 impl NamedObject for InclusionProof {

@@ -104,6 +104,15 @@ pub struct DentryRecord {
     pub mtime: Option<u64>,
 }
 
+/// Materialized list entry from fsmeta list cache.
+/// For `IndexNodeId` targets, `inode` is prefetched in start_list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FsMetaListEntry {
+    pub name: String,
+    pub target: DentryTarget,
+    pub inode: Option<NodeRecord>,
+}
+
 // /// ------------------------------
 // /// FsMeta Service original Traits
 // /// ------------------------------
@@ -329,6 +338,62 @@ impl FsMetaListDentriesReq {
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
             RPCErrors::ParseRequestError(format!("Failed to parse FsMetaListDentriesReq: {}", e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaStartListReq {
+    pub parent: IndexNodeId,
+    pub txid: Option<String>,
+}
+
+impl FsMetaStartListReq {
+    pub fn new(parent: IndexNodeId, txid: Option<String>) -> Self {
+        Self { parent, txid }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaStartListReq: {}", e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaListNextReq {
+    pub list_session_id: u64,
+    pub page_size: u32,
+}
+
+impl FsMetaListNextReq {
+    pub fn new(list_session_id: u64, page_size: u32) -> Self {
+        Self {
+            list_session_id,
+            page_size,
+        }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaListNextReq: {}", e))
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsMetaStopListReq {
+    pub list_session_id: u64,
+}
+
+impl FsMetaStopListReq {
+    pub fn new(list_session_id: u64) -> Self {
+        Self { list_session_id }
+    }
+
+    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
+        serde_json::from_value(value).map_err(|e| {
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaStopListReq: {}", e))
         })
     }
 }
@@ -880,6 +945,79 @@ impl FsMetaClient {
         }
     }
 
+    pub async fn start_list(
+        &self,
+        parent: IndexNodeId,
+        txid: Option<String>,
+    ) -> Result<u64, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_start_list(parent, txid, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaStartListReq::new(parent, txid);
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+
+                let result = client.call("start_list", req_json).await?;
+                result.as_u64().ok_or_else(|| {
+                    RPCErrors::ParserResponseError("Expected u64 result".to_string())
+                })
+            }
+        }
+    }
+
+    pub async fn list_next(
+        &self,
+        list_session_id: u64,
+        page_size: u32,
+    ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler
+                    .handle_list_next(list_session_id, page_size, ctx)
+                    .await
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaListNextReq::new(list_session_id, page_size);
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+
+                let result = client.call("list_next", req_json).await?;
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!(
+                        "Expected Vec<FsMetaListEntry> result: {}",
+                        e
+                    ))
+                })
+            }
+        }
+    }
+
+    pub async fn stop_list(&self, list_session_id: u64) -> Result<(), RPCErrors> {
+        match self {
+            Self::InProcess(handler) => {
+                let ctx = RPCContext::default();
+                handler.handle_stop_list(list_session_id, ctx).await
+            }
+            Self::KRPC(client) => {
+                let req = FsMetaStopListReq::new(list_session_id);
+                let req_json = serde_json::to_value(&req).map_err(|e| {
+                    RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
+                })?;
+
+                let result = client.call("stop_list", req_json).await?;
+                serde_json::from_value(result).map_err(|e| {
+                    RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
+                })
+            }
+        }
+    }
+
     pub async fn upsert_dentry(
         &self,
         parent: IndexNodeId,
@@ -1419,6 +1557,23 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<Vec<DentryRecord>, RPCErrors>;
+    async fn handle_start_list(
+        &self,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<u64, RPCErrors>;
+    async fn handle_list_next(
+        &self,
+        list_session_id: u64,
+        page_size: u32,
+        ctx: RPCContext,
+    ) -> Result<Vec<FsMetaListEntry>, RPCErrors>;
+    async fn handle_stop_list(
+        &self,
+        list_session_id: u64,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
     async fn handle_upsert_dentry(
         &self,
         parent: IndexNodeId,
@@ -1633,6 +1788,24 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
+            "start_list" => {
+                let req = FsMetaStartListReq::from_json(req.params)?;
+                let result = self.0.handle_start_list(req.parent, req.txid, ctx).await?;
+                RPCResult::Success(serde_json::json!(result))
+            }
+            "list_next" => {
+                let req = FsMetaListNextReq::from_json(req.params)?;
+                let result = self
+                    .0
+                    .handle_list_next(req.list_session_id, req.page_size, ctx)
+                    .await?;
+                RPCResult::Success(serde_json::json!(result))
+            }
+            "stop_list" => {
+                let req = FsMetaStopListReq::from_json(req.params)?;
+                let result = self.0.handle_stop_list(req.list_session_id, ctx).await?;
+                RPCResult::Success(serde_json::json!(result))
+            }
             "upsert_dentry" => {
                 let req = FsMetaUpsertDentryReq::from_json(req.params)?;
                 let result = self
@@ -1773,6 +1946,8 @@ mod tests {
         next_inode: IndexNodeId,
         inodes: HashMap<IndexNodeId, NodeRecord>,
         dentries: HashMap<(IndexNodeId, String), DentryRecord>,
+        next_list_session: u64,
+        list_sessions: HashMap<u64, (Vec<FsMetaListEntry>, usize)>,
         dir_rev: HashMap<IndexNodeId, u64>,
         lease_seq: HashMap<IndexNodeId, u64>,
         obj_stats: HashMap<ObjId, ObjStat>,
@@ -1787,6 +1962,8 @@ mod tests {
                     next_inode: 1,
                     inodes: HashMap::new(),
                     dentries: HashMap::new(),
+                    next_list_session: 0,
+                    list_sessions: HashMap::new(),
                     dir_rev: HashMap::new(),
                     lease_seq: HashMap::new(),
                     obj_stats: HashMap::new(),
@@ -1947,6 +2124,78 @@ mod tests {
                 }
             }
             Ok(out)
+        }
+
+        async fn handle_start_list(
+            &self,
+            parent: IndexNodeId,
+            _txid: Option<String>,
+            _ctx: RPCContext,
+        ) -> Result<u64, RPCErrors> {
+            let mut state = self.state.lock().unwrap();
+            let mut entries = Vec::new();
+            for ((p, _), dentry) in state.dentries.iter() {
+                if *p != parent {
+                    continue;
+                }
+                let target = dentry.target.clone();
+                let inode = match &target {
+                    DentryTarget::IndexNodeId(id) => state.inodes.get(id).cloned(),
+                    _ => None,
+                };
+                entries.push(FsMetaListEntry {
+                    name: dentry.name.clone(),
+                    target,
+                    inode,
+                });
+            }
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+            state.next_list_session += 1;
+            let list_session_id = state.next_list_session;
+            state
+                .list_sessions
+                .insert(list_session_id, (entries, 0usize));
+            Ok(list_session_id)
+        }
+
+        async fn handle_list_next(
+            &self,
+            list_session_id: u64,
+            page_size: u32,
+            _ctx: RPCContext,
+        ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+            let mut state = self.state.lock().unwrap();
+            let (entries, pos) = state
+                .list_sessions
+                .get_mut(&list_session_id)
+                .ok_or_else(|| RPCErrors::ReasonError("list session not found".to_string()))?;
+
+            if *pos >= entries.len() {
+                return Ok(Vec::new());
+            }
+
+            let end = if page_size == 0 {
+                entries.len()
+            } else {
+                (*pos + page_size as usize).min(entries.len())
+            };
+            let out = entries[*pos..end].to_vec();
+            *pos = end;
+            Ok(out)
+        }
+
+        async fn handle_stop_list(
+            &self,
+            list_session_id: u64,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
+            self.state
+                .lock()
+                .unwrap()
+                .list_sessions
+                .remove(&list_session_id);
+            Ok(())
         }
 
         async fn handle_upsert_dentry(
@@ -2404,6 +2653,12 @@ mod tests {
 
         let list = client.list_dentries(7, None).await.unwrap();
         assert_eq!(list.len(), 1);
+
+        let list_session_id = client.start_list(7, None).await.unwrap();
+        let page1 = client.list_next(list_session_id, 1).await.unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].name, "hello");
+        client.stop_list(list_session_id).await.unwrap();
     }
 
     #[tokio::test]

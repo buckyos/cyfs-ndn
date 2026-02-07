@@ -247,10 +247,7 @@ impl ChunkListReader {
         local_mode: bool,
         open_chunk_reader: Option<OpenChunkReader>,
     ) -> std::io::Result<ChunkReader> {
-        match named_store_mgr
-            .open_chunk_reader(&chunk_id, offset)
-            .await
-        {
+        match named_store_mgr.open_chunk_reader(&chunk_id, offset).await {
             Ok((reader, _)) => Ok(reader),
             Err(open_err) => {
                 if local_mode {
@@ -707,9 +704,7 @@ mod tests {
                 let fallback_store = fallback_store.clone();
                 Box::pin(async move {
                     let store = fallback_store.lock().await;
-                    store
-                        .open_chunk_reader(&chunk_id, offset)
-                        .await
+                    store.open_chunk_reader(&chunk_id, offset).await
                 })
             },
         ));

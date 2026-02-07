@@ -22,7 +22,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
- 
+
 #[derive(Clone)]
 pub struct NamedStoreMgr {
     /// Store layouts ordered by epoch (newest first)
@@ -443,10 +443,7 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            match store_guard
-                .open_chunk_reader(chunk_id, offset)
-                .await
-            {
+            match store_guard.open_chunk_reader(chunk_id, offset).await {
                 Ok(result) => return Ok(result),
                 Err(NdnError::NotFound(_)) | Err(NdnError::InComplete(_)) => {
                     last_error = Some(NdnError::NotFound(format!(
@@ -474,7 +471,7 @@ impl NamedStoreMgr {
     pub async fn open_chunklist_reader(
         &self,
         chunklist_id: &ObjId,
-        offset: u64
+        offset: u64,
     ) -> NdnResult<(ChunkReader, u64)> {
         if !chunklist_id.is_chunk_list() {
             return Err(NdnError::InvalidObjType(format!(
@@ -502,7 +499,7 @@ impl NamedStoreMgr {
     pub async fn open_reader(
         &self,
         obj_id: &ObjId,
-        inner_obj_path: Option<String>
+        inner_obj_path: Option<String>,
     ) -> NdnResult<(ChunkReader, u64)> {
         let mut current_obj_id = obj_id.clone();
         let mut current_inner_path = inner_obj_path;
@@ -534,9 +531,7 @@ impl NamedStoreMgr {
                     )));
                 }
 
-                let (reader, size) = self
-                    .open_chunklist_reader(&current_obj_id, 0)
-                    .await?;
+                let (reader, size) = self.open_chunklist_reader(&current_obj_id, 0).await?;
                 return Ok((reader, size_override.unwrap_or(size)));
             }
 
@@ -671,7 +666,6 @@ impl NamedStoreMgr {
             .await
     }
 
-   
     /// Put chunk by reader (uses current layout for write target)
     pub async fn put_chunk_by_reader(
         &self,
@@ -728,7 +722,6 @@ impl NamedStoreMgr {
             .add_chunk_by_link_to_local_file(chunk_id, chunk_size, chunk_local_info)
             .await
     }
-
 
     /// Get store by store_id
     pub async fn get_store(
@@ -804,7 +797,7 @@ impl NamedStoreMgr {
             ))),
         }
     }
-    
+
     //TODO:ndn-lib里有通用函数？
     fn extract_json_by_path(value: &Value, path: &str) -> NdnResult<Value> {
         let mut current = value;
@@ -820,8 +813,9 @@ impl NamedStoreMgr {
                     let index: usize = segment.parse().map_err(|_| {
                         NdnError::InvalidParam(format!("invalid array index: {}", segment))
                     })?;
-                    list.get(index)
-                        .ok_or_else(|| NdnError::NotFound(format!("inner path not found: {}", path)))?
+                    list.get(index).ok_or_else(|| {
+                        NdnError::NotFound(format!("inner path not found: {}", path))
+                    })?
                 }
                 _ => {
                     return Err(NdnError::NotFound(format!(

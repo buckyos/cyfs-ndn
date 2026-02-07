@@ -2,8 +2,9 @@ use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
 use log::{info, warn};
 use ndm::{
-    ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, IndexNodeId, MoveOptions,
-    NdmInstanceId, NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
+    ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry, IndexNodeId,
+    MoveOptions, NdmInstanceId, NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp,
+    OpenWriteFlag,
 };
 use ndn_lib::{ChunkId, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -13,8 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::path_resolve_cache::PathResolveCache;
 use crate::background::BackgroundMgr;
+use crate::list_cache::ListCache;
+use crate::path_resolve_cache::PathResolveCache;
 
 const NODE_STATE_DIR_NORMAL: i64 = 0;
 const NODE_STATE_DIR_OVERLAY: i64 = 1;
@@ -94,6 +96,7 @@ pub struct FSMetaService {
     _cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 
     resolve_path_cache: Arc<RwLock<PathResolveCache>>,
+    list_cache: Arc<Mutex<ListCache>>,
 
     /// Instance identifier for lease session naming (required for high-level file operations)
     instance: Option<NdmInstanceId>,
@@ -136,6 +139,7 @@ impl FSMetaService {
             txn_timeout_secs,
             _cleanup_handle: Some(cleanup_handle),
             resolve_path_cache: Arc::new(RwLock::new(PathResolveCache::default())),
+            list_cache: Arc::new(Mutex::new(ListCache::default())),
             instance: None,
             buffer: None,
         })
@@ -1410,6 +1414,68 @@ impl ndm::FsMetaHandler for FSMetaService {
             Ok(out)
         })
         .await
+    }
+
+    async fn handle_start_list(
+        &self,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<u64, RPCErrors> {
+        let dentries = self
+            .handle_list_dentries(parent, txid.clone(), ctx.clone())
+            .await?;
+        let mut entries = Vec::with_capacity(dentries.len());
+        for dentry in dentries {
+            let target = dentry.target.clone();
+            let inode = match &target {
+                DentryTarget::IndexNodeId(id) => {
+                    self.handle_get_inode(*id, txid.clone(), ctx.clone())
+                        .await?
+                }
+                _ => None,
+            };
+            entries.push(FsMetaListEntry {
+                name: dentry.name,
+                target,
+                inode,
+            });
+        }
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut cache = self
+            .list_cache
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
+        Ok(cache.start_session(entries))
+    }
+
+    async fn handle_list_next(
+        &self,
+        list_session_id: u64,
+        page_size: u32,
+        _ctx: RPCContext,
+    ) -> Result<Vec<FsMetaListEntry>, RPCErrors> {
+        let mut cache = self
+            .list_cache
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
+        cache
+            .list_next(list_session_id, page_size)
+            .ok_or_else(|| RPCErrors::ReasonError("list session not found".to_string()))
+    }
+
+    async fn handle_stop_list(
+        &self,
+        list_session_id: u64,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let mut cache = self
+            .list_cache
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
+        cache.stop_session(list_session_id);
+        Ok(())
     }
 
     async fn handle_upsert_dentry(

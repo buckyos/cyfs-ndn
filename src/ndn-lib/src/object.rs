@@ -5,7 +5,7 @@ use crate::{
     OBJ_TYPE_LIST_SIMPLE, OBJ_TYPE_OBJMAP, OBJ_TYPE_OBJMAP_SIMPLE, OBJ_TYPE_PACK, OBJ_TYPE_PKG,
     OBJ_TYPE_TRIE_SIMPLE,
 };
-use jsonwebtoken::{DecodingKeyKind, EncodingKey, encode};
+use jsonwebtoken::{encode, DecodingKeyKind, EncodingKey};
 use name_lib::EncodedDocument;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -267,7 +267,6 @@ pub trait NamedObject: Serialize {
         let json_value = serde_json::to_value(self).expect("failed to serialize named object");
         build_named_object_by_json(Self::get_obj_type(), &json_value)
     }
-
 }
 
 //obj_data_str 可以是jwt或json_string
@@ -284,7 +283,7 @@ pub fn load_named_obj<T: DeserializeOwned>(obj_data_str: &str) -> NdnResult<T> {
 //只验证objid,不会验证jwt.jwt通常需要读取特定对象的字段后才能决定怎么验证，无法自动化验证
 pub fn load_named_obj_and_verify<T: DeserializeOwned>(
     obj_id: &ObjId,
-    obj_data_str: &str
+    obj_data_str: &str,
 ) -> NdnResult<T> {
     let obj_json = load_named_object_from_obj_str(obj_data_str)?;
     if !verify_named_object(obj_id, &obj_json) {

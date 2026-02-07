@@ -2,15 +2,15 @@
 //!
 //! This module coordinates fs_meta, fs_buffer, and named_store to provide
 //! a unified file/directory namespace with overlay semantics.
-//! 
+//!
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fs_buffer::{FileBufferSeekWriter, FileBufferService};
 use named_store::{
-    NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout,
-    StoreTarget as LayoutStoreTarget,
+    NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
     ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId, SimpleChunkList,
@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    DentryRecord, DentryTarget, FsMetaClient, IndexNodeId, MoveOptions, NodeKind, NodeRecord,
-    NodeState, ObjStat,
+    DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, IndexNodeId, MoveOptions, NodeKind,
+    NodeRecord, NodeState, ObjStat,
 };
 
 // ------------------------------
@@ -37,7 +37,7 @@ pub struct PathStat {
     pub kind: PathKind,
     pub size: Option<u64>,
     pub obj_id: Option<ObjId>,
-    pub obj_inner_path:Option<String>,
+    pub obj_inner_path: Option<String>,
     pub inode_id: Option<IndexNodeId>,
     pub state: Option<NodeState>,
 }
@@ -112,6 +112,12 @@ struct MovePlan {
     source: MoveSource,
 }
 
+struct NamedListSession {
+    fsmeta_list_session_id: Option<u64>,
+    entries: Vec<(String, PathStat)>,
+    pos: usize,
+}
+
 // ------------------------------
 // Trait definitions for dependencies
 // ------------------------------
@@ -161,7 +167,7 @@ pub enum OpenWriteFlag {
 }
 
 pub struct CopyOptions {
-    pub is_target_readonly:bool,
+    pub is_target_readonly: bool,
 }
 
 impl Default for CopyOptions {
@@ -191,6 +197,9 @@ pub struct NamedDataMgr {
     /// Optional store layout manager for multi-version store fallback
     /// When set, get_object operations will try multiple layout versions
     layout_mgr: Option<Arc<NamedStoreMgr>>,
+
+    list_session_seq: AtomicU64,
+    list_sessions: Arc<tokio::sync::Mutex<HashMap<u64, NamedListSession>>>,
 }
 
 impl NamedDataMgr {
@@ -208,6 +217,8 @@ impl NamedDataMgr {
             fetcher,
             default_commit_policy,
             layout_mgr: None,
+            list_session_seq: AtomicU64::new(1),
+            list_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -227,6 +238,8 @@ impl NamedDataMgr {
             fetcher,
             default_commit_policy,
             layout_mgr: Some(layout_mgr),
+            list_session_seq: AtomicU64::new(1),
+            list_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -289,13 +302,12 @@ impl NamedDataMgr {
 
                 if let Some(dentry) = dentry {
                     match dentry.target {
-                        DentryTarget::ObjId(obj_id) => return self.path_stat_from_obj_id(obj_id).await,
+                        DentryTarget::ObjId(obj_id) => {
+                            return self.path_stat_from_obj_id(obj_id).await
+                        }
                         DentryTarget::IndexNodeId(id) => {
-                            if let Some(node) = self
-                                .fsmeta
-                                .get_inode(id, None)
-                                .await
-                                .map_err(|e| {
+                            if let Some(node) =
+                                self.fsmeta.get_inode(id, None).await.map_err(|e| {
                                     NdnError::Internal(format!("failed to get inode: {}", e))
                                 })?
                             {
@@ -352,7 +364,7 @@ impl NamedDataMgr {
         self.fsmeta.set_file(path, obj_id).await
     }
 
-    pub async fn set_file_with_body(&self,path:&NdmPath,obj_data:String) -> NdnResult<()> {
+    pub async fn set_file_with_body(&self, path: &NdmPath, obj_data: String) -> NdnResult<()> {
         //gen obj_id by obj_data
         //store_mgr.put
         //self.set_file
@@ -389,10 +401,17 @@ impl NamedDataMgr {
         self.set_file(target, obj_id).await
     }
 
-    pub async fn copy_dir(&self, src: &NdmPath, target: &NdmPath,copy_option:CopyOptions) -> NdnResult<()> {
+    pub async fn copy_dir(
+        &self,
+        src: &NdmPath,
+        target: &NdmPath,
+        copy_option: CopyOptions,
+    ) -> NdnResult<()> {
         let stat = self.stat(src).await?;
         if stat.kind != PathKind::Dir {
-            return Err(NdnError::InvalidParam("source is not a directory".to_string()));
+            return Err(NdnError::InvalidParam(
+                "source is not a directory".to_string(),
+            ));
         }
         if stat.obj_id.is_some() {
             //1) src已经物化，非常简单的set_dir就可以了
@@ -406,7 +425,7 @@ impl NamedDataMgr {
     //快照的逻辑是copy_dir的特殊情况，复制后把target设置为readonly,并很快会触发物化流程冻结
     pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         let cp_option = CopyOptions {
-            is_target_readonly: false
+            is_target_readonly: false,
         };
         self.copy_dir(src, target, cp_option).await
     }
@@ -422,103 +441,201 @@ impl NamedDataMgr {
         pos: u32,
         page_size: u32,
     ) -> NdnResult<Vec<(String, PathStat)>> {
-        //TODO 性能优化: 减少RPC,支持Cache 
-        // fsmeta应该接管 list_dentries + get_inode的流程，并在服务器上建立一个可以关闭的内存cache
-        // ndm做和DirObject的合并后，并cache，最终实现支持接口（减少使用者的心智负担)
-        let resolved = self.fsmeta.resolve_path(path).await?;
-        if let Some((dir_id, dir_node)) = resolved {
+        let list_session_id = self.start_list(path).await?;
+        {
+            let mut sessions = self.list_sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&list_session_id) {
+                session.pos = (pos as usize).min(session.entries.len());
+            }
+        }
+
+        let list_result = self.list_next(list_session_id, page_size).await;
+        let stop_result = self.stop_list(list_session_id).await;
+
+        match list_result {
+            Ok(result) => {
+                stop_result?;
+                Ok(result)
+            }
+            Err(e) => {
+                let _ = stop_result;
+                Err(e)
+            }
+        }
+    }
+
+    //return list_session_id
+    pub async fn start_list(&self, path: &NdmPath) -> NdnResult<u64> {
+        if let Some((dir_id, dir_node)) = self.fsmeta.resolve_path(path).await? {
             if dir_node.kind != NodeKind::Dir {
                 return Err(NdnError::InvalidParam(
                     "path is not a directory".to_string(),
                 ));
             }
 
-            let dentries = self
+            let fsmeta_list_session_id = self
                 .fsmeta
-                .list_dentries(dir_id, None)
+                .start_list(dir_id, None)
                 .await
-                .map_err(|e| NdnError::Internal(format!("failed to list dentries: {}", e)))?;
-            //merge detries and DirObject.children()
-            let mut upper_map: HashMap<String, DentryRecord> = HashMap::new();
-            for dentry in dentries {
-                upper_map.insert(dentry.name.clone(), dentry);
-            }
-            let mut results: HashMap<String, PathStat> = HashMap::new();
-            if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
-                let dir_obj = self.load_dir_object(&base_obj_id).await?;
-                for (name, item) in dir_obj.iter() {
-                    if let Some(upper) = upper_map.get(name) {
-                        if matches!(upper.target, DentryTarget::Tombstone) {
-                            continue;
-                        }
-                        continue;
-                    }
-                    let child_stat = self.path_stat_from_simple_map_item(item).await?;
-                    results.insert(name.clone(), child_stat);
+                .map_err(|e| NdnError::Internal(format!("start_list failed: {}", e)))?;
+
+            let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                    return Err(NdnError::Internal(format!("list_next failed: {}", e)));
                 }
-            }
+            };
 
-
-            for (name, dentry) in upper_map {
-                if matches!(dentry.target, DentryTarget::Tombstone) {
-                    continue;
+            let merged_entries = match self
+                .build_merged_dir_entries(&dir_node, upper_entries)
+                .await
+            {
+                Ok(entries) => entries,
+                Err(e) => {
+                    let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                    return Err(e);
                 }
+            };
 
-                let child_stat = match dentry.target {
-                    DentryTarget::IndexNodeId(id) => {
-                        let node = self
-                            .fsmeta
-                            .get_inode(id, None)
-                            .await
-                            .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
-
-                        match node {
-                            Some(n) => {
-                                let kind = match n.kind {
-                                    NodeKind::File => PathKind::File,
-                                    NodeKind::Dir => PathKind::Dir,
-                                    NodeKind::Object => PathKind::File,
-                                };
-                                let obj_id = Self::node_obj_id(&n);
-                                let size = if let Some(ref id) = obj_id {
-                                    self.obj_size_from_obj_id(id).await
-                                } else {
-                                    None
-                                };
-                                PathStat {
-                                    kind,
-                                    size,
-                                    obj_id,
-                                    obj_inner_path: None,
-                                    inode_id: Some(id),
-                                    state: Some(n.state),
-                                }
-                            }
-                            None => continue,
-                        }
-                    }
-                    DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
-                    DentryTarget::Tombstone => continue,
-                };
-
-                results.insert(name, child_stat);
-            }
-
-            let mut out: Vec<(String, PathStat)> = results.into_iter().collect();
-            out.sort_by(|a, b| a.0.cmp(&b.0));
-
-            if page_size > 0 {
-                let start = pos as usize;
-                if start >= out.len() {
-                    return Ok(Vec::new());
-                }
-                let end = (start + page_size as usize).min(out.len());
-                return Ok(out[start..end].to_vec());
-            }
-
-            return Ok(out);
+            let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
+            let mut sessions = self.list_sessions.lock().await;
+            sessions.insert(
+                list_session_id,
+                NamedListSession {
+                    fsmeta_list_session_id: Some(fsmeta_list_session_id),
+                    entries: merged_entries,
+                    pos: 0,
+                },
+            );
+            return Ok(list_session_id);
         }
 
+        if let Some(entries) = self.load_obj_dir_entries(path).await? {
+            let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
+            let mut sessions = self.list_sessions.lock().await;
+            sessions.insert(
+                list_session_id,
+                NamedListSession {
+                    fsmeta_list_session_id: None,
+                    entries,
+                    pos: 0,
+                },
+            );
+            return Ok(list_session_id);
+        }
+
+        Err(NdnError::NotFound("path not found".to_string()))
+    }
+
+    pub async fn stop_list(&self, list_session_id: u64) -> NdnResult<()> {
+        let session = {
+            let mut sessions = self.list_sessions.lock().await;
+            sessions.remove(&list_session_id)
+        };
+        let session = session.ok_or_else(|| {
+            NdnError::NotFound(format!("list session {} not found", list_session_id))
+        })?;
+
+        if let Some(fsmeta_list_session_id) = session.fsmeta_list_session_id {
+            self.fsmeta
+                .stop_list(fsmeta_list_session_id)
+                .await
+                .map_err(|e| NdnError::Internal(format!("stop_list failed: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_next(
+        &self,
+        list_session_id: u64,
+        page_size: u32,
+    ) -> NdnResult<Vec<(String, PathStat)>> {
+        let mut sessions = self.list_sessions.lock().await;
+        let session = sessions.get_mut(&list_session_id).ok_or_else(|| {
+            NdnError::NotFound(format!("list session {} not found", list_session_id))
+        })?;
+
+        if session.pos >= session.entries.len() {
+            return Ok(Vec::new());
+        }
+
+        let end = if page_size == 0 {
+            session.entries.len()
+        } else {
+            (session.pos + page_size as usize).min(session.entries.len())
+        };
+        let out = session.entries[session.pos..end].to_vec();
+        session.pos = end;
+        Ok(out)
+    }
+
+    async fn build_merged_dir_entries(
+        &self,
+        dir_node: &NodeRecord,
+        upper_entries: Vec<FsMetaListEntry>,
+    ) -> NdnResult<Vec<(String, PathStat)>> {
+        let mut upper_map: HashMap<String, FsMetaListEntry> = HashMap::new();
+        for entry in upper_entries {
+            upper_map.insert(entry.name.clone(), entry);
+        }
+
+        let mut merged: HashMap<String, PathStat> = HashMap::new();
+        if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
+            let dir_obj = self.load_dir_object(&base_obj_id).await?;
+            for (name, item) in dir_obj.iter() {
+                if let Some(upper) = upper_map.get(name) {
+                    if matches!(upper.target, DentryTarget::Tombstone) {
+                        continue;
+                    }
+                    continue;
+                }
+                let child_stat = self.path_stat_from_simple_map_item(item).await?;
+                merged.insert(name.clone(), child_stat);
+            }
+        }
+
+        for entry in upper_map.into_values() {
+            let FsMetaListEntry {
+                name,
+                target,
+                inode,
+            } = entry;
+            if matches!(target, DentryTarget::Tombstone) {
+                continue;
+            }
+
+            let child_stat = match target {
+                DentryTarget::IndexNodeId(id) => {
+                    let node = match inode {
+                        Some(node) => Some(node),
+                        None => self.fsmeta.get_inode(id, None).await.map_err(|e| {
+                            NdnError::Internal(format!("failed to get inode: {}", e))
+                        })?,
+                    };
+                    let node = match node {
+                        Some(node) => node,
+                        None => continue,
+                    };
+                    self.path_stat_from_inode_node(id, node).await
+                }
+                DentryTarget::ObjId(obj_id) => self.path_stat_from_obj_id(obj_id).await?,
+                DentryTarget::Tombstone => continue,
+            };
+
+            merged.insert(name, child_stat);
+        }
+
+        let mut out: Vec<(String, PathStat)> = merged.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    async fn load_obj_dir_entries(
+        &self,
+        path: &NdmPath,
+    ) -> NdnResult<Option<Vec<(String, PathStat)>>> {
         if let Some((parent_path, name)) = path.split_parent_name() {
             if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
                 let dentry = self
@@ -542,15 +659,7 @@ impl NamedDataMgr {
                                 out.push((entry_name.clone(), child_stat));
                             }
                             out.sort_by(|a, b| a.0.cmp(&b.0));
-                            if page_size > 0 {
-                                let start = pos as usize;
-                                if start >= out.len() {
-                                    return Ok(Vec::new());
-                                }
-                                let end = (start + page_size as usize).min(out.len());
-                                return Ok(out[start..end].to_vec());
-                            }
-                            return Ok(out);
+                            return Ok(Some(out));
                         }
                         DentryTarget::IndexNodeId(_) | DentryTarget::Tombstone => {}
                     }
@@ -558,7 +667,7 @@ impl NamedDataMgr {
             }
         }
 
-        Err(NdnError::NotFound("path not found".to_string()))
+        Ok(None)
     }
 
     // ========== Read Operations ==========
@@ -589,7 +698,6 @@ impl NamedDataMgr {
         }
     }
 
-    
     pub async fn get_object_by_path(&self, path: &NdmPath) -> NdnResult<String> {
         let stat = self.stat(path).await?;
         if stat.kind == PathKind::NotFound {
@@ -662,8 +770,35 @@ impl NamedDataMgr {
     async fn obj_size_from_obj_id(&self, obj_id: &ObjId) -> Option<u64> {
         match Self::obj_kind_from_obj_id(obj_id) {
             ObjectKind::File => self.load_file_object(obj_id).await.ok().map(|f| f.size),
-            ObjectKind::Dir => self.load_dir_object(obj_id).await.ok().map(|d| d.total_size),
+            ObjectKind::Dir => self
+                .load_dir_object(obj_id)
+                .await
+                .ok()
+                .map(|d| d.total_size),
             ObjectKind::Unknown => None,
+        }
+    }
+
+    async fn path_stat_from_inode_node(&self, inode_id: IndexNodeId, node: NodeRecord) -> PathStat {
+        let kind = match node.kind {
+            NodeKind::File => PathKind::File,
+            NodeKind::Dir => PathKind::Dir,
+            NodeKind::Object => PathKind::File,
+        };
+        let obj_id = Self::node_obj_id(&node);
+        let size = if let Some(ref id) = obj_id {
+            self.obj_size_from_obj_id(id).await
+        } else {
+            None
+        };
+
+        PathStat {
+            kind,
+            size,
+            obj_id,
+            obj_inner_path: None,
+            inode_id: Some(inode_id),
+            state: Some(node.state),
         }
     }
 
@@ -678,17 +813,13 @@ impl NamedDataMgr {
             kind,
             size,
             obj_id: Some(obj_id),
-            obj_inner_path:None,
+            obj_inner_path: None,
             inode_id: None,
             state: None,
         })
     }
 
-    async fn path_stat_from_simple_map_item(
-        &self,
-        item: &SimpleMapItem,
-    ) -> NdnResult<PathStat> {
-        
+    async fn path_stat_from_simple_map_item(&self, item: &SimpleMapItem) -> NdnResult<PathStat> {
         let (obj_id, _) = item.get_obj_id()?;
         let kind = match Self::obj_kind_from_obj_id(&obj_id) {
             ObjectKind::Dir => PathKind::Dir,
@@ -699,14 +830,16 @@ impl NamedDataMgr {
         let size = match item {
             SimpleMapItem::Object(obj_type, _) => {
                 if obj_type == OBJ_TYPE_FILE {
-                    let file_obj: FileObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
-                        NdnError::Internal(format!("failed to parse FileObject: {}", e))
-                    })?;
+                    let file_obj: FileObject =
+                        serde_json::from_value(item.get_obj()?).map_err(|e| {
+                            NdnError::Internal(format!("failed to parse FileObject: {}", e))
+                        })?;
                     Some(file_obj.size)
                 } else if obj_type == OBJ_TYPE_DIR {
-                    let dir_obj: DirObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
-                        NdnError::Internal(format!("failed to parse DirObject: {}", e))
-                    })?;
+                    let dir_obj: DirObject =
+                        serde_json::from_value(item.get_obj()?).map_err(|e| {
+                            NdnError::Internal(format!("failed to parse DirObject: {}", e))
+                        })?;
                     Some(dir_obj.total_size)
                 } else {
                     None
@@ -714,14 +847,16 @@ impl NamedDataMgr {
             }
             SimpleMapItem::ObjectJwt(obj_type, _) => {
                 if obj_type == OBJ_TYPE_FILE {
-                    let file_obj: FileObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
-                        NdnError::Internal(format!("failed to parse FileObject: {}", e))
-                    })?;
+                    let file_obj: FileObject =
+                        serde_json::from_value(item.get_obj()?).map_err(|e| {
+                            NdnError::Internal(format!("failed to parse FileObject: {}", e))
+                        })?;
                     Some(file_obj.size)
                 } else if obj_type == OBJ_TYPE_DIR {
-                    let dir_obj: DirObject = serde_json::from_value(item.get_obj()?).map_err(|e| {
-                        NdnError::Internal(format!("failed to parse DirObject: {}", e))
-                    })?;
+                    let dir_obj: DirObject =
+                        serde_json::from_value(item.get_obj()?).map_err(|e| {
+                            NdnError::Internal(format!("failed to parse DirObject: {}", e))
+                        })?;
                     Some(dir_obj.total_size)
                 } else {
                     None
@@ -874,7 +1009,7 @@ impl NamedDataMgr {
             .layout_mgr
             .as_ref()
             .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
-        let have_chunk =  layout_mgr.have_chunk(chunk_id).await;
+        let have_chunk = layout_mgr.have_chunk(chunk_id).await;
         Ok(have_chunk)
     }
 
@@ -921,12 +1056,12 @@ impl NamedDataMgr {
         layout_mgr.register_store(store_ref).await;
 
         let current = layout_mgr.current_layout().await;
-        let mut targets = current.as_ref().map(|l| l.targets.clone()).unwrap_or_default();
+        let mut targets = current
+            .as_ref()
+            .map(|l| l.targets.clone())
+            .unwrap_or_default();
 
-        if !targets
-            .iter()
-            .any(|t| t.store_id == _new_target.store_id)
-        {
+        if !targets.iter().any(|t| t.store_id == _new_target.store_id) {
             targets.push(LayoutStoreTarget {
                 store_id: _new_target.store_id.clone(),
                 device_did: None,
@@ -979,7 +1114,9 @@ impl NamedDataMgr {
 
         if node.kind != NodeKind::Dir {
             let _ = self.fsmeta.rollback(Some(txid.clone())).await;
-            return Err(NdnError::InvalidParam("path is not a directory".to_string()));
+            return Err(NdnError::InvalidParam(
+                "path is not a directory".to_string(),
+            ));
         }
 
         let rev0 = node.rev.unwrap_or(0);
@@ -1031,10 +1168,7 @@ impl NamedDataMgr {
                         }
                     };
                     Self::node_obj_id(&child).ok_or_else(|| {
-                        NdnError::InvalidState(format!(
-                            "child {} not published",
-                            dentry.name
-                        ))
+                        NdnError::InvalidState(format!("child {} not published", dentry.name))
                     })?
                 }
                 DentryTarget::Tombstone => continue,
@@ -1096,8 +1230,6 @@ impl NamedDataMgr {
 
         Ok(dir_obj_id)
     }
-
-   
 
     async fn move_path_with_opts(
         &self,
