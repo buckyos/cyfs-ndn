@@ -887,7 +887,7 @@ async fn open_store_chunk_reader_with_fallback(
     open_chunk_reader: Option<OpenChunkReader>,
 ) -> NdnResult<ChunkReader> {
     match named_store_mgr
-        .open_chunk_reader(&chunk_id, offset, auto_cache)
+        .open_chunk_reader(&chunk_id, offset)
         .await
     {
         Ok((reader, _)) => Ok(reader),

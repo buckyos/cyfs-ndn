@@ -18,7 +18,6 @@ pub type OpenChunkReader =
 
 #[derive(Default)]
 pub struct ChunkListReaderOptions {
-    pub auto_cache: bool,
     pub local_mode: bool,
     pub fixed_chunk_size: Option<u64>,
     pub chunk_sizes: Option<Vec<u64>>,
@@ -56,7 +55,6 @@ struct ChunkMeta {
 
 pub struct ChunkListReader {
     named_store_mgr: Arc<NamedStoreMgr>,
-    auto_cache: bool,
     local_mode: bool,
     open_chunk_reader: Option<OpenChunkReader>,
 
@@ -81,10 +79,8 @@ impl ChunkListReader {
         named_store_mgr: Arc<NamedStoreMgr>,
         chunk_list: SimpleChunkList,
         seek_from: SeekFrom,
-        auto_cache: bool,
     ) -> NdnResult<Self> {
         let options = ChunkListReaderOptions {
-            auto_cache,
             ..Default::default()
         };
         Self::with_options(named_store_mgr, chunk_list, seek_from, options).await
@@ -117,7 +113,6 @@ impl ChunkListReader {
 
         let mut reader = Self {
             named_store_mgr,
-            auto_cache: options.auto_cache,
             local_mode: options.local_mode,
             open_chunk_reader: options.open_chunk_reader,
             chunks,
@@ -220,7 +215,6 @@ impl ChunkListReader {
         let named_store_mgr = self.named_store_mgr.clone();
         let chunk_id = chunk.chunk_id;
         let offset = self.next_chunk_offset;
-        let auto_cache = self.auto_cache;
         let local_mode = self.local_mode;
         let open_chunk_reader = self.open_chunk_reader.clone();
 
@@ -230,7 +224,6 @@ impl ChunkListReader {
                 named_store_mgr,
                 chunk_id,
                 offset,
-                auto_cache,
                 local_mode,
                 open_chunk_reader,
             )
@@ -251,12 +244,11 @@ impl ChunkListReader {
         named_store_mgr: Arc<NamedStoreMgr>,
         chunk_id: ChunkId,
         offset: u64,
-        auto_cache: bool,
         local_mode: bool,
         open_chunk_reader: Option<OpenChunkReader>,
     ) -> std::io::Result<ChunkReader> {
         match named_store_mgr
-            .open_chunk_reader(&chunk_id, offset, auto_cache)
+            .open_chunk_reader(&chunk_id, offset)
             .await
         {
             Ok((reader, _)) => Ok(reader),
@@ -275,7 +267,7 @@ impl ChunkListReader {
                     open_err
                 );
 
-                custom_open_chunk_reader(chunk_id, offset, auto_cache)
+                custom_open_chunk_reader(chunk_id, offset, false)
                     .await
                     .map(|(reader, _)| reader)
                     .map_err(Self::to_io_error)
@@ -632,7 +624,7 @@ mod tests {
         }
 
         let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids).unwrap();
-        let mut reader = ChunkListReader::new(store_mgr, chunk_list, SeekFrom::Start(0), false)
+        let mut reader = ChunkListReader::new(store_mgr, chunk_list, SeekFrom::Start(0))
             .await
             .unwrap();
 
@@ -711,12 +703,12 @@ mod tests {
 
         let fallback_store = backup_store.clone();
         let options = ChunkListReaderOptions::default().with_open_chunk_reader(Arc::new(
-            move |chunk_id: ChunkId, offset: u64, auto_cache: bool| {
+            move |chunk_id: ChunkId, offset: u64, _auto_cache: bool| {
                 let fallback_store = fallback_store.clone();
                 Box::pin(async move {
                     let store = fallback_store.lock().await;
                     store
-                        .open_chunk_reader(&chunk_id, offset, auto_cache)
+                        .open_chunk_reader(&chunk_id, offset)
                         .await
                 })
             },

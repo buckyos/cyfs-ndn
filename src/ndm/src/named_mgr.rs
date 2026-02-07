@@ -188,9 +188,6 @@ pub struct NamedDataMgr {
     /// Default commit policy
     default_commit_policy: CommitPolicy,
 
-    /// Background task manager
-    bg: Arc<tokio::sync::Mutex<BackgroundMgr>>,
-
     /// Optional store layout manager for multi-version store fallback
     /// When set, get_object operations will try multiple layout versions
     layout_mgr: Option<Arc<NamedStoreMgr>>,
@@ -210,7 +207,6 @@ impl NamedDataMgr {
             fsbuffer: buffer,
             fetcher,
             default_commit_policy,
-            bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
             layout_mgr: None,
         }
     }
@@ -230,7 +226,6 @@ impl NamedDataMgr {
             fsbuffer: buffer,
             fetcher,
             default_commit_policy,
-            bg: Arc::new(tokio::sync::Mutex::new(BackgroundMgr::new())),
             layout_mgr: Some(layout_mgr),
         }
     }
@@ -267,6 +262,7 @@ impl NamedDataMgr {
                 kind,
                 size,
                 obj_id,
+                obj_inner_path: None,
                 inode_id: Some(inode_id),
                 state: Some(node.state),
             });
@@ -277,6 +273,7 @@ impl NamedDataMgr {
                 kind: PathKind::NotFound,
                 size: None,
                 obj_id: None,
+                obj_inner_path: None,
                 inode_id: None,
                 state: None,
             });
@@ -317,6 +314,7 @@ impl NamedDataMgr {
                                     kind,
                                     size,
                                     obj_id,
+                                    obj_inner_path: None,
                                     inode_id: Some(id),
                                     state: Some(node.state),
                                 });
@@ -332,6 +330,7 @@ impl NamedDataMgr {
             kind: PathKind::NotFound,
             size: None,
             obj_id: None,
+            obj_inner_path: None,
             inode_id: None,
             state: None,
         })
@@ -490,6 +489,7 @@ impl NamedDataMgr {
                                     kind,
                                     size,
                                     obj_id,
+                                    obj_inner_path: None,
                                     inode_id: Some(id),
                                     state: Some(n.state),
                                 }
@@ -583,7 +583,7 @@ impl NamedDataMgr {
                 let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
                     NdnError::NotFound("store layout manager not configured".to_string())
                 })?;
-                let (reader, size) = layout_mgr.open_reader(&obj_id, inner_path, false).await?;
+                let (reader, size) = layout_mgr.open_reader(&obj_id, inner_path).await?;
                 Ok((Box::new(reader), size))
             }
         }
@@ -734,6 +734,7 @@ impl NamedDataMgr {
             kind,
             size,
             obj_id: Some(obj_id),
+            obj_inner_path: None,
             inode_id: None,
             state: None,
         })

@@ -492,69 +492,10 @@ impl NamedStoreMgr {
             Arc::new(self.clone()),
             chunk_list,
             std::io::SeekFrom::Start(offset),
-            auto_cache,
         )
         .await?;
 
         Ok((Box::pin(reader), total_size))
-    }
-
-     //  move to store_layout_mgr
-    /// Lookup a child entry in a DirObject by inner_path.
-    /// Returns the ObjId if the child exists and is a directory.
-    #[allow(dead_code)]
-    async fn lookup_in_dir_object(
-        &self,
-        dir_obj_id: &ObjId,
-        child_name: &str,
-    ) -> NdnResult<Option<ObjId>> {
-        let layout_mgr = self
-            .layout_mgr
-            .as_ref()
-            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
-
-        let obj_json = layout_mgr
-            .get_object(dir_obj_id)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get DirObject: {}", e)))?;
-
-        // Parse as DirObject
-        let dir_obj: DirObject = serde_json::from_value(obj_json)
-            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))?;
-
-        // Look up child in the object map
-        match dir_obj.get(child_name) {
-            Some(item) => {
-                match item {
-                    SimpleMapItem::ObjId(child_obj_id) => {
-                        if child_obj_id.obj_type == OBJ_TYPE_DIR {
-                            Ok(Some(child_obj_id.clone()))
-                        } else {
-                            // Child exists but is not a directory
-                            Err(NdnError::InvalidParam(format!(
-                                "{} in DirObject is not a directory",
-                                child_name
-                            )))
-                        }
-                    }
-                    SimpleMapItem::Object(obj_type, _) | SimpleMapItem::ObjectJwt(obj_type, _) => {
-                        if obj_type == OBJ_TYPE_DIR {
-                            // Embedded directory object - need to compute its ObjId
-                            let (child_obj_id, _) = item.get_obj_id().map_err(|e| {
-                                NdnError::Internal(format!("failed to get obj_id: {}", e))
-                            })?;
-                            Ok(Some(child_obj_id))
-                        } else {
-                            Err(NdnError::InvalidParam(format!(
-                                "{} in DirObject is not a directory",
-                                child_name
-                            )))
-                        }
-                    }
-                }
-            }
-            None => Ok(None), // Child not found in DirObject
-        }
     }
 
     /// Open a generic reader by object id and optional inner path.

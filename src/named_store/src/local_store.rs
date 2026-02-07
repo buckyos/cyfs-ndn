@@ -272,7 +272,7 @@ impl NamedLocalStore {
                     )));
                 }
                 let chunk_id = ChunkId::from_obj_id(&current_obj_id);
-                let (reader, size) = self.open_chunk_reader(&chunk_id, 0, false).await?;
+                let (reader, size) = self.open_chunk_reader(&chunk_id, 0).await?;
                 return Ok((reader, size_override.unwrap_or(size)));
             }
 
@@ -631,7 +631,7 @@ impl NamedLocalStore {
     }
 
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
-        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
+        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         chunk_reader.read_to_end(&mut buffer).await.map_err(|e| {
             warn!("get_chunk_data: read file failed! {}", e.to_string());
@@ -646,7 +646,7 @@ impl NamedLocalStore {
         offset: u64,
         piece_size: u32,
     ) -> NdnResult<Vec<u8>> {
-        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
+        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, 0).await?;
         if offset > chunk_size {
             return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
         }
@@ -869,7 +869,7 @@ mod tests {
         store.put_chunk(&chunk_id, &data, true).await.unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0)
             .await
             .unwrap();
         assert_eq!(size, data.len() as u64);
@@ -990,7 +990,7 @@ mod tests {
             .unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0)
             .await
             .unwrap();
         assert_eq!(size, data.len() as u64);
@@ -1030,7 +1030,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .open_chunk_reader(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0)
             .await
             .err()
             .expect("expected verify error");
@@ -1065,7 +1065,7 @@ mod tests {
             .unwrap();
 
         let err = store
-            .open_chunk_reader(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0)
             .await
             .err()
             .expect("expected invalid link error");
@@ -1109,7 +1109,7 @@ mod tests {
         store.complete_chunk_writer(&chunk_id).await.unwrap();
 
         let (mut reader, size) = store
-            .open_chunk_reader(&chunk_id, 0, false)
+            .open_chunk_reader(&chunk_id, 0)
             .await
             .unwrap();
         assert_eq!(size, chunk_size);
