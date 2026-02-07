@@ -211,6 +211,17 @@ struct DentryItem {
 }
 ```
 
+## 同步盘场景
+
+用户把ndm的一个目录，挂载到多个设备。用户的期望
+1. 常规情况下，能正常使用
+2. 当设备断网的情况下，提供有限的可用性
+3. 设备在断网的情况下做的修改，在网络回复后可以继续同步。如果出现了冲突，有一定的自动解决能力
+
+这需要基于ndm的基础协议，实现一个更高级的客户端 -> NamedDataMgr Client Daemon
+
+
+
 
 ## 系统整体性能分析
 
@@ -258,6 +269,8 @@ fn OnMountObject(objid,option<obj_body>,deep) {
 obj_stat表保存在哪？
 - objid->objstat是可变的，因此不能周named_store的逻辑，否则扩容了就不知道以为为准了。
 - 目前还是作为fsmeta db的一部分，但这必然会对fsmeta造成比较大的压力
+
+
 
 ## 物化（对象化)
 

@@ -1,9 +1,5 @@
-use crate::{build_named_object_by_json, ObjId, OBJ_TYPE_ACTION};
-use buckyos_kit::buckyos_get_unix_timestamp;
-use name_lib::DID;
+use crate::{NamedObject, ObjId, OBJ_TYPE_ACTION};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
 
 pub const ACTION_TYPE_VIEWED: &str = "viewed";
 pub const ACTION_TYPE_DOWNLOAD: &str = "download";
@@ -26,4 +22,10 @@ pub struct ActionObject {
     pub details: Option<serde_json::Value>,
     pub iat: u64,
     pub exp: u64,
+}
+
+impl NamedObject for ActionObject {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_ACTION
+    }
 }

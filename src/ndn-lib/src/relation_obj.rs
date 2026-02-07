@@ -1,6 +1,6 @@
 use crate::{
-    build_named_object_by_json, ChunkId, NdnError, NdnResult, ObjId, OBJ_TYPE_RELATION,
-    RELATION_TYPE_PART_OF, RELATION_TYPE_SAME,
+    ChunkId, NamedObject, NdnError, NdnResult, ObjId, OBJ_TYPE_RELATION, RELATION_TYPE_PART_OF,
+    RELATION_TYPE_SAME,
 };
 use buckyos_kit::buckyos_get_unix_timestamp;
 use serde::{Deserialize, Serialize};
@@ -120,9 +120,11 @@ impl RelationObject {
         }
     }
 
-    pub fn gen_obj_id(&self) -> (ObjId, String) {
-        let obj_value = serde_json::to_value(self).unwrap();
-        return build_named_object_by_json(OBJ_TYPE_RELATION, &obj_value);
+}
+
+impl NamedObject for RelationObject {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_RELATION
     }
 }
 

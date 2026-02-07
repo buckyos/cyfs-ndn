@@ -7,15 +7,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 
-/*注意,SimpleObjectMap是一个"虚“对象，不应该直接使用。而是被嵌入到一个ReallyObject中使用
-struct ReallyObject {
-    pub other_filed:Value,
-    ...
-    #[serde(flatten)]
-    pub children: SimpleObjectMap,
-}
 
-*/
 
 #[derive(Debug, Clone)]
 pub enum SimpleMapItem {

@@ -1,4 +1,4 @@
-use crate::{build_named_object_by_json, ObjId, OBJ_TYPE_INCLUSION_PROOF};
+use crate::{NamedObject, ObjId, OBJ_TYPE_INCLUSION_PROOF};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use name_lib::DID;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub struct BaseContentObject {
     #[serde(default)]
     pub author: String,
     #[serde(skip_serializing_if = "is_owner_invalid")]
+    #[serde(default)]
     pub owner: DID,
     pub create_time: u64,
     pub last_update_time: u64,
@@ -148,9 +149,11 @@ impl InclusionProof {
         }
     }
 
-    pub fn gen_obj_id(&self) -> (ObjId, String) {
-        let json_value = serde_json::to_value(self).unwrap();
-        build_named_object_by_json(OBJ_TYPE_INCLUSION_PROOF, &json_value)
+}
+
+impl NamedObject for InclusionProof {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_INCLUSION_PROOF
     }
 }
 

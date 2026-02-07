@@ -1,4 +1,4 @@
-use ndn_lib::{FileObject, OBJ_TYPE_PKG, ObjId, build_named_object_by_json};
+use ndn_lib::{FileObject, NamedObject, OBJ_TYPE_PKG};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -87,9 +87,11 @@ impl PackageMeta {
         }
     }
 
-    pub fn gen_obj_id(&self) -> (ObjId, String) {
-        let json_value = serde_json::to_value(self).unwrap();
-        build_named_object_by_json(OBJ_TYPE_PKG, &json_value)  
+}
+
+impl NamedObject for PackageMeta {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_PKG
     }
 }
 

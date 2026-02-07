@@ -1,4 +1,4 @@
-use crate::{build_named_object_by_json, BaseContentObject, ObjId, OBJ_TYPE_FILE, OBJ_TYPE_PATH};
+use crate::{BaseContentObject, NamedObject, ObjId, OBJ_TYPE_FILE, OBJ_TYPE_PATH};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use buckyos_kit::is_zero;
 use serde::{Deserialize, Serialize};
@@ -57,10 +57,11 @@ impl FileObject {
             meta: HashMap::new(),
         }
     }
+}
 
-    pub fn gen_obj_id(&self) -> (ObjId, String) {
-        let json_value = serde_json::to_value(self).unwrap();
-        build_named_object_by_json(OBJ_TYPE_FILE, &json_value)
+impl NamedObject for FileObject {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_FILE
     }
 }
 
@@ -81,16 +82,18 @@ impl PathObject {
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 3,
         }
     }
+}
 
-    pub fn gen_obj_id(&self) -> (ObjId, String) {
-        let json_value = serde_json::to_value(self).unwrap();
-        build_named_object_by_json(OBJ_TYPE_PATH, &json_value)
+impl NamedObject for PathObject {
+    fn get_obj_type() -> &'static str {
+        OBJ_TYPE_PATH
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::build_named_object_by_json;
+    use serde_json::json;
 
     use super::*;
 
@@ -107,6 +110,33 @@ mod tests {
         let (objid, obj_str) = file_object.gen_obj_id();
         println!("fileobj id {}", objid.to_string());
         println!("fileobj str {}", obj_str);
+    }
+
+    #[test]
+    fn test_file_object_with_custom_meta() {
+        let mut file_object = FileObject::new(
+            "test-with-meta.data".to_string(),
+            2048,
+            "sha256:1234567890ABCDEF".to_string(),
+        );
+        file_object
+            .meta
+            .insert("app_version".to_string(), json!("1.2.3"));
+        file_object.meta.insert("priority".to_string(), json!(7));
+
+        let file_object_str = serde_json::to_string(&file_object).unwrap();
+        let file_object_json: serde_json::Value = serde_json::from_str(&file_object_str).unwrap();
+        assert_eq!(file_object_json["app_version"], json!("1.2.3"));
+        assert_eq!(file_object_json["priority"], json!(7));
+
+        let file_object2: FileObject = serde_json::from_str(&file_object_str).unwrap();
+        assert_eq!(file_object2.meta.get("app_version"), Some(&json!("1.2.3")));
+        assert_eq!(file_object2.meta.get("priority"), Some(&json!(7)));
+
+        let (obj_id, _obj_str) = file_object.gen_obj_id();
+        let (obj_id2, _obj_str2) =
+            build_named_object_by_json(OBJ_TYPE_FILE, &serde_json::to_value(&file_object).unwrap());
+        assert_eq!(obj_id, obj_id2);
     }
 
     #[test]

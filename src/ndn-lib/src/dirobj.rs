@@ -1,26 +1,81 @@
 use crate::object::ObjId;
 use crate::{BaseContentObject, FileObject, NdnError, NdnResult, OBJ_TYPE_DIR, OBJ_TYPE_FILE};
 use crate::{SimpleMapItem, SimpleObjectMap};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct DirObject {
-    #[serde(flatten)]
     pub content_obj: BaseContentObject,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    #[serde(default)]
-    #[serde(flatten)]
     pub meta: HashMap<String, serde_json::Value>,
 
     pub total_size: u64, //包含所有子文件夹和当前文件夹下文件的总大小
     pub file_count: u64,
     pub file_size: u64, //不包含子文件，只计算当前文件夹下文件的总大小
 
-    #[serde(flatten)]
     pub object_map: SimpleObjectMap, // 保存真正的sub items
+}
+
+#[derive(Serialize)]
+struct DirObjectSer<'a> {
+    #[serde(flatten)]
+    content_obj: &'a BaseContentObject,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    meta: &'a HashMap<String, serde_json::Value>,
+    total_size: u64,
+    file_count: u64,
+    file_size: u64,
+    body: &'a HashMap<String, SimpleMapItem>,
+}
+
+#[derive(Deserialize)]
+struct DirObjectDe {
+    #[serde(flatten)]
+    content_obj: BaseContentObject,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default)]
+    meta: HashMap<String, serde_json::Value>,
+    total_size: u64,
+    file_count: u64,
+    file_size: u64,
+    #[serde(default)]
+    body: HashMap<String, SimpleMapItem>,
+}
+
+impl Serialize for DirObject {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = DirObjectSer {
+            content_obj: &self.content_obj,
+            meta: &self.meta,
+            total_size: self.total_size,
+            file_count: self.file_count,
+            file_size: self.file_size,
+            body: &self.object_map.body,
+        };
+        value.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DirObject {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = DirObjectDe::deserialize(deserializer)?;
+        Ok(Self {
+            content_obj: value.content_obj,
+            meta: value.meta,
+            total_size: value.total_size,
+            file_count: value.file_count,
+            file_size: value.file_size,
+            object_map: SimpleObjectMap { body: value.body },
+        })
+    }
 }
 
 impl Deref for DirObject {
@@ -237,6 +292,9 @@ mod tests {
 
         let json_str = serde_json::to_string_pretty(&dir_root).unwrap();
         println!("json_str_for_dir_root: {}", json_str);
+        let dir_2: DirObject = serde_json::from_str(json_str.as_str()).unwrap();
+        let json_str = serde_json::to_string_pretty(&dir_2).unwrap();
+        println!("Dir2 : {}", json_str);
 
         let (obj_id, json_str) = dir_root.gen_obj_id().unwrap();
         println!("dir_root_obj_id: {}", obj_id.to_string());

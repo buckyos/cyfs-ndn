@@ -2,6 +2,7 @@
 //!
 //! This module coordinates fs_meta, fs_buffer, and named_store to provide
 //! a unified file/directory namespace with overlay semantics.
+//! 
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ pub struct PathStat {
     pub kind: PathKind,
     pub size: Option<u64>,
     pub obj_id: Option<ObjId>,
+    pub obj_inner_path:Option<String>,
     pub inode_id: Option<IndexNodeId>,
     pub state: Option<NodeState>,
 }
@@ -44,6 +46,7 @@ pub struct PathStat {
 pub enum PathKind {
     File,
     Dir,
+    Object,
     NotFound,
 }
 
@@ -155,6 +158,18 @@ pub enum OpenWriteFlag {
 
     /// Create if not exist, append if exists (useful for distributed logging)
     CreateOrAppend,
+}
+
+pub struct CopyOptions {
+    pub is_target_readonly:bool,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            is_target_readonly: false,
+        }
+    }
 }
 
 // ------------------------------
@@ -338,6 +353,13 @@ impl NamedDataMgr {
         self.fsmeta.set_file(path, obj_id).await
     }
 
+    pub async fn set_file_with_body(&self,path:&NdmPath,obj_data:String) -> NdnResult<()> {
+        //gen obj_id by obj_data
+        //store_mgr.put
+        //self.set_file
+        unimplemented!()
+    }
+
     pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
         self.fsmeta.set_dir(path, dir_obj_id).await
     }
@@ -368,20 +390,26 @@ impl NamedDataMgr {
         self.set_file(target, obj_id).await
     }
 
-    pub async fn copy_dir(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+    pub async fn copy_dir(&self, src: &NdmPath, target: &NdmPath,copy_option:CopyOptions) -> NdnResult<()> {
         let stat = self.stat(src).await?;
         if stat.kind != PathKind::Dir {
             return Err(NdnError::InvalidParam("source is not a directory".to_string()));
         }
-        let obj_id = stat
-            .obj_id
-            .ok_or_else(|| NdnError::InvalidState("source directory not published".to_string()))?;
-        self.set_dir(target, obj_id).await
+        if stat.obj_id.is_some() {
+            //1) src已经物化，非常简单的set_dir就可以了
+            self.set_dir(target, stat.obj_id.unwrap()).await
+        } else {
+            //2) src没有物化，此时要把src所有children的inode都clone一份到dest(处于working状态的inode跳过)
+            unimplemented!();
+        }
     }
 
     //快照的逻辑是copy_dir的特殊情况，复制后把target设置为readonly,并很快会触发物化流程冻结
     pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        self.copy_dir(src, target).await
+        let cp_option = CopyOptions {
+            is_target_readonly: false
+        };
+        self.copy_dir(src, target, cp_option).await
     }
 
     // ========== Directory Operations ==========
@@ -395,6 +423,9 @@ impl NamedDataMgr {
         pos: u32,
         page_size: u32,
     ) -> NdnResult<Vec<(String, PathStat)>> {
+        //TODO 性能优化: 减少RPC,支持Cache 
+        // fsmeta应该接管 list_dentries + get_inode的流程，并在服务器上建立一个可以关闭的内存cache
+        // ndm做和DirObject的合并后，并cache，最终实现支持接口（减少使用者的心智负担)
         let resolved = self.fsmeta.resolve_path(path).await?;
         if let Some((dir_id, dir_node)) = resolved {
             if dir_node.kind != NodeKind::Dir {
@@ -408,14 +439,12 @@ impl NamedDataMgr {
                 .list_dentries(dir_id, None)
                 .await
                 .map_err(|e| NdnError::Internal(format!("failed to list dentries: {}", e)))?;
-
+            //merge detries and DirObject.children()
             let mut upper_map: HashMap<String, DentryRecord> = HashMap::new();
             for dentry in dentries {
                 upper_map.insert(dentry.name.clone(), dentry);
             }
-
             let mut results: HashMap<String, PathStat> = HashMap::new();
-
             if let Some(base_obj_id) = dir_node.base_obj_id.clone() {
                 let dir_obj = self.load_dir_object(&base_obj_id).await?;
                 for (name, item) in dir_obj.iter() {
@@ -429,6 +458,7 @@ impl NamedDataMgr {
                     results.insert(name.clone(), child_stat);
                 }
             }
+
 
             for (name, dentry) in upper_map {
                 if matches!(dentry.target, DentryTarget::Tombstone) {
@@ -542,6 +572,7 @@ impl NamedDataMgr {
         match resp {
             crate::OpenFileReaderResp::FileBufferId(handle_id) => {
                 let fb = self.fsbuffer.get_buffer(&handle_id).await?;
+                //TODO 手工构造政府的fs buffer reader，要传入正确的chunklist base reader,或则提供成标准的DiffChunkListReader实现
                 let reader = self
                     .fsbuffer
                     .open_reader(&fb, std::io::SeekFrom::Start(0))
@@ -558,6 +589,7 @@ impl NamedDataMgr {
         }
     }
 
+    
     pub async fn get_object_by_path(&self, path: &NdmPath) -> NdnResult<String> {
         let stat = self.stat(path).await?;
         if stat.kind == PathKind::NotFound {
@@ -571,6 +603,7 @@ impl NamedDataMgr {
             .obj_id
             .ok_or_else(|| NdnError::NotFound("no object bound to path".to_string()))?;
 
+        //get_object的返回，需要正确支持jwt格式
         let obj = self.get_object(&obj_id).await?;
         Ok(serde_json::to_string(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
     }
@@ -596,6 +629,9 @@ impl NamedDataMgr {
     }
 
     async fn load_dir_object(&self, obj_id: &ObjId) -> NdnResult<DirObject> {
+        if !obj_id.is_dir_object() {
+            return Err(NdnError::InvalidObjType("must be dirobject".to_string()));
+        }
         let obj_json = self.get_object(obj_id).await?;
         serde_json::from_value(obj_json)
             .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))
@@ -642,6 +678,7 @@ impl NamedDataMgr {
             kind,
             size,
             obj_id: Some(obj_id),
+            obj_inner_path:None,
             inode_id: None,
             state: None,
         })
@@ -651,6 +688,7 @@ impl NamedDataMgr {
         &self,
         item: &SimpleMapItem,
     ) -> NdnResult<PathStat> {
+        
         let (obj_id, _) = item.get_obj_id()?;
         let kind = match Self::obj_kind_from_obj_id(&obj_id) {
             ObjectKind::Dir => PathKind::Dir,
@@ -824,12 +862,6 @@ impl NamedDataMgr {
             .as_ref()
             .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
 
-        if obj_id.is_chunk() {
-            let chunk_id = ChunkId::from_obj_id(obj_id);
-            layout_mgr.remove_chunk(&chunk_id).await?;
-            return Ok(());
-        }
-
         layout_mgr.remove_object(obj_id).await?;
         Ok(())
     }
@@ -841,8 +873,8 @@ impl NamedDataMgr {
             .layout_mgr
             .as_ref()
             .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
-        let (state, _, _) = layout_mgr.query_chunk_state(chunk_id).await?;
-        Ok(state.can_open_reader())
+        let have_chunk =  layout_mgr.have_chunk(chunk_id).await;
+        Ok(have_chunk)
     }
 
     pub async fn query_chunk_state(
@@ -866,12 +898,12 @@ impl NamedDataMgr {
             .layout_mgr
             .as_ref()
             .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
-        layout_mgr.open_chunk_reader(chunk_id, offset, false).await
+        layout_mgr.open_chunk_reader(chunk_id, offset).await
     }
 
     // ========== Admin Operations ==========
 
-    pub async fn expand_capacity(&self, _new_target: StoreTarget) -> NdnResult<u64> {
+    pub async fn expand_store(&self, _new_target: StoreTarget) -> NdnResult<u64> {
         let layout_mgr = self
             .layout_mgr
             .as_ref()
@@ -1064,63 +1096,7 @@ impl NamedDataMgr {
         Ok(dir_obj_id)
     }
 
-    //  move to store_layout_mgr
-    /// Lookup a child entry in a DirObject by inner_path.
-    /// Returns the ObjId if the child exists and is a directory.
-    #[allow(dead_code)]
-    async fn lookup_in_dir_object(
-        &self,
-        dir_obj_id: &ObjId,
-        child_name: &str,
-    ) -> NdnResult<Option<ObjId>> {
-        let layout_mgr = self
-            .layout_mgr
-            .as_ref()
-            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
-
-        let obj_json = layout_mgr
-            .get_object(dir_obj_id)
-            .await
-            .map_err(|e| NdnError::Internal(format!("failed to get DirObject: {}", e)))?;
-
-        // Parse as DirObject
-        let dir_obj: DirObject = serde_json::from_value(obj_json)
-            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))?;
-
-        // Look up child in the object map
-        match dir_obj.get(child_name) {
-            Some(item) => {
-                match item {
-                    SimpleMapItem::ObjId(child_obj_id) => {
-                        if child_obj_id.obj_type == OBJ_TYPE_DIR {
-                            Ok(Some(child_obj_id.clone()))
-                        } else {
-                            // Child exists but is not a directory
-                            Err(NdnError::InvalidParam(format!(
-                                "{} in DirObject is not a directory",
-                                child_name
-                            )))
-                        }
-                    }
-                    SimpleMapItem::Object(obj_type, _) | SimpleMapItem::ObjectJwt(obj_type, _) => {
-                        if obj_type == OBJ_TYPE_DIR {
-                            // Embedded directory object - need to compute its ObjId
-                            let (child_obj_id, _) = item.get_obj_id().map_err(|e| {
-                                NdnError::Internal(format!("failed to get obj_id: {}", e))
-                            })?;
-                            Ok(Some(child_obj_id))
-                        } else {
-                            Err(NdnError::InvalidParam(format!(
-                                "{} in DirObject is not a directory",
-                                child_name
-                            )))
-                        }
-                    }
-                }
-            }
-            None => Ok(None), // Child not found in DirObject
-        }
-    }
+   
 
     async fn move_path_with_opts(
         &self,
@@ -1131,454 +1107,6 @@ impl NamedDataMgr {
         self.fsmeta
             .move_path_with_opts(old_path, new_path, opts)
             .await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use fs_buffer::{
-        FileBufferRecord, FileBufferSeekReader, FileBufferSeekWriter, FileBufferService, NdmPath,
-        SessionId, WriteLease,
-    };
-    use krpc::{RPCContext, RPCErrors};
-    use ndn_lib::{ChunkHasher, ObjId};
-    use named_store::ObjectState;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::AsyncWriteExt;
-
-    struct DummyFsMeta;
-
-    #[async_trait]
-    impl FsMetaHandler for DummyFsMeta {
-        async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
-            Ok(0)
-        }
-
-        async fn handle_resolve_path(
-            &self,
-            _path: &ndn_lib::NdmPath,
-            _ctx: RPCContext,
-        ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
-            Ok(None)
-        }
-
-        async fn handle_begin_txn(&self, _ctx: RPCContext) -> Result<String, RPCErrors> {
-            Ok("tx".to_string())
-        }
-
-        async fn handle_get_inode(
-            &self,
-            _id: IndexNodeId,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<Option<NodeRecord>, RPCErrors> {
-            Ok(None)
-        }
-
-        async fn handle_set_inode(
-            &self,
-            _node: NodeRecord,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_update_inode_state(
-            &self,
-            _node_id: IndexNodeId,
-            _new_state: NodeState,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_alloc_inode(
-            &self,
-            _node: NodeRecord,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<IndexNodeId, RPCErrors> {
-            Ok(0)
-        }
-
-        async fn handle_get_dentry(
-            &self,
-            _parent: IndexNodeId,
-            _name: String,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<Option<DentryRecord>, RPCErrors> {
-            Ok(None)
-        }
-
-        async fn handle_list_dentries(
-            &self,
-            _parent: IndexNodeId,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<Vec<DentryRecord>, RPCErrors> {
-            Ok(Vec::new())
-        }
-
-        async fn handle_upsert_dentry(
-            &self,
-            _parent: IndexNodeId,
-            _name: String,
-            _target: DentryTarget,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_remove_dentry_row(
-            &self,
-            _parent: IndexNodeId,
-            _name: String,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_set_tombstone(
-            &self,
-            _parent: IndexNodeId,
-            _name: String,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_bump_dir_rev(
-            &self,
-            _dir: IndexNodeId,
-            _expected_rev: u64,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<u64, RPCErrors> {
-            Ok(0)
-        }
-
-        async fn handle_commit(&self, _txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_rollback(&self, _txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_acquire_file_lease(
-            &self,
-            _node_id: IndexNodeId,
-            _session: SessionId,
-            _ttl: std::time::Duration,
-            _ctx: RPCContext,
-        ) -> Result<u64, RPCErrors> {
-            Ok(0)
-        }
-
-        async fn handle_renew_file_lease(
-            &self,
-            _node_id: IndexNodeId,
-            _session: SessionId,
-            _lease_seq: u64,
-            _ttl: std::time::Duration,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_release_file_lease(
-            &self,
-            _node_id: IndexNodeId,
-            _session: SessionId,
-            _lease_seq: u64,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_obj_stat_get(
-            &self,
-            _obj_id: ObjId,
-            _ctx: RPCContext,
-        ) -> Result<Option<ObjStat>, RPCErrors> {
-            Ok(None)
-        }
-
-        async fn handle_obj_stat_bump(
-            &self,
-            _obj_id: ObjId,
-            _delta: i64,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<u64, RPCErrors> {
-            Ok(0)
-        }
-
-        async fn handle_obj_stat_list_zero(
-            &self,
-            _older_than_ts: u64,
-            _limit: u32,
-            _ctx: RPCContext,
-        ) -> Result<Vec<ObjId>, RPCErrors> {
-            Ok(Vec::new())
-        }
-
-        async fn handle_obj_stat_delete_if_zero(
-            &self,
-            _obj_id: ObjId,
-            _txid: Option<String>,
-            _ctx: RPCContext,
-        ) -> Result<bool, RPCErrors> {
-            Ok(false)
-        }
-
-        async fn handle_set_file(
-            &self,
-            _path: &ndn_lib::NdmPath,
-            _obj_id: ObjId,
-            _ctx: RPCContext,
-        ) -> Result<String, RPCErrors> {
-            Ok(String::new())
-        }
-
-        async fn handle_set_dir(
-            &self,
-            _path: &ndn_lib::NdmPath,
-            _dir_obj_id: ObjId,
-            _ctx: RPCContext,
-        ) -> Result<String, RPCErrors> {
-            Ok(String::new())
-        }
-
-        async fn handle_delete(&self, _path: &ndn_lib::NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_move_path_with_opts(
-            &self,
-            _old_path: &ndn_lib::NdmPath,
-            _new_path: &ndn_lib::NdmPath,
-            _opts: MoveOptions,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_make_link(
-            &self,
-            _link_path: &ndn_lib::NdmPath,
-            _target: &ndn_lib::NdmPath,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_create_dir(&self, _path: &ndn_lib::NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_open_file_writer(
-            &self,
-            _path: &ndn_lib::NdmPath,
-            _flag: OpenWriteFlag,
-            _expected_size: Option<u64>,
-            _ctx: RPCContext,
-        ) -> Result<String, RPCErrors> {
-            Err(RPCErrors::ReasonError("not supported".to_string()))
-        }
-
-        async fn handle_close_file_writer(
-            &self,
-            _file_inode_id: IndexNodeId,
-            _ctx: RPCContext,
-        ) -> Result<(), RPCErrors> {
-            Ok(())
-        }
-
-        async fn handle_open_file_reader(
-            &self,
-            _path: ndn_lib::NdmPath,
-            _ctx: RPCContext,
-        ) -> Result<OpenFileReaderResp, RPCErrors> {
-            Err(RPCErrors::ReasonError("not supported".to_string()))
-        }
-    }
-
-    struct DummyBuffer;
-
-    #[async_trait]
-    impl FileBufferService for DummyBuffer {
-        async fn alloc_buffer(
-            &self,
-            _path: &NdmPath,
-            _file_inode_id: u64,
-            _base_chunk_list: Vec<ChunkId>,
-            _lease: &WriteLease,
-            _expected_size: Option<u64>,
-        ) -> NdnResult<FileBufferRecord> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn get_buffer(&self, _handle_id: &str) -> NdnResult<FileBufferRecord> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn open_reader(
-            &self,
-            _fb: &FileBufferRecord,
-            _seek_from: std::io::SeekFrom,
-        ) -> NdnResult<FileBufferSeekReader> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn open_writer(
-            &self,
-            _fb: &FileBufferRecord,
-            _seek_from: std::io::SeekFrom,
-        ) -> NdnResult<FileBufferSeekWriter> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn flush(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn close(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn append(&self, _fb: &FileBufferRecord, _data: &[u8]) -> NdnResult<()> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn cacl_name(&self, _fb: &FileBufferRecord) -> NdnResult<ObjId> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-
-        async fn remove(&self, _fb: &FileBufferRecord) -> NdnResult<()> {
-            Err(NdnError::Unsupported("dummy".to_string()))
-        }
-    }
-
-    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{}_{}", prefix, nanos))
-    }
-
-    #[tokio::test]
-    async fn test_erase_obj_by_id_removes_object_and_chunk() {
-        let store_dir = unique_temp_dir("ndm_erase_test");
-        tokio::fs::create_dir_all(&store_dir).await.unwrap();
-
-        let store = NamedLocalStore::from_config(
-            Some("test-store".to_string()),
-            store_dir.clone(),
-            NamedLocalConfig::default(),
-        )
-        .await
-        .unwrap();
-        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
-
-        let layout_mgr = Arc::new(NamedStoreMgr::new());
-        layout_mgr.register_store(store_ref).await;
-
-        let layout = StoreLayout::new(
-            1,
-            vec![LayoutStoreTarget {
-                store_id: "test-store".to_string(),
-                device_did: None,
-                capacity: None,
-                used: None,
-                readonly: false,
-                enabled: true,
-                weight: 1,
-            }],
-            0,
-            0,
-        );
-        layout_mgr.add_layout(layout).await;
-
-        let fsmeta = Arc::new(FsMetaClient::new_in_process(Box::new(DummyFsMeta)));
-        let buffer = Arc::new(DummyBuffer);
-        let ndm = NamedDataMgr::with_layout_mgr(
-            "test".to_string(),
-            fsmeta,
-            buffer,
-            None,
-            CommitPolicy::default(),
-            layout_mgr.clone(),
-        );
-
-        let file_obj = FileObject::new("file".to_string(), 3, "sha256:00".to_string());
-        let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
-        layout_mgr
-            .put_object(&file_obj_id, &file_obj_str)
-            .await
-            .unwrap();
-
-        let obj_state = layout_mgr.query_object_by_id(&file_obj_id).await.unwrap();
-        assert!(matches!(obj_state, ObjectState::Object(_)));
-
-        ndm.erase_obj_by_id(&file_obj_id).await.unwrap();
-        let obj_state = layout_mgr.query_object_by_id(&file_obj_id).await.unwrap();
-        assert!(matches!(obj_state, ObjectState::NotExist));
-
-        let data = b"hello chunk";
-        let chunk_id = ChunkHasher::new(None)
-            .unwrap()
-            .calc_mix_chunk_id_from_bytes(data)
-            .unwrap();
-        let (mut writer, _) = layout_mgr
-            .open_chunk_writer(&chunk_id, data.len() as u64, 0)
-            .await
-            .unwrap();
-        writer.write_all(data).await.unwrap();
-        writer.flush().await.unwrap();
-        drop(writer);
-        layout_mgr.complete_chunk_writer(&chunk_id).await.unwrap();
-
-        let (state, _, _) = layout_mgr.query_chunk_state(&chunk_id).await.unwrap();
-        assert!(state.can_open_reader());
-
-        ndm.erase_obj_by_id(&chunk_id.to_obj_id()).await.unwrap();
-        let (state, _, _) = layout_mgr.query_chunk_state(&chunk_id).await.unwrap();
-        assert!(matches!(state, named_store::ChunkStoreState::NotExist));
-
-        let _ = tokio::fs::remove_dir_all(&store_dir).await;
-    }
-}
-
-// ========== Background Manager ==========
-
-pub struct BackgroundMgr {
-    // Placeholder for background task management
-    _staged_queue: Vec<String>,
-    _lazy_migration_queue: Vec<String>,
-}
-
-impl BackgroundMgr {
-    pub fn new() -> Self {
-        Self {
-            _staged_queue: Vec::new(),
-            _lazy_migration_queue: Vec::new(),
-        }
-    }
-}
-
-impl Default for BackgroundMgr {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

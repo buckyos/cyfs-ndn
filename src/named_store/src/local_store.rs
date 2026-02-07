@@ -327,7 +327,6 @@ impl NamedLocalStore {
         &self,
         chunk_id: &ChunkId,
         offset: u64,
-        _auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
         let chunk_item = self.get_chunk_item(chunk_id).await?;
         match chunk_item.chunk_state {

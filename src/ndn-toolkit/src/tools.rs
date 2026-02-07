@@ -1,4 +1,4 @@
-use crate::{CHUNK_NORMAL_SIZE, ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NdnAction, NdnError, NdnProgressCallback, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, PackedObjItem, ProgressCallbackResult, SimpleChunkList, StoreMode};
+use crate::{CHUNK_NORMAL_SIZE, ChunkHasher, ChunkLocalInfo, ChunkState, ChunkType, DirObject, FileObject, NamedDataMgr, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, ObjId, PackedObjItem, ProgressCallbackResult, SimpleChunkList, StoreMode};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::collections::HashMap;

@@ -200,58 +200,6 @@ impl NamedStoreMgr {
         }))
     }
 
-    /// Get object with extended fallback - try all targets in each layout
-    ///
-    /// More aggressive search: for each layout, try all possible targets
-    /// (not just primary) before moving to next layout version
-    pub async fn get_object_exhaustive(&self, obj_id: &ObjId) -> NdnResult<serde_json::Value> {
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-
-        if versions.is_empty() {
-            return Err(NdnError::NotFound(
-                "no layout versions available".to_string(),
-            ));
-        }
-
-        let mut last_error: Option<NdnError> = None;
-        let mut tried_stores: Vec<String> = Vec::new();
-
-        for version in versions.iter() {
-            // Get all possible targets from this layout
-            let targets = version.layout.select_targets(obj_id);
-
-            for target in targets {
-                // Skip if we already tried this store
-                if tried_stores.contains(&target.store_id) {
-                    continue;
-                }
-                tried_stores.push(target.store_id.clone());
-
-                // Get store instance
-                let store = match stores.get(&target.store_id) {
-                    Some(s) => s,
-                    None => continue,
-                };
-
-                // Try to get object from this store
-                let store_guard = store.lock().await;
-                match store_guard.get_object(obj_id, None).await {
-                    Ok(obj) => return Ok(obj),
-                    Err(NdnError::NotFound(_)) => continue,
-                    Err(e) => {
-                        last_error = Some(e);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            NdnError::NotFound(format!("object {:?} not found in any store", obj_id))
-        }))
-    }
-
     /// Select primary store for a new object (uses current layout)
     pub async fn select_store_for_write(
         &self,
@@ -458,7 +406,6 @@ impl NamedStoreMgr {
         &self,
         chunk_id: &ChunkId,
         offset: u64,
-        auto_cache: bool,
     ) -> NdnResult<(ChunkReader, u64)> {
         let obj_id = chunk_id.to_obj_id();
         let versions = self.versions.read().await;
@@ -497,7 +444,7 @@ impl NamedStoreMgr {
 
             let store_guard = store.lock().await;
             match store_guard
-                .open_chunk_reader(chunk_id, offset, auto_cache)
+                .open_chunk_reader(chunk_id, offset)
                 .await
             {
                 Ok(result) => return Ok(result),
@@ -527,8 +474,7 @@ impl NamedStoreMgr {
     pub async fn open_chunklist_reader(
         &self,
         chunklist_id: &ObjId,
-        offset: u64,
-        auto_cache: bool,
+        offset: u64
     ) -> NdnResult<(ChunkReader, u64)> {
         if !chunklist_id.is_chunk_list() {
             return Err(NdnError::InvalidObjType(format!(
@@ -553,29 +499,79 @@ impl NamedStoreMgr {
         Ok((Box::pin(reader), total_size))
     }
 
-    /// Compatibility alias for typo-ed API name.
-    pub async fn open_chunklist_rader(
+     //  move to store_layout_mgr
+    /// Lookup a child entry in a DirObject by inner_path.
+    /// Returns the ObjId if the child exists and is a directory.
+    #[allow(dead_code)]
+    async fn lookup_in_dir_object(
         &self,
-        chunklist_id: &ObjId,
-        offset: u64,
-        auto_cache: bool,
-    ) -> NdnResult<(ChunkReader, u64)> {
-        self.open_chunklist_reader(chunklist_id, offset, auto_cache)
+        dir_obj_id: &ObjId,
+        child_name: &str,
+    ) -> NdnResult<Option<ObjId>> {
+        let layout_mgr = self
+            .layout_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+
+        let obj_json = layout_mgr
+            .get_object(dir_obj_id)
             .await
+            .map_err(|e| NdnError::Internal(format!("failed to get DirObject: {}", e)))?;
+
+        // Parse as DirObject
+        let dir_obj: DirObject = serde_json::from_value(obj_json)
+            .map_err(|e| NdnError::Internal(format!("failed to parse DirObject: {}", e)))?;
+
+        // Look up child in the object map
+        match dir_obj.get(child_name) {
+            Some(item) => {
+                match item {
+                    SimpleMapItem::ObjId(child_obj_id) => {
+                        if child_obj_id.obj_type == OBJ_TYPE_DIR {
+                            Ok(Some(child_obj_id.clone()))
+                        } else {
+                            // Child exists but is not a directory
+                            Err(NdnError::InvalidParam(format!(
+                                "{} in DirObject is not a directory",
+                                child_name
+                            )))
+                        }
+                    }
+                    SimpleMapItem::Object(obj_type, _) | SimpleMapItem::ObjectJwt(obj_type, _) => {
+                        if obj_type == OBJ_TYPE_DIR {
+                            // Embedded directory object - need to compute its ObjId
+                            let (child_obj_id, _) = item.get_obj_id().map_err(|e| {
+                                NdnError::Internal(format!("failed to get obj_id: {}", e))
+                            })?;
+                            Ok(Some(child_obj_id))
+                        } else {
+                            Err(NdnError::InvalidParam(format!(
+                                "{} in DirObject is not a directory",
+                                child_name
+                            )))
+                        }
+                    }
+                }
+            }
+            None => Ok(None), // Child not found in DirObject
+        }
     }
 
     /// Open a generic reader by object id and optional inner path.
     pub async fn open_reader(
         &self,
         obj_id: &ObjId,
-        inner_obj_path: Option<String>,
-        auto_cache: bool,
+        inner_obj_path: Option<String>
     ) -> NdnResult<(ChunkReader, u64)> {
         let mut current_obj_id = obj_id.clone();
         let mut current_inner_path = inner_obj_path;
         let mut size_override: Option<u64> = None;
 
         loop {
+            if current_obj_id.is_dir_object() {
+                unimplemented!()
+            }
+
             if current_obj_id.is_chunk() {
                 if current_inner_path.is_some() {
                     return Err(NdnError::InvalidObjType(format!(
@@ -585,7 +581,7 @@ impl NamedStoreMgr {
                 }
 
                 let chunk_id = ChunkId::from_obj_id(&current_obj_id);
-                let (reader, size) = self.open_chunk_reader(&chunk_id, 0, auto_cache).await?;
+                let (reader, size) = self.open_chunk_reader(&chunk_id, 0).await?;
                 return Ok((reader, size_override.unwrap_or(size)));
             }
 
@@ -598,7 +594,7 @@ impl NamedStoreMgr {
                 }
 
                 let (reader, size) = self
-                    .open_chunklist_reader(&current_obj_id, 0, auto_cache)
+                    .open_chunklist_reader(&current_obj_id, 0)
                     .await?;
                 return Ok((reader, size_override.unwrap_or(size)));
             }
@@ -665,7 +661,7 @@ impl NamedStoreMgr {
 
     /// Get chunk data (tries all layout versions)
     pub async fn get_chunk_data(&self, chunk_id: &ChunkId) -> NdnResult<Vec<u8>> {
-        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0, false).await?;
+        let (mut chunk_reader, chunk_size) = self.open_chunk_reader(chunk_id, 0).await?;
         let mut buffer = Vec::with_capacity(chunk_size as usize);
         use tokio::io::AsyncReadExt;
         chunk_reader
@@ -682,7 +678,7 @@ impl NamedStoreMgr {
         offset: u64,
         piece_size: u32,
     ) -> NdnResult<Vec<u8>> {
-        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, offset, false).await?;
+        let (mut reader, chunk_size) = self.open_chunk_reader(chunk_id, offset).await?;
         if offset > chunk_size {
             return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
         }
@@ -716,7 +712,7 @@ impl NamedStoreMgr {
             .await
     }
 
-    /// Open new chunk writer (uses current layout for write target)
+    /// TODO:考虑到chunk writer的连续性，应该在OpenWriter后，返回store_id,或则推荐用户用原始的select_writer语义实现。
     pub async fn open_new_chunk_writer(
         &self,
         chunk_id: &ChunkId,
@@ -734,97 +730,7 @@ impl NamedStoreMgr {
             .await
     }
 
-    /// Update chunk progress (needs to find the correct store first)
-    /// This operation finds the store where chunk is being written
-    pub async fn update_chunk_progress(
-        &self,
-        chunk_id: &ChunkId,
-        progress: String,
-    ) -> NdnResult<()> {
-        // First query chunk state to find which store has it
-        let (state, _, _) = self.query_chunk_state(chunk_id).await?;
-        if state == ChunkStoreState::NotExist {
-            return Err(NdnError::NotFound(format!(
-                "chunk {} not found",
-                chunk_id.to_string()
-            )));
-        }
-
-        // Get the store that has this chunk
-        let obj_id = chunk_id.to_obj_id();
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-
-        let mut tried_stores: Vec<String> = Vec::new();
-
-        for version in versions.iter() {
-            let target = match version.layout.select_primary_target(&obj_id) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if tried_stores.contains(&target.store_id) {
-                continue;
-            }
-            tried_stores.push(target.store_id.clone());
-
-            let store = match stores.get(&target.store_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let store_guard = store.lock().await;
-            let (chunk_state, _, _) = store_guard.query_chunk_state(chunk_id).await?;
-            if chunk_state == ChunkStoreState::Incompleted {
-                return store_guard
-                    .update_chunk_progress(chunk_id, progress)
-                    .await;
-            }
-        }
-
-        Err(NdnError::NotFound(format!(
-            "chunk {} not in incompleted state",
-            chunk_id.to_string()
-        )))
-    }
-
-    /// Complete chunk writer (needs to find the correct store first)
-    pub async fn complete_chunk_writer(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        let obj_id = chunk_id.to_obj_id();
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-
-        let mut tried_stores: Vec<String> = Vec::new();
-
-        for version in versions.iter() {
-            let target = match version.layout.select_primary_target(&obj_id) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if tried_stores.contains(&target.store_id) {
-                continue;
-            }
-            tried_stores.push(target.store_id.clone());
-
-            let store = match stores.get(&target.store_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let store_guard = store.lock().await;
-            let (chunk_state, _, _) = store_guard.query_chunk_state(chunk_id).await?;
-            if chunk_state == ChunkStoreState::Incompleted {
-                return store_guard.complete_chunk_writer(chunk_id).await;
-            }
-        }
-
-        Err(NdnError::NotFound(format!(
-            "chunk {} not in incompleted state",
-            chunk_id.to_string()
-        )))
-    }
-
+   
     /// Put chunk by reader (uses current layout for write target)
     pub async fn put_chunk_by_reader(
         &self,
@@ -882,7 +788,6 @@ impl NamedStoreMgr {
             .await
     }
 
-    // ==================== Helper Methods ====================
 
     /// Get store by store_id
     pub async fn get_store(
@@ -934,6 +839,7 @@ impl NamedStoreMgr {
         None
     }
 
+    //TODO:ndn-lib里有通用函数？
     fn value_to_obj_id(value: &Value) -> NdnResult<ObjId> {
         match value {
             Value::String(v) => ObjId::new(v),
@@ -957,7 +863,8 @@ impl NamedStoreMgr {
             ))),
         }
     }
-
+    
+    //TODO:ndn-lib里有通用函数？
     fn extract_json_by_path(value: &Value, path: &str) -> NdnResult<Value> {
         let mut current = value;
         for segment in path.split('/') {
