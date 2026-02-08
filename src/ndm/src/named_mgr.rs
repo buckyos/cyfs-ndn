@@ -21,11 +21,10 @@ use ndn_lib::{
     load_named_obj, ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId,
     SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, IndexNodeId, MoveOptions, NodeKind,
-    NodeRecord, NodeState, ObjStat,
+    NodeRecord, NodeState, ObjStat, OpenWriteFlag,
 };
 
 // ------------------------------
@@ -178,27 +177,6 @@ pub struct PullContext {
 pub struct StoreTarget {
     pub store_id: String,
     pub path: String,
-}
-
-//Open write flags
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OpenWriteFlag {
-    /// Append to existing file (file must exist)
-    /// Returns error if file not found
-    Append,
-
-    /// Continue previous write session (file must exist, state must be Cooling/Working)
-    /// For resuming interrupted writes
-    ContinueWrite,
-
-    /// Create new file exclusively (fails if file exists)
-    CreateExclusive,
-
-    /// Create if not exist, truncate if exists
-    CreateOrTruncate,
-
-    /// Create if not exist, append if exists (useful for distributed logging)
-    CreateOrAppend,
 }
 
 pub struct CopyOptions {
@@ -1132,6 +1110,7 @@ impl NamedDataMgr {
             local_mode: writer_state.local_mode,
             fixed_chunk_size: writer_state.fixed_chunk_size,
             append_merge_last_chunk: writer_state.append_merge_last_chunk,
+            ..Default::default()
         }
     }
 

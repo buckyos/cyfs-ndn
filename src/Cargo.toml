@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "./package-lib",
     "./ndn-lib",
+    "./ndm-lib",
     "./named_store",
     "./fs_buffer",
     "./ndm",

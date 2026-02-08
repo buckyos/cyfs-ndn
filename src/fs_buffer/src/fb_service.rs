@@ -1,14 +1,11 @@
 use async_trait::async_trait;
-use ndn_lib::{ChunkId, NdnResult, ObjId};
-use serde::{Deserialize, Serialize};
+use ndm_lib::SessionId;
+use ndn_lib::{ChunkId, NdnResult};
 
 use crate::local_filebuffer::FileBufferRecord;
 
 #[derive(Debug, Clone)]
 pub struct NdmPath(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SessionId(pub String);
 
 #[derive(Debug, Clone)]
 pub struct WriteLease {
@@ -38,7 +35,10 @@ pub trait FileBufferService: Send + Sync {
     async fn append(&self, fb: &FileBufferRecord, data: &[u8]) -> NdnResult<()>;
 
     // 计算文件 buffer 的 objid，让 inode 处于 linked 状态
-    async fn cacl_name(&self, fb: &FileBufferRecord) -> NdnResult<ObjId>;
+    // 返回是否已经 finalized（true=已完成 finalized，无需再调 finalize）
+    async fn cacl_name(&self, fb: &FileBufferRecord) -> NdnResult<bool>;
+
+    async fn finalize(&self, fb_id: String) -> NdnResult<()>;
 
     async fn remove(&self, fb: &FileBufferRecord) -> NdnResult<()>;
 }

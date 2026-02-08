@@ -1,5 +1,4 @@
-mod fsmeta_client;
 mod named_mgr;
 
-pub use fsmeta_client::*;
+pub use ndm_lib::*;
 pub use named_mgr::*;

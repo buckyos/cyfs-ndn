@@ -1,13 +1,20 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use ndn_lib::{ChunkId, NdnError, NdnResult, ObjId};
+use ndm_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
+use ndn_lib::{
+    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, FileObject,
+    NamedObject, NdnError, NdnResult, ObjId, SimpleChunkList, CHUNK_DEFAULT_SIZE,
+    MIN_QCID_FILE_SIZE,
+};
+use named_store::{ChunkLocalInfo, NamedStoreMgr};
 use tokio::fs::{self, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::buffer_db::LocalFileBufferDB;
 use crate::fb_service::{FileBufferService, NdmPath, WriteLease};
@@ -16,6 +23,7 @@ static HANDLE_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const BUFFER_DIR_NAME: &str = "buffers";
 const BUFFER_DB_FILE: &str = "file_buffer.db";
+const DIRECT_FINALIZE_FILE_SIZE: u64 = CHUNK_DEFAULT_SIZE * 2;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct FileBufferDiffState {
@@ -29,6 +37,10 @@ pub struct FileBufferDiffState {
     pub local_mode: bool,
     pub fixed_chunk_size: Option<u64>,
     pub append_merge_last_chunk: bool,
+    pub linked_obj_id: Option<ObjId>,
+    pub linked_qcid: Option<ChunkId>,
+    pub linked_at: Option<u64>,
+    pub finalized_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -101,6 +113,54 @@ impl FileBufferRecord {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ChunkSegment {
+    chunk_id: ChunkId,
+    offset: u64,
+    size: u64,
+}
+
+#[derive(Clone, Debug)]
+enum ContentLayout {
+    Single {
+        segment: ChunkSegment,
+    },
+    ChunkList {
+        segments: Vec<ChunkSegment>,
+        chunk_list_obj_id: ObjId,
+        chunk_list_obj_str: String,
+    },
+}
+
+impl ContentLayout {
+    fn content_obj_id(&self) -> ObjId {
+        match self {
+            Self::Single { segment } => segment.chunk_id.to_obj_id(),
+            Self::ChunkList {
+                chunk_list_obj_id, ..
+            } => chunk_list_obj_id.clone(),
+        }
+    }
+
+    fn segments(&self) -> Vec<ChunkSegment> {
+        match self {
+            Self::Single { segment } => vec![segment.clone()],
+            Self::ChunkList { segments, .. } => segments.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FinalizeData {
+    file_inode_id: u64,
+    diff_file_path: PathBuf,
+    content_layout: ContentLayout,
+    file_obj_id: ObjId,
+    file_obj_str: String,
+    qcid: ChunkId,
+    linked_at: u64,
+}
+
 pub struct LocalFileBufferService {
     base_dir: PathBuf,
     buffer_dir: PathBuf,
@@ -108,9 +168,18 @@ pub struct LocalFileBufferService {
     size_used: RwLock<u64>,
     db: Arc<LocalFileBufferDB>,
     records: RwLock<HashMap<String, Arc<RwLock<FileBufferRecord>>>>,
+    named_store_mgr: RwLock<Option<Arc<NamedStoreMgr>>>,
+    fsmeta_client: RwLock<Option<Arc<FsMetaClient>>>,
 }
 
 impl LocalFileBufferService {
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
     pub fn new(base_dir: PathBuf, size_limit: u64) -> Self {
         let buffer_dir = base_dir.join(BUFFER_DIR_NAME);
         let db_path = base_dir.join(BUFFER_DB_FILE);
@@ -135,7 +204,37 @@ impl LocalFileBufferService {
             size_used: RwLock::new(0),
             db,
             records,
+            named_store_mgr: RwLock::new(None),
+            fsmeta_client: RwLock::new(None),
         }
+    }
+
+    pub fn with_named_store_mgr(mut self, named_store_mgr: Arc<NamedStoreMgr>) -> Self {
+        self.named_store_mgr = RwLock::new(Some(named_store_mgr));
+        self
+    }
+
+    pub fn with_fsmeta_client(mut self, fsmeta_client: Arc<FsMetaClient>) -> Self {
+        self.fsmeta_client = RwLock::new(Some(fsmeta_client));
+        self
+    }
+
+    pub fn set_named_store_mgr(&self, named_store_mgr: Arc<NamedStoreMgr>) -> NdnResult<()> {
+        let mut guard = self
+            .named_store_mgr
+            .write()
+            .map_err(|_| NdnError::InvalidState("named_store_mgr lock poisoned".to_string()))?;
+        *guard = Some(named_store_mgr);
+        Ok(())
+    }
+
+    pub fn set_fsmeta_client(&self, fsmeta_client: Arc<FsMetaClient>) -> NdnResult<()> {
+        let mut guard = self
+            .fsmeta_client
+            .write()
+            .map_err(|_| NdnError::InvalidState("fsmeta_client lock poisoned".to_string()))?;
+        *guard = Some(fsmeta_client);
+        Ok(())
     }
 
     fn get_record(&self, handle_id: &str) -> NdnResult<Arc<RwLock<FileBufferRecord>>> {
@@ -210,6 +309,320 @@ impl LocalFileBufferService {
             .read()
             .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
         Ok(guard.clone_ref())
+    }
+
+    async fn persist_meta(&self, record: &FileBufferRecord) -> NdnResult<()> {
+        let meta = record.to_meta();
+        let handle_id = record.handle_id.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.set_meta(&handle_id, &meta))
+            .await
+            .map_err(|e| NdnError::IoError(format!("persist meta join error: {}", e)))??;
+        Ok(())
+    }
+
+    async fn calculate_content_layout(
+        &self,
+        diff_file_path: &PathBuf,
+        file_size: u64,
+    ) -> NdnResult<ContentLayout> {
+        if file_size <= CHUNK_DEFAULT_SIZE {
+            let path_str = diff_file_path.to_string_lossy().to_string();
+            let (chunk_id, _) =
+                calculate_file_chunk_id(&path_str, ChunkId::default_chunk_type()).await?;
+            return Ok(ContentLayout::Single {
+                segment: ChunkSegment {
+                    chunk_id,
+                    offset: 0,
+                    size: file_size,
+                },
+            });
+        }
+
+        let mut file = fs::File::open(diff_file_path).await.map_err(|e| {
+            NdnError::IoError(format!("open diff file for chunk list failed: {}", e))
+        })?;
+        let mut segments = Vec::new();
+        let mut chunk_ids = Vec::new();
+        let mut remaining = file_size;
+        let mut offset = 0u64;
+
+        while remaining > 0 {
+            let this_chunk_size = std::cmp::min(remaining, CHUNK_DEFAULT_SIZE) as usize;
+            let mut buf = vec![0u8; this_chunk_size];
+            file.read_exact(&mut buf).await.map_err(|e| {
+                NdnError::IoError(format!("read diff file for chunk list failed: {}", e))
+            })?;
+            let chunk_id = ChunkHasher::new(None)?.calc_mix_chunk_id_from_bytes(&buf)?;
+            segments.push(ChunkSegment {
+                chunk_id: chunk_id.clone(),
+                offset,
+                size: this_chunk_size as u64,
+            });
+            chunk_ids.push(chunk_id);
+            remaining -= this_chunk_size as u64;
+            offset += this_chunk_size as u64;
+        }
+
+        if chunk_ids.is_empty() {
+            return Err(NdnError::InvalidData(
+                "chunk list calc failed: empty chunk list for non-empty file".to_string(),
+            ));
+        }
+
+        let simple_chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let (chunk_list_obj_id, chunk_list_obj_str) = simple_chunk_list.gen_obj_id();
+        Ok(ContentLayout::ChunkList {
+            segments,
+            chunk_list_obj_id,
+            chunk_list_obj_str,
+        })
+    }
+
+    fn get_named_store_mgr(&self) -> NdnResult<Option<Arc<NamedStoreMgr>>> {
+        let guard = self
+            .named_store_mgr
+            .read()
+            .map_err(|_| NdnError::InvalidState("named_store_mgr lock poisoned".to_string()))?;
+        Ok(guard.clone())
+    }
+
+    fn get_fsmeta_client(&self) -> NdnResult<Option<Arc<FsMetaClient>>> {
+        let guard = self
+            .fsmeta_client
+            .read()
+            .map_err(|_| NdnError::InvalidState("fsmeta_client lock poisoned".to_string()))?;
+        Ok(guard.clone())
+    }
+
+    async fn put_chunks_to_store(
+        &self,
+        named_store_mgr: &Arc<NamedStoreMgr>,
+        diff_file_path: &PathBuf,
+        segments: &[ChunkSegment],
+    ) -> NdnResult<()> {
+        let mut file = fs::File::open(diff_file_path).await.map_err(|e| {
+            NdnError::IoError(format!("open diff file for store put failed: {}", e))
+        })?;
+        let mut cursor = 0u64;
+
+        for segment in segments {
+            if named_store_mgr.have_chunk(&segment.chunk_id).await {
+                continue;
+            }
+
+            if cursor != segment.offset {
+                file.seek(std::io::SeekFrom::Start(segment.offset))
+                    .await
+                    .map_err(|e| NdnError::IoError(format!("seek diff file failed: {}", e)))?;
+                cursor = segment.offset;
+            }
+
+            let mut buf = vec![0u8; segment.size as usize];
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e| NdnError::IoError(format!("read chunk bytes failed: {}", e)))?;
+            named_store_mgr.put_chunk(&segment.chunk_id, &buf, true).await?;
+            cursor += segment.size;
+        }
+
+        Ok(())
+    }
+
+    async fn put_links_to_store(
+        &self,
+        named_store_mgr: &Arc<NamedStoreMgr>,
+        diff_file_path: &PathBuf,
+        segments: &[ChunkSegment],
+        qcid: &ChunkId,
+    ) -> NdnResult<()> {
+        let local_path = diff_file_path.to_string_lossy().to_string();
+        let now = Self::now_unix_secs();
+
+        for segment in segments {
+            let local_info = ChunkLocalInfo {
+                path: local_path.clone(),
+                qcid: qcid.to_string(),
+                last_modify_time: now,
+                range: Some(Range {
+                    start: segment.offset,
+                    end: segment.offset + segment.size,
+                }),
+            };
+            named_store_mgr
+                .add_chunk_by_link_to_local_file(&segment.chunk_id, segment.size, &local_info)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn put_objects_to_store(
+        &self,
+        named_store_mgr: &Arc<NamedStoreMgr>,
+        content_layout: &ContentLayout,
+        file_obj_id: &ObjId,
+        file_obj_str: &str,
+    ) -> NdnResult<()> {
+        if let ContentLayout::ChunkList {
+            chunk_list_obj_id,
+            chunk_list_obj_str,
+            ..
+        } = content_layout
+        {
+            named_store_mgr
+                .put_object(chunk_list_obj_id, chunk_list_obj_str)
+                .await?;
+        }
+        named_store_mgr.put_object(file_obj_id, file_obj_str).await
+    }
+
+    async fn build_finalize_data(
+        &self,
+        file_inode_id: u64,
+        diff_file_path: &PathBuf,
+        existing_linked_at: Option<u64>,
+    ) -> NdnResult<FinalizeData> {
+        let metadata = fs::metadata(diff_file_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                NdnError::NotFound(format!("diff file not found: {}", diff_file_path.display()))
+            } else {
+                NdnError::IoError(format!("stat diff file failed: {}", e))
+            }
+        })?;
+        let file_size = metadata.len();
+        let content_layout = self
+            .calculate_content_layout(diff_file_path, file_size)
+            .await?;
+        let content_obj_id = content_layout.content_obj_id();
+        let file_obj = FileObject::new(
+            format!("inode-{}", file_inode_id),
+            file_size,
+            content_obj_id.to_string(),
+        );
+        let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
+        let qcid = if file_size >= MIN_QCID_FILE_SIZE {
+            caculate_qcid_from_file(diff_file_path).await?
+        } else {
+            match &content_layout {
+                ContentLayout::Single { segment } => segment.chunk_id.clone(),
+                ContentLayout::ChunkList { segments, .. } => {
+                    segments.first().map(|s| s.chunk_id.clone()).ok_or_else(|| {
+                        NdnError::InvalidData("empty chunk list for qcid fallback".to_string())
+                    })?
+                }
+            }
+        };
+
+        Ok(FinalizeData {
+            file_inode_id,
+            diff_file_path: diff_file_path.clone(),
+            content_layout,
+            file_obj_id,
+            file_obj_str,
+            qcid,
+            linked_at: existing_linked_at.unwrap_or_else(Self::now_unix_secs),
+        })
+    }
+
+    async fn update_fsmeta_linked_state(
+        &self,
+        file_inode_id: u64,
+        file_obj_id: ObjId,
+        qcid: ChunkId,
+        fb_handle: String,
+        linked_at: u64,
+    ) -> NdnResult<()> {
+        let Some(client) = self.get_fsmeta_client()? else {
+            return Ok(());
+        };
+
+        client
+            .update_inode_state(
+                file_inode_id,
+                NodeState::Linked(FileLinkedState {
+                    obj_id: file_obj_id,
+                    qcid: qcid.to_obj_id(),
+                    filebuffer_id: fb_handle,
+                    linked_at,
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("fsmeta update linked state failed: {}", e)))
+    }
+
+    async fn update_fsmeta_finalized_state(
+        &self,
+        file_inode_id: u64,
+        file_obj_id: ObjId,
+        finalized_at: u64,
+    ) -> NdnResult<()> {
+        let Some(client) = self.get_fsmeta_client()? else {
+            return Ok(());
+        };
+
+        client
+            .update_inode_state(
+                file_inode_id,
+                NodeState::Finalized(FinalizedObjState {
+                    obj_id: file_obj_id,
+                    finalized_at,
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("fsmeta update finalized state failed: {}", e)))
+    }
+
+    async fn do_finalize(
+        &self,
+        arc_record: &Arc<RwLock<FileBufferRecord>>,
+        finalize_data: FinalizeData,
+    ) -> NdnResult<()> {
+        let snapshot = {
+            let mut guard = arc_record
+                .write()
+                .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
+            guard.read_only = true;
+            {
+                let mut state = guard.diff_state.write().map_err(|_| {
+                    NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+                })?;
+                state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
+                state.linked_qcid = Some(finalize_data.qcid.clone());
+                state.linked_at = Some(finalize_data.linked_at);
+                state.finalized_at = Some(Self::now_unix_secs());
+            }
+            guard.clone_ref()
+        };
+
+        self.persist_meta(&snapshot).await?;
+
+        let finalized_at = snapshot
+            .diff_state
+            .read()
+            .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
+            .finalized_at
+            .unwrap_or_else(Self::now_unix_secs);
+        self.update_fsmeta_finalized_state(
+            finalize_data.file_inode_id,
+            finalize_data.file_obj_id,
+            finalized_at,
+        )
+        .await?;
+
+        if let Ok(meta) = fs::metadata(&finalize_data.diff_file_path).await {
+            let mut used = self.size_used.write().unwrap();
+            *used = used.saturating_sub(meta.len());
+        }
+        if let Err(e) = fs::remove_file(&finalize_data.diff_file_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(NdnError::IoError(format!("remove file failed: {}", e)));
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -352,10 +765,188 @@ impl FileBufferService for LocalFileBufferService {
         Ok(())
     }
 
-    async fn cacl_name(&self, _fb: &FileBufferRecord) -> NdnResult<ObjId> {
-        Err(NdnError::Unsupported(
-            "cacl_name not implemented".to_string(),
-        ))
+    async fn cacl_name(&self, fb: &FileBufferRecord) -> NdnResult<bool> {
+        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
+            return Err(NdnError::Unsupported(
+                "overlay base chunk list is not implemented yet".to_string(),
+            ));
+        }
+
+        self.close(fb).await?;
+
+        {
+            let state = fb
+                .diff_state
+                .read()
+                .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?;
+            if state.finalized_at.is_some() {
+                return Ok(true);
+            }
+            if state.linked_obj_id.is_some() {
+                return Ok(false);
+            }
+        }
+
+        let finalize_data = self
+            .build_finalize_data(fb.file_inode_id, &fb.diff_file_path, None)
+            .await?;
+        let file_size = fs::metadata(&fb.diff_file_path).await?.len();
+
+        if file_size <= DIRECT_FINALIZE_FILE_SIZE {
+            if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+                let segments = finalize_data.content_layout.segments();
+                self.put_chunks_to_store(&named_store_mgr, &fb.diff_file_path, &segments)
+                    .await?;
+                self.put_objects_to_store(
+                    &named_store_mgr,
+                    &finalize_data.content_layout,
+                    &finalize_data.file_obj_id,
+                    &finalize_data.file_obj_str,
+                )
+                    .await?;
+            } else {
+                log::warn!(
+                    "cacl_name direct finalize without named_store_mgr configured, handle={}",
+                    fb.handle_id
+                );
+            }
+            let arc_record = self.get_record(&fb.handle_id)?;
+            self.do_finalize(&arc_record, finalize_data).await?;
+            return Ok(true);
+        }
+
+        if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+            let segments = finalize_data.content_layout.segments();
+            self.put_links_to_store(
+                &named_store_mgr,
+                &fb.diff_file_path,
+                &segments,
+                &finalize_data.qcid,
+            )
+                .await?;
+            self.put_objects_to_store(
+                &named_store_mgr,
+                &finalize_data.content_layout,
+                &finalize_data.file_obj_id,
+                &finalize_data.file_obj_str,
+            )
+                .await?;
+        } else {
+            log::warn!(
+                "cacl_name linked without named_store_mgr configured, handle={}",
+                fb.handle_id
+            );
+        }
+
+        {
+            let mut state = fb
+                .diff_state
+                .write()
+                .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?;
+            state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
+            state.linked_qcid = Some(finalize_data.qcid.clone());
+            state.linked_at = Some(finalize_data.linked_at);
+            state.finalized_at = None;
+        }
+        self.persist_meta(fb).await?;
+
+        self.update_fsmeta_linked_state(
+            fb.file_inode_id,
+            finalize_data.file_obj_id,
+            finalize_data.qcid,
+            fb.handle_id.clone(),
+            finalize_data.linked_at,
+        )
+        .await?;
+
+        Ok(false)
+    }
+
+    async fn finalize(&self, fb_id: String) -> NdnResult<()> {
+        let _ = self.get_buffer(&fb_id).await?;
+        let arc_record = self.get_record(&fb_id)?;
+
+        let (
+            base_reader,
+            diff_file_path,
+            already_finalized,
+            file_inode_id,
+            existing_linked_obj_id,
+            existing_linked_qcid,
+            existing_linked_at,
+        ) = {
+            let guard = arc_record
+                .read()
+                .map_err(|_| NdnError::InvalidState("record lock poisoned".to_string()))?;
+            let state = guard
+                .diff_state
+                .read()
+                .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?;
+            (
+                guard.base_reader.clone(),
+                guard.diff_file_path.clone(),
+                state.finalized_at.is_some(),
+                guard.file_inode_id,
+                state.linked_obj_id.clone(),
+                state.linked_qcid.clone(),
+                state.linked_at,
+            )
+        };
+
+        if already_finalized {
+            return Ok(());
+        }
+
+        if matches!(base_reader, FileBufferBaseReader::BaseChunkList(_)) {
+            return Err(NdnError::Unsupported(
+                "overlay base chunk list is not implemented yet".to_string(),
+            ));
+        }
+
+        let finalize_data = self
+            .build_finalize_data(file_inode_id, &diff_file_path, existing_linked_at)
+            .await?;
+
+        if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+            let segments = finalize_data.content_layout.segments();
+            self.put_chunks_to_store(&named_store_mgr, &diff_file_path, &segments)
+                .await?;
+            self.put_objects_to_store(
+                &named_store_mgr,
+                &finalize_data.content_layout,
+                &finalize_data.file_obj_id,
+                &finalize_data.file_obj_str,
+            )
+                .await?;
+        } else {
+            log::warn!(
+                "finalize without named_store_mgr configured, handle={}",
+                fb_id
+            );
+        }
+
+        if let Some(existing) = existing_linked_obj_id {
+            if existing != finalize_data.file_obj_id {
+                log::warn!(
+                    "finalize recalculated file obj differs from linked state, handle={}, old={}, new={}",
+                    fb_id,
+                    existing,
+                    finalize_data.file_obj_id
+                );
+            }
+        }
+        if let Some(existing_qcid) = existing_linked_qcid {
+            if existing_qcid != finalize_data.qcid {
+                log::warn!(
+                    "finalize recalculated qcid differs from linked state, handle={}, old={}, new={}",
+                    fb_id,
+                    existing_qcid.to_string(),
+                    finalize_data.qcid.to_string()
+                );
+            }
+        }
+
+        self.do_finalize(&arc_record, finalize_data).await
     }
 
     async fn remove(&self, fb: &FileBufferRecord) -> NdnResult<()> {
@@ -385,6 +976,7 @@ impl FileBufferService for LocalFileBufferService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndn_lib::{ChunkHasher, FileObject, NamedObject, SimpleChunkList, CHUNK_DEFAULT_SIZE};
     use tempfile::tempdir;
 
     fn test_lease() -> WriteLease {
@@ -481,5 +1073,147 @@ mod tests {
         service.remove(&fb).await.unwrap();
         assert!(!fb.diff_file_path.exists());
         assert!(service.get_buffer(&fb.handle_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_cacl_name_and_finalize_for_none_base_reader() {
+        let dir = tempdir().unwrap();
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let fb = service
+            .alloc_buffer(
+                &NdmPath("/d.txt".to_string()),
+                103,
+                vec![],
+                &test_lease(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        service.append(&fb, b"linked-data").await.unwrap();
+        service.close(&fb).await.unwrap();
+
+        let finalized = service.cacl_name(&fb).await.unwrap();
+        assert!(finalized);
+
+        let record = service.get_buffer(&fb.handle_id).await.unwrap();
+        let finalized_state = record.diff_state.read().unwrap().clone();
+        assert!(finalized_state.linked_obj_id.is_some());
+        assert!(finalized_state.linked_qcid.is_some());
+        assert!(finalized_state.linked_at.is_some());
+        assert!(finalized_state.finalized_at.is_some());
+        assert!(record.read_only);
+        assert!(!record.diff_file_path.exists());
+
+        // idempotent
+        service.finalize(fb.handle_id.clone()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cacl_name_rejects_overlay_mode() {
+        let dir = tempdir().unwrap();
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let base_chunk = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(b"base-chunk")
+            .unwrap();
+        let fb = service
+            .alloc_buffer(
+                &NdmPath("/e.txt".to_string()),
+                104,
+                vec![base_chunk],
+                &test_lease(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let err = service.cacl_name(&fb).await.unwrap_err();
+        assert!(matches!(err, NdnError::Unsupported(_)));
+    }
+
+    #[tokio::test]
+    async fn test_cacl_name_uses_chunk_list_when_file_exceeds_default_chunk_size() {
+        let dir = tempdir().unwrap();
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let fb = service
+            .alloc_buffer(
+                &NdmPath("/big.txt".to_string()),
+                105,
+                vec![],
+                &test_lease(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first = vec![0x11u8; CHUNK_DEFAULT_SIZE as usize];
+        let second = vec![0x22u8; 19];
+        service.append(&fb, &first).await.unwrap();
+        service.append(&fb, &second).await.unwrap();
+        service.close(&fb).await.unwrap();
+
+        let finalized = service.cacl_name(&fb).await.unwrap();
+        assert!(finalized);
+        let linked = service.get_buffer(&fb.handle_id).await.unwrap();
+        let linked_obj_id = linked.diff_state.read().unwrap().linked_obj_id.clone().unwrap();
+        assert!(linked.diff_state.read().unwrap().finalized_at.is_some());
+
+        let chunk_1 = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(&first)
+            .unwrap();
+        let chunk_2 = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(&second)
+            .unwrap();
+        let simple_chunk_list = SimpleChunkList::from_chunk_list(vec![chunk_1, chunk_2]).unwrap();
+        let (content_obj_id, _) = simple_chunk_list.gen_obj_id();
+        assert!(content_obj_id.is_chunk_list());
+
+        let file_obj = FileObject::new(
+            format!("inode-{}", fb.file_inode_id),
+            (first.len() + second.len()) as u64,
+            content_obj_id.to_string(),
+        );
+        let (expected_file_obj_id, _) = file_obj.gen_obj_id();
+        assert_eq!(linked_obj_id, expected_file_obj_id);
+    }
+
+    #[tokio::test]
+    async fn test_cacl_name_enters_linked_state_when_file_exceeds_direct_finalize_limit() {
+        let dir = tempdir().unwrap();
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let fb = service
+            .alloc_buffer(
+                &NdmPath("/linked-big.txt".to_string()),
+                106,
+                vec![],
+                &test_lease(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let first = vec![0x31u8; CHUNK_DEFAULT_SIZE as usize];
+        let second = vec![0x32u8; CHUNK_DEFAULT_SIZE as usize];
+        let third = vec![0x33u8; 19];
+        assert!((first.len() + second.len() + third.len()) as u64 > DIRECT_FINALIZE_FILE_SIZE);
+
+        service.append(&fb, &first).await.unwrap();
+        service.append(&fb, &second).await.unwrap();
+        service.append(&fb, &third).await.unwrap();
+        service.close(&fb).await.unwrap();
+
+        let finalized = service.cacl_name(&fb).await.unwrap();
+        assert!(!finalized);
+
+        let linked = service.get_buffer(&fb.handle_id).await.unwrap();
+        let linked_state = linked.diff_state.read().unwrap().clone();
+        assert!(linked_state.linked_obj_id.is_some());
+        assert!(linked_state.linked_qcid.is_some());
+        assert!(linked_state.linked_at.is_some());
+        assert!(linked_state.finalized_at.is_none());
+        assert!(linked.diff_file_path.exists());
     }
 }

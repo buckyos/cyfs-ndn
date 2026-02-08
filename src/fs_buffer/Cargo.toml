@@ -12,6 +12,8 @@ rusqlite = { workspace = true }
 fs2 = "*"
 once_cell = "*"
 ndn-lib = { path = "../ndn-lib" }
+ndm-lib = { path = "../ndm-lib" }
+named_store = { path = "../named_store" }
 async-trait = "0.1"
 
 [dev-dependencies]

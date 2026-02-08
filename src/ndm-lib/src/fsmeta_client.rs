@@ -1,14 +1,13 @@
 /// ------------------------------
 /// FsMeta: Inode/Dentry Model (Strategy B)
 /// ------------------------------
-use fs_buffer::SessionId;
+use crate::{OpenWriteFlag, SessionId};
 use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
 use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 
-use crate::OpenWriteFlag;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientSessionId(pub String);
