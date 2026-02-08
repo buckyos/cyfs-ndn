@@ -34,7 +34,7 @@ ndm.close_file_writer(real_writer)
 - 通过inode_id，查询得到parent_inode，判断状态是否可读。上面这种路径，[metadb.read 1]
   如果filename处已经有同名DirObject那么是会失败的，如果有同名filename,需要得到old_file_inode,要看flag是否允许覆盖
 - 在DirObject模式下，如果有需要，需要填补路径上的parent_inode,parent_parent_inode, 
-  例子的这种情况，需要创建3个inode. 注意DirObject的child只能是Object,不能是inode
+  例子的这种情况，需要创建3个inode. 注意DirObject的child只能是Object,不能是inode,因此必须从DirChildItem变成DentryItem
 - 创建目录项 filename_item -> file_inode -> fb_handle(Option<BaseFileObject>)（下面操作是事务) [metadb.write 3]
   - 创建的新inode,判断是否需要有BaseFileObject? [metadb.write 1]
     Flag是否是新文件，新文件一定不需要BaseFileObject（小文件大概率不要)

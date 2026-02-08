@@ -1,12 +1,13 @@
 use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
 use log::{info, warn};
+use named_store::NamedStoreMgr;
 use ndm::{
-    ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry, IndexNodeId,
-    FsMetaResolvePathItem, FsMetaResolvePathResp, MoveOptions, NdmInstanceId, NodeKind,
-    NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
+    ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry,
+    FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, MoveOptions, NdmInstanceId,
+    NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
-use ndn_lib::{ChunkId, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
+use ndn_lib::{load_named_obj, ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -29,6 +30,8 @@ const DENTRY_TARGET_INODE: i64 = 0;
 const DENTRY_TARGET_OBJ: i64 = 1;
 const DENTRY_TARGET_TOMBSTONE: i64 = 2;
 const DENTRY_TARGET_SYMLINK: i64 = 3;
+
+const DEFAULT_SYMLINK_COUNT:u32 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectKind {
@@ -60,6 +63,13 @@ struct MovePlan {
     src_rev0: u64,
     dst_rev0: u64,
     source: MoveSource,
+}
+
+#[derive(Clone, Debug)]
+enum BaseChildLookup {
+    Missing,
+    DirObj(ObjId),
+    NonDirObj(ObjId),
 }
 
 const ROOT_KEY: &str = "root_dir";
@@ -103,6 +113,8 @@ pub struct FSMetaService {
     instance: Option<NdmInstanceId>,
     /// File buffer service for managing write buffers (required for high-level file operations)
     buffer: Option<Arc<dyn FileBufferService>>,
+    /// Named store manager for resolving base DirObject children
+    store_mgr: Option<Arc<NamedStoreMgr>>,
 }
 
 impl FSMetaService {
@@ -144,6 +156,7 @@ impl FSMetaService {
             list_cache: Arc::new(Mutex::new(ListCache::default())),
             instance: None,
             buffer: None,
+            store_mgr: None,
         })
     }
 
@@ -155,6 +168,12 @@ impl FSMetaService {
     ) -> Self {
         self.instance = Some(instance);
         self.buffer = Some(buffer);
+        self
+    }
+
+    /// Set named store manager for DirObject child resolution.
+    pub fn with_named_store(mut self, store_mgr: Arc<NamedStoreMgr>) -> Self {
+        self.store_mgr = Some(store_mgr);
         self
     }
 
@@ -641,12 +660,31 @@ impl FSMetaService {
             self.root_inode
         } else {
             let resolved = self
-                .handle_resolve_path(&parent_path, ctx.clone())
+                .handle_resolve_path_ex(&parent_path, 0, ctx.clone())
                 .await
                 .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-            resolved
-                .map(|(id, _)| id)
-                .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?
+            match resolved {
+                Some(FsMetaResolvePathResp {
+                    item:
+                        FsMetaResolvePathItem::Inode {
+                            inode_id,
+                            inode: parent_node,
+                        },
+                    inner_path: _,
+                }) => {
+                    if parent_node.kind != NodeKind::Dir {
+                        return Err(RPCErrors::ReasonError(
+                            "parent is not a directory".to_string(),
+                        ));
+                    }
+                    inode_id
+                }
+                _ => {
+                    return Err(RPCErrors::ReasonError(
+                        "parent directory not found".to_string(),
+                    ));
+                }
+            }
         };
 
         // Check if already exists
@@ -767,6 +805,170 @@ impl FSMetaService {
         Ok(new_id)
     }
 
+    async fn create_dir_under_parent(
+        &self,
+        parent_id: IndexNodeId,
+        name: &str,
+        ctx: RPCContext,
+    ) -> Result<IndexNodeId, RPCErrors> {
+        let txid = self.handle_begin_txn(ctx.clone()).await?;
+
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
+        }
+
+        let existing = self
+            .handle_get_dentry(parent_id, name.to_string(), Some(txid.clone()), ctx.clone())
+            .await?;
+        if let Some(d) = existing {
+            match d.target {
+                DentryTarget::IndexNodeId(id) => {
+                    let node = self
+                        .handle_get_inode(id, Some(txid.clone()), ctx.clone())
+                        .await?
+                        .ok_or_else(|| {
+                            RPCErrors::ReasonError("existing inode not found".to_string())
+                        })?;
+                    if node.kind != NodeKind::Dir {
+                        rollback_and_err!(RPCErrors::ReasonError(format!(
+                            "{} exists and is not a directory",
+                            name
+                        )));
+                    }
+                    self.handle_commit(Some(txid), ctx).await?;
+                    return Ok(id);
+                }
+                DentryTarget::Tombstone => {}
+                DentryTarget::ObjId(_) | DentryTarget::SymLink(_) => {
+                    rollback_and_err!(RPCErrors::ReasonError(format!(
+                        "{} exists and is not a directory",
+                        name
+                    )));
+                }
+            }
+        }
+
+        let node = NodeRecord {
+            inode_id: 0,
+            kind: NodeKind::Dir,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::DirNormal,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+
+        let new_id = self
+            .handle_alloc_inode(node, Some(txid.clone()), ctx.clone())
+            .await?;
+        self.handle_upsert_dentry(
+            parent_id,
+            name.to_string(),
+            DentryTarget::IndexNodeId(new_id),
+            Some(txid.clone()),
+            ctx.clone(),
+        )
+        .await?;
+        self.handle_commit(Some(txid), ctx).await?;
+        Ok(new_id)
+    }
+
+    async fn lookup_base_child(
+        &self,
+        dir_node: &NodeRecord,
+        name: &str,
+    ) -> Result<BaseChildLookup, RPCErrors> {
+        let Some(base_obj_id) = dir_node.base_obj_id.as_ref() else {
+            return Ok(BaseChildLookup::Missing);
+        };
+        if base_obj_id.obj_type != OBJ_TYPE_DIR {
+            return Err(RPCErrors::ReasonError(format!(
+                "invalid base_obj_id type for directory inode: {}",
+                base_obj_id.obj_type
+            )));
+        }
+
+        let store_mgr = self.store_mgr.as_ref().ok_or_else(|| {
+            RPCErrors::ReasonError(
+                "named store manager not configured for DirObject traversal".to_string(),
+            )
+        })?;
+
+        let base_obj_str = store_mgr
+            .get_object(base_obj_id)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
+        let base_dir: DirObject = load_named_obj(base_obj_str.as_str())
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e)))?;
+
+        let Some(item) = base_dir.get(name) else {
+            return Ok(BaseChildLookup::Missing);
+        };
+
+        let (child_obj_id, child_obj_str) = item
+            .get_obj_id()
+            .map_err(|e| RPCErrors::ReasonError(format!("invalid base child entry: {}", e)))?;
+
+        // Persist embedded object forms (Object/ObjectJwt) so later lookups by obj_id can reuse store APIs.
+        if !child_obj_str.is_empty() {
+            store_mgr
+                .put_object(&child_obj_id, child_obj_str.as_str())
+                .await
+                .map_err(|e| {
+                    RPCErrors::ReasonError(format!("failed to cache embedded child object: {}", e))
+                })?;
+        }
+
+        if child_obj_id.obj_type == OBJ_TYPE_DIR {
+            Ok(BaseChildLookup::DirObj(child_obj_id))
+        } else {
+            Ok(BaseChildLookup::NonDirObj(child_obj_id))
+        }
+    }
+
+    async fn ensure_name_absent_for_create(
+        &self,
+        parent_id: IndexNodeId,
+        parent_node: &NodeRecord,
+        name: &str,
+        path: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let upper = self
+            .handle_get_dentry(parent_id, name.to_string(), None, ctx.clone())
+            .await?;
+
+        match upper {
+            Some(DentryRecord {
+                target: DentryTarget::Tombstone,
+                ..
+            }) => {
+                // Tombstone in upper hides base item, so it's safe to create.
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(RPCErrors::ReasonError(format!(
+                    "path {} already exists",
+                    path.as_str()
+                )));
+            }
+            None => {}
+        }
+
+        match self.lookup_base_child(parent_node, name).await? {
+            BaseChildLookup::Missing => Ok(()),
+            BaseChildLookup::DirObj(_) | BaseChildLookup::NonDirObj(_) => Err(
+                RPCErrors::ReasonError(format!("path {} already exists", path.as_str())),
+            ),
+        }
+    }
+
     /// Load existing file chunks from base object for append operations.
     /// Note: This is a simplified implementation that returns empty chunks.
     /// For full append support with existing file content, the store would need to be accessed.
@@ -829,11 +1031,18 @@ impl FSMetaService {
 
         // Try to resolve existing path first
         match self
-            .handle_resolve_path(path, ctx.clone())
+            .handle_resolve_path_ex(path, DEFAULT_SYMLINK_COUNT, ctx.clone())
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
         {
-            Some((id, node)) => {
+            Some(FsMetaResolvePathResp {
+                item:
+                    FsMetaResolvePathItem::Inode {
+                        inode_id: id,
+                        inode: node,
+                    },
+                inner_path: _,
+            }) => {
                 if node.kind != NodeKind::Dir {
                     return Err(RPCErrors::ReasonError(format!(
                         "{} is not a directory",
@@ -842,28 +1051,48 @@ impl FSMetaService {
                 }
                 return Ok(id);
             }
+            Some(FsMetaResolvePathResp {
+                item: FsMetaResolvePathItem::SymLink(_),
+                inner_path: _,
+            }) => {
+                return Err(RPCErrors::ReasonError(format!(
+                    "{} is not a directory",
+                    path.as_str()
+                )));
+            }
+            Some(FsMetaResolvePathResp {
+                item: FsMetaResolvePathItem::ObjId(obj_id),
+                inner_path: _,
+            }) => {
+                if obj_id.obj_type != OBJ_TYPE_DIR {
+                    return Err(RPCErrors::ReasonError(format!(
+                        "{} is not a directory",
+                        path.as_str()
+                    )));
+                }
+                // DirObject path exists but may need materialization; continue walking below.
+            }
             None => {
                 // Path doesn't exist, will create it below
             }
         }
 
-        // Resolve path with materialization support
-        // Walk through the path components, materializing DirObjects as needed
+        // Walk through path components:
+        // 1) honor upper dentries first
+        // 2) if upper miss and parent has base DirObject, consult base child
+        // 3) materialize DirObject child as Overlay inode when needed
+        // 4) otherwise create directory inode (mkdir -p semantics)
         let components = path.components();
-
-        let root_id = self.root_inode;
-
-        let mut current_id = root_id;
+        let mut current_id = self.root_inode;
 
         for (i, component) in components.iter().enumerate() {
             let dentry = self
                 .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
                 .await?;
 
-            match dentry {
+            let next_id = match dentry {
                 Some(d) => match d.target {
                     DentryTarget::IndexNodeId(id) => {
-                        // Already an inode, verify it's a directory
                         let node = self
                             .handle_get_inode(id, None, ctx.clone())
                             .await?
@@ -875,11 +1104,9 @@ impl FSMetaService {
                                 components[..=i].join("/")
                             )));
                         }
-                        current_id = id;
+                        id
                     }
                     DentryTarget::ObjId(obj_id) => {
-                        // Dentry points to a DirObject - need to materialize
-                        // Verify it's a directory object
                         if obj_id.obj_type != OBJ_TYPE_DIR {
                             return Err(RPCErrors::ReasonError(format!(
                                 "path component {} points to non-directory object",
@@ -887,12 +1114,9 @@ impl FSMetaService {
                             )));
                         }
 
-                        // Materialize: create inode with base_obj_id pointing to this DirObject
-                        let new_id = self
+                        self
                             .materialize_dir_from_obj(current_id, component.to_string(), &obj_id)
-                            .await
-                            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-                        current_id = new_id;
+                            .await?
                     }
                     DentryTarget::SymLink(_) => {
                         return Err(RPCErrors::ReasonError(format!(
@@ -901,51 +1125,44 @@ impl FSMetaService {
                         )));
                     }
                     DentryTarget::Tombstone => {
-                        // Tombstone - need to create new directory
-                        let remaining_path = format!("/{}", components[..=i].join("/"));
-                        self.create_dir_internal(&NdmPath::new(&remaining_path))
-                            .await?;
-
-                        // Get the newly created inode
-                        let new_dentry = self
-                            .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
+                        self.create_dir_under_parent(current_id, component, ctx.clone())
                             .await?
-                            .ok_or_else(|| {
-                                RPCErrors::ReasonError("failed to create directory".to_string())
-                            })?;
-
-                        if let DentryTarget::IndexNodeId(id) = new_dentry.target {
-                            current_id = id;
-                        } else {
-                            return Err(RPCErrors::ReasonError(
-                                "unexpected dentry target after creation".to_string(),
-                            ));
-                        }
                     }
                 },
                 None => {
-                    // Directory doesn't exist - create it
-                    let remaining_path = format!("/{}", components[..=i].join("/"));
-                    self.create_dir_internal(&NdmPath::new(&remaining_path))
-                        .await?;
-
-                    // Get the newly created inode
-                    let new_dentry = self
-                        .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
+                    let parent_node = self
+                        .handle_get_inode(current_id, None, ctx.clone())
                         .await?
-                        .ok_or_else(|| {
-                            RPCErrors::ReasonError("failed to create directory".to_string())
-                        })?;
+                        .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?;
+                    if parent_node.kind != NodeKind::Dir {
+                        return Err(RPCErrors::ReasonError(format!(
+                            "{} is not a directory",
+                            components[..i].join("/")
+                        )));
+                    }
 
-                    if let DentryTarget::IndexNodeId(id) = new_dentry.target {
-                        current_id = id;
-                    } else {
-                        return Err(RPCErrors::ReasonError(
-                            "unexpected dentry target after creation".to_string(),
-                        ));
+                    match self.lookup_base_child(&parent_node, component).await? {
+                        BaseChildLookup::DirObj(child_dir_obj) => self
+                            .materialize_dir_from_obj(
+                                current_id,
+                                component.to_string(),
+                                &child_dir_obj,
+                            )
+                            .await?,
+                        BaseChildLookup::NonDirObj(_) => {
+                            return Err(RPCErrors::ReasonError(format!(
+                                "{} is not a directory",
+                                components[..=i].join("/")
+                            )));
+                        }
+                        BaseChildLookup::Missing => self
+                            .create_dir_under_parent(current_id, component, ctx.clone())
+                            .await?,
                     }
                 }
-            }
+            };
+
+            current_id = next_id;
         }
 
         Ok(current_id)
@@ -1095,108 +1312,6 @@ impl FSMetaService {
 impl ndm::FsMetaHandler for FSMetaService {
     async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
         Ok(self.root_inode)
-    }
-
-    async fn handle_resolve_path(
-        &self,
-        path: &NdmPath,
-        ctx: RPCContext,
-    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
-        if path.is_root() {
-            let root_id = self
-                .handle_root_dir(ctx.clone())
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
-            let node = self
-                .handle_get_inode(root_id, None, ctx)
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get root inode: {}", e)))?;
-            return Ok(node.map(|n| (root_id, n)));
-        }
-
-        let components = path.components();
-        let cached_prefix_ids = self
-            .resolve_path_cache
-            .write()
-            .ok()
-            .and_then(|mut cache| cache.get_longest_prefix_ids_for_path(&components));
-
-        let (mut ids, mut current_id, start_idx) = if let Some(prefix_ids) = cached_prefix_ids {
-            let matched_len = prefix_ids.len().saturating_sub(1);
-            let inode_id = *prefix_ids.last().unwrap_or(&self.root_inode);
-            if matched_len == components.len() {
-                let node = self
-                    .handle_get_inode(inode_id, None, ctx)
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?;
-                return Ok(node.map(|n| (inode_id, n)));
-            }
-            (prefix_ids, inode_id, matched_len)
-        } else {
-            info!("MISS path_resolve_cache,do resovle : {}", path.as_str());
-            let root_id = self
-                .handle_root_dir(ctx.clone())
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get root dir: {}", e)))?;
-            (vec![root_id], root_id, 0usize)
-        };
-
-        for (i, component) in components.iter().enumerate().skip(start_idx) {
-            let is_last = i == components.len() - 1;
-
-            let dentry = self
-                .handle_get_dentry(current_id, component.to_string(), None, ctx.clone())
-                .await
-                .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-            match dentry {
-                Some(d) => match d.target {
-                    DentryTarget::IndexNodeId(id) => {
-                        ids.push(id);
-                        if is_last {
-                            let node = self.handle_get_inode(id, None, ctx.clone()).await.map_err(
-                                |e| NdnError::Internal(format!("failed to get inode: {}", e)),
-                            )?;
-                            if node.is_some() {
-                                if let Ok(mut cache) = self.resolve_path_cache.write() {
-                                    let comps: Vec<String> =
-                                        components.iter().map(|s| (*s).to_string()).collect();
-                                    cache.put_ids_for_path(comps, ids.clone());
-                                }
-                            }
-                            return Ok(node.map(|n| (id, n)));
-                        }
-                        current_id = id;
-                    }
-                    DentryTarget::SymLink(_target_path) => {
-                        if is_last {
-                            return Ok(None);
-                        }
-                        return Err(NdnError::NotFound(format!(
-                            "path {} crosses symbolic link",
-                            path.as_str()
-                        )));
-                    }
-                    DentryTarget::ObjId(_obj_id) => {
-                        if is_last {
-                            return Ok(None);
-                        }
-                        return Err(NdnError::NotFound(format!(
-                            "path {} requires materialization",
-                            path.as_str()
-                        )));
-                    }
-                    DentryTarget::Tombstone => {
-                        return Ok(None);
-                    }
-                },
-                None => {
-                    return Ok(None);
-                }
-            }
-        }
-
-        Ok(None)
     }
 
     async fn handle_resolve_path_ex(
@@ -2336,6 +2451,18 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
         let parent = self.ensure_dir_inode(&parent_path).await?;
+        let parent_node = self
+            .handle_get_inode(parent, None, ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+        if parent_node.kind != NodeKind::Dir {
+            return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+        }
+        if parent_node.read_only {
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+        }
+        self.ensure_name_absent_for_create(parent, &parent_node, &name, path, ctx.clone())
+            .await?;
 
         // Upsert dentry
         self.handle_upsert_dentry(
@@ -2363,7 +2490,25 @@ impl ndm::FsMetaHandler for FSMetaService {
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
+        if dir_obj_id.obj_type != OBJ_TYPE_DIR {
+            return Err(RPCErrors::ReasonError(
+                "set_dir requires a DirObject id".to_string(),
+            ));
+        }
+
         let parent = self.ensure_dir_inode(&parent_path).await?;
+        let parent_node = self
+            .handle_get_inode(parent, None, ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+        if parent_node.kind != NodeKind::Dir {
+            return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+        }
+        if parent_node.read_only {
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+        }
+        self.ensure_name_absent_for_create(parent, &parent_node, &name, path, ctx.clone())
+            .await?;
 
         self.handle_upsert_dentry(
             parent,
@@ -2384,12 +2529,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
-        let resolved = self
-            .handle_resolve_path(&parent_path, ctx.clone())
-            .await
-            .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
-        let (parent_id, _parent_node) =
-            resolved.ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
+        let parent_id = self.ensure_dir_inode(&parent_path).await?;
 
         // Set tombstone instead of deleting (overlay semantics)
         self.handle_set_tombstone(parent_id, name, None, ctx)
@@ -2601,7 +2741,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
-        let parent_id = self.ensure_dir_inode(&parent_path).await?;
+        let parent_id: u64 = self.ensure_dir_inode(&parent_path).await?;
 
         // Check parent is not read-only
         let parent_node = self
@@ -2628,20 +2768,34 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_dentry(parent_id, name.clone(), Some(txid.clone()), ctx.clone())
             .await?;
 
+        let mut visible_base_obj: Option<ObjId> = None;
+        if dentry.is_none() {
+            match self.lookup_base_child(&parent_node, &name).await? {
+                BaseChildLookup::Missing => {}
+                BaseChildLookup::DirObj(_) => {
+                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                }
+                BaseChildLookup::NonDirObj(obj_id) => {
+                    visible_base_obj = Some(obj_id);
+                }
+            }
+        }
+
         // Determine if file exists
-        let file_exists = matches!(
-            &dentry,
-            Some(DentryRecord {
-                target: DentryTarget::IndexNodeId(_),
-                ..
-            }) | Some(DentryRecord {
-                target: DentryTarget::SymLink(_),
-                ..
-            }) | Some(DentryRecord {
-                target: DentryTarget::ObjId(_),
-                ..
-            })
-        );
+        let file_exists = visible_base_obj.is_some()
+            || matches!(
+                &dentry,
+                Some(DentryRecord {
+                    target: DentryTarget::IndexNodeId(_),
+                    ..
+                }) | Some(DentryRecord {
+                    target: DentryTarget::SymLink(_),
+                    ..
+                }) | Some(DentryRecord {
+                    target: DentryTarget::ObjId(_),
+                    ..
+                })
+            );
 
         // Validate flag against file existence
         match flag {
@@ -2668,8 +2822,73 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         // Resolve or create file_id based on dentry and flag
         let (file_id, existing_base_obj, existing_state) = match dentry {
-            None
-            | Some(DentryRecord {
+            None if visible_base_obj.is_none() => {
+                // File doesn't exist - create new inode
+                // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
+                let new_node = NodeRecord {
+                    inode_id: 0,
+                    kind: NodeKind::File,
+                    read_only: false,
+                    base_obj_id: None,
+                    state: NodeState::DirNormal,
+                    rev: None,
+                    meta: None,
+                    lease_client_session: None,
+                    lease_seq: None,
+                    lease_expire_at: None,
+                };
+
+                let fid = self
+                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
+                    .await?;
+
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    Some(txid.clone()),
+                    ctx.clone(),
+                )
+                .await?;
+
+                (fid, None, NodeState::DirNormal)
+            }
+            None => {
+                // Upper miss but base has a same-name non-directory object:
+                // materialize as inode so write flow can continue.
+                let base_oid = visible_base_obj
+                    .take()
+                    .ok_or_else(|| RPCErrors::ReasonError("base object missing".to_string()))?;
+
+                let new_node = NodeRecord {
+                    inode_id: 0,
+                    kind: NodeKind::File,
+                    read_only: false,
+                    base_obj_id: Some(base_oid.clone()),
+                    state: NodeState::DirNormal,
+                    rev: None,
+                    meta: None,
+                    lease_client_session: None,
+                    lease_seq: None,
+                    lease_expire_at: None,
+                };
+
+                let fid = self
+                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
+                    .await?;
+
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    Some(txid.clone()),
+                    ctx.clone(),
+                )
+                .await?;
+
+                (fid, Some(base_oid), NodeState::DirNormal)
+            }
+            Some(DentryRecord {
                 target: DentryTarget::Tombstone,
                 ..
             }) => {
@@ -2713,6 +2932,13 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .await?
                     .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
+                if node.kind == NodeKind::Dir {
+                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                }
+                if node.kind != NodeKind::File {
+                    rollback_and_err!(RPCErrors::ReasonError("path is not a file".to_string()));
+                }
+
                 // Validate state based on flag
                 match (&flag, &node.state) {
                     // ContinueWrite: allow Working or Cooling state
@@ -2743,6 +2969,10 @@ impl ndm::FsMetaHandler for FSMetaService {
                 target: DentryTarget::ObjId(oid),
                 ..
             }) => {
+                if oid.obj_type == OBJ_TYPE_DIR {
+                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                }
+
                 // Dentry points to ObjId directly - materialize inode
                 let new_node = NodeRecord {
                     inode_id: 0,
@@ -3001,50 +3231,31 @@ impl ndm::FsMetaHandler for FSMetaService {
             return Err(RPCErrors::ReasonError("path is a directory".to_string()));
         }
 
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
-
-        let parent = self
-            .handle_resolve_path(&parent_path, ctx.clone())
+        let resolved = self
+            .handle_resolve_path_ex(&path, 0, ctx.clone())
             .await
             .map_err(|e| RPCErrors::ReasonError(e.to_string()))?
-            .ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
-
-        if parent.1.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError(
-                "parent is not a directory".to_string(),
-            ));
-        }
-
-        let dentry = self
-            .handle_get_dentry(parent.0, name.clone(), None, ctx.clone())
-            .await?
             .ok_or_else(|| RPCErrors::ReasonError("path not found".to_string()))?;
 
-        match dentry.target {
-            DentryTarget::Tombstone => Err(RPCErrors::ReasonError("path not found".to_string())),
-            DentryTarget::ObjId(obj_id) => Ok(OpenFileReaderResp::Object(obj_id, None)),
-            DentryTarget::SymLink(_target_path) => Err(RPCErrors::ReasonError(
+        match resolved.item {
+            FsMetaResolvePathItem::SymLink(_) => Err(RPCErrors::ReasonError(
                 "path is a symbolic link".to_string(),
             )),
-            DentryTarget::IndexNodeId(inode_id) => {
-                let node = self
-                    .handle_get_inode(inode_id, None, ctx)
-                    .await?
-                    .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
-
-                if node.kind == NodeKind::Dir {
+            FsMetaResolvePathItem::ObjId(obj_id) => {
+                Ok(OpenFileReaderResp::Object(obj_id, resolved.inner_path))
+            }
+            FsMetaResolvePathItem::Inode { inode, .. } => {
+                if inode.kind == NodeKind::Dir {
                     return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
 
-                match node.state {
+                match inode.state {
                     NodeState::Working(ws) => Ok(OpenFileReaderResp::FileBufferId(ws.fb_handle)),
                     NodeState::Cooling(cs) => Ok(OpenFileReaderResp::FileBufferId(cs.fb_handle)),
                     NodeState::Linked(ls) => Ok(OpenFileReaderResp::Object(ls.obj_id, None)),
                     NodeState::Finalized(fs) => Ok(OpenFileReaderResp::Object(fs.obj_id, None)),
                     NodeState::DirNormal | NodeState::DirOverlay => {
-                        if let Some(obj_id) = node.base_obj_id {
+                        if let Some(obj_id) = inode.base_obj_id {
                             Ok(OpenFileReaderResp::Object(obj_id, None))
                         } else {
                             Err(RPCErrors::ReasonError("no readable content".to_string()))

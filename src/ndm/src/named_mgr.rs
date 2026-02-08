@@ -23,8 +23,8 @@ use ndn_lib::{
 };
 
 use crate::{
-    DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, IndexNodeId, MoveOptions, NodeKind,
-    NodeRecord, NodeState, ObjStat, OpenWriteFlag,
+    DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, FsMetaResolvePathItem, IndexNodeId,
+    MoveOptions, NodeKind, NodeRecord, NodeState, ObjStat, OpenWriteFlag,
 };
 
 // ------------------------------
@@ -269,99 +269,34 @@ impl NamedDataMgr {
     // ========== Basic Operations ==========
 
     pub async fn stat(&self, path: &NdmPath) -> NdnResult<PathStat> {
-        let resolved = self.fsmeta.resolve_path(path).await?;
-        if let Some((inode_id, node)) = resolved {
-            let kind = match node.kind {
-                NodeKind::File => PathKind::File,
-                NodeKind::Dir => PathKind::Dir,
-                NodeKind::Object => PathKind::File,
-            };
-
-            let obj_id = Self::node_obj_id(&node).or_else(|| node.base_obj_id.clone());
-            let size = if let Some(ref id) = obj_id {
-                self.obj_size_from_obj_id(id).await
-            } else {
-                None
-            };
-
-            return Ok(PathStat {
-                kind,
-                size,
-                obj_id,
-                obj_inner_path: None,
-                inode_id: Some(inode_id),
-                state: Some(node.state),
-            });
-        }
-
-        if path.is_root() {
-            return Ok(PathStat {
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        match resolved {
+            None => Ok(PathStat {
                 kind: PathKind::NotFound,
                 size: None,
                 obj_id: None,
                 obj_inner_path: None,
                 inode_id: None,
                 state: None,
-            });
-        }
-
-        if let Some((parent_path, name)) = path.split_parent_name() {
-            if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
-                let dentry = self
-                    .fsmeta
-                    .get_dentry(parent_id, name, None)
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-                if let Some(dentry) = dentry {
-                    match dentry.target {
-                        DentryTarget::ObjId(obj_id) => {
-                            return self.path_stat_from_obj_id(obj_id).await
-                        }
-                        DentryTarget::SymLink(target_path) => {
-                            return Ok(Self::path_stat_from_symlink(target_path));
-                        }
-                        DentryTarget::IndexNodeId(id) => {
-                            if let Some(node) =
-                                self.fsmeta.get_inode(id, None).await.map_err(|e| {
-                                    NdnError::Internal(format!("failed to get inode: {}", e))
-                                })?
-                            {
-                                let kind = match node.kind {
-                                    NodeKind::File => PathKind::File,
-                                    NodeKind::Dir => PathKind::Dir,
-                                    NodeKind::Object => PathKind::File,
-                                };
-                                let obj_id = Self::node_obj_id(&node);
-                                let size = if let Some(ref id) = obj_id {
-                                    self.obj_size_from_obj_id(id).await
-                                } else {
-                                    None
-                                };
-                                return Ok(PathStat {
-                                    kind,
-                                    size,
-                                    obj_id,
-                                    obj_inner_path: None,
-                                    inode_id: Some(id),
-                                    state: Some(node.state),
-                                });
-                            }
-                        }
-                        DentryTarget::Tombstone => {}
-                    }
+            }),
+            Some(resp) => match resp.item {
+                FsMetaResolvePathItem::Inode { inode_id, inode } => {
+                    Ok(self.path_stat_from_inode_node(inode_id, inode).await)
                 }
-            }
+                FsMetaResolvePathItem::ObjId(obj_id) => {
+                    let mut stat = self.path_stat_from_obj_id(obj_id).await?;
+                    stat.obj_inner_path = resp.inner_path;
+                    Ok(stat)
+                }
+                FsMetaResolvePathItem::SymLink(target_path) => {
+                    let mut stat = Self::path_stat_from_symlink(target_path);
+                    if let Some(tail) = resp.inner_path {
+                        stat.obj_inner_path = stat.obj_inner_path.map(|v| format!("{}{}", v, tail));
+                    }
+                    Ok(stat)
+                }
+            },
         }
-
-        Ok(PathStat {
-            kind: PathKind::NotFound,
-            size: None,
-            obj_id: None,
-            obj_inner_path: None,
-            inode_id: None,
-            state: None,
-        })
     }
 
     pub async fn stat_by_objid(&self, obj_id: &ObjId) -> NdnResult<ObjStat> {
@@ -453,75 +388,84 @@ impl NamedDataMgr {
 
     //return list_session_id
     pub async fn start_list(&self, path: &NdmPath) -> NdnResult<u64> {
-        if let Some((dir_id, dir_node)) = self.fsmeta.resolve_path(path).await? {
-            if dir_node.kind != NodeKind::Dir {
-                warn!(
-                    "NamedDataMgr::start_list: path is not a directory, path={}, kind={:?}",
-                    path.as_str(),
-                    dir_node.kind
-                );
-                return Err(NdnError::InvalidParam(
-                    "path is not a directory".to_string(),
-                ));
-            }
-
-            let fsmeta_list_session_id =
-                self.fsmeta.start_list(dir_id, None).await.map_err(|e| {
+        if let Some(resp) = self.fsmeta.resolve_path_ex(path, 0).await? {
+            if let FsMetaResolvePathItem::Inode {
+                inode_id: dir_id,
+                inode: dir_node,
+            } = resp.item
+            {
+                if dir_node.kind != NodeKind::Dir {
                     warn!(
-                        "NamedDataMgr::start_list: start_list failed, path={}, dir_id={}, err={}",
+                        "NamedDataMgr::start_list: path is not a directory, path={}, kind={:?}",
                         path.as_str(),
-                        dir_id,
-                        e
+                        dir_node.kind
                     );
-                    NdnError::Internal(format!("start_list failed: {}", e))
-                })?;
+                    return Err(NdnError::InvalidParam(
+                        "path is not a directory".to_string(),
+                    ));
+                }
 
-            let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
-            let mut local_entries: Option<BTreeMap<String, PathStat>> = None;
-            if dir_node.base_obj_id.is_some() {
-                let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await {
-                    Ok(entries) => entries,
-                    Err(e) => {
+                let fsmeta_list_session_id =
+                    self.fsmeta.start_list(dir_id, None).await.map_err(|e| {
                         warn!(
-                            "NamedDataMgr::start_list: list_next failed, path={}, dir_id={}, err={}",
+                            "NamedDataMgr::start_list: start_list failed, path={}, dir_id={}, err={}",
                             path.as_str(),
                             dir_id,
                             e
                         );
-                        if let Err(stop_err) = self.fsmeta.stop_list(fsmeta_list_session_id).await {
+                        NdnError::Internal(format!("start_list failed: {}", e))
+                    })?;
+
+                let list_session_id = self.list_session_seq.fetch_add(1, Ordering::SeqCst);
+                let mut local_entries: Option<BTreeMap<String, PathStat>> = None;
+                if dir_node.base_obj_id.is_some() {
+                    let upper_entries = match self.fsmeta.list_next(fsmeta_list_session_id, 0).await
+                    {
+                        Ok(entries) => entries,
+                        Err(e) => {
                             warn!(
-                                "NamedDataMgr::start_list: stop_list failed after list_next error, session_id={}, err={}",
-                                fsmeta_list_session_id,
-                                stop_err
+                                "NamedDataMgr::start_list: list_next failed, path={}, dir_id={}, err={}",
+                                path.as_str(),
+                                dir_id,
+                                e
                             );
+                            if let Err(stop_err) =
+                                self.fsmeta.stop_list(fsmeta_list_session_id).await
+                            {
+                                warn!(
+                                    "NamedDataMgr::start_list: stop_list failed after list_next error, session_id={}, err={}",
+                                    fsmeta_list_session_id,
+                                    stop_err
+                                );
+                            }
+                            return Err(NdnError::Internal(format!("list_next failed: {}", e)));
                         }
-                        return Err(NdnError::Internal(format!("list_next failed: {}", e)));
-                    }
-                };
+                    };
 
-                let merged_entries = match self
-                    .build_merged_dir_entries(&dir_node, upper_entries)
-                    .await
-                {
-                    Ok(entries) => entries,
-                    Err(e) => {
-                        let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
-                        return Err(e);
-                    }
-                };
-                local_entries = Some(merged_entries);
+                    let merged_entries = match self
+                        .build_merged_dir_entries(&dir_node, upper_entries)
+                        .await
+                    {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            let _ = self.fsmeta.stop_list(fsmeta_list_session_id).await;
+                            return Err(e);
+                        }
+                    };
+                    local_entries = Some(merged_entries);
+                }
+
+                let mut sessions = self.list_sessions.lock().await;
+                sessions.insert(
+                    list_session_id,
+                    NamedListSession {
+                        fsmeta_list_session_id: Some(fsmeta_list_session_id),
+                        entries: local_entries,
+                        cursor: None,
+                    },
+                );
+                return Ok(list_session_id);
             }
-
-            let mut sessions = self.list_sessions.lock().await;
-            sessions.insert(
-                list_session_id,
-                NamedListSession {
-                    fsmeta_list_session_id: Some(fsmeta_list_session_id),
-                    entries: local_entries,
-                    cursor: None,
-                },
-            );
-            return Ok(list_session_id);
         }
 
         if let Some(entries) = self.load_obj_dir_entries(path).await? {
@@ -672,39 +616,66 @@ impl NamedDataMgr {
         &self,
         path: &NdmPath,
     ) -> NdnResult<Option<BTreeMap<String, PathStat>>> {
-        if let Some((parent_path, name)) = path.split_parent_name() {
-            if let Some((parent_id, _)) = self.fsmeta.resolve_path(&parent_path).await? {
-                let dentry = self
-                    .fsmeta
-                    .get_dentry(parent_id, name, None)
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
-
-                if let Some(dentry) = dentry {
-                    match dentry.target {
-                        DentryTarget::ObjId(obj_id) => {
-                            if obj_id.obj_type != OBJ_TYPE_DIR {
-                                return Err(NdnError::InvalidParam(
-                                    "path is not a directory".to_string(),
-                                ));
-                            }
-                            let dir_obj = self.load_dir_object(&obj_id).await?;
-                            let mut out = BTreeMap::new();
-                            for (entry_name, item) in dir_obj.iter() {
-                                let child_stat = self.path_stat_from_simple_map_item(item).await?;
-                                out.insert(entry_name.clone(), child_stat);
-                            }
-                            return Ok(Some(out));
-                        }
-                        DentryTarget::IndexNodeId(_)
-                        | DentryTarget::SymLink(_)
-                        | DentryTarget::Tombstone => {}
-                    }
-                }
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        let Some(resp) = resolved else {
+            return Ok(None);
+        };
+        let (item, inner_path) = (resp.item, resp.inner_path);
+        let obj_id = match item {
+            FsMetaResolvePathItem::ObjId(obj_id) => obj_id,
+            FsMetaResolvePathItem::Inode { .. } | FsMetaResolvePathItem::SymLink(_) => {
+                return Ok(None);
             }
+        };
+
+        let target_obj_id = self
+            .resolve_inner_obj_id(obj_id, inner_path.as_deref())
+            .await?;
+        let Some(target_obj_id) = target_obj_id else {
+            return Ok(None);
+        };
+
+        if target_obj_id.obj_type != OBJ_TYPE_DIR {
+            return Err(NdnError::InvalidParam(
+                "path is not a directory".to_string(),
+            ));
         }
 
-        Ok(None)
+        let dir_obj = self.load_dir_object(&target_obj_id).await?;
+        let mut out = BTreeMap::new();
+        for (entry_name, item) in dir_obj.iter() {
+            let child_stat = self.path_stat_from_simple_map_item(item).await?;
+            out.insert(entry_name.clone(), child_stat);
+        }
+        Ok(Some(out))
+    }
+
+    async fn resolve_inner_obj_id(
+        &self,
+        root_obj_id: ObjId,
+        inner_path: Option<&str>,
+    ) -> NdnResult<Option<ObjId>> {
+        let Some(inner_path) = inner_path else {
+            return Ok(Some(root_obj_id));
+        };
+        let trimmed = inner_path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(Some(root_obj_id));
+        }
+
+        let mut current = root_obj_id;
+        for segment in trimmed.split('/') {
+            if current.obj_type != OBJ_TYPE_DIR {
+                return Ok(None);
+            }
+            let dir_obj = self.load_dir_object(&current).await?;
+            let Some(item) = dir_obj.get(segment) else {
+                return Ok(None);
+            };
+            let (next_obj_id, _) = item.get_obj_id()?;
+            current = next_obj_id;
+        }
+        Ok(Some(current))
     }
 
     fn page_from_ordered_map<T: Clone>(
@@ -1360,9 +1331,39 @@ impl NamedDataMgr {
             .as_ref()
             .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
 
-        let resolved = self.fsmeta.resolve_path(path).await?;
-        let (dir_id, _) =
-            resolved.ok_or_else(|| NdnError::NotFound("path not found".to_string()))?;
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        let dir_id = match resolved {
+            None => return Err(NdnError::NotFound("path not found".to_string())),
+            Some(resp) => match (resp.item, resp.inner_path) {
+                (FsMetaResolvePathItem::Inode { inode_id, inode }, _) => {
+                    if inode.kind != NodeKind::Dir {
+                        return Err(NdnError::InvalidParam(
+                            "path is not a directory".to_string(),
+                        ));
+                    }
+                    inode_id
+                }
+                (FsMetaResolvePathItem::ObjId(obj_id), inner_path) => {
+                    let target_obj_id = self
+                        .resolve_inner_obj_id(obj_id, inner_path.as_deref())
+                        .await?;
+                    let Some(target_obj_id) = target_obj_id else {
+                        return Err(NdnError::NotFound("path not found".to_string()));
+                    };
+                    if target_obj_id.obj_type != OBJ_TYPE_DIR {
+                        return Err(NdnError::InvalidParam(
+                            "path is not a directory".to_string(),
+                        ));
+                    }
+                    return Ok(target_obj_id);
+                }
+                (FsMetaResolvePathItem::SymLink(_), _) => {
+                    return Err(NdnError::InvalidParam(
+                        "path is a symbolic link".to_string(),
+                    ));
+                }
+            },
+        };
 
         let txid = self
             .fsmeta

@@ -1,14 +1,15 @@
 #[cfg(test)]
 mod tests {
     use crate::fs_meta_service::FSMetaService;
-    use fs_buffer::SessionId;
+    use fs_buffer::{LocalFileBufferService, SessionId};
     use krpc::RPCContext;
+    use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
     use ndm::{
-        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
-        NodeRecord, NodeState,
+        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId,
+        NodeKind, NodeRecord, NodeState, OpenWriteFlag,
     };
-    use ndn_lib::NdmPath;
-    use ndn_lib::ObjId;
+    use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -17,6 +18,81 @@ mod tests {
         let db_path = tmp_dir.path().join("test.db");
         let svc = FSMetaService::new(db_path.to_str().unwrap()).unwrap();
         (svc, tmp_dir)
+    }
+
+    fn create_test_service_with_buffer() -> (FSMetaService, TempDir, TempDir) {
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let fb_tmp_dir = TempDir::new().unwrap();
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let buffer = Arc::new(LocalFileBufferService::new(fb_tmp_dir.path().to_path_buf(), 0));
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_buffer("test-instance".to_string(), buffer);
+        (svc, meta_tmp_dir, fb_tmp_dir)
+    }
+
+    fn build_test_layout(store_id: &str) -> StoreLayout {
+        let target = StoreTarget {
+            store_id: store_id.to_string(),
+            device_did: None,
+            capacity: None,
+            used: None,
+            readonly: false,
+            enabled: true,
+            weight: 1,
+        };
+        StoreLayout::new(1, vec![target], 0, 0)
+    }
+
+    async fn create_test_service_with_store() -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let store_tmp_dir = TempDir::new().unwrap();
+
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let store_path = store_tmp_dir.path().join("named_store");
+        let store = NamedLocalStore::get_named_store_by_path(store_path)
+            .await
+            .unwrap();
+        let store_id = store.store_id().to_string();
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+
+        let store_mgr = Arc::new(NamedStoreMgr::new());
+        store_mgr.register_store(store_ref).await;
+        store_mgr.add_layout(build_test_layout(&store_id)).await;
+
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_named_store(store_mgr.clone());
+
+        (svc, meta_tmp_dir, store_tmp_dir, store_mgr)
+    }
+
+    async fn create_test_service_with_store_and_buffer(
+    ) -> (FSMetaService, TempDir, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let store_tmp_dir = TempDir::new().unwrap();
+        let fb_tmp_dir = TempDir::new().unwrap();
+
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let store_path = store_tmp_dir.path().join("named_store");
+        let store = NamedLocalStore::get_named_store_by_path(store_path)
+            .await
+            .unwrap();
+        let store_id = store.store_id().to_string();
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+
+        let store_mgr = Arc::new(NamedStoreMgr::new());
+        store_mgr.register_store(store_ref).await;
+        store_mgr.add_layout(build_test_layout(&store_id)).await;
+
+        let buffer = Arc::new(LocalFileBufferService::new(fb_tmp_dir.path().to_path_buf(), 0));
+
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_named_store(store_mgr.clone())
+            .with_buffer("test-instance".to_string(), buffer);
+
+        (svc, meta_tmp_dir, store_tmp_dir, fb_tmp_dir, store_mgr)
     }
 
     fn create_obj_id(seed: u8) -> ObjId {
@@ -275,10 +351,15 @@ mod tests {
         }
 
         let resolved = svc
-            .handle_resolve_path(&NdmPath::new("/link_file"), ctx)
+            .handle_resolve_path_ex(&NdmPath::new("/link_file"), 0, ctx)
             .await
+            .unwrap()
             .unwrap();
-        assert!(resolved.is_none());
+        match resolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "/target_file"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(resolved.inner_path, None);
     }
 
     #[tokio::test]
@@ -350,9 +431,13 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        svc.handle_make_link(&NdmPath::new("/link_a"), &NdmPath::new("/target_a"), ctx.clone())
-            .await
-            .unwrap();
+        svc.handle_make_link(
+            &NdmPath::new("/link_a"),
+            &NdmPath::new("/target_a"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
 
         let resolved = svc
             .handle_resolve_path_ex(&NdmPath::new("/link_a/sub/path"), 0, ctx)
@@ -377,9 +462,15 @@ mod tests {
         let dir_x = create_dir_node(621);
         let dir_y = create_dir_node(622);
         let file = create_file_node_working(623, "fb-symlink-rel");
-        svc.handle_set_inode(dir_a, None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(dir_x, None, ctx.clone()).await.unwrap();
-        svc.handle_set_inode(dir_y, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(dir_a, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(dir_x, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(dir_y, None, ctx.clone())
+            .await
+            .unwrap();
         svc.handle_set_inode(file, None, ctx.clone()).await.unwrap();
 
         svc.handle_upsert_dentry(
@@ -1305,10 +1396,14 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx.clone())
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(resolved.unwrap().0, c.inode_id);
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, c.inode_id),
+            _ => panic!("expected Inode result"),
+        }
 
         // Change edge /a/b -> new inode, should invalidate /a/b/* cache entries.
         let b2 = create_dir_node(20);
@@ -1326,7 +1421,7 @@ mod tests {
         .unwrap();
 
         let resolved2 = svc
-            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx)
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());
@@ -1382,10 +1477,14 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx.clone())
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(resolved.unwrap().0, c.inode_id);
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, c.inode_id),
+            _ => panic!("expected Inode result"),
+        }
 
         // Mutate /a/b within a transaction.
         let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
@@ -1406,9 +1505,404 @@ mod tests {
 
         // After commit, the cached /a/b/* entries must be invalidated.
         let resolved2 = svc
-            .handle_resolve_path(&NdmPath::new("/a/b/c"), ctx)
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_materializes_overlay_chain_from_dir_object() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_c = DirObject::new(Some("c".to_string()));
+        let (c_obj_id, c_obj_str) = dir_c.gen_obj_id().unwrap();
+        store_mgr.put_object(&c_obj_id, c_obj_str.as_str()).await.unwrap();
+
+        let mut dir_b = DirObject::new(Some("b".to_string()));
+        dir_b
+            .add_directory("c".to_string(), c_obj_id.clone(), 0)
+            .unwrap();
+        let (b_obj_id, b_obj_str) = dir_b.gen_obj_id().unwrap();
+        store_mgr.put_object(&b_obj_id, b_obj_str.as_str()).await.unwrap();
+
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_directory("b".to_string(), b_obj_id.clone(), 0)
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        svc.handle_create_dir(&NdmPath::new("/a/b/c/new"), ctx.clone())
+            .await
+            .unwrap();
+
+        let dentry_a = svc
+            .handle_get_dentry(root, "a".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_a = match dentry_a.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a"),
+        };
+        let node_a = svc
+            .handle_get_inode(inode_a, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_a.base_obj_id, Some(a_obj_id));
+        match node_a.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a"),
+        }
+
+        let dentry_b = svc
+            .handle_get_dentry(inode_a, "b".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_b = match dentry_b.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b"),
+        };
+        let node_b = svc
+            .handle_get_inode(inode_b, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_b.base_obj_id, Some(b_obj_id));
+        match node_b.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a/b"),
+        }
+
+        let dentry_c = svc
+            .handle_get_dentry(inode_b, "c".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_c = match dentry_c.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b/c"),
+        };
+        let node_c = svc
+            .handle_get_inode(inode_c, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_c.base_obj_id, Some(c_obj_id));
+        match node_c.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a/b/c"),
+        }
+
+        let dentry_new = svc
+            .handle_get_dentry(inode_c, "new".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_new = match dentry_new.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b/c/new"),
+        };
+        let node_new = svc
+            .handle_get_inode(inode_new, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_new.base_obj_id, None);
+        match node_new.state {
+            NodeState::DirNormal => {}
+            _ => panic!("expected DirNormal for /a/b/c/new"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_rejects_non_dir_child_in_base_dir_object() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_create_dir(&NdmPath::new("/a/leaf/new"), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn test_set_file_rejects_existing_upper_entry() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        svc.handle_create_dir(&NdmPath::new("/a"), ctx.clone())
+            .await
+            .unwrap();
+
+        svc.handle_set_file(&NdmPath::new("/a/file"), create_obj_id(11), ctx.clone())
+            .await
+            .unwrap();
+
+        let err = svc
+            .handle_set_file(&NdmPath::new("/a/file"), create_obj_id(12), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_dir_rejects_existing_upper_entry() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        svc.handle_create_dir(&NdmPath::new("/a"), ctx.clone())
+            .await
+            .unwrap();
+
+        let dir1 = DirObject::new(Some("d1".to_string()));
+        let (dir1_id, _) = dir1.gen_obj_id().unwrap();
+        svc.handle_set_dir(&NdmPath::new("/a/dir"), dir1_id, ctx.clone())
+            .await
+            .unwrap();
+
+        let dir2 = DirObject::new(Some("d2".to_string()));
+        let (dir2_id, _) = dir2.gen_obj_id().unwrap();
+        let err = svc
+            .handle_set_dir(&NdmPath::new("/a/dir"), dir2_id, ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_file_rejects_existing_base_entry() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_set_file(&NdmPath::new("/a/leaf"), create_obj_id(33), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_dir_rejects_existing_base_entry() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child_dir = DirObject::new(Some("sub".to_string()));
+        let (child_id, child_str) = child_dir.gen_obj_id().unwrap();
+        store_mgr.put_object(&child_id, child_str.as_str()).await.unwrap();
+
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_directory("sub".to_string(), child_id, 0)
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dir_new = DirObject::new(Some("new".to_string()));
+        let (dir_new_id, _) = dir_new.gen_obj_id().unwrap();
+        let err = svc
+            .handle_set_dir(&NdmPath::new("/a/sub"), dir_new_id, ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_rejects_upper_dir_object() {
+        let (svc, _meta_tmp, _fb_tmp) = create_test_service_with_buffer();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_obj = DirObject::new(Some("a".to_string()));
+        let (dir_obj_id, _) = dir_obj.gen_obj_id().unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(dir_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_open_file_writer(
+                &NdmPath::new("/a"),
+                OpenWriteFlag::CreateOrTruncate,
+                None,
+                ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_rejects_existing_base_file_on_create_exclusive() {
+        let (svc, _meta_tmp, _store_tmp, _fb_tmp, store_mgr) =
+            create_test_service_with_store_and_buffer().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_open_file_writer(
+                &NdmPath::new("/a/leaf"),
+                OpenWriteFlag::CreateExclusive,
+                None,
+                ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_continue_write_treats_base_file_as_existing() {
+        let (svc, _meta_tmp, _store_tmp, _fb_tmp, store_mgr) =
+            create_test_service_with_store_and_buffer().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_open_file_writer(
+                &NdmPath::new("/a/leaf"),
+                OpenWriteFlag::ContinueWrite,
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+
+        let err_msg = err.to_string();
+        assert!(!err_msg.contains("file not found"), "err={}", err_msg);
     }
 }

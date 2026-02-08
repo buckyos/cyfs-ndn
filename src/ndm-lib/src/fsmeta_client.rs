@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
 
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ClientSessionId(pub String);
 
@@ -77,7 +76,7 @@ pub struct NodeRecord {
     pub state: NodeState,
     pub read_only: bool,
     pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)
-    pub rev: Option<u64>, // only for dirs
+    pub rev: Option<u64>,           // only for dirs
     // metas:
     pub meta: Option<Value>,
 
@@ -189,23 +188,6 @@ impl FsMetaRootDirReq {
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
             RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRootDirReq: {}", e))
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsMetaResolvePathReq {
-    pub path: String,
-}
-
-impl FsMetaResolvePathReq {
-    pub fn new(path: String) -> Self {
-        Self { path }
-    }
-
-    pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
-        serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaResolvePathReq: {}", e))
         })
     }
 }
@@ -777,35 +759,6 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn resolve_path(
-        &self,
-        path: &NdmPath,
-    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
-        match self {
-            Self::InProcess(handler) => {
-                let ctx = RPCContext::default();
-                handler.handle_resolve_path(path, ctx).await
-            }
-            Self::KRPC(client) => {
-                let req = FsMetaResolvePathReq::new(path.as_str().to_string());
-                let req_json = serde_json::to_value(&req).map_err(|e| {
-                    NdnError::Internal(format!("Failed to serialize request: {}", e))
-                })?;
-
-                let result = client
-                    .call("resolve_path", req_json)
-                    .await
-                    .map_err(|e| NdnError::Internal(format!("resolve_path rpc failed: {}", e)))?;
-                serde_json::from_value(result).map_err(|e| {
-                    NdnError::Internal(format!(
-                        "Expected Option<(IndexNodeId, NodeRecord)> result: {}",
-                        e
-                    ))
-                })
-            }
-        }
-    }
-
     pub async fn resolve_path_ex(
         &self,
         path: &NdmPath,
@@ -825,7 +778,9 @@ impl FsMetaClient {
                 let result = client
                     .call("resolve_path_ex", req_json)
                     .await
-                    .map_err(|e| NdnError::Internal(format!("resolve_path_ex rpc failed: {}", e)))?;
+                    .map_err(|e| {
+                        NdnError::Internal(format!("resolve_path_ex rpc failed: {}", e))
+                    })?;
                 serde_json::from_value(result).map_err(|e| {
                     NdnError::Internal(format!(
                         "Expected Option<FsMetaResolvePathResp> result: {}",
@@ -1577,23 +1532,12 @@ impl FsMetaClient {
 #[async_trait::async_trait]
 pub trait FsMetaHandler: Send + Sync {
     async fn handle_root_dir(&self, ctx: RPCContext) -> Result<IndexNodeId, RPCErrors>;
-    async fn handle_resolve_path(
-        &self,
-        path: &NdmPath,
-        ctx: RPCContext,
-    ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>>;
     async fn handle_resolve_path_ex(
         &self,
         path: &NdmPath,
-        _sym_count: u32,
+        sym_count: u32,
         ctx: RPCContext,
-    ) -> NdnResult<Option<FsMetaResolvePathResp>> {
-        let resolved = self.handle_resolve_path(path, ctx).await?;
-        Ok(resolved.map(|(inode_id, inode)| FsMetaResolvePathResp {
-            item: FsMetaResolvePathItem::Inode { inode_id, inode },
-            inner_path: None,
-        }))
-    }
+    ) -> NdnResult<Option<FsMetaResolvePathResp>>;
     async fn handle_begin_txn(&self, ctx: RPCContext) -> Result<String, RPCErrors>;
     async fn handle_get_inode(
         &self,
@@ -1811,15 +1755,6 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                 let result = self.0.handle_root_dir(ctx).await?;
                 RPCResult::Success(serde_json::json!(result))
             }
-            "resolve_path" => {
-                let req = FsMetaResolvePathReq::from_json(req.params)?;
-                let path = NdmPath::new(req.path);
-                let result =
-                    self.0.handle_resolve_path(&path, ctx).await.map_err(|e| {
-                        RPCErrors::ReasonError(format!("resolve_path failed: {}", e))
-                    })?;
-                RPCResult::Success(serde_json::json!(result))
-            }
             "resolve_path_ex" => {
                 let req = FsMetaResolvePathExReq::from_json(req.params)?;
                 let path = NdmPath::new(req.path);
@@ -1827,7 +1762,9 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                     .0
                     .handle_resolve_path_ex(&path, req.sym_count, ctx)
                     .await
-                    .map_err(|e| RPCErrors::ReasonError(format!("resolve_path_ex failed: {}", e)))?;
+                    .map_err(|e| {
+                        RPCErrors::ReasonError(format!("resolve_path_ex failed: {}", e))
+                    })?;
                 RPCResult::Success(serde_json::json!(result))
             }
             "begin_txn" => {
@@ -2064,17 +2001,24 @@ mod tests {
             Ok(self.state.lock().unwrap().root_dir)
         }
 
-        async fn handle_resolve_path(
+        async fn handle_resolve_path_ex(
             &self,
             path: &NdmPath,
+            sym_count: u32,
             _ctx: RPCContext,
-        ) -> NdnResult<Option<(IndexNodeId, NodeRecord)>> {
+        ) -> NdnResult<Option<FsMetaResolvePathResp>> {
             let state = self.state.lock().unwrap();
 
             let root_id = state.root_dir;
             if path.is_root() {
                 let node = state.inodes.get(&root_id).cloned();
-                return Ok(node.map(|n| (root_id, n)));
+                return Ok(node.map(|inode| FsMetaResolvePathResp {
+                    item: FsMetaResolvePathItem::Inode {
+                        inode_id: root_id,
+                        inode,
+                    },
+                    inner_path: None,
+                }));
             }
 
             let components = path.components();
@@ -2094,27 +2038,42 @@ mod tests {
                         DentryTarget::IndexNodeId(id) => {
                             if is_last {
                                 let node = state.inodes.get(&id).cloned();
-                                return Ok(node.map(|n| (id, n)));
+                                return Ok(node.map(|inode| FsMetaResolvePathResp {
+                                    item: FsMetaResolvePathItem::Inode {
+                                        inode_id: id,
+                                        inode,
+                                    },
+                                    inner_path: None,
+                                }));
                             }
                             current_id = id;
                         }
-                        DentryTarget::SymLink(_target_path) => {
-                            if is_last {
-                                return Ok(None);
+                        DentryTarget::SymLink(target_path) => {
+                            let tail = if i + 1 >= components.len() {
+                                None
+                            } else {
+                                Some(format!("/{}", components[i + 1..].join("/")))
+                            };
+                            if sym_count == 0 {
+                                return Ok(Some(FsMetaResolvePathResp {
+                                    item: FsMetaResolvePathItem::SymLink(target_path),
+                                    inner_path: tail,
+                                }));
                             }
-                            return Err(NdnError::NotFound(format!(
-                                "path {} crosses symbolic link",
-                                path.as_str()
-                            )));
+                            return Err(NdnError::Unsupported(
+                                "mock handler does not support symbolic link expansion".to_string(),
+                            ));
                         }
-                        DentryTarget::ObjId(_obj_id) => {
-                            if is_last {
-                                return Ok(None);
-                            }
-                            return Err(NdnError::NotFound(format!(
-                                "path {} requires materialization",
-                                path.as_str()
-                            )));
+                        DentryTarget::ObjId(obj_id) => {
+                            let tail = if i + 1 >= components.len() {
+                                None
+                            } else {
+                                Some(format!("/{}", components[i + 1..].join("/")))
+                            };
+                            return Ok(Some(FsMetaResolvePathResp {
+                                item: FsMetaResolvePathItem::ObjId(obj_id),
+                                inner_path: tail,
+                            }));
                         }
                         DentryTarget::Tombstone => {
                             return Ok(None);

@@ -687,10 +687,6 @@ fn init_named_mgr(
 
     let db_path = fs_meta_dir.join("fs_meta.db");
     let buffer_service = Arc::new(LocalFileBufferService::new(fs_buffer_dir, 0));
-    let fs_meta_service = FSMetaService::new(db_path.to_string_lossy().to_string())
-        .map_err(|e| NdnError::Internal(e.to_string()))
-        .map(|svc| svc.with_buffer(instance_id.to_string(), buffer_service.clone()))?;
-    let fs_meta_client = Arc::new(ndm::FsMetaClient::new_in_process(Box::new(fs_meta_service)));
 
     let store_mgr = Arc::new(NamedStoreMgr::new());
     let store = runtime
@@ -701,6 +697,14 @@ fn init_named_mgr(
         store_mgr.register_store(store_ref).await;
         store_mgr.add_layout(build_layout(&store_id)).await;
     });
+
+    let fs_meta_service = FSMetaService::new(db_path.to_string_lossy().to_string())
+        .map_err(|e| NdnError::Internal(e.to_string()))
+        .map(|svc| {
+            svc.with_buffer(instance_id.to_string(), buffer_service.clone())
+                .with_named_store(store_mgr.clone())
+        })?;
+    let fs_meta_client = Arc::new(ndm::FsMetaClient::new_in_process(Box::new(fs_meta_service)));
 
     let named_mgr = NamedDataMgr::with_layout_mgr(
         instance_id.to_string(),
