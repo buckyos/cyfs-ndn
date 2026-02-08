@@ -711,6 +711,103 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_dir_rev_auto_bump_on_dentry_real_change() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(990);
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let root_node0 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node0.rev, Some(0));
+
+        // Insert dentry => rev +1
+        svc.handle_upsert_dentry(
+            root,
+            "rev_case".to_string(),
+            DentryTarget::IndexNodeId(990),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let root_node1 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node1.rev, Some(1));
+
+        // Same upsert (no effective change) => rev unchanged
+        svc.handle_upsert_dentry(
+            root,
+            "rev_case".to_string(),
+            DentryTarget::IndexNodeId(990),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let root_node2 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node2.rev, Some(1));
+
+        // Target change to tombstone => rev +1
+        svc.handle_set_tombstone(root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node3 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node3.rev, Some(2));
+
+        // Same tombstone again (no effective change) => rev unchanged
+        svc.handle_set_tombstone(root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node4 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node4.rev, Some(2));
+
+        // Delete existing dentry row => rev +1
+        svc.handle_remove_dentry_row(root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node5 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node5.rev, Some(3));
+
+        // Delete non-existing dentry row => rev unchanged
+        svc.handle_remove_dentry_row(root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node6 = svc
+            .handle_get_inode(root, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node6.rev, Some(3));
+    }
+
     // ==================== Transaction Tests ====================
 
     #[tokio::test]

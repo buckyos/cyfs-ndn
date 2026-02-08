@@ -1104,13 +1104,6 @@ impl FSMetaService {
             rollback_and_err!(e);
         }
 
-        if let Err(e) = self
-            .handle_bump_dir_rev(parent_id, parent_rev0, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            rollback_and_err!(e);
-        }
-
         self.handle_commit(Some(txid), ctx).await?;
         Ok(true)
     }
@@ -1607,32 +1600,6 @@ impl FSMetaService {
             ctx.clone(),
         )
         .await?;
-
-        // Bump revisions
-        if plan.src_parent == plan.dst_parent {
-            self.handle_bump_dir_rev(
-                plan.src_parent,
-                plan.src_rev0,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await?;
-        } else {
-            self.handle_bump_dir_rev(
-                plan.src_parent,
-                plan.src_rev0,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await?;
-            self.handle_bump_dir_rev(
-                plan.dst_parent,
-                plan.dst_rev0,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await?;
-        }
 
         self.handle_commit(Some(txid), ctx).await?;
 
@@ -2284,17 +2251,22 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
-        let result = self.with_conn(txid.as_deref(), move |conn| {
+        let changed = self.with_conn(txid.as_deref(), move |conn| {
             let now = unix_timestamp() as i64;
             let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
-            conn.execute(
+            let updated = conn
+                .execute(
                 "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(parent_inode_id, name) DO UPDATE SET
                     target_type = excluded.target_type,
                     target_inode_id = excluded.target_inode_id,
                     target_obj_id = excluded.target_obj_id,
-                    mtime = excluded.mtime",
+                    mtime = excluded.mtime
+                 WHERE
+                    dentries.target_type IS NOT excluded.target_type OR
+                    dentries.target_inode_id IS NOT excluded.target_inode_id OR
+                    dentries.target_obj_id IS NOT excluded.target_obj_id",
                 params![
                     parent as i64,
                     name,
@@ -2305,21 +2277,33 @@ impl ndm::FsMetaHandler for FSMetaService {
                 ],
             )
             .map_err(map_db_err)?;
-            Ok(())
+            if updated > 0 {
+                // Any effective child-item change bumps parent directory rev.
+                conn.execute(
+                    "UPDATE nodes
+                     SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                     WHERE inode_id = ?1",
+                    params![parent as i64, now],
+                )
+                .map_err(map_db_err)?;
+            }
+            Ok(updated > 0)
         })
-        .await;
+        .await?;
 
-        result?;
-
-        if let Some(txid) = txid {
-            let entry = self.get_txn_entry(&txid)?;
-            entry
-                .touched_edges
-                .lock()
-                .map_err(|e| RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e)))?
-                .insert((parent, name_for_invalidate));
-        } else if let Ok(mut cache) = self.resolve_path_cache.write() {
-            cache.invalidate_by_edge(parent, &name_for_invalidate);
+        if changed {
+            if let Some(txid) = txid {
+                let entry = self.get_txn_entry(&txid)?;
+                entry
+                    .touched_edges
+                    .lock()
+                    .map_err(|e| {
+                        RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
+                    })?
+                    .insert((parent, name_for_invalidate));
+            } else if let Ok(mut cache) = self.resolve_path_cache.write() {
+                cache.invalidate_by_edge(parent, &name_for_invalidate);
+            }
         }
 
         Ok(())
@@ -2333,28 +2317,42 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
-        let result = self
+        let changed = self
             .with_conn(txid.as_deref(), move |conn| {
-                conn.execute(
-                    "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
-                    params![parent as i64, name],
-                )
-                .map_err(map_db_err)?;
-                Ok(())
+                let now = unix_timestamp() as i64;
+                let removed = conn
+                    .execute(
+                        "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                        params![parent as i64, name],
+                    )
+                    .map_err(map_db_err)?;
+                if removed > 0 {
+                    // Any effective child-item change bumps parent directory rev.
+                    conn.execute(
+                        "UPDATE nodes
+                         SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                         WHERE inode_id = ?1",
+                        params![parent as i64, now],
+                    )
+                    .map_err(map_db_err)?;
+                }
+                Ok(removed > 0)
             })
-            .await;
+            .await?;
 
-        result?;
-
-        if let Some(txid) = txid {
-            let entry = self.get_txn_entry(&txid)?;
-            entry
-                .touched_edges
-                .lock()
-                .map_err(|e| RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e)))?
-                .insert((parent, name_for_invalidate));
-        } else if let Ok(mut cache) = self.resolve_path_cache.write() {
-            cache.invalidate_by_edge(parent, &name_for_invalidate);
+        if changed {
+            if let Some(txid) = txid {
+                let entry = self.get_txn_entry(&txid)?;
+                entry
+                    .touched_edges
+                    .lock()
+                    .map_err(|e| {
+                        RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
+                    })?
+                    .insert((parent, name_for_invalidate));
+            } else if let Ok(mut cache) = self.resolve_path_cache.write() {
+                cache.invalidate_by_edge(parent, &name_for_invalidate);
+            }
         }
 
         Ok(())
