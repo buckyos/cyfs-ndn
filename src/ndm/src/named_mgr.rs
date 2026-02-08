@@ -376,7 +376,7 @@ impl NamedDataMgr {
     //快照的逻辑是copy_dir的特殊情况，复制后把target设置为readonly,并很快会触发物化流程冻结
     pub async fn snapshot(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         let cp_option = CopyOptions {
-            is_target_readonly: false,
+            is_target_readonly: true,
         };
         self.copy_dir(src, target, cp_option).await
     }
@@ -812,9 +812,8 @@ impl NamedDataMgr {
             .obj_id
             .ok_or_else(|| NdnError::NotFound("no object bound to path".to_string()))?;
 
-        //get_object的返回，需要正确支持jwt格式
         let obj = self.get_object(&obj_id).await?;
-        Ok(serde_json::to_string(&obj).map_err(|e| NdnError::Internal(e.to_string()))?)
+        Ok(obj)
     }
 
     /// Internal method to get object with multi-version layout fallback

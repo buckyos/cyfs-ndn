@@ -81,6 +81,13 @@ const ROOT_KEY: &str = "root_dir";
 const TXN_TIMEOUT_SECS: u64 = 300;
 /// Interval for cleaning up stale transactions: 30 seconds
 const TXN_CLEANUP_INTERVAL_SECS: u64 = 30;
+/// TTL for write leases created by open_file_writer: 5 minutes
+const WRITE_LEASE_TTL_SECS: u64 = 300;
+/// Interval for cleaning up expired write leases.
+#[cfg(not(test))]
+const WRITE_LEASE_CLEANUP_INTERVAL_SECS: u64 = 30;
+#[cfg(test)]
+const WRITE_LEASE_CLEANUP_INTERVAL_SECS: u64 = 1;
 
 #[derive(Clone)]
 struct TxnEntry {
@@ -106,8 +113,10 @@ pub struct FSMetaService {
     txn_seq: AtomicU64,
     /// Transaction timeout in seconds
     txn_timeout_secs: u64,
-    /// Handle to stop the cleanup task on drop
-    _cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to stop the transaction cleanup task on drop
+    txn_cleanup_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Handle to stop the write lease cleanup task on drop
+    lease_cleanup_handle: Option<tokio::task::JoinHandle<()>>,
 
     resolve_path_cache: Arc<RwLock<PathResolveCache>>,
     list_cache: Arc<Mutex<ListCache>>,
@@ -143,20 +152,23 @@ impl FSMetaService {
         Self::create_schema(&conn)?;
         Self::migrate_schema(&conn)?;
         let root_inode = Self::ensure_root_dir(&conn)?;
+        let conn = Arc::new(Mutex::new(conn));
 
         let txns = Arc::new(Mutex::new(HashMap::new()));
 
         // Start background cleanup task
-        let cleanup_handle = Self::start_cleanup_task(txns.clone(), txn_timeout_secs);
+        let txn_cleanup_handle = Self::start_cleanup_task(txns.clone(), txn_timeout_secs);
+        let lease_cleanup_handle = Self::start_write_lease_cleanup_task(conn.clone());
 
         Ok(Self {
             db_path,
-            conn: Arc::new(Mutex::new(conn)),
+            conn,
             txns,
             root_inode,
             txn_seq: AtomicU64::new(1),
             txn_timeout_secs,
-            _cleanup_handle: Some(cleanup_handle),
+            txn_cleanup_handle: Some(txn_cleanup_handle),
+            lease_cleanup_handle: Some(lease_cleanup_handle),
             resolve_path_cache: Arc::new(RwLock::new(PathResolveCache::default())),
             list_cache: Arc::new(Mutex::new(ListCache::default())),
             instance: None,
@@ -274,6 +286,59 @@ impl FSMetaService {
         })
     }
 
+    /// Start a background task that periodically reclaims expired write leases.
+    /// For timed-out leases on Working files, this also transitions node state to Cooling.
+    fn start_write_lease_cleanup_task(conn: Arc<Mutex<Connection>>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(WRITE_LEASE_CLEANUP_INTERVAL_SECS));
+            loop {
+                interval.tick().await;
+
+                let conn = conn.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let now = unix_timestamp() as i64;
+                    let conn_guard = conn.lock().map_err(|e| {
+                        RPCErrors::ReasonError(format!("conn lock poisoned: {}", e))
+                    })?;
+                    Self::reclaim_expired_write_leases(&conn_guard, now)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(reclaimed)) if reclaimed > 0 => {
+                        info!(
+                            "write lease cleanup: reclaimed {} expired leases",
+                            reclaimed
+                        );
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => warn!("write lease cleanup failed: {}", e),
+                    Err(e) => warn!("write lease cleanup join failed: {}", e),
+                }
+            }
+        })
+    }
+
+    fn reclaim_expired_write_leases(conn: &Connection, now: i64) -> Result<usize, RPCErrors> {
+        let reclaimed = conn
+            .execute(
+                "UPDATE nodes
+                 SET
+                    lease_client_session = NULL,
+                    lease_expire_at = NULL,
+                    state = CASE WHEN state = ?2 THEN ?3 ELSE state END,
+                    closed_at = CASE WHEN state = ?2 THEN ?1 ELSE closed_at END,
+                    updated_at = ?1
+                 WHERE
+                    lease_expire_at IS NOT NULL
+                    AND lease_expire_at <= ?1",
+                params![now, NODE_STATE_WORKING, NODE_STATE_COOLING],
+            )
+            .map_err(map_db_err)?;
+        Ok(reclaimed)
+    }
+
     fn init_connection(conn: &Connection) -> Result<(), RPCErrors> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -338,6 +403,9 @@ impl FSMetaService {
 
             CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
             CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_inode_target
+                ON dentries(target_inode_id)
+                WHERE target_type = 0;
 
             CREATE TABLE IF NOT EXISTS obj_stat (
                 obj_id BLOB PRIMARY KEY,
@@ -411,6 +479,9 @@ impl FSMetaService {
              DROP TABLE dentries_old;
              CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
              CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
+             CREATE UNIQUE INDEX IF NOT EXISTS uniq_inode_target
+                ON dentries(target_inode_id)
+                WHERE target_type = 0;
              COMMIT;",
         )
         .map_err(|e| RPCErrors::ReasonError(format!("migrate schema failed: {}", e)))?;
@@ -1307,16 +1378,109 @@ impl FSMetaService {
         }
     }
 
+    async fn load_base_dir_children(
+        &self,
+        dir_node: &NodeRecord,
+    ) -> Result<BTreeMap<String, ObjId>, RPCErrors> {
+        let mut out = BTreeMap::new();
+        let Some(base_obj_id) = dir_node.base_obj_id.as_ref() else {
+            return Ok(out);
+        };
+        if base_obj_id.obj_type != OBJ_TYPE_DIR {
+            return Err(RPCErrors::ReasonError(format!(
+                "invalid base_obj_id type for directory inode: {}",
+                base_obj_id.obj_type
+            )));
+        }
+
+        let store_mgr = self.store_mgr.as_ref().ok_or_else(|| {
+            RPCErrors::ReasonError(
+                "named store manager not configured for DirObject traversal".to_string(),
+            )
+        })?;
+        let base_obj_str = store_mgr
+            .get_object(base_obj_id)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
+        let base_dir: DirObject = load_named_obj(base_obj_str.as_str())
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e)))?;
+        for (name, item) in base_dir.iter() {
+            let (obj_id, obj_str) = item
+                .get_obj_id()
+                .map_err(|e| RPCErrors::ReasonError(format!("invalid base child entry: {}", e)))?;
+            if !obj_str.is_empty() {
+                store_mgr
+                    .put_object(&obj_id, obj_str.as_str())
+                    .await
+                    .map_err(|e| {
+                        RPCErrors::ReasonError(format!(
+                            "failed to cache embedded child object: {}",
+                            e
+                        ))
+                    })?;
+            }
+            out.insert(name.clone(), obj_id);
+        }
+        Ok(out)
+    }
+
+    async fn list_merged_dentries(
+        &self,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<Vec<DentryRecord>, RPCErrors> {
+        let parent_node = self
+            .handle_get_inode(parent, txid.clone(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?;
+        if parent_node.kind != NodeKind::Dir {
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
+            ));
+        }
+
+        let mut merged = BTreeMap::<String, DentryRecord>::new();
+        for (name, obj_id) in self.load_base_dir_children(&parent_node).await? {
+            merged.insert(
+                name.clone(),
+                DentryRecord {
+                    parent,
+                    name,
+                    target: DentryTarget::ObjId(obj_id),
+                    mtime: None,
+                },
+            );
+        }
+
+        for d in self
+            .handle_list_dentries(parent, txid.clone(), ctx.clone())
+            .await?
+        {
+            match d.target {
+                DentryTarget::Tombstone => {
+                    merged.remove(&d.name);
+                }
+                _ => {
+                    merged.insert(d.name.clone(), d);
+                }
+            }
+        }
+
+        Ok(merged.into_values().collect())
+    }
+
     async fn ensure_name_absent_for_create(
         &self,
         parent_id: IndexNodeId,
         parent_node: &NodeRecord,
         name: &str,
         path: &NdmPath,
+        txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let upper = self
-            .handle_get_dentry(parent_id, name.to_string(), None, ctx.clone())
+            .handle_get_dentry(parent_id, name.to_string(), txid, ctx.clone())
             .await?;
 
         match upper {
@@ -1659,6 +1823,164 @@ impl FSMetaService {
         Err(RPCErrors::ReasonError("not found".to_string()))
     }
 
+    async fn acquire_file_lease_inner(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        ttl: Duration,
+        txid: Option<String>,
+    ) -> Result<u64, RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let now = unix_timestamp() as i64;
+            let expire_at = now.saturating_add(ttl.as_secs() as i64);
+
+            let renewed = conn
+                .execute(
+                    "UPDATE nodes SET lease_expire_at = ?1 
+                     WHERE inode_id = ?2 
+                       AND lease_client_session = ?3 
+                       AND lease_expire_at > ?4",
+                    params![expire_at, node_id as i64, &session.0, now],
+                )
+                .map_err(map_db_err)?;
+
+            if renewed > 0 {
+                let seq: i64 = conn
+                    .query_row(
+                        "SELECT COALESCE(lease_seq, 0) FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_db_err)?;
+                return Ok(seq as u64);
+            }
+
+            let acquired = conn
+                .execute(
+                    "UPDATE nodes SET 
+                        lease_client_session = ?1, 
+                        lease_seq = COALESCE(lease_seq, 0) + 1, 
+                        lease_expire_at = ?2
+                     WHERE inode_id = ?3 
+                       AND (lease_expire_at IS NULL OR lease_expire_at <= ?4)",
+                    params![&session.0, expire_at, node_id as i64, now],
+                )
+                .map_err(map_db_err)?;
+
+            if acquired > 0 {
+                let seq: i64 = conn
+                    .query_row(
+                        "SELECT lease_seq FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |row| row.get(0),
+                    )
+                    .map_err(map_db_err)?;
+                return Ok(seq as u64);
+            }
+
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                    params![node_id as i64],
+                    |_| Ok(true),
+                )
+                .optional()
+                .map_err(map_db_err)?
+                .unwrap_or(false);
+
+            if !exists {
+                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+            }
+
+            Err(RPCErrors::ReasonError("lease conflict".to_string()))
+        })
+        .await
+    }
+
+    async fn renew_file_lease_inner(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        lease_seq: u64,
+        ttl: Duration,
+        txid: Option<String>,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let now = unix_timestamp() as i64;
+            let expire_at = now.saturating_add(ttl.as_secs() as i64);
+
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET lease_expire_at = ?1 
+                     WHERE inode_id = ?2 
+                       AND lease_client_session = ?3 
+                       AND lease_seq = ?4",
+                    params![expire_at, node_id as i64, &session.0, lease_seq as i64],
+                )
+                .map_err(map_db_err)?;
+
+            if updated == 0 {
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?
+                    .unwrap_or(false);
+
+                if !exists {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
+                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn release_file_lease_inner(
+        &self,
+        node_id: IndexNodeId,
+        session: SessionId,
+        lease_seq: u64,
+        txid: Option<String>,
+    ) -> Result<(), RPCErrors> {
+        self.with_conn(txid.as_deref(), move |conn| {
+            let updated = conn
+                .execute(
+                    "UPDATE nodes SET 
+                        lease_client_session = NULL, 
+                        lease_expire_at = NULL
+                     WHERE inode_id = ?1 
+                       AND lease_client_session = ?2 
+                       AND lease_seq = ?3",
+                    params![node_id as i64, &session.0, lease_seq as i64],
+                )
+                .map_err(map_db_err)?;
+
+            if updated == 0 {
+                let exists: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |_| Ok(true),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?
+                    .unwrap_or(false);
+
+                if !exists {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
+                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn handle_remove_inode(
         &self,
         id: IndexNodeId,
@@ -1681,6 +2003,17 @@ impl FSMetaService {
             Ok(())
         })
         .await
+    }
+}
+
+impl Drop for FSMetaService {
+    fn drop(&mut self) {
+        if let Some(handle) = self.txn_cleanup_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.lease_cleanup_handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1788,16 +2121,37 @@ impl ndm::FsMetaHandler for FSMetaService {
                 let name = components[i].clone();
                 let is_last = i == components.len() - 1;
 
-                let dentry = self
-                    .handle_get_dentry(current_id, name, None, ctx.clone())
+                let target = match self
+                    .handle_get_dentry(current_id, name.clone(), None, ctx.clone())
                     .await
-                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?;
+                    .map_err(|e| NdnError::Internal(format!("failed to get dentry: {}", e)))?
+                {
+                    Some(dentry) => dentry.target,
+                    None => {
+                        let parent_node = self
+                            .handle_get_inode(current_id, None, ctx.clone())
+                            .await
+                            .map_err(|e| {
+                                NdnError::Internal(format!("failed to get inode: {}", e))
+                            })?
+                            .ok_or_else(|| {
+                                NdnError::Internal("parent inode not found".to_string())
+                            })?;
+                        if parent_node.kind != NodeKind::Dir {
+                            return Ok(None);
+                        }
 
-                let Some(dentry) = dentry else {
-                    return Ok(None);
+                        match self.lookup_base_child(&parent_node, &name).await.map_err(|e| {
+                            NdnError::Internal(format!("failed to lookup base child: {}", e))
+                        })? {
+                            BaseChildLookup::Missing => return Ok(None),
+                            BaseChildLookup::DirObj(obj_id)
+                            | BaseChildLookup::NonDirObj(obj_id) => DentryTarget::ObjId(obj_id),
+                        }
+                    }
                 };
 
-                match dentry.target {
+                match target {
                     DentryTarget::Tombstone => return Ok(None),
                     DentryTarget::IndexNodeId(id) => {
                         ids.push(id);
@@ -2184,9 +2538,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        let dentries = self
-            .handle_list_dentries(parent, txid.clone(), ctx.clone())
-            .await?;
+        let dentries = self.list_merged_dentries(parent, txid.clone(), ctx.clone()).await?;
         let mut entries = BTreeMap::new();
         for dentry in dentries {
             let target = dentry.target.clone();
@@ -2542,79 +2894,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         ttl: Duration,
         _ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        self.with_conn(None, move |conn| {
-            let now = unix_timestamp() as i64;
-            let expire_at = now.saturating_add(ttl.as_secs() as i64);
-
-            // Case 1: Try to renew existing lease (same session, not expired)
-            // This is an atomic conditional update
-            let renewed = conn
-                .execute(
-                    "UPDATE nodes SET lease_expire_at = ?1 
-                     WHERE inode_id = ?2 
-                       AND lease_client_session = ?3 
-                       AND lease_expire_at > ?4",
-                    params![expire_at, node_id as i64, &session.0, now],
-                )
-                .map_err(map_db_err)?;
-
-            if renewed > 0 {
-                // Successfully renewed, get current seq
-                let seq: i64 = conn
-                    .query_row(
-                        "SELECT COALESCE(lease_seq, 0) FROM nodes WHERE inode_id = ?1",
-                        params![node_id as i64],
-                        |row| row.get(0),
-                    )
-                    .map_err(map_db_err)?;
-                return Ok(seq as u64);
-            }
-
-            // Case 2: Try to acquire new lease (expired or no existing lease)
-            // Atomically update only if lease is expired or null
-            let acquired = conn
-                .execute(
-                    "UPDATE nodes SET 
-                        lease_client_session = ?1, 
-                        lease_seq = COALESCE(lease_seq, 0) + 1, 
-                        lease_expire_at = ?2
-                     WHERE inode_id = ?3 
-                       AND (lease_expire_at IS NULL OR lease_expire_at <= ?4)",
-                    params![&session.0, expire_at, node_id as i64, now],
-                )
-                .map_err(map_db_err)?;
-
-            if acquired > 0 {
-                // Successfully acquired, get new seq
-                let seq: i64 = conn
-                    .query_row(
-                        "SELECT lease_seq FROM nodes WHERE inode_id = ?1",
-                        params![node_id as i64],
-                        |row| row.get(0),
-                    )
-                    .map_err(map_db_err)?;
-                return Ok(seq as u64);
-            }
-
-            // Case 3: Neither renewed nor acquired - check if inode exists
-            let exists: bool = conn
-                .query_row(
-                    "SELECT 1 FROM nodes WHERE inode_id = ?1",
-                    params![node_id as i64],
-                    |_| Ok(true),
-                )
-                .optional()
-                .map_err(map_db_err)?
-                .unwrap_or(false);
-
-            if !exists {
-                return Err(RPCErrors::ReasonError("inode not found".to_string()));
-            }
-
-            // Inode exists but lease held by another session and not expired
-            Err(RPCErrors::ReasonError("lease conflict".to_string()))
-        })
-        .await
+        self.acquire_file_lease_inner(node_id, session, ttl, None).await
     }
 
     async fn handle_renew_file_lease(
@@ -2625,41 +2905,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         ttl: Duration,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(None, move |conn| {
-            let now = unix_timestamp() as i64;
-            let expire_at = now.saturating_add(ttl.as_secs() as i64);
-
-            // Atomic conditional update - only if session and seq match
-            let updated = conn
-                .execute(
-                    "UPDATE nodes SET lease_expire_at = ?1 
-                     WHERE inode_id = ?2 
-                       AND lease_client_session = ?3 
-                       AND lease_seq = ?4",
-                    params![expire_at, node_id as i64, &session.0, lease_seq as i64],
-                )
-                .map_err(map_db_err)?;
-
-            if updated == 0 {
-                // Check if inode exists to provide better error message
-                let exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
-                        params![node_id as i64],
-                        |_| Ok(true),
-                    )
-                    .optional()
-                    .map_err(map_db_err)?
-                    .unwrap_or(false);
-
-                if !exists {
-                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
-                }
-                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
-            }
-            Ok(())
-        })
-        .await
+        self.renew_file_lease_inner(node_id, session, lease_seq, ttl, None)
+            .await
     }
 
     async fn handle_release_file_lease(
@@ -2669,41 +2916,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         lease_seq: u64,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(None, move |conn| {
-            // Atomic conditional update - only clear session and expire, but keep seq for fencing token
-            // This prevents seq from being reused (monotonically increasing)
-            let updated = conn
-                .execute(
-                    "UPDATE nodes SET 
-                        lease_client_session = NULL, 
-                        lease_expire_at = NULL
-                     WHERE inode_id = ?1 
-                       AND lease_client_session = ?2 
-                       AND lease_seq = ?3",
-                    params![node_id as i64, &session.0, lease_seq as i64],
-                )
-                .map_err(map_db_err)?;
-
-            if updated == 0 {
-                // Check if inode exists to provide better error message
-                let exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
-                        params![node_id as i64],
-                        |_| Ok(true),
-                    )
-                    .optional()
-                    .map_err(map_db_err)?
-                    .unwrap_or(false);
-
-                if !exists {
-                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
-                }
-                return Err(RPCErrors::ReasonError("lease mismatch".to_string()));
-            }
-            Ok(())
-        })
-        .await
+        self.release_file_lease_inner(node_id, session, lease_seq, None)
+            .await
     }
 
     async fn handle_obj_stat_get(
@@ -2858,33 +3072,68 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
         let parent = self.ensure_dir_inode(&parent_path).await?;
-        let parent_node = self
-            .handle_get_inode(parent, None, ctx.clone())
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+        let txid = self.handle_begin_txn(ctx.clone()).await?;
+
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
+        }
+
+        let parent_node = match self
+            .handle_get_inode(parent, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "parent directory not found".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
         if parent_node.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError(
-                "parent is not a directory".to_string(),
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent is not a directory".to_string()
             ));
         }
         if parent_node.read_only {
-            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
-        self.ensure_name_absent_for_create(parent, &parent_node, &name, path, ctx.clone())
-            .await?;
+        if let Err(e) = self
+            .ensure_name_absent_for_create(
+                parent,
+                &parent_node,
+                &name,
+                path,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
 
-        // Upsert dentry
-        self.handle_upsert_dentry(
-            parent,
-            name,
-            DentryTarget::ObjId(obj_id.clone()),
-            None,
-            ctx.clone(),
-        )
-        .await?;
+        if let Err(e) = self
+            .handle_upsert_dentry(
+                parent,
+                name,
+                DentryTarget::ObjId(obj_id.clone()),
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
 
-        // Bump ref count
-        let _ = self.handle_obj_stat_bump(obj_id, 1, None, ctx).await?;
+        if let Err(e) = self
+            .handle_obj_stat_bump(obj_id, 1, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        self.handle_commit(Some(txid), ctx).await?;
 
         Ok(String::new())
     }
@@ -2906,29 +3155,61 @@ impl ndm::FsMetaHandler for FSMetaService {
         }
 
         let parent = self.ensure_dir_inode(&parent_path).await?;
-        let parent_node = self
-            .handle_get_inode(parent, None, ctx.clone())
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+        let txid = self.handle_begin_txn(ctx.clone()).await?;
+
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
+        }
+
+        let parent_node = match self
+            .handle_get_inode(parent, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "parent directory not found".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
         if parent_node.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError(
-                "parent is not a directory".to_string(),
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent is not a directory".to_string()
             ));
         }
         if parent_node.read_only {
-            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
-        self.ensure_name_absent_for_create(parent, &parent_node, &name, path, ctx.clone())
-            .await?;
+        if let Err(e) = self
+            .ensure_name_absent_for_create(
+                parent,
+                &parent_node,
+                &name,
+                path,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
 
-        self.handle_upsert_dentry(
-            parent,
-            name,
-            DentryTarget::ObjId(dir_obj_id.clone()),
-            None,
-            ctx,
-        )
-        .await?;
+        if let Err(e) = self
+            .handle_upsert_dentry(
+                parent,
+                name,
+                DentryTarget::ObjId(dir_obj_id.clone()),
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        self.handle_commit(Some(txid), ctx).await?;
 
         // TODO: update ref_count for dir and its children
 
@@ -3059,19 +3340,62 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid link path".to_string()))?;
 
         let link_parent_id = self.ensure_dir_inode(&link_parent_path).await?;
+        let txid = self.handle_begin_txn(ctx.clone()).await?;
 
-        let existing = self
-            .handle_get_dentry(link_parent_id, link_name.clone(), None, ctx.clone())
-            .await?;
-
-        if let Some(d) = existing {
-            if !matches!(d.target, DentryTarget::Tombstone) {
-                return Err(RPCErrors::ReasonError("link already exists".to_string()));
-            }
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
         }
 
-        self.handle_upsert_dentry(link_parent_id, link_name, link_target, None, ctx)
-            .await?;
+        let parent_node = match self
+            .handle_get_inode(link_parent_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "parent directory not found".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
+        if parent_node.kind != NodeKind::Dir {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent is not a directory".to_string()
+            ));
+        }
+        if parent_node.read_only {
+            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+        }
+
+        if let Err(e) = self
+            .ensure_name_absent_for_create(
+                link_parent_id,
+                &parent_node,
+                &link_name,
+                link_path,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        if let Err(e) = self
+            .handle_upsert_dentry(
+                link_parent_id,
+                link_name,
+                link_target,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        self.handle_commit(Some(txid), ctx).await?;
 
         Ok(())
     }
@@ -3083,22 +3407,47 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         let parent_id = self.ensure_dir_inode(&parent_path).await?;
 
-        // Check if already exists
-        let existing = self
-            .handle_get_dentry(parent_id, name.clone(), None, ctx.clone())
-            .await?;
-
-        if let Some(d) = existing {
-            if !matches!(d.target, DentryTarget::Tombstone) {
-                return Err(RPCErrors::ReasonError(format!(
-                    "path {} already exists",
-                    path.as_str()
-                )));
-            }
-        }
-
         // Create directory inode
         let txid = self.handle_begin_txn(ctx.clone()).await?;
+
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
+        }
+
+        let parent_node = match self
+            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "parent directory not found".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
+        if parent_node.kind != NodeKind::Dir {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent is not a directory".to_string()
+            ));
+        }
+        if parent_node.read_only {
+            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+        }
+        if let Err(e) = self
+            .ensure_name_absent_for_create(
+                parent_id,
+                &parent_node,
+                &name,
+                path,
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
 
         let new_node = NodeRecord {
             inode_id: 0, // Will be assigned by alloc
@@ -3113,18 +3462,26 @@ impl ndm::FsMetaHandler for FSMetaService {
             lease_expire_at: None,
         };
 
-        let new_id = self
+        let new_id = match self
             .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => rollback_and_err!(e),
+        };
 
-        self.handle_upsert_dentry(
-            parent_id,
-            name,
-            DentryTarget::IndexNodeId(new_id),
-            Some(txid.clone()),
-            ctx.clone(),
-        )
-        .await?;
+        if let Err(e) = self
+            .handle_upsert_dentry(
+                parent_id,
+                name,
+                DentryTarget::IndexNodeId(new_id),
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
 
         self.handle_commit(Some(txid), ctx).await?;
 
@@ -3138,7 +3495,6 @@ impl ndm::FsMetaHandler for FSMetaService {
         expected_size: Option<u64>,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
-        // Ensure buffer and instance are configured
         let buffer = self
             .buffer
             .as_ref()
@@ -3151,22 +3507,9 @@ impl ndm::FsMetaHandler for FSMetaService {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
-
         let parent_id: u64 = self.ensure_dir_inode(&parent_path).await?;
 
-        // Check parent is not read-only
-        let parent_node = self
-            .handle_get_inode(parent_id, None, ctx.clone())
-            .await?
-            .ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
-
-        if parent_node.read_only {
-            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
-        }
-
         let txid = self.handle_begin_txn(ctx.clone()).await?;
-
-        // Helper macro for rollback on error
         macro_rules! rollback_and_err {
             ($err:expr) => {{
                 let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
@@ -3174,25 +3517,45 @@ impl ndm::FsMetaHandler for FSMetaService {
             }};
         }
 
-        // Check existing dentry
-        let dentry = self
+        let parent_node = match self
+            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError("parent not found".to_string())),
+            Err(e) => rollback_and_err!(e),
+        };
+        if parent_node.kind != NodeKind::Dir {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent is not a directory".to_string()
+            ));
+        }
+        if parent_node.read_only {
+            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+        }
+
+        let dentry = match self
             .handle_get_dentry(parent_id, name.clone(), Some(txid.clone()), ctx.clone())
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => rollback_and_err!(e),
+        };
 
         let mut visible_base_obj: Option<ObjId> = None;
         if dentry.is_none() {
-            match self.lookup_base_child(&parent_node, &name).await? {
-                BaseChildLookup::Missing => {}
-                BaseChildLookup::DirObj(_) => {
+            match self.lookup_base_child(&parent_node, &name).await {
+                Ok(BaseChildLookup::Missing) => {}
+                Ok(BaseChildLookup::DirObj(_)) => {
                     rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
-                BaseChildLookup::NonDirObj(obj_id) => {
+                Ok(BaseChildLookup::NonDirObj(obj_id)) => {
                     visible_base_obj = Some(obj_id);
                 }
+                Err(e) => rollback_and_err!(e),
             }
         }
 
-        // Determine if file exists
         let file_exists = visible_base_obj.is_some()
             || matches!(
                 &dentry,
@@ -3207,8 +3570,6 @@ impl ndm::FsMetaHandler for FSMetaService {
                     ..
                 })
             );
-
-        // Validate flag against file existence
         match flag {
             OpenWriteFlag::Append | OpenWriteFlag::ContinueWrite => {
                 if !file_exists {
@@ -3226,16 +3587,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                     )));
                 }
             }
-            OpenWriteFlag::CreateOrTruncate | OpenWriteFlag::CreateOrAppend => {
-                // Both cases are allowed regardless of file existence
-            }
+            OpenWriteFlag::CreateOrTruncate | OpenWriteFlag::CreateOrAppend => {}
         }
 
-        // Resolve or create file_id based on dentry and flag
         let (file_id, existing_base_obj, existing_state) = match dentry {
             None if visible_base_obj.is_none() => {
-                // File doesn't exist - create new inode
-                // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
@@ -3248,29 +3604,34 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-
-                let fid = self
+                let fid = match self
                     .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await?;
-
-                self.handle_upsert_dentry(
-                    parent_id,
-                    name.clone(),
-                    DentryTarget::IndexNodeId(fid),
-                    Some(txid.clone()),
-                    ctx.clone(),
-                )
-                .await?;
-
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => rollback_and_err!(e),
+                };
+                if let Err(e) = self
+                    .handle_upsert_dentry(
+                        parent_id,
+                        name.clone(),
+                        DentryTarget::IndexNodeId(fid),
+                        Some(txid.clone()),
+                        ctx.clone(),
+                    )
+                    .await
+                {
+                    rollback_and_err!(e);
+                }
                 (fid, None, NodeState::DirNormal)
             }
             None => {
-                // Upper miss but base has a same-name non-directory object:
-                // materialize as inode so write flow can continue.
-                let base_oid = visible_base_obj
-                    .take()
-                    .ok_or_else(|| RPCErrors::ReasonError("base object missing".to_string()))?;
-
+                let base_oid = match visible_base_obj.take() {
+                    Some(v) => v,
+                    None => rollback_and_err!(RPCErrors::ReasonError(
+                        "base object missing".to_string()
+                    )),
+                };
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
@@ -3283,28 +3644,31 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-
-                let fid = self
+                let fid = match self
                     .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await?;
-
-                self.handle_upsert_dentry(
-                    parent_id,
-                    name.clone(),
-                    DentryTarget::IndexNodeId(fid),
-                    Some(txid.clone()),
-                    ctx.clone(),
-                )
-                .await?;
-
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => rollback_and_err!(e),
+                };
+                if let Err(e) = self
+                    .handle_upsert_dentry(
+                        parent_id,
+                        name.clone(),
+                        DentryTarget::IndexNodeId(fid),
+                        Some(txid.clone()),
+                        ctx.clone(),
+                    )
+                    .await
+                {
+                    rollback_and_err!(e);
+                }
                 (fid, Some(base_oid), NodeState::DirNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::Tombstone,
                 ..
             }) => {
-                // File doesn't exist - create new inode
-                // (Already validated: must be CreateExclusive, CreateOrTruncate, or CreateOrAppend)
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
@@ -3317,31 +3681,41 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-
-                let fid = self
+                let fid = match self
                     .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await?;
-
-                self.handle_upsert_dentry(
-                    parent_id,
-                    name.clone(),
-                    DentryTarget::IndexNodeId(fid),
-                    Some(txid.clone()),
-                    ctx.clone(),
-                )
-                .await?;
-
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => rollback_and_err!(e),
+                };
+                if let Err(e) = self
+                    .handle_upsert_dentry(
+                        parent_id,
+                        name.clone(),
+                        DentryTarget::IndexNodeId(fid),
+                        Some(txid.clone()),
+                        ctx.clone(),
+                    )
+                    .await
+                {
+                    rollback_and_err!(e);
+                }
                 (fid, None, NodeState::DirNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::IndexNodeId(fid),
                 ..
             }) => {
-                // Existing inode - get current state
-                let node = self
+                let node = match self
                     .handle_get_inode(fid, Some(txid.clone()), ctx.clone())
-                    .await?
-                    .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                    .await
+                {
+                    Ok(Some(node)) => node,
+                    Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                        "inode not found".to_string()
+                    )),
+                    Err(e) => rollback_and_err!(e),
+                };
 
                 if node.kind == NodeKind::Dir {
                     rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
@@ -3349,28 +3723,20 @@ impl ndm::FsMetaHandler for FSMetaService {
                 if node.kind != NodeKind::File {
                     rollback_and_err!(RPCErrors::ReasonError("path is not a file".to_string()));
                 }
-
-                // Validate state based on flag
                 match (&flag, &node.state) {
-                    // ContinueWrite: allow Working or Cooling state
                     (OpenWriteFlag::ContinueWrite, NodeState::Working(_))
-                    | (OpenWriteFlag::ContinueWrite, NodeState::Cooling(_)) => {
-                        // OK - will resume the existing buffer
-                    }
-                    // For other flags, Working state is not allowed (file busy)
+                    | (OpenWriteFlag::ContinueWrite, NodeState::Cooling(_)) => {}
                     (_, NodeState::Working(_)) => {
                         rollback_and_err!(RPCErrors::ReasonError(
                             "file is already being written".to_string()
                         ));
                     }
-                    // ContinueWrite requires Working or Cooling state
                     (OpenWriteFlag::ContinueWrite, _) => {
                         rollback_and_err!(RPCErrors::ReasonError(format!(
                             "ContinueWrite requires Working or Cooling state, current: {:?}",
                             node.state
                         )));
                     }
-                    // All other combinations are OK
                     _ => {}
                 }
 
@@ -3383,8 +3749,6 @@ impl ndm::FsMetaHandler for FSMetaService {
                 if oid.obj_type == OBJ_TYPE_DIR {
                     rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
-
-                // Dentry points to ObjId directly - materialize inode
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
@@ -3397,20 +3761,25 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-
-                let fid = self
+                let fid = match self
                     .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await?;
-
-                self.handle_upsert_dentry(
-                    parent_id,
-                    name.clone(),
-                    DentryTarget::IndexNodeId(fid),
-                    Some(txid.clone()),
-                    ctx.clone(),
-                )
-                .await?;
-
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => rollback_and_err!(e),
+                };
+                if let Err(e) = self
+                    .handle_upsert_dentry(
+                        parent_id,
+                        name.clone(),
+                        DentryTarget::IndexNodeId(fid),
+                        Some(txid.clone()),
+                        ctx.clone(),
+                    )
+                    .await
+                {
+                    rollback_and_err!(e);
+                }
                 (fid, Some(oid), NodeState::DirNormal)
             }
             Some(DentryRecord {
@@ -3423,14 +3792,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
         };
 
-        // Determine write mode based on flag and existing state
         let (should_truncate, existing_chunks, resume_handle) = match flag {
             OpenWriteFlag::CreateExclusive | OpenWriteFlag::CreateOrTruncate => {
-                // Fresh start - no existing data
                 (true, vec![], None)
             }
             OpenWriteFlag::Append | OpenWriteFlag::CreateOrAppend => {
-                // Append mode - need to load existing chunks if file has content
                 let chunks = if let Some(ref base_oid) = existing_base_obj {
                     self.load_file_chunklist(base_oid).await.unwrap_or_default()
                 } else {
@@ -3438,49 +3804,39 @@ impl ndm::FsMetaHandler for FSMetaService {
                 };
                 (false, chunks, None)
             }
-            OpenWriteFlag::ContinueWrite => {
-                // Resume existing write session
-                match existing_state {
-                    NodeState::Working(ws) => {
-                        // File is still in Working state - reuse existing buffer
-                        (false, vec![], Some(ws.fb_handle))
-                    }
-                    NodeState::Cooling(cs) => {
-                        // File is in Cooling state - reopen the buffer
-                        (false, vec![], Some(cs.fb_handle))
-                    }
-                    _ => {
-                        // Should not reach here due to earlier validation
-                        rollback_and_err!(RPCErrors::ReasonError(
-                            "unexpected state for ContinueWrite".to_string()
-                        ));
-                    }
+            OpenWriteFlag::ContinueWrite => match existing_state {
+                NodeState::Working(ws) => (false, vec![], Some(ws.fb_handle)),
+                NodeState::Cooling(cs) => (false, vec![], Some(cs.fb_handle)),
+                _ => {
+                    rollback_and_err!(RPCErrors::ReasonError(
+                        "unexpected state for ContinueWrite".to_string()
+                    ));
                 }
-            }
+            },
         };
 
-        // Handle ContinueWrite with existing buffer
         if let Some(handle) = resume_handle {
-            // For ContinueWrite, verify the buffer exists and can be resumed
-            let _fb = buffer.get_buffer(&handle).await.map_err(|_| {
-                RPCErrors::ReasonError(format!(
+            if let Err(_e) = buffer.get_buffer(&handle).await {
+                rollback_and_err!(RPCErrors::ReasonError(format!(
                     "buffer {} not found for ContinueWrite, may have been cleaned up",
                     handle
-                ))
-            })?;
+                )));
+            }
 
-            // Re-acquire lease
             let session = SessionId(format!("{}:{}", instance, file_id));
-            let lease_seq = self
-                .handle_acquire_file_lease(
+            let lease_seq = match self
+                .acquire_file_lease_inner(
                     file_id,
                     session.clone(),
-                    Duration::from_secs(300),
-                    ctx.clone(),
+                    Duration::from_secs(WRITE_LEASE_TTL_SECS),
+                    Some(txid.clone()),
                 )
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => rollback_and_err!(e),
+            };
 
-            // Update inode state to Working with the existing buffer handle
             let working_state = NodeState::Working(ndm::FileWorkingState {
                 fb_handle: handle.clone(),
                 last_write_at: SystemTime::now()
@@ -3488,39 +3844,39 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .unwrap_or_default()
                     .as_secs(),
             });
-
-            self.handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
-                .await?;
-
-            self.handle_commit(Some(txid), ctx.clone()).await?;
-
-            // Note: The buffer's lease info may need to be updated separately
-            // if FileBufferService supports lease renewal. For now, we assume
-            // the buffer is still valid for continued writes.
-            let _ = (session, lease_seq); // Suppress unused warnings
-
+            if let Err(e) = self
+                .handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
+                .await
+            {
+                rollback_and_err!(e);
+            }
+            if let Err(e) = self.handle_commit(Some(txid.clone()), ctx.clone()).await {
+                rollback_and_err!(e);
+            }
+            let _ = (session, lease_seq);
             return Ok(handle);
         }
 
-        // Acquire lease for new/truncated/append writes
         let session = SessionId(format!("{}:{}", instance, file_id));
-        let lease_seq = self
-            .handle_acquire_file_lease(
+        let lease_seq = match self
+            .acquire_file_lease_inner(
                 file_id,
                 session.clone(),
-                Duration::from_secs(300),
-                ctx.clone(),
+                Duration::from_secs(WRITE_LEASE_TTL_SECS),
+                Some(txid.clone()),
             )
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => rollback_and_err!(e),
+        };
 
-        // Allocate buffer
         let lease = fs_buffer::WriteLease {
             session: session.clone(),
             session_seq: lease_seq,
             expires_at: 0,
         };
-
-        let fb = buffer
+        let fb = match buffer
             .alloc_buffer(
                 &fs_buffer::NdmPath(path.0.clone()),
                 file_id,
@@ -3529,9 +3885,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                 expected_size,
             )
             .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to alloc buffer: {}", e)))?;
+        {
+            Ok(v) => v,
+            Err(e) => rollback_and_err!(RPCErrors::ReasonError(format!(
+                "failed to alloc buffer: {}",
+                e
+            ))),
+        };
 
-        // Update inode state to Working
         let working_state = NodeState::Working(ndm::FileWorkingState {
             fb_handle: fb.handle_id.clone(),
             last_write_at: SystemTime::now()
@@ -3539,26 +3900,35 @@ impl ndm::FsMetaHandler for FSMetaService {
                 .unwrap_or_default()
                 .as_secs(),
         });
-
-        // If truncating, clear base_obj_id by updating the inode
         if should_truncate && existing_base_obj.is_some() {
-            // Get current inode and clear base_obj_id
-            let mut node = self
+            let mut node = match self
                 .handle_get_inode(file_id, Some(txid.clone()), ctx.clone())
-                .await?
-                .ok_or_else(|| {
-                    RPCErrors::ReasonError("inode not found for truncate".to_string())
-                })?;
-
+                .await
+            {
+                Ok(Some(node)) => node,
+                Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                    "inode not found for truncate".to_string()
+                )),
+                Err(e) => rollback_and_err!(e),
+            };
             node.base_obj_id = None;
-            self.handle_set_inode(node, Some(txid.clone()), ctx.clone())
-                .await?;
+            if let Err(e) = self
+                .handle_set_inode(node, Some(txid.clone()), ctx.clone())
+                .await
+            {
+                rollback_and_err!(e);
+            }
         }
 
-        self.handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
-            .await?;
-
-        self.handle_commit(Some(txid), ctx.clone()).await?;
+        if let Err(e) = self
+            .handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            rollback_and_err!(e);
+        }
+        if let Err(e) = self.handle_commit(Some(txid.clone()), ctx.clone()).await {
+            rollback_and_err!(e);
+        }
 
         Ok(fb.handle_id)
     }

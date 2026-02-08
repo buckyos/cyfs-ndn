@@ -10,7 +10,7 @@ mod tests {
     };
     use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
     fn create_test_service() -> (FSMetaService, TempDir) {
@@ -634,6 +634,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_list_merges_overlay_base_and_upper() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let base_child_dir = DirObject::new(Some("base_child".to_string()));
+        let (base_child_dir_id, base_child_dir_str) = base_child_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_child_dir_id, base_child_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let base_file = FileObject::new(
+            "base.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut base_dir = DirObject::new(Some("a".to_string()));
+        base_dir
+            .add_file(
+                "base_file".to_string(),
+                serde_json::to_value(base_file).unwrap(),
+                1,
+            )
+            .unwrap();
+        base_dir
+            .add_directory("base_dir".to_string(), base_child_dir_id, 0)
+            .unwrap();
+        let (base_dir_id, base_dir_str) = base_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_dir_id, base_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let overlay_inode = NodeRecord {
+            inode_id: 900,
+            kind: NodeKind::Dir,
+            read_only: false,
+            base_obj_id: Some(base_dir_id),
+            state: NodeState::DirOverlay,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+        svc.handle_set_inode(overlay_inode, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(900),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let upper_child = create_dir_node(901);
+        svc.handle_set_inode(upper_child, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_tombstone(900, "base_dir".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            900,
+            "upper_dir".to_string(),
+            DentryTarget::IndexNodeId(901),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let list_id = svc.handle_start_list(900, None, ctx.clone()).await.unwrap();
+        let entries = svc.handle_list_next(list_id, 100, ctx.clone()).await.unwrap();
+        svc.handle_stop_list(list_id, ctx).await.unwrap();
+
+        assert!(entries.contains_key("base_file"));
+        assert!(entries.contains_key("upper_dir"));
+        assert!(!entries.contains_key("base_dir"));
+    }
+
+    #[tokio::test]
     async fn test_remove_dentry_row() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
@@ -1056,6 +1142,77 @@ mod tests {
             .handle_release_file_lease(806, wrong_session, 1, ctx)
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_lease_cleanup_task_reclaims_expired_open_writer_lease() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let inode_id = 807;
+        let mut inode = create_file_node_working(inode_id, "fb-807");
+        inode.lease_client_session = Some(ClientSessionId("test-instance:807".to_string()));
+        inode.lease_seq = Some(1);
+        inode.lease_expire_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(1),
+        );
+        svc.handle_set_inode(inode, None, ctx.clone())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let refreshed = svc
+            .handle_get_inode(inode_id, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.lease_client_session.is_none());
+        assert!(refreshed.lease_expire_at.is_none());
+        assert!(matches!(refreshed.state, NodeState::Cooling(_)));
+    }
+
+    #[tokio::test]
+    async fn test_write_lease_cleanup_unblocks_new_acquire_after_timeout() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let inode_id = 808;
+        let node = create_file_node_working(inode_id, "fb-808");
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let first_session = SessionId("s1".to_string());
+        svc.handle_acquire_file_lease(inode_id, first_session, Duration::from_secs(1), ctx.clone())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let second_session = SessionId("s2".to_string());
+        let seq2 = svc
+            .handle_acquire_file_lease(
+                inode_id,
+                second_session,
+                Duration::from_secs(60),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(seq2 >= 2);
+
+        let refreshed = svc
+            .handle_get_inode(inode_id, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(refreshed.state, NodeState::Cooling(_)));
+        assert_eq!(
+            refreshed.lease_client_session,
+            Some(ClientSessionId("s2".to_string()))
+        );
+        assert!(refreshed.lease_expire_at.is_some());
     }
 
     // ==================== ObjStat Tests ====================
@@ -1744,6 +1901,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_resolve_path_ex_reads_base_child_in_overlay_inode() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let base_file = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut base_dir = DirObject::new(Some("a".to_string()));
+        base_dir
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(base_file).unwrap(),
+                1,
+            )
+            .unwrap();
+        let expected_leaf_obj = {
+            let item = base_dir.get("leaf").unwrap();
+            let (obj_id, _) = item.get_obj_id().unwrap();
+            obj_id
+        };
+        let (base_dir_id, base_dir_str) = base_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_dir_id, base_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let overlay_inode = NodeRecord {
+            inode_id: 910,
+            kind: NodeKind::Dir,
+            read_only: false,
+            base_obj_id: Some(base_dir_id),
+            state: NodeState::DirOverlay,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+        svc.handle_set_inode(overlay_inode, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(910),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/leaf"), 0, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::ObjId(obj_id) => assert_eq!(obj_id, expected_leaf_obj),
+            _ => panic!("expected ObjId from base child"),
+        }
+        assert_eq!(resolved.inner_path, None);
+    }
+
+    #[tokio::test]
     async fn test_create_dir_rejects_non_dir_child_in_base_dir_object() {
         let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
         let ctx = dummy_ctx();
@@ -2033,5 +2257,53 @@ mod tests {
 
         let err_msg = err.to_string();
         assert!(!err_msg.contains("file not found"), "err={}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_create_exclusive_new_file_succeeds() {
+        let (svc, _meta_tmp, _fb_tmp) = create_test_service_with_buffer();
+        let ctx = dummy_ctx();
+
+        let handle = svc
+            .handle_open_file_writer(
+                &NdmPath::new("/new_file"),
+                OpenWriteFlag::CreateExclusive,
+                None,
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!handle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_strong_tree_unique_inode_target_constraint() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(920);
+        svc.handle_set_inode(child, None, ctx.clone()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "left".to_string(),
+            DentryTarget::IndexNodeId(920),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = svc
+            .handle_upsert_dentry(
+                root,
+                "right".to_string(),
+                DentryTarget::IndexNodeId(920),
+                None,
+                ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"));
     }
 }

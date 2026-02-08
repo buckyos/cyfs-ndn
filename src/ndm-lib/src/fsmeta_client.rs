@@ -1954,6 +1954,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
@@ -2565,11 +2566,13 @@ mod tests {
         listener.set_nonblocking(true).expect("set nonblocking");
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_flag = shutdown.clone();
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
         let handle = thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio rt");
+            let _ = ready_tx.send(());
             while !shutdown_flag.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, peer)) => {
@@ -2600,10 +2603,16 @@ mod tests {
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Err(_) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        // Keep serving despite transient accept failures.
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                 }
             }
         });
+        let _ = ready_rx.recv_timeout(Duration::from_secs(1));
         MockServer {
             url: format!("http://{}", addr),
             shutdown,
@@ -2613,7 +2622,8 @@ mod tests {
     }
 
     fn read_http_body(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        // Keep this generous to reduce flaky timeout failures on loaded CI machines.
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         let mut buf = Vec::new();
         let mut temp = [0u8; 4096];
         let mut header_end = None;
