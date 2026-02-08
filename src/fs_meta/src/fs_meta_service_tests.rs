@@ -5,8 +5,8 @@ mod tests {
     use krpc::RPCContext;
     use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
     use ndm::{
-        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId,
-        NodeKind, NodeRecord, NodeState, OpenWriteFlag,
+        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
+        NodeRecord, NodeState, OpenWriteFlag,
     };
     use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
     use std::sync::Arc;
@@ -24,7 +24,10 @@ mod tests {
         let meta_tmp_dir = TempDir::new().unwrap();
         let fb_tmp_dir = TempDir::new().unwrap();
         let db_path = meta_tmp_dir.path().join("test.db");
-        let buffer = Arc::new(LocalFileBufferService::new(fb_tmp_dir.path().to_path_buf(), 0));
+        let buffer = Arc::new(LocalFileBufferService::new(
+            fb_tmp_dir.path().to_path_buf(),
+            0,
+        ));
         let svc = FSMetaService::new(db_path.to_str().unwrap())
             .unwrap()
             .with_buffer("test-instance".to_string(), buffer);
@@ -44,7 +47,8 @@ mod tests {
         StoreLayout::new(1, vec![target], 0, 0)
     }
 
-    async fn create_test_service_with_store() -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
+    async fn create_test_service_with_store(
+    ) -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();
 
@@ -85,7 +89,10 @@ mod tests {
         store_mgr.register_store(store_ref).await;
         store_mgr.add_layout(build_test_layout(&store_id)).await;
 
-        let buffer = Arc::new(LocalFileBufferService::new(fb_tmp_dir.path().to_path_buf(), 0));
+        let buffer = Arc::new(LocalFileBufferService::new(
+            fb_tmp_dir.path().to_path_buf(),
+            0,
+        ));
 
         let svc = FSMetaService::new(db_path.to_str().unwrap())
             .unwrap()
@@ -1519,21 +1526,30 @@ mod tests {
 
         let dir_c = DirObject::new(Some("c".to_string()));
         let (c_obj_id, c_obj_str) = dir_c.gen_obj_id().unwrap();
-        store_mgr.put_object(&c_obj_id, c_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&c_obj_id, c_obj_str.as_str())
+            .await
+            .unwrap();
 
         let mut dir_b = DirObject::new(Some("b".to_string()));
         dir_b
             .add_directory("c".to_string(), c_obj_id.clone(), 0)
             .unwrap();
         let (b_obj_id, b_obj_str) = dir_b.gen_obj_id().unwrap();
-        store_mgr.put_object(&b_obj_id, b_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&b_obj_id, b_obj_str.as_str())
+            .await
+            .unwrap();
 
         let mut dir_a = DirObject::new(Some("a".to_string()));
         dir_a
             .add_directory("b".to_string(), b_obj_id.clone(), 0)
             .unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
 
         svc.handle_upsert_dentry(
             root,
@@ -1650,7 +1666,10 @@ mod tests {
             )
             .unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
 
         svc.handle_upsert_dentry(
             root,
@@ -1733,7 +1752,10 @@ mod tests {
             )
             .unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
         svc.handle_upsert_dentry(
             root,
             "a".to_string(),
@@ -1759,14 +1781,18 @@ mod tests {
 
         let child_dir = DirObject::new(Some("sub".to_string()));
         let (child_id, child_str) = child_dir.gen_obj_id().unwrap();
-        store_mgr.put_object(&child_id, child_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&child_id, child_str.as_str())
+            .await
+            .unwrap();
 
         let mut dir_a = DirObject::new(Some("a".to_string()));
-        dir_a
-            .add_directory("sub".to_string(), child_id, 0)
-            .unwrap();
+        dir_a.add_directory("sub".to_string(), child_id, 0).unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
         svc.handle_upsert_dentry(
             root,
             "a".to_string(),
@@ -1837,7 +1863,10 @@ mod tests {
             )
             .unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
         svc.handle_upsert_dentry(
             root,
             "a".to_string(),
@@ -1881,7 +1910,10 @@ mod tests {
             )
             .unwrap();
         let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
-        store_mgr.put_object(&a_obj_id, a_obj_str.as_str()).await.unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
         svc.handle_upsert_dentry(
             root,
             "a".to_string(),

@@ -7,7 +7,10 @@ use ndm::{
     FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, MoveOptions, NdmInstanceId,
     NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
-use ndn_lib::{load_named_obj, ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
+use ndn_lib::{
+    load_named_obj, ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, SimpleMapItem,
+    OBJ_TYPE_DIR,
+};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -31,7 +34,7 @@ const DENTRY_TARGET_OBJ: i64 = 1;
 const DENTRY_TARGET_TOMBSTONE: i64 = 2;
 const DENTRY_TARGET_SYMLINK: i64 = 3;
 
-const DEFAULT_SYMLINK_COUNT:u32 = 40;
+const DEFAULT_SYMLINK_COUNT: u32 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ObjectKind {
@@ -115,6 +118,8 @@ pub struct FSMetaService {
     buffer: Option<Arc<dyn FileBufferService>>,
     /// Named store manager for resolving base DirObject children
     store_mgr: Option<Arc<NamedStoreMgr>>,
+    /// Background task manager for deferred operations (finalize/lazy migration)
+    background_mgr: Arc<Mutex<BackgroundMgr>>,
 }
 
 impl FSMetaService {
@@ -157,6 +162,7 @@ impl FSMetaService {
             instance: None,
             buffer: None,
             store_mgr: None,
+            background_mgr: Arc::new(Mutex::new(BackgroundMgr::default())),
         })
     }
 
@@ -174,6 +180,12 @@ impl FSMetaService {
     /// Set named store manager for DirObject child resolution.
     pub fn with_named_store(mut self, store_mgr: Arc<NamedStoreMgr>) -> Self {
         self.store_mgr = Some(store_mgr);
+        self
+    }
+
+    /// Set background manager for deferred tasks.
+    pub fn with_background_mgr(mut self, background_mgr: Arc<Mutex<BackgroundMgr>>) -> Self {
+        self.background_mgr = background_mgr;
         self
     }
 
@@ -734,6 +746,375 @@ impl FSMetaService {
         Ok(())
     }
 
+    fn join_child_path(parent: &NdmPath, name: &str) -> NdmPath {
+        let parent_str = parent.as_str().trim_end_matches('/');
+        if parent_str.is_empty() || parent_str == "/" {
+            NdmPath::new(format!("/{}", name))
+        } else {
+            NdmPath::new(format!("{}/{}", parent_str, name))
+        }
+    }
+
+    async fn resolve_symlink_child_as_obj(
+        &self,
+        child_path: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<Option<ObjId>, RPCErrors> {
+        let resolved = self
+            .handle_resolve_path_ex(child_path, DEFAULT_SYMLINK_COUNT, ctx)
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("resolve symlink child failed: {}", e)))?;
+
+        let Some(resp) = resolved else {
+            return Ok(None);
+        };
+
+        if resp.inner_path.is_some() {
+            return Ok(None);
+        }
+
+        match resp.item {
+            FsMetaResolvePathItem::ObjId(obj_id) => {
+                warn!(
+                    "finalize_dir: symlink child {} resolved to ObjId={}, this may be surprising to users",
+                    child_path.as_str(),
+                    obj_id
+                );
+                Ok(Some(obj_id))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn enqueue_finalize_tasks(&self, pending_paths: Vec<String>) -> Result<(), RPCErrors> {
+        let mut mgr = self
+            .background_mgr
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("background mgr lock poisoned: {}", e)))?;
+        for path in pending_paths {
+            mgr.add_finalize_dir_task(path);
+        }
+        Ok(())
+    }
+
+    //如果finalize_dir成功，则返回true,如果dir不满足finalzie条件，需要先finalzie child,返回false
+    async fn try_finalize_dir(&self, dir_path: &NdmPath) -> Result<bool, RPCErrors> {
+        /*
+        finalize_dir是系统减少元数据的重要方法。
+        检查children是不是都finalize了，如果都finalize了，可以立刻完成并返回true
+        - 计算DirObject，并设置
+        - 删除目录的iNode，
+        - 更新DentryItem指向的DirObject?
+        - 删除chilren DentryItem和children iNodes
+          inode一般很少删除，这里要判断风险：我们的系统没有hardlink,按道理是严格树结构的（一个inode只会被一个dentryItem引用）
+
+        如果child没有finalize,则把children放入”待处理队列，处理类型是finalize"
+        最后把当前目录放入”待处理队列“
+        等待后台管理器处理finalzie
+         */
+        if dir_path.is_root() {
+            return Err(RPCErrors::ReasonError(
+                "finalize root directory is not supported".to_string(),
+            ));
+        }
+
+        let store_mgr = self.store_mgr.as_ref().ok_or_else(|| {
+            RPCErrors::ReasonError("named store manager not configured".to_string())
+        })?;
+        let ctx = RPCContext::default();
+
+        let (parent_path, dir_name) = dir_path
+            .split_parent_name()
+            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+        let parent_id = self.ensure_dir_inode(&parent_path).await?;
+        let parent_node = self
+            .handle_get_inode(parent_id, None, ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+        if parent_node.kind != NodeKind::Dir {
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
+            ));
+        }
+        let parent_rev0 = parent_node.rev.unwrap_or(0);
+
+        let dir_dentry = self
+            .handle_get_dentry(parent_id, dir_name.clone(), None, ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("directory not found".to_string()))?;
+
+        let dir_inode_id = match dir_dentry.target {
+            DentryTarget::ObjId(obj_id) => {
+                if obj_id.obj_type != OBJ_TYPE_DIR {
+                    return Err(RPCErrors::ReasonError(
+                        "path is not a directory".to_string(),
+                    ));
+                }
+                return Ok(true);
+            }
+            DentryTarget::IndexNodeId(id) => id,
+            DentryTarget::SymLink(_) => {
+                return Err(RPCErrors::ReasonError(
+                    "path is a symbolic link".to_string(),
+                ))
+            }
+            DentryTarget::Tombstone => {
+                return Err(RPCErrors::ReasonError("directory not found".to_string()))
+            }
+        };
+
+        let dir_node = self
+            .handle_get_inode(dir_inode_id, None, ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("directory inode not found".to_string()))?;
+        if dir_node.kind != NodeKind::Dir {
+            return Err(RPCErrors::ReasonError(
+                "path is not a directory".to_string(),
+            ));
+        }
+        let dir_rev0 = dir_node.rev.unwrap_or(0);
+
+        let mut merged_children: BTreeMap<String, ObjId> = BTreeMap::new();
+        if let Some(base_obj_id) = dir_node.base_obj_id.as_ref() {
+            if base_obj_id.obj_type != OBJ_TYPE_DIR {
+                return Err(RPCErrors::ReasonError(format!(
+                    "invalid base_obj_id type for directory inode: {}",
+                    base_obj_id.obj_type
+                )));
+            }
+            let base_obj_str = store_mgr.get_object(base_obj_id).await.map_err(|e| {
+                RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e))
+            })?;
+            let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
+                RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e))
+            })?;
+            for (base_name, item) in base_dir.iter() {
+                let (obj_id, obj_str) = item
+                    .get_obj_id()
+                    .map_err(|e| RPCErrors::ReasonError(format!("invalid base child: {}", e)))?;
+                if !obj_str.is_empty() {
+                    store_mgr
+                        .put_object(&obj_id, obj_str.as_str())
+                        .await
+                        .map_err(|e| {
+                            RPCErrors::ReasonError(format!(
+                                "failed to cache embedded base child object: {}",
+                                e
+                            ))
+                        })?;
+                }
+                merged_children.insert(base_name.clone(), obj_id);
+            }
+        }
+
+        let upper_children = self
+            .handle_list_dentries(dir_inode_id, None, ctx.clone())
+            .await?;
+        let mut pending_finalize_paths: Vec<String> = Vec::new();
+        for child in upper_children.iter() {
+            match &child.target {
+                DentryTarget::Tombstone => {
+                    merged_children.remove(&child.name);
+                }
+                DentryTarget::ObjId(obj_id) => {
+                    merged_children.insert(child.name.clone(), obj_id.clone());
+                }
+                DentryTarget::IndexNodeId(child_inode_id) => {
+                    let child_inode = self
+                        .handle_get_inode(*child_inode_id, None, ctx.clone())
+                        .await?
+                        .ok_or_else(|| {
+                            RPCErrors::ReasonError(format!(
+                                "child inode {} not found",
+                                child_inode_id
+                            ))
+                        })?;
+                    match child_inode.kind {
+                        NodeKind::Dir => {
+                            let child_path = Self::join_child_path(dir_path, &child.name);
+                            pending_finalize_paths.push(child_path.as_str().to_string());
+                        }
+                        NodeKind::File | NodeKind::Object => match child_inode.state {
+                            NodeState::Finalized(ref fs) => {
+                                merged_children.insert(child.name.clone(), fs.obj_id.clone());
+                            }
+                            _ => {
+                                let child_path = Self::join_child_path(dir_path, &child.name);
+                                pending_finalize_paths.push(child_path.as_str().to_string());
+                            }
+                        },
+                    }
+                }
+                DentryTarget::SymLink(_) => {
+                    //TODO：应该把SymbLink当成一个纯粹的DirItem来看
+                    let child_path = Self::join_child_path(dir_path, &child.name);
+                    if let Some(obj_id) = self
+                        .resolve_symlink_child_as_obj(&child_path, ctx.clone())
+                        .await?
+                    {
+                        merged_children.insert(child.name.clone(), obj_id);
+                    } else {
+                        pending_finalize_paths.push(child_path.as_str().to_string());
+                    }
+                }
+            }
+        }
+
+        if !pending_finalize_paths.is_empty() {
+            let mut unique = HashSet::new();
+            pending_finalize_paths.retain(|p| unique.insert(p.clone()));
+            pending_finalize_paths.push(dir_path.as_str().to_string());
+            self.enqueue_finalize_tasks(pending_finalize_paths)?;
+            return Ok(false);
+        }
+
+        let mut new_dir_obj = DirObject::new(Some(dir_name.clone()));
+        for (child_name, child_obj_id) in merged_children.iter() {
+            new_dir_obj.object_map.insert(
+                child_name.clone(),
+                SimpleMapItem::ObjId(child_obj_id.clone()),
+            );
+        }
+        let (new_dir_obj_id, new_dir_obj_str) = new_dir_obj
+            .gen_obj_id()
+            .map_err(|e| RPCErrors::ReasonError(format!("build dir object failed: {}", e)))?;
+        store_mgr
+            .put_object(&new_dir_obj_id, new_dir_obj_str.as_str())
+            .await
+            .map_err(|e| RPCErrors::ReasonError(format!("store dir object failed: {}", e)))?;
+
+        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        macro_rules! rollback_and_err {
+            ($err:expr) => {{
+                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
+                return Err($err);
+            }};
+        }
+
+        let parent_now = match self
+            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "parent inode missing during finalize".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
+        if parent_now.rev.unwrap_or(0) != parent_rev0 {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "parent rev changed during finalize".to_string()
+            ));
+        }
+
+        let current_dentry = match self
+            .handle_get_dentry(parent_id, dir_name.clone(), Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(d)) => d,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "directory dentry missing during finalize".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
+        match current_dentry.target {
+            DentryTarget::ObjId(obj_id) => {
+                if obj_id.obj_type == OBJ_TYPE_DIR {
+                    let _ = self.handle_rollback(Some(txid), ctx).await;
+                    return Ok(true);
+                }
+                rollback_and_err!(RPCErrors::ReasonError(
+                    "path is not a directory".to_string()
+                ));
+            }
+            DentryTarget::IndexNodeId(id) => {
+                if id != dir_inode_id {
+                    rollback_and_err!(RPCErrors::ReasonError(
+                        "directory target changed during finalize".to_string()
+                    ));
+                }
+            }
+            DentryTarget::SymLink(_) | DentryTarget::Tombstone => rollback_and_err!(
+                RPCErrors::ReasonError("directory target changed during finalize".to_string())
+            ),
+        }
+
+        let dir_now = match self
+            .handle_get_inode(dir_inode_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(Some(node)) => node,
+            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
+                "directory inode missing during finalize".to_string()
+            )),
+            Err(e) => rollback_and_err!(e),
+        };
+        if dir_now.kind != NodeKind::Dir {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "path is not a directory".to_string()
+            ));
+        }
+        if dir_now.rev.unwrap_or(0) != dir_rev0 {
+            rollback_and_err!(RPCErrors::ReasonError(
+                "directory rev changed during finalize".to_string()
+            ));
+        }
+
+        if let Err(e) = self
+            .handle_upsert_dentry(
+                parent_id,
+                dir_name,
+                DentryTarget::ObjId(new_dir_obj_id),
+                Some(txid.clone()),
+                ctx.clone(),
+            )
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        let children_in_tx = match self
+            .handle_list_dentries(dir_inode_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            Ok(items) => items,
+            Err(e) => rollback_and_err!(e),
+        };
+        for child in children_in_tx {
+            if let DentryTarget::IndexNodeId(child_inode_id) = child.target {
+                if let Err(e) = self
+                    .handle_remove_inode(child_inode_id, Some(txid.clone()), ctx.clone())
+                    .await
+                {
+                    rollback_and_err!(e);
+                }
+            }
+            if let Err(e) = self
+                .handle_remove_dentry_row(dir_inode_id, child.name, Some(txid.clone()), ctx.clone())
+                .await
+            {
+                rollback_and_err!(e);
+            }
+        }
+
+        if let Err(e) = self
+            .handle_remove_inode(dir_inode_id, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        if let Err(e) = self
+            .handle_bump_dir_rev(parent_id, parent_rev0, Some(txid.clone()), ctx.clone())
+            .await
+        {
+            rollback_and_err!(e);
+        }
+
+        self.handle_commit(Some(txid), ctx).await?;
+        Ok(true)
+    }
+
     /// Materialize a directory from a DirObject.
     /// Creates a new inode with base_obj_id pointing to the DirObject,
     /// and updates the dentry to point to the new inode.
@@ -904,8 +1285,9 @@ impl FSMetaService {
             .get_object(base_obj_id)
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
-        let base_dir: DirObject = load_named_obj(base_obj_str.as_str())
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e)))?;
+        let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
+            RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e))
+        })?;
 
         let Some(item) = base_dir.get(name) else {
             return Ok(BaseChildLookup::Missing);
@@ -1114,8 +1496,7 @@ impl FSMetaService {
                             )));
                         }
 
-                        self
-                            .materialize_dir_from_obj(current_id, component.to_string(), &obj_id)
+                        self.materialize_dir_from_obj(current_id, component.to_string(), &obj_id)
                             .await?
                     }
                     DentryTarget::SymLink(_) => {
@@ -1133,7 +1514,9 @@ impl FSMetaService {
                     let parent_node = self
                         .handle_get_inode(current_id, None, ctx.clone())
                         .await?
-                        .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?;
+                        .ok_or_else(|| {
+                            RPCErrors::ReasonError("parent inode not found".to_string())
+                        })?;
                     if parent_node.kind != NodeKind::Dir {
                         return Err(RPCErrors::ReasonError(format!(
                             "{} is not a directory",
@@ -1142,22 +1525,24 @@ impl FSMetaService {
                     }
 
                     match self.lookup_base_child(&parent_node, component).await? {
-                        BaseChildLookup::DirObj(child_dir_obj) => self
-                            .materialize_dir_from_obj(
+                        BaseChildLookup::DirObj(child_dir_obj) => {
+                            self.materialize_dir_from_obj(
                                 current_id,
                                 component.to_string(),
                                 &child_dir_obj,
                             )
-                            .await?,
+                            .await?
+                        }
                         BaseChildLookup::NonDirObj(_) => {
                             return Err(RPCErrors::ReasonError(format!(
                                 "{} is not a directory",
                                 components[..=i].join("/")
                             )));
                         }
-                        BaseChildLookup::Missing => self
-                            .create_dir_under_parent(current_id, component, ctx.clone())
-                            .await?,
+                        BaseChildLookup::Missing => {
+                            self.create_dir_under_parent(current_id, component, ctx.clone())
+                                .await?
+                        }
                     }
                 }
             };
@@ -1305,6 +1690,30 @@ impl FSMetaService {
         // TODO: look up child in base DirObject
         // For now, return NotFound
         Err(RPCErrors::ReasonError("not found".to_string()))
+    }
+
+    async fn handle_remove_inode(
+        &self,
+        id: IndexNodeId,
+        txid: Option<String>,
+        _ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        if id == self.root_inode {
+            return Err(RPCErrors::ReasonError(
+                "cannot remove root inode".to_string(),
+            ));
+        }
+
+        self.with_conn(txid.as_deref(), move |conn| {
+            let removed = conn
+                .execute("DELETE FROM nodes WHERE inode_id = ?1", params![id as i64])
+                .map_err(map_db_err)?;
+            if removed == 0 {
+                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+            }
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -2456,7 +2865,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
+            ));
         }
         if parent_node.read_only {
             return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
@@ -2502,7 +2913,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
+            ));
         }
         if parent_node.read_only {
             return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
