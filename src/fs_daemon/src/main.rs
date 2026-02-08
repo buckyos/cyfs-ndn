@@ -9,7 +9,6 @@ use ndm::{CommitPolicy, NamedDataMgr, NamedDataMgrRef, OpenWriteFlag, PathKind, 
 use ndn_lib::{NdmPath, NdnError, NdnResult};
 use std::collections::HashMap;
 use std::env;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -137,6 +136,60 @@ impl FsDaemon {
         }
     }
 
+    fn lookup_entry(&self, parent: u64, name: &str) -> Result<(u64, FileAttr), i32> {
+        let path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
+        let stat = self.stat_path(&path)?;
+        let inode = self.inode_table.get_or_create(stat.inode_id, &path);
+        let attr = self.build_attr(inode, &stat);
+        Ok((inode, attr))
+    }
+
+    fn getattr_entry(&self, ino: u64) -> Result<(u64, FileAttr), i32> {
+        let path = self.inode_table.get_path(ino).ok_or(ENOENT)?;
+        let stat = self.stat_path(&path)?;
+        let inode = self.inode_table.get_or_create(stat.inode_id, &path);
+        let attr = self.build_attr(inode, &stat);
+        Ok((inode, attr))
+    }
+
+    fn readdir_entries(&self, ino: u64, offset: i64) -> Result<Vec<(u64, FileType, String, i64)>, i32> {
+        let path = self.inode_table.get_path(ino).ok_or(ENOENT)?;
+        let entries = self
+            .runtime
+            .block_on(async {
+                let mgr = self.named_mgr.lock().await;
+                let session = mgr.start_list(&NdmPath::new(path.clone())).await?;
+                let list = mgr.list_next(session, 0).await?;
+                mgr.stop_list(session).await?;
+                Ok::<_, NdnError>(list)
+            })
+            .map_err(map_ndn_err)?;
+
+        let mut out = Vec::new();
+        let mut idx: i64 = offset;
+        if offset == 0 {
+            out.push((ino, FileType::Directory, ".".to_string(), 1));
+            out.push((ino, FileType::Directory, "..".to_string(), 2));
+            idx = 2;
+        }
+
+        for (name, stat) in entries.into_iter().skip((idx - 2).max(0) as usize) {
+            let child_path = if path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", path, name)
+            };
+            let inode = self.inode_table.get_or_create(stat.inode_id, &child_path);
+            let file_type = match stat.kind {
+                PathKind::Dir => FileType::Directory,
+                _ => FileType::RegularFile,
+            };
+            idx += 1;
+            out.push((inode, file_type, name, idx));
+        }
+        Ok(out)
+    }
+
     fn stat_path(&self, path: &str) -> Result<ndm::PathStat, i32> {
         self.runtime
             .block_on(async {
@@ -186,110 +239,14 @@ impl FsDaemon {
         let fh = self.handle_table.insert(OpenHandle { writer, inode_id });
         Ok(fh)
     }
-}
 
-impl Filesystem for FsDaemon {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        let name = match name.to_str() {
-            Some(v) => v,
-            None => {
-                reply.error(EINVAL);
-                return;
-            }
-        };
-        let Some(path) = self.path_from_parent(parent, name) else {
-            reply.error(ENOENT);
-            return;
-        };
-        match self.stat_path(&path) {
-            Ok(stat) => {
-                let inode = self.inode_table.get_or_create(stat.inode_id, &path);
-                let attr = self.build_attr(inode, &stat);
-                reply.entry(&TTL, &attr, 0);
-            }
-            Err(code) => reply.error(code),
-        }
-    }
-
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        let Some(path) = self.inode_table.get_path(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        match self.stat_path(&path) {
-            Ok(stat) => {
-                let inode = self.inode_table.get_or_create(stat.inode_id, &path);
-                let attr = self.build_attr(inode, &stat);
-                reply.attr(&TTL, &attr);
-            }
-            Err(code) => reply.error(code),
-        }
-    }
-
-    fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
-    ) {
-        let Some(path) = self.inode_table.get_path(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-
-        let entries = match self.runtime.block_on(async {
-            let mgr = self.named_mgr.lock().await;
-            let session = mgr.start_list(&NdmPath::new(path.clone())).await?;
-            let list = mgr.list_next(session, 0).await?;
-            mgr.stop_list(session).await?;
-            Ok::<_, NdnError>(list)
-        }) {
-            Ok(list) => list,
-            Err(err) => {
-                reply.error(map_ndn_err(err));
-                return;
-            }
-        };
-
-        let mut idx: i64 = offset;
-        if offset == 0 {
-            let _ = reply.add(ino, 1, FileType::Directory, ".");
-            let _ = reply.add(ino, 2, FileType::Directory, "..");
-            idx = 2;
-        }
-
-        for (name, stat) in entries.into_iter().skip((idx - 2).max(0) as usize) {
-            let child_path = if path == "/" {
-                format!("/{}", name)
-            } else {
-                format!("{}/{}", path, name)
-            };
-            let inode = self.inode_table.get_or_create(stat.inode_id, &child_path);
-            let file_type = match stat.kind {
-                PathKind::Dir => FileType::Directory,
-                _ => FileType::RegularFile,
-            };
-            idx += 1;
-            if reply.add(inode, idx, file_type, name) {
-                break;
-            }
-        }
-        reply.ok();
-    }
-
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open_file(&self, ino: u64, flags: i32) -> Result<u64, i32> {
         let accmode = flags & libc::O_ACCMODE;
         let write = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         if !write {
-            reply.opened(0, 0);
-            return;
+            return Ok(0);
         }
-        let Some(path) = self.inode_table.get_path(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
+        let path = self.inode_table.get_path(ino).ok_or(ENOENT)?;
         let flag = if (flags & libc::O_TRUNC) != 0 {
             OpenWriteFlag::CreateOrTruncate
         } else if (flags & libc::O_APPEND) != 0 {
@@ -297,33 +254,11 @@ impl Filesystem for FsDaemon {
         } else {
             OpenWriteFlag::CreateOrAppend
         };
-        match self.open_writer(&path, flag) {
-            Ok(fh) => reply.opened(fh, 0),
-            Err(code) => reply.error(code),
-        }
+        self.open_writer(&path, flag)
     }
 
-    fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &std::ffi::OsStr,
-        _mode: u32,
-        _umask: u32,
-        flags: i32,
-        reply: ReplyCreate,
-    ) {
-        let name = match name.to_str() {
-            Some(v) => v,
-            None => {
-                reply.error(EINVAL);
-                return;
-            }
-        };
-        let Some(path) = self.path_from_parent(parent, name) else {
-            reply.error(ENOENT);
-            return;
-        };
+    fn create_file(&self, parent: u64, name: &str, flags: i32) -> Result<(FileAttr, u64), i32> {
+        let path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
         let flag = if (flags & libc::O_EXCL) != 0 {
             OpenWriteFlag::CreateExclusive
         } else if (flags & libc::O_TRUNC) != 0 {
@@ -331,89 +266,88 @@ impl Filesystem for FsDaemon {
         } else {
             OpenWriteFlag::CreateOrAppend
         };
-        let fh = match self.open_writer(&path, flag) {
-            Ok(fh) => fh,
-            Err(code) => {
-                reply.error(code);
-                return;
-            }
-        };
-        match self.stat_path(&path) {
-            Ok(stat) => {
-                let inode = self.inode_table.get_or_create(stat.inode_id, &path);
-                let attr = self.build_attr(inode, &stat);
-                reply.created(&TTL, &attr, 0, fh, 0);
-            }
-            Err(code) => reply.error(code),
-        }
+        let fh = self.open_writer(&path, flag)?;
+        let stat = self.stat_path(&path)?;
+        let inode = self.inode_table.get_or_create(stat.inode_id, &path);
+        let attr = self.build_attr(inode, &stat);
+        Ok((attr, fh))
     }
 
-    fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        let Some(path) = self.inode_table.get_path(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let result = self.runtime.block_on(async {
-            let mgr = self.named_mgr.lock().await;
-            let (mut reader, _) = mgr
-                .open_reader(&NdmPath::new(path.clone()), ReadOptions::default())
-                .await?;
-            if offset > 0 {
-                let mut remaining = offset as u64;
-                let mut buffer = [0u8; 8192];
-                while remaining > 0 {
-                    let read_len = std::cmp::min(remaining as usize, buffer.len());
-                    let n = reader.read(&mut buffer[..read_len]).await?;
+    fn mkdir_path(&self, parent: u64, name: &str) -> Result<FileAttr, i32> {
+        let path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
+        self.runtime
+            .block_on(async {
+                let mgr = self.named_mgr.lock().await;
+                mgr.create_dir(&NdmPath::new(path.clone())).await
+            })
+            .map_err(map_ndn_err)?;
+        let stat = self.stat_path(&path)?;
+        let inode = self.inode_table.get_or_create(stat.inode_id, &path);
+        Ok(self.build_attr(inode, &stat))
+    }
+
+    fn unlink_path(&self, parent: u64, name: &str) -> Result<(), i32> {
+        let path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
+        self.runtime
+            .block_on(async {
+                let mgr = self.named_mgr.lock().await;
+                mgr.delete(&NdmPath::new(path)).await
+            })
+            .map_err(map_ndn_err)
+    }
+
+    fn rename_path(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
+        let old_path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
+        let new_path = self.path_from_parent(newparent, newname).ok_or(ENOENT)?;
+        self.runtime
+            .block_on(async {
+                let mgr = self.named_mgr.lock().await;
+                mgr.move_path(&NdmPath::new(old_path), &NdmPath::new(new_path))
+                    .await
+            })
+            .map_err(map_ndn_err)
+    }
+
+    fn read_path(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        let path = self.inode_table.get_path(ino).ok_or(ENOENT)?;
+        self.runtime
+            .block_on(async {
+                let mgr = self.named_mgr.lock().await;
+                let (mut reader, _) = mgr
+                    .open_reader(&NdmPath::new(path.clone()), ReadOptions::default())
+                    .await?;
+                if offset > 0 {
+                    let mut remaining = offset as u64;
+                    let mut buffer = [0u8; 8192];
+                    while remaining > 0 {
+                        let read_len = std::cmp::min(remaining as usize, buffer.len());
+                        let n = reader.read(&mut buffer[..read_len]).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        remaining -= n as u64;
+                    }
+                }
+                let mut buffer = vec![0u8; size as usize];
+                let mut read_total = 0usize;
+                loop {
+                    let n = reader.read(&mut buffer[read_total..]).await?;
                     if n == 0 {
                         break;
                     }
-                    remaining -= n as u64;
+                    read_total += n;
+                    if read_total == buffer.len() {
+                        break;
+                    }
                 }
-            }
-            let mut buffer = vec![0u8; size as usize];
-            let mut read_total = 0usize;
-            loop {
-                let n = reader.read(&mut buffer[read_total..]).await?;
-                if n == 0 {
-                    break;
-                }
-                read_total += n;
-                if read_total == buffer.len() {
-                    break;
-                }
-            }
-            buffer.truncate(read_total);
-            Ok::<_, NdnError>(buffer)
-        });
-        match result {
-            Ok(data) => reply.data(&data),
-            Err(err) => reply.error(map_ndn_err(err)),
-        }
+                buffer.truncate(read_total);
+                Ok::<_, NdnError>(buffer)
+            })
+            .map_err(map_ndn_err)
     }
 
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        let result = self.handle_table.with_handle_mut(fh, |handle| {
+    fn write_handle(&self, fh: u64, offset: i64, data: &[u8]) -> Result<usize, i32> {
+        self.handle_table.with_handle_mut(fh, |handle| {
             let written = self.runtime.block_on(async {
                 handle
                     .writer
@@ -436,8 +370,125 @@ impl Filesystem for FsDaemon {
                 Ok(n) => Ok(n),
                 Err(err) => Err(map_ndn_err(err)),
             }
-        });
-        match result {
+        })
+    }
+
+    fn release_handle(&self, fh: u64) -> Result<(), i32> {
+        if let Some(handle) = self.handle_table.remove(fh) {
+            self.runtime
+                .block_on(async {
+                    let mgr = self.named_mgr.lock().await;
+                    mgr.close_file(handle.inode_id).await
+                })
+                .map_err(map_ndn_err)?;
+        }
+        Ok(())
+    }
+}
+
+impl Filesystem for FsDaemon {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
+        let name = match name.to_str() {
+            Some(v) => v,
+            None => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        match self.lookup_entry(parent, name) {
+            Ok((_ino, attr)) => reply.entry(&TTL, &attr, 0),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        match self.getattr_entry(ino) {
+            Ok((_ino, attr)) => reply.attr(&TTL, &attr),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        match self.readdir_entries(ino, offset) {
+            Ok(entries) => {
+                for (inode, file_type, name, next_offset) in entries {
+                    if reply.add(inode, next_offset, file_type, name) {
+                        break;
+                    }
+                }
+                reply.ok();
+            }
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        match self.open_file(ino, flags) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let name = match name.to_str() {
+            Some(v) => v,
+            None => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        match self.create_file(parent, name, flags) {
+            Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        match self.read_path(ino, offset, size) {
+            Ok(data) => reply.data(&data),
+            Err(code) => reply.error(code),
+        }
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        match self.write_handle(fh, offset, data) {
             Ok(n) => reply.written(n as u32),
             Err(code) => reply.error(code),
         }
@@ -453,17 +504,10 @@ impl Filesystem for FsDaemon {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(handle) = self.handle_table.remove(fh) {
-            let result = self.runtime.block_on(async {
-                let mgr = self.named_mgr.lock().await;
-                mgr.close_file(handle.inode_id).await
-            });
-            if let Err(err) = result {
-                reply.error(map_ndn_err(err));
-                return;
-            }
+        match self.release_handle(fh) {
+            Ok(_) => reply.ok(),
+            Err(code) => reply.error(code),
         }
-        reply.ok();
     }
 
     fn mkdir(
@@ -482,24 +526,8 @@ impl Filesystem for FsDaemon {
                 return;
             }
         };
-        let Some(path) = self.path_from_parent(parent, name) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let result = self.runtime.block_on(async {
-            let mgr = self.named_mgr.lock().await;
-            mgr.create_dir(&NdmPath::new(path.clone())).await
-        });
-        if let Err(err) = result {
-            reply.error(map_ndn_err(err));
-            return;
-        }
-        match self.stat_path(&path) {
-            Ok(stat) => {
-                let inode = self.inode_table.get_or_create(stat.inode_id, &path);
-                let attr = self.build_attr(inode, &stat);
-                reply.entry(&TTL, &attr, 0);
-            }
+        match self.mkdir_path(parent, name) {
+            Ok(attr) => reply.entry(&TTL, &attr, 0),
             Err(code) => reply.error(code),
         }
     }
@@ -518,17 +546,9 @@ impl Filesystem for FsDaemon {
                 return;
             }
         };
-        let Some(path) = self.path_from_parent(parent, name) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let result = self.runtime.block_on(async {
-            let mgr = self.named_mgr.lock().await;
-            mgr.delete(&NdmPath::new(path)).await
-        });
-        match result {
+        match self.unlink_path(parent, name) {
             Ok(_) => reply.ok(),
-            Err(err) => reply.error(map_ndn_err(err)),
+            Err(code) => reply.error(code),
         }
     }
 
@@ -566,22 +586,9 @@ impl Filesystem for FsDaemon {
                 return;
             }
         };
-        let Some(old_path) = self.path_from_parent(parent, name) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let Some(new_path) = self.path_from_parent(newparent, newname) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let result = self.runtime.block_on(async {
-            let mgr = self.named_mgr.lock().await;
-            mgr.move_path(&NdmPath::new(old_path), &NdmPath::new(new_path))
-                .await
-        });
-        match result {
+        match self.rename_path(parent, name, newparent, newname) {
             Ok(_) => reply.ok(),
-            Err(err) => reply.error(map_ndn_err(err)),
+            Err(code) => reply.error(code),
         }
     }
 
@@ -741,3 +748,6 @@ fn main() {
         }
     }
 }
+
+#[cfg(test)]
+mod fs_daemon_tests;

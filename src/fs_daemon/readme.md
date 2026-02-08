@@ -27,3 +27,7 @@ Notes:
 
 - The daemon initializes `named_mgr` in single-machine mode (in-process fs_meta + fs_buffer + named_store).
 - FUSE operations route through `NamedDataMgr` APIs; the daemon avoids direct store_mgr usage in the request path.
+
+Testing:
+
+- Run `cargo test -p fs_daemon` to execute the simulated filesystem logic tests.
