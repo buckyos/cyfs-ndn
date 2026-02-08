@@ -5,21 +5,23 @@
 //!
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::SeekFrom;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use fs_buffer::{FileBufferSeekWriter, FileBufferService};
+use fs_buffer::{FileBufferBaseReader, FileBufferDiffState, FileBufferRecord, FileBufferService};
 use log::warn;
 use named_store::{
-    NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget as LayoutStoreTarget,
+    DiffChunkList, DiffChunkListReader, DiffChunkListWriter, DiffChunkListWriterOptions,
+    DiffChunkListWriterState, NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout,
+    StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
     load_named_obj, ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId,
     SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, IndexNodeId, MoveOptions, NodeKind,
@@ -76,6 +78,36 @@ pub struct ReadOptions {
 
 /// Inner path for accessing content within an object
 pub type InnerPath = String;
+
+pub struct NdmFileWriter {
+    writer: DiffChunkListWriter,
+    fb: FileBufferRecord,
+    fsbuffer: Arc<dyn FileBufferService>,
+}
+
+impl NdmFileWriter {
+    pub async fn seek(&mut self, seek_from: SeekFrom) -> NdnResult<u64> {
+        self.writer.seek(seek_from)
+    }
+
+    pub async fn write_all(&mut self, buf: &[u8]) -> NdnResult<()> {
+        self.writer.write_all(buf).await
+    }
+
+    pub async fn flush(&mut self) -> NdnResult<()> {
+        let writer_state = self.writer.close().await?;
+        let diff_state = NamedDataMgr::diff_state_from_writer_state(&writer_state);
+        let mut state =
+            self.fb.diff_state.write().map_err(|_| {
+                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+            })?;
+        *state = diff_state;
+        drop(state);
+
+        self.fsbuffer.flush(&self.fb).await?;
+        Ok(())
+    }
+}
 
 // ------------------------------
 // Move-related types
@@ -761,12 +793,48 @@ impl NamedDataMgr {
         match resp {
             crate::OpenFileReaderResp::FileBufferId(handle_id) => {
                 let fb = self.fsbuffer.get_buffer(&handle_id).await?;
-                //TODO 手工构造政府的fs buffer reader，要传入正确的chunklist base reader,或则提供成标准的DiffChunkListReader实现
-                let reader = self
-                    .fsbuffer
-                    .open_reader(&fb, std::io::SeekFrom::Start(0))
-                    .await?;
-                Ok((Box::new(reader), 0))
+                let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+                    NdnError::NotFound("store layout manager not configured".to_string())
+                })?;
+                let base_chunk_list = Self::base_simple_chunk_list(&fb)?;
+                let base_chunk_list_id = Self::simple_chunk_list_id(&base_chunk_list);
+                let diff_state = fb
+                    .diff_state
+                    .read()
+                    .map_err(|_| {
+                        NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+                    })?
+                    .clone();
+
+                let reader = if Self::has_writer_state(&diff_state) {
+                    let writer_state =
+                        Self::writer_state_from_diff_state(base_chunk_list_id, &fb, &diff_state);
+                    DiffChunkListReader::from_writer_state(
+                        layout_mgr.clone(),
+                        Self::clone_chunk_list(&base_chunk_list),
+                        &writer_state,
+                        SeekFrom::Start(0),
+                        None,
+                    )
+                    .await?
+                } else {
+                    let diff_chunk_list = DiffChunkList {
+                        base_chunk_list: base_chunk_list_id,
+                        diff_file_path: fb.diff_file_path.clone(),
+                        chunk_indices: Vec::new(),
+                        chunk_ids: None,
+                    };
+                    DiffChunkListReader::new(
+                        layout_mgr.clone(),
+                        Self::clone_chunk_list(&base_chunk_list),
+                        diff_chunk_list,
+                        SeekFrom::Start(0),
+                        false,
+                    )
+                    .await?
+                };
+                let size = reader.total_size();
+                Ok((Box::new(reader), size))
             }
             crate::OpenFileReaderResp::Object(obj_id, inner_path) => {
                 let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
@@ -983,6 +1051,90 @@ impl NamedDataMgr {
         }
     }
 
+    fn base_simple_chunk_list(file_handle: &FileBufferRecord) -> NdnResult<SimpleChunkList> {
+        match &file_handle.base_reader {
+            FileBufferBaseReader::None => Ok(SimpleChunkList::new()),
+            FileBufferBaseReader::BaseChunkList(chunk_ids) => {
+                if chunk_ids.is_empty() {
+                    return Ok(SimpleChunkList::new());
+                }
+
+                match SimpleChunkList::from_chunk_list(chunk_ids.clone()) {
+                    Ok(list) => Ok(list),
+                    Err(_) => {
+                        let total_size = chunk_ids
+                            .iter()
+                            .filter_map(|chunk_id| chunk_id.get_length())
+                            .sum::<u64>();
+                        Ok(SimpleChunkList {
+                            total_size,
+                            body: chunk_ids.clone(),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    fn clone_chunk_list(list: &SimpleChunkList) -> SimpleChunkList {
+        SimpleChunkList {
+            total_size: list.total_size,
+            body: list.body.clone(),
+        }
+    }
+
+    fn simple_chunk_list_id(list: &SimpleChunkList) -> ObjId {
+        let (id, _) = Self::clone_chunk_list(list).gen_obj_id();
+        id
+    }
+
+    fn has_writer_state(diff_state: &FileBufferDiffState) -> bool {
+        !diff_state.base_chunk_sizes.is_empty()
+            || !diff_state.chunk_indices.is_empty()
+            || !diff_state.diff_chunk_sizes.is_empty()
+            || !diff_state.merged_chunk_sizes.is_empty()
+            || diff_state.total_size > 0
+            || diff_state.position > 0
+    }
+
+    fn writer_state_from_diff_state(
+        base_chunk_list_id: ObjId,
+        file_handle: &FileBufferRecord,
+        diff_state: &FileBufferDiffState,
+    ) -> DiffChunkListWriterState {
+        DiffChunkListWriterState {
+            base_chunk_list: base_chunk_list_id,
+            diff_file_path: file_handle.diff_file_path.clone(),
+            chunk_indices: diff_state.chunk_indices.clone(),
+            diff_chunk_sizes: diff_state.diff_chunk_sizes.clone(),
+            base_chunk_sizes: diff_state.base_chunk_sizes.clone(),
+            merged_chunk_sizes: diff_state.merged_chunk_sizes.clone(),
+            position: diff_state.position,
+            total_size: diff_state.total_size,
+            auto_cache: diff_state.auto_cache,
+            local_mode: diff_state.local_mode,
+            fixed_chunk_size: diff_state.fixed_chunk_size,
+            append_merge_last_chunk: diff_state.append_merge_last_chunk,
+        }
+    }
+
+    fn diff_state_from_writer_state(
+        writer_state: &DiffChunkListWriterState,
+    ) -> FileBufferDiffState {
+        FileBufferDiffState {
+            chunk_indices: writer_state.chunk_indices.clone(),
+            diff_chunk_sizes: writer_state.diff_chunk_sizes.clone(),
+            base_chunk_sizes: writer_state.base_chunk_sizes.clone(),
+            merged_chunk_sizes: writer_state.merged_chunk_sizes.clone(),
+            position: writer_state.position,
+            total_size: writer_state.total_size,
+            auto_cache: writer_state.auto_cache,
+            local_mode: writer_state.local_mode,
+            fixed_chunk_size: writer_state.fixed_chunk_size,
+            append_merge_last_chunk: writer_state.append_merge_last_chunk,
+        }
+    }
+
     /// Load existing file chunks from base object for append operations
     async fn load_file_chunklist(&self, obj_id: &ObjId) -> NdnResult<Vec<ChunkId>> {
         let Some(_layout_mgr) = self.layout_mgr.as_ref() else {
@@ -1025,35 +1177,75 @@ impl NamedDataMgr {
         path: &NdmPath,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
-    ) -> NdnResult<(FileBufferSeekWriter, IndexNodeId)> {
+    ) -> NdnResult<(NdmFileWriter, IndexNodeId)> {
         let file_handle_id = self
             .fsmeta
             .open_file_writer(path, flag, expected_size)
             .await?;
         let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await?;
+        let inode_id = file_handle.file_inode_id;
+        let layout_mgr = self
+            .layout_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+        let base_chunk_list = Self::base_simple_chunk_list(&file_handle)?;
+        let base_chunk_list_id = Self::simple_chunk_list_id(&base_chunk_list);
+        let diff_state = file_handle
+            .diff_state
+            .read()
+            .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
+            .clone();
 
-        let writer = self
-            .fsbuffer
-            .open_writer(&file_handle, std::io::SeekFrom::Start(0))
-            .await?;
-        Ok((writer, file_handle.file_inode_id))
+        let writer = if Self::has_writer_state(&diff_state) {
+            let writer_state = Self::writer_state_from_diff_state(
+                base_chunk_list_id.clone(),
+                &file_handle,
+                &diff_state,
+            );
+            DiffChunkListWriter::open_from_state(
+                layout_mgr.clone(),
+                Self::clone_chunk_list(&base_chunk_list),
+                writer_state,
+                None,
+            )
+            .await?
+        } else {
+            let mut options = DiffChunkListWriterOptions::default();
+            if let Some(fixed_chunk_size) = diff_state.fixed_chunk_size {
+                options = options.with_fixed_chunk_size(fixed_chunk_size);
+            }
+            if !diff_state.base_chunk_sizes.is_empty() {
+                options = options.with_base_chunk_sizes(diff_state.base_chunk_sizes.clone());
+            }
+            options = options.with_append_merge_last_chunk(diff_state.append_merge_last_chunk);
+            DiffChunkListWriter::new(
+                layout_mgr.clone(),
+                base_chunk_list_id.clone(),
+                Self::clone_chunk_list(&base_chunk_list),
+                &file_handle.diff_file_path,
+                options,
+            )
+            .await?
+        };
+
+        Ok((
+            NdmFileWriter {
+                writer,
+                fb: file_handle,
+                fsbuffer: self.fsbuffer.clone(),
+            },
+            inode_id,
+        ))
     }
 
     pub async fn append(&self, path: &NdmPath, data: &[u8]) -> NdnResult<()> {
-        let file_handle_id = self
-            .fsmeta
+        let (mut writer, inode_id) = self
             .open_file_writer(path, OpenWriteFlag::CreateOrAppend, None)
             .await?;
-        let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await?;
-        let mut writer = self
-            .fsbuffer
-            .open_writer(&file_handle, std::io::SeekFrom::End(0))
-            .await?;
+        writer.seek(SeekFrom::End(0)).await?;
         writer.write_all(data).await?;
         writer.flush().await?;
-        self.fsmeta
-            .close_file_writer(file_handle.file_inode_id)
-            .await?;
+        self.fsmeta.close_file_writer(inode_id).await?;
         Ok(())
     }
 

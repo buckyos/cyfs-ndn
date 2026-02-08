@@ -2,10 +2,13 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EBADF, EIO, EINVAL, ENOENT, ENOSYS, EPERM};
+use libc::{EBADF, EINVAL, EIO, ENOENT, ENOSYS, EPERM};
 use log::{error, info};
 use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-use ndm::{CommitPolicy, NamedDataMgr, NamedDataMgrRef, OpenWriteFlag, PathKind, ReadOptions};
+use ndm::{
+    CommitPolicy, NamedDataMgr, NamedDataMgrRef, NdmFileWriter, OpenWriteFlag, PathKind,
+    ReadOptions,
+};
 use ndn_lib::{NdmPath, NdnError, NdnResult};
 use std::collections::HashMap;
 use std::env;
@@ -13,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::runtime::Runtime;
 
 use fs_buffer::LocalFileBufferService;
@@ -67,11 +70,10 @@ impl InodeTable {
         self.remember(inode, path.to_string());
         inode
     }
-
 }
 
 struct OpenHandle {
-    writer: fs_buffer::FileBufferSeekWriter,
+    writer: NdmFileWriter,
     inode_id: u64,
 }
 
@@ -152,7 +154,11 @@ impl FsDaemon {
         Ok((inode, attr))
     }
 
-    fn readdir_entries(&self, ino: u64, offset: i64) -> Result<Vec<(u64, FileType, String, i64)>, i32> {
+    fn readdir_entries(
+        &self,
+        ino: u64,
+        offset: i64,
+    ) -> Result<Vec<(u64, FileType, String, i64)>, i32> {
         let path = self.inode_table.get_path(ino).ok_or(ENOENT)?;
         let entries = self
             .runtime
@@ -296,7 +302,13 @@ impl FsDaemon {
             .map_err(map_ndn_err)
     }
 
-    fn rename_path(&self, parent: u64, name: &str, newparent: u64, newname: &str) -> Result<(), i32> {
+    fn rename_path(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+    ) -> Result<(), i32> {
         let old_path = self.path_from_parent(parent, name).ok_or(ENOENT)?;
         let new_path = self.path_from_parent(newparent, newname).ok_or(ENOENT)?;
         self.runtime
@@ -352,18 +364,9 @@ impl FsDaemon {
                 handle
                     .writer
                     .seek(std::io::SeekFrom::Start(offset as u64))
-                    .await
-                    .map_err(|e| NdnError::IoError(e.to_string()))?;
-                handle
-                    .writer
-                    .write_all(data)
-                    .await
-                    .map_err(|e| NdnError::IoError(e.to_string()))?;
-                handle
-                    .writer
-                    .flush()
-                    .await
-                    .map_err(|e| NdnError::IoError(e.to_string()))?;
+                    .await?;
+                handle.writer.write_all(data).await?;
+                handle.writer.flush().await?;
                 Ok::<usize, NdnError>(data.len())
             });
             match written {
@@ -374,9 +377,10 @@ impl FsDaemon {
     }
 
     fn release_handle(&self, fh: u64) -> Result<(), i32> {
-        if let Some(handle) = self.handle_table.remove(fh) {
+        if let Some(mut handle) = self.handle_table.remove(fh) {
             self.runtime
                 .block_on(async {
+                    handle.writer.flush().await?;
                     let mgr = self.named_mgr.lock().await;
                     mgr.close_file(handle.inode_id).await
                 })
@@ -387,7 +391,13 @@ impl FsDaemon {
 }
 
 impl Filesystem for FsDaemon {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
+    fn lookup(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: ReplyEntry,
+    ) {
         let name = match name.to_str() {
             Some(v) => v,
             None => {
@@ -662,7 +672,12 @@ fn build_layout(store_id: &str) -> StoreLayout {
     StoreLayout::new(1, vec![target], 0, 0)
 }
 
-fn init_named_mgr(runtime: &Runtime, mgr_id: &str, base_dir: &Path, instance_id: &str) -> NdnResult<NamedDataMgrRef> {
+fn init_named_mgr(
+    runtime: &Runtime,
+    mgr_id: &str,
+    base_dir: &Path,
+    instance_id: &str,
+) -> NdnResult<NamedDataMgrRef> {
     let fs_meta_dir = base_dir.join("fs_meta");
     let fs_buffer_dir = base_dir.join("fs_buffer");
     let store_dir = base_dir.join("named_store");
@@ -678,9 +693,8 @@ fn init_named_mgr(runtime: &Runtime, mgr_id: &str, base_dir: &Path, instance_id:
     let fs_meta_client = Arc::new(ndm::FsMetaClient::new_in_process(Box::new(fs_meta_service)));
 
     let store_mgr = Arc::new(NamedStoreMgr::new());
-    let store = runtime.block_on(async {
-        NamedLocalStore::get_named_store_by_path(store_dir.clone()).await
-    })?;
+    let store = runtime
+        .block_on(async { NamedLocalStore::get_named_store_by_path(store_dir.clone()).await })?;
     let store_id = store.store_id().to_string();
     let store_ref = Arc::new(tokio::sync::Mutex::new(store));
     runtime.block_on(async {
@@ -706,8 +720,14 @@ fn parse_args() -> Result<(PathBuf, PathBuf, String, String), String> {
     }
     let mountpoint = PathBuf::from(args.remove(0));
     let data_dir = PathBuf::from(args.remove(0));
-    let mgr_id = args.get(0).cloned().unwrap_or_else(|| "default".to_string());
-    let instance_id = args.get(1).cloned().unwrap_or_else(|| "default".to_string());
+    let mgr_id = args
+        .get(0)
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
+    let instance_id = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
     Ok((mountpoint, data_dir, mgr_id, instance_id))
 }
 

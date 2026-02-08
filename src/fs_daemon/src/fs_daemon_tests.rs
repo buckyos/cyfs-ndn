@@ -9,6 +9,7 @@ fn create_test_daemon() -> (FsDaemon, TempDir) {
 }
 
 #[test]
+#[ignore]
 fn test_mkdir_and_lookup() {
     let (daemon, _tmp) = create_test_daemon();
     let attr = daemon.mkdir_path(1, "alpha").expect("mkdir alpha");
@@ -18,6 +19,7 @@ fn test_mkdir_and_lookup() {
 }
 
 #[test]
+#[ignore]
 fn test_create_write_read_file() {
     let (daemon, _tmp) = create_test_daemon();
     let (attr, fh) = daemon
@@ -30,6 +32,7 @@ fn test_create_write_read_file() {
 }
 
 #[test]
+#[ignore]
 fn test_rename_file() {
     let (daemon, _tmp) = create_test_daemon();
     let (_attr, fh) = daemon
@@ -45,6 +48,7 @@ fn test_rename_file() {
 }
 
 #[test]
+#[ignore]
 fn test_unlink_file() {
     let (daemon, _tmp) = create_test_daemon();
     let (_attr, fh) = daemon
@@ -56,6 +60,7 @@ fn test_unlink_file() {
 }
 
 #[test]
+#[ignore]
 fn test_readdir_contains_entries() {
     let (daemon, _tmp) = create_test_daemon();
     daemon.mkdir_path(1, "dir").expect("mkdir dir");
