@@ -64,7 +64,9 @@ ndm.close_file_writer(real_writer)
 
 - 本地文件操作，如果文件足够小，可以利用OSBuffer还在的时候，直接计算chunkId
 
-### fsmeta.close_file(fb_handle)
+### fb.close_file(fb_handle)
+
+fb_service会在内部调用fsmeta.close_file,调整inode状态
 
 根据fb_handle的信息，要求meta更新file_inode的状态:
 

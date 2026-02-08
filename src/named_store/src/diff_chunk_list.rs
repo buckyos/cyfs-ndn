@@ -2,6 +2,7 @@ use crate::{chunk_list_reader::OpenChunkReader, NamedStoreMgr};
 use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, SimpleChunkList};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -214,6 +215,63 @@ impl DiffChunkListReader {
         let target = reader.calc_seek_target(seek_from)?;
         reader.apply_seek_target(target);
         Ok(reader)
+    }
+
+    pub async fn from_writer_state(
+        named_store_mgr: Arc<NamedStoreMgr>,
+        base_chunk_list: SimpleChunkList,
+        writer_state: &DiffChunkListWriterState,
+        seek_from: SeekFrom,
+        open_chunk_reader: Option<OpenChunkReader>,
+    ) -> NdnResult<Self> {
+        let diff_chunk_list = DiffChunkList {
+            base_chunk_list: writer_state.base_chunk_list.clone(),
+            diff_file_path: writer_state.diff_file_path.clone(),
+            chunk_indices: writer_state.chunk_indices.clone(),
+            chunk_ids: None,
+        };
+
+        let options = DiffChunkListReaderOptions {
+            auto_cache: writer_state.auto_cache,
+            local_mode: writer_state.local_mode,
+            fixed_chunk_size: writer_state.fixed_chunk_size,
+            base_chunk_sizes: Some(writer_state.base_chunk_sizes.clone()),
+            diff_chunk_sizes: Some(writer_state.diff_chunk_sizes.clone()),
+            open_chunk_reader: None,
+        };
+
+        let options = if let Some(open_chunk_reader) = open_chunk_reader {
+            options.with_open_chunk_reader(open_chunk_reader)
+        } else {
+            options
+        };
+
+        Self::with_options(
+            named_store_mgr,
+            base_chunk_list,
+            diff_chunk_list,
+            seek_from,
+            options,
+        )
+        .await
+    }
+
+    pub async fn from_writer_state_file(
+        named_store_mgr: Arc<NamedStoreMgr>,
+        base_chunk_list: SimpleChunkList,
+        diff_file_path: impl AsRef<Path>,
+        seek_from: SeekFrom,
+        open_chunk_reader: Option<OpenChunkReader>,
+    ) -> NdnResult<Self> {
+        let state = DiffChunkListWriter::load_state(diff_file_path).await?;
+        Self::from_writer_state(
+            named_store_mgr,
+            base_chunk_list,
+            &state,
+            seek_from,
+            open_chunk_reader,
+        )
+        .await
     }
 
     pub fn total_size(&self) -> u64 {
@@ -540,6 +598,29 @@ impl DiffChunkListWriterOptions {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffChunkListWriterState {
+    pub base_chunk_list: ObjId,
+    pub diff_file_path: PathBuf,
+    pub chunk_indices: Vec<u64>,
+    pub diff_chunk_sizes: Vec<u64>,
+    pub base_chunk_sizes: Vec<u64>,
+    pub merged_chunk_sizes: Vec<u64>,
+    pub position: u64,
+    pub total_size: u64,
+    pub auto_cache: bool,
+    pub local_mode: bool,
+    pub fixed_chunk_size: Option<u64>,
+    pub append_merge_last_chunk: bool,
+}
+
+struct PersistedDirtyChunks {
+    chunk_indices: Vec<u64>,
+    diff_chunk_sizes: Vec<u64>,
+    dirty_chunk_id_map: HashMap<usize, ChunkId>,
+    diff_chunk_ids: Vec<ChunkId>,
+}
+
 pub struct DiffChunkListWriter {
     named_store_mgr: Arc<NamedStoreMgr>,
     base_chunk_list_id: ObjId,
@@ -592,6 +673,139 @@ impl DiffChunkListWriter {
             dirty_chunks: BTreeMap::new(),
             position: 0,
             total_size,
+        })
+    }
+
+    pub fn state_file_path_for(diff_file_path: &Path) -> PathBuf {
+        let mut file_name = diff_file_path
+            .file_name()
+            .map(|v| v.to_os_string())
+            .unwrap_or_else(|| OsString::from("diff_chunk_list"));
+        file_name.push(".state.json");
+        diff_file_path.with_file_name(file_name)
+    }
+
+    pub fn state_file_path(&self) -> PathBuf {
+        Self::state_file_path_for(&self.diff_file_path)
+    }
+
+    pub async fn load_state(
+        diff_file_path: impl AsRef<Path>,
+    ) -> NdnResult<DiffChunkListWriterState> {
+        let state_path = Self::state_file_path_for(diff_file_path.as_ref());
+        let state_bytes = fs::read(&state_path)
+            .await
+            .map_err(|e| NdnError::IoError(format!("read writer state failed: {}", e)))?;
+        serde_json::from_slice::<DiffChunkListWriterState>(&state_bytes)
+            .map_err(|e| NdnError::DecodeError(format!("decode writer state failed: {}", e)))
+    }
+
+    pub async fn open_from_state(
+        named_store_mgr: Arc<NamedStoreMgr>,
+        base_chunk_list: SimpleChunkList,
+        state: DiffChunkListWriterState,
+        open_chunk_reader: Option<OpenChunkReader>,
+    ) -> NdnResult<Self> {
+        if state.base_chunk_sizes.len() != base_chunk_list.body.len() {
+            return Err(NdnError::InvalidData(format!(
+                "base chunk size count {} mismatch base chunk id count {}",
+                state.base_chunk_sizes.len(),
+                base_chunk_list.body.len()
+            )));
+        }
+        if state.position > state.total_size {
+            return Err(NdnError::InvalidData(format!(
+                "writer state position {} exceeds total_size {}",
+                state.position, state.total_size
+            )));
+        }
+
+        let merged_total: u64 = state.merged_chunk_sizes.iter().sum();
+        if merged_total != state.total_size {
+            return Err(NdnError::InvalidData(format!(
+                "writer state total_size mismatch, expect {} got {}",
+                merged_total, state.total_size
+            )));
+        }
+        if state.chunk_indices.len() != state.diff_chunk_sizes.len() {
+            return Err(NdnError::InvalidData(format!(
+                "writer state diff size count {} mismatch index count {}",
+                state.diff_chunk_sizes.len(),
+                state.chunk_indices.len()
+            )));
+        }
+
+        let mut file_data = if state.diff_file_path.exists() {
+            fs::read(&state.diff_file_path)
+                .await
+                .map_err(|e| NdnError::IoError(format!("read diff file failed: {}", e)))?
+        } else {
+            Vec::new()
+        };
+
+        let expected_file_size: u64 = state.diff_chunk_sizes.iter().sum();
+        if expected_file_size != file_data.len() as u64 {
+            return Err(NdnError::InvalidData(format!(
+                "diff file size mismatch, expect {} got {}",
+                expected_file_size,
+                file_data.len()
+            )));
+        }
+
+        let mut dirty_chunks = BTreeMap::new();
+        let mut cursor = 0usize;
+        let mut seen = HashSet::new();
+        for (chunk_index_u64, chunk_size) in state
+            .chunk_indices
+            .iter()
+            .zip(state.diff_chunk_sizes.iter())
+        {
+            let chunk_index = *chunk_index_u64 as usize;
+            if !seen.insert(chunk_index) {
+                return Err(NdnError::InvalidData(format!(
+                    "duplicate dirty chunk index {} in writer state",
+                    chunk_index
+                )));
+            }
+            let expected_size = state
+                .merged_chunk_sizes
+                .get(chunk_index)
+                .copied()
+                .ok_or_else(|| {
+                    NdnError::InvalidData(format!(
+                        "dirty chunk index {} out of merged chunk range {}",
+                        chunk_index,
+                        state.merged_chunk_sizes.len()
+                    ))
+                })?;
+            if *chunk_size != expected_size {
+                return Err(NdnError::InvalidData(format!(
+                    "dirty chunk size mismatch for index {}, expect {} got {}",
+                    chunk_index, expected_size, chunk_size
+                )));
+            }
+
+            let end = cursor.saturating_add(*chunk_size as usize);
+            dirty_chunks.insert(chunk_index, file_data[cursor..end].to_vec());
+            cursor = end;
+        }
+        file_data.clear();
+
+        Ok(Self {
+            named_store_mgr,
+            base_chunk_list_id: state.base_chunk_list,
+            base_chunk_ids: base_chunk_list.body,
+            base_chunk_sizes: state.base_chunk_sizes,
+            auto_cache: state.auto_cache,
+            local_mode: state.local_mode,
+            open_chunk_reader,
+            fixed_chunk_size: state.fixed_chunk_size,
+            append_merge_last_chunk: state.append_merge_last_chunk,
+            diff_file_path: state.diff_file_path,
+            merged_chunk_sizes: state.merged_chunk_sizes,
+            dirty_chunks,
+            position: state.position,
+            total_size: state.total_size,
         })
     }
 
@@ -673,7 +887,83 @@ impl DiffChunkListWriter {
         Ok(())
     }
 
+    pub async fn close(&self) -> NdnResult<DiffChunkListWriterState> {
+        let persisted = self.persist_dirty_chunks_to_diff_file(false).await?;
+        let state = DiffChunkListWriterState {
+            base_chunk_list: self.base_chunk_list_id.clone(),
+            diff_file_path: self.diff_file_path.clone(),
+            chunk_indices: persisted.chunk_indices,
+            diff_chunk_sizes: persisted.diff_chunk_sizes,
+            base_chunk_sizes: self.base_chunk_sizes.clone(),
+            merged_chunk_sizes: self.merged_chunk_sizes.clone(),
+            position: self.position,
+            total_size: self.total_size,
+            auto_cache: self.auto_cache,
+            local_mode: self.local_mode,
+            fixed_chunk_size: self.fixed_chunk_size,
+            append_merge_last_chunk: self.append_merge_last_chunk,
+        };
+
+        let state_path = self.state_file_path();
+        if let Some(parent) = state_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| NdnError::IoError(e.to_string()))?;
+        }
+        let state_bytes = serde_json::to_vec(&state)
+            .map_err(|e| NdnError::InvalidParam(format!("serialize writer state failed: {}", e)))?;
+        fs::write(&state_path, state_bytes)
+            .await
+            .map_err(|e| NdnError::IoError(format!("write writer state failed: {}", e)))?;
+
+        Ok(state)
+    }
+
     pub async fn finalize(self, named_mode: bool) -> NdnResult<(DiffChunkList, SimpleChunkList)> {
+        let persisted = self.persist_dirty_chunks_to_diff_file(named_mode).await?;
+
+        let mut merged_chunk_ids = Vec::with_capacity(self.merged_chunk_sizes.len());
+        for index in 0..self.merged_chunk_sizes.len() {
+            if let Some(chunk_id) = persisted.dirty_chunk_id_map.get(&index) {
+                merged_chunk_ids.push(chunk_id.clone());
+                continue;
+            }
+
+            if let Some(base_chunk_id) = self.base_chunk_ids.get(index) {
+                merged_chunk_ids.push(base_chunk_id.clone());
+                continue;
+            }
+
+            return Err(NdnError::InvalidData(format!(
+                "chunk index {} has no chunk id (not in base and not dirty)",
+                index
+            )));
+        }
+
+        let merged_chunk_list = SimpleChunkList::from_chunk_list(merged_chunk_ids)?;
+        let diff_chunk_list = DiffChunkList {
+            base_chunk_list: self.base_chunk_list_id,
+            diff_file_path: self.diff_file_path,
+            chunk_indices: persisted.chunk_indices,
+            chunk_ids: if named_mode {
+                Some(persisted.diff_chunk_ids)
+            } else {
+                None
+            },
+        };
+
+        let state_path = Self::state_file_path_for(&diff_chunk_list.diff_file_path);
+        if state_path.exists() {
+            let _ = fs::remove_file(state_path).await;
+        }
+
+        Ok((diff_chunk_list, merged_chunk_list))
+    }
+
+    async fn persist_dirty_chunks_to_diff_file(
+        &self,
+        named_mode: bool,
+    ) -> NdnResult<PersistedDirtyChunks> {
         if let Some(parent) = self.diff_file_path.parent() {
             fs::create_dir_all(parent)
                 .await
@@ -684,8 +974,9 @@ impl DiffChunkListWriter {
             .await
             .map_err(|e| NdnError::IoError(e.to_string()))?;
 
-        let mut dirty_chunk_id_map: HashMap<usize, ChunkId> = HashMap::new();
+        let mut dirty_chunk_id_map = HashMap::new();
         let mut chunk_indices = Vec::new();
+        let mut diff_chunk_sizes = Vec::new();
         let mut diff_chunk_ids = Vec::new();
 
         for (chunk_index, chunk_data) in self.dirty_chunks.iter() {
@@ -721,43 +1012,19 @@ impl DiffChunkListWriter {
 
             dirty_chunk_id_map.insert(*chunk_index, chunk_id);
             chunk_indices.push(*chunk_index as u64);
+            diff_chunk_sizes.push(chunk_data.len() as u64);
         }
 
         file.flush()
             .await
             .map_err(|e| NdnError::IoError(e.to_string()))?;
 
-        let mut merged_chunk_ids = Vec::with_capacity(self.merged_chunk_sizes.len());
-        for index in 0..self.merged_chunk_sizes.len() {
-            if let Some(chunk_id) = dirty_chunk_id_map.get(&index) {
-                merged_chunk_ids.push(chunk_id.clone());
-                continue;
-            }
-
-            if let Some(base_chunk_id) = self.base_chunk_ids.get(index) {
-                merged_chunk_ids.push(base_chunk_id.clone());
-                continue;
-            }
-
-            return Err(NdnError::InvalidData(format!(
-                "chunk index {} has no chunk id (not in base and not dirty)",
-                index
-            )));
-        }
-
-        let merged_chunk_list = SimpleChunkList::from_chunk_list(merged_chunk_ids)?;
-        let diff_chunk_list = DiffChunkList {
-            base_chunk_list: self.base_chunk_list_id,
-            diff_file_path: self.diff_file_path,
+        Ok(PersistedDirtyChunks {
             chunk_indices,
-            chunk_ids: if named_mode {
-                Some(diff_chunk_ids)
-            } else {
-                None
-            },
-        };
-
-        Ok((diff_chunk_list, merged_chunk_list))
+            diff_chunk_sizes,
+            dirty_chunk_id_map,
+            diff_chunk_ids,
+        })
     }
 
     fn preferred_chunk_size(&self, remaining: u64) -> u64 {
@@ -1371,6 +1638,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_diff_chunk_list_writer_close_then_reader_before_finalize() {
+        let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
+
+        let base_chunks = vec![b"ABCD".to_vec(), b"E".to_vec()];
+        let base_chunk_list = setup_base_chunk_list(&store, &base_chunks).await;
+        let (base_chunk_list_id, _) = clone_chunk_list(&base_chunk_list).gen_obj_id();
+
+        let diff_file_path = temp_dir.path().join("writer-close-reader.bin");
+        let options = DiffChunkListWriterOptions::default().with_fixed_chunk_size(4);
+        let mut writer = DiffChunkListWriter::new(
+            store_mgr.clone(),
+            base_chunk_list_id,
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            options,
+        )
+        .await
+        .unwrap();
+
+        writer.seek(SeekFrom::Start(1)).unwrap();
+        writer.write_all(b"Z").await.unwrap();
+        writer.seek(SeekFrom::End(0)).unwrap();
+        writer.write_all(b"FGH").await.unwrap();
+
+        let state = writer.close().await.unwrap();
+        assert_eq!(state.chunk_indices, vec![0, 1]);
+        assert_eq!(state.diff_chunk_sizes, vec![4, 4]);
+
+        let loaded_state = DiffChunkListWriter::load_state(&diff_file_path)
+            .await
+            .unwrap();
+        assert_eq!(loaded_state.chunk_indices, state.chunk_indices);
+        assert_eq!(loaded_state.diff_chunk_sizes, state.diff_chunk_sizes);
+
+        let mut reader = DiffChunkListReader::from_writer_state(
+            store_mgr.clone(),
+            clone_chunk_list(&base_chunk_list),
+            &state,
+            SeekFrom::Start(0),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut merged = Vec::new();
+        reader.read_to_end(&mut merged).await.unwrap();
+        assert_eq!(merged, b"AZCDEFGH".to_vec());
+
+        let mut reader_by_file = DiffChunkListReader::from_writer_state_file(
+            store_mgr.clone(),
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            SeekFrom::Start(0),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut merged2 = Vec::new();
+        reader_by_file.read_to_end(&mut merged2).await.unwrap();
+        assert_eq!(merged2, b"AZCDEFGH".to_vec());
+
+        let (_diff_chunk_list, _merged_chunk_list) = writer.finalize(false).await.unwrap();
+        let state_path = DiffChunkListWriter::state_file_path_for(&diff_file_path);
+        assert!(!state_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_diff_chunk_list_writer_reopen_from_state_and_continue() {
+        let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
+
+        let base_chunks = vec![b"ABCD".to_vec(), b"E".to_vec()];
+        let base_chunk_list = setup_base_chunk_list(&store, &base_chunks).await;
+        let (base_chunk_list_id, _) = clone_chunk_list(&base_chunk_list).gen_obj_id();
+
+        let diff_file_path = temp_dir.path().join("writer-reopen.bin");
+        let options = DiffChunkListWriterOptions::default().with_fixed_chunk_size(4);
+        let mut writer = DiffChunkListWriter::new(
+            store_mgr.clone(),
+            base_chunk_list_id,
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            options,
+        )
+        .await
+        .unwrap();
+
+        writer.seek(SeekFrom::Start(1)).unwrap();
+        writer.write_all(b"Z").await.unwrap();
+        let _state1 = writer.close().await.unwrap();
+
+        let state = DiffChunkListWriter::load_state(&diff_file_path)
+            .await
+            .unwrap();
+        let mut reopened = DiffChunkListWriter::open_from_state(
+            store_mgr.clone(),
+            clone_chunk_list(&base_chunk_list),
+            state,
+            None,
+        )
+        .await
+        .unwrap();
+
+        reopened.seek(SeekFrom::End(0)).unwrap();
+        reopened.write_all(b"FGH").await.unwrap();
+        let state2 = reopened.close().await.unwrap();
+        assert_eq!(state2.chunk_indices, vec![0, 1]);
+
+        let mut reader = DiffChunkListReader::from_writer_state(
+            store_mgr.clone(),
+            clone_chunk_list(&base_chunk_list),
+            &state2,
+            SeekFrom::Start(0),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut merged = Vec::new();
+        reader.read_to_end(&mut merged).await.unwrap();
+        assert_eq!(merged, b"AZCDEFGH".to_vec());
+
+        let (diff_chunk_list, _merged_chunk_list) = reopened.finalize(false).await.unwrap();
+        let mut reader_after_finalize = DiffChunkListReader::new(
+            store_mgr,
+            clone_chunk_list(&base_chunk_list),
+            diff_chunk_list,
+            SeekFrom::Start(0),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut merged_after_finalize = Vec::new();
+        reader_after_finalize
+            .read_to_end(&mut merged_after_finalize)
+            .await
+            .unwrap();
+        assert_eq!(merged_after_finalize, b"AZCDEFGH".to_vec());
+    }
+
+    #[tokio::test]
     async fn test_reader_build_simple_chunk_list() {
         let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
 
@@ -1402,5 +1807,176 @@ mod tests {
         assert_eq!(merged.body[0], base_chunk_list.body[0]);
         assert_eq!(merged.body[2], base_chunk_list.body[2]);
         assert_eq!(merged.body[1], calc_mix_chunk_id(b"ABCD"));
+    }
+
+    #[tokio::test]
+    async fn test_overlay_single_dirty_chunk_compact_like() {
+        let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
+
+        let chunk_size = 1024usize;
+        let base_chunks = vec![vec![b'x'; chunk_size]];
+        let base_chunk_list = setup_base_chunk_list(&store, &base_chunks).await;
+        let (base_chunk_list_id, _) = clone_chunk_list(&base_chunk_list).gen_obj_id();
+
+        let diff_file_path = temp_dir.path().join("overlay-single-dirty.bin");
+        let mut writer = DiffChunkListWriter::new(
+            store_mgr.clone(),
+            base_chunk_list_id,
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            DiffChunkListWriterOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        writer.write_all(b"abc").await.unwrap();
+        let (diff_chunk_list, _merged_chunk_list) = writer.finalize(true).await.unwrap();
+
+        assert_eq!(diff_chunk_list.chunk_indices, vec![0]);
+        let meta = fs::metadata(&diff_file_path).await.unwrap();
+        assert_eq!(meta.len(), chunk_size as u64);
+
+        let mut reader = DiffChunkListReader::new(
+            store_mgr,
+            clone_chunk_list(&base_chunk_list),
+            diff_chunk_list,
+            SeekFrom::Start(0),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut head = [0u8; 3];
+        reader.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"abc");
+
+        let mut untouched = [0u8; 3];
+        reader.read_exact(&mut untouched).await.unwrap();
+        assert_eq!(&untouched, b"xxx");
+    }
+
+    #[tokio::test]
+    async fn test_overlay_dirty_then_clean_read_across_chunks() {
+        let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
+
+        let chunk_size = 1024u64;
+        let base_chunks = vec![
+            vec![0x00; chunk_size as usize],
+            vec![0x11; chunk_size as usize],
+        ];
+        let base_chunk_list = setup_base_chunk_list(&store, &base_chunks).await;
+        let (base_chunk_list_id, _) = clone_chunk_list(&base_chunk_list).gen_obj_id();
+
+        let diff_file_path = temp_dir.path().join("overlay-dirty-clean.bin");
+        let mut writer = DiffChunkListWriter::new(
+            store_mgr.clone(),
+            base_chunk_list_id,
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            DiffChunkListWriterOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        writer.seek(SeekFrom::Start(10)).unwrap();
+        writer.write_all(b"DIRTY").await.unwrap();
+        let (diff_chunk_list, _merged_chunk_list) = writer.finalize(true).await.unwrap();
+
+        assert_eq!(diff_chunk_list.chunk_indices, vec![0]);
+
+        let mut reader = DiffChunkListReader::new(
+            store_mgr,
+            clone_chunk_list(&base_chunk_list),
+            diff_chunk_list,
+            SeekFrom::Start(0),
+            false,
+        )
+        .await
+        .unwrap();
+
+        reader.seek(SeekFrom::Start(chunk_size - 4)).await.unwrap();
+        let mut buf = [0u8; 8];
+        reader.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf[..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&buf[4..], &[0x11, 0x11, 0x11, 0x11]);
+    }
+
+    #[tokio::test]
+    async fn test_overlay_complex_write_read() {
+        let (temp_dir, store_mgr, store) = create_mgr_with_store("store-main").await;
+
+        let chunk_size = 4096u64;
+        let mut base_chunks = Vec::new();
+        for idx in 0..16u64 {
+            let len = if idx == 15 {
+                chunk_size - 256
+            } else {
+                chunk_size
+            };
+            base_chunks.push(vec![idx as u8; len as usize]);
+        }
+        let base_chunk_list = setup_base_chunk_list(&store, &base_chunks).await;
+        let (base_chunk_list_id, _) = clone_chunk_list(&base_chunk_list).gen_obj_id();
+        let base_size = chunk_size * 16 - 256;
+
+        let diff_file_path = temp_dir.path().join("diff-complex-overlay.bin");
+        let mut writer = DiffChunkListWriter::new(
+            store_mgr.clone(),
+            base_chunk_list_id,
+            clone_chunk_list(&base_chunk_list),
+            &diff_file_path,
+            DiffChunkListWriterOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        let chunk_middle = chunk_size / 2;
+        writer
+            .seek(SeekFrom::Start(5 * chunk_size + chunk_middle))
+            .unwrap();
+        writer.write_all(b"HELLO").await.unwrap();
+
+        writer.seek(SeekFrom::Start(2 * chunk_size)).unwrap();
+        writer.write_all(b"WORLD").await.unwrap();
+
+        writer.seek(SeekFrom::Start(base_size)).unwrap();
+        writer.write_all(&vec![0xffu8; 512]).await.unwrap();
+
+        let (diff_chunk_list, _merged_chunk_list) = writer.finalize(true).await.unwrap();
+        assert_eq!(diff_chunk_list.chunk_indices, vec![2, 5, 15, 16]);
+
+        let mut reader = DiffChunkListReader::new(
+            store_mgr,
+            clone_chunk_list(&base_chunk_list),
+            diff_chunk_list,
+            SeekFrom::Start(0),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut head = vec![0u8; 256];
+        reader.read_exact(&mut head).await.unwrap();
+        assert!(head.iter().all(|b| *b == 0));
+
+        reader.seek(SeekFrom::Start(2 * chunk_size)).await.unwrap();
+        let mut world = [0u8; 5];
+        reader.read_exact(&mut world).await.unwrap();
+        assert_eq!(&world, b"WORLD");
+
+        reader
+            .seek(SeekFrom::Start(5 * chunk_size + chunk_middle))
+            .await
+            .unwrap();
+        let mut hello = [0u8; 5];
+        reader.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"HELLO");
+
+        reader.seek(SeekFrom::Start(base_size)).await.unwrap();
+        let mut tail = vec![0u8; 512];
+        reader.read_exact(&mut tail).await.unwrap();
+        assert!(tail.iter().all(|b| *b == 0xff));
+
+        let _ = fs::remove_file(&diff_file_path).await;
     }
 }
