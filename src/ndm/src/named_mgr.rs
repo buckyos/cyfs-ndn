@@ -1503,11 +1503,18 @@ impl NamedDataMgr {
             .await
             .map_err(|e| NdnError::Internal(format!("set_inode failed: {}", e)))?;
 
+        let mut dir_rev_for_delete = new_rev;
         for dentry in upper_dentries.iter() {
             self.fsmeta
-                .remove_dentry_row(dir_id, dentry.name.clone(), Some(txid.clone()))
+                .delete_dentry(
+                    dir_id,
+                    dentry.name.clone(),
+                    dir_rev_for_delete,
+                    Some(txid.clone()),
+                )
                 .await
                 .map_err(|e| NdnError::Internal(format!("remove_dentry failed: {}", e)))?;
+            dir_rev_for_delete += 1;
         }
 
         self.fsmeta

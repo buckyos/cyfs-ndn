@@ -600,8 +600,8 @@ impl FSMetaService {
         };
 
         let has_dentry_id = ddl.contains("dentry_id INTEGER PRIMARY KEY");
-        let has_symlink_constraint =
-            ddl.contains("target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL");
+        let has_symlink_constraint = ddl
+            .contains("target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL");
         if !has_dentry_id || !has_symlink_constraint {
             conn.execute_batch(
                 "BEGIN IMMEDIATE;
@@ -985,12 +985,15 @@ impl FSMetaService {
         let new_id = self
             .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
             .await?;
+        let parent_rev = self
+            .get_inode_rev(parent_id, txn.txid(), ctx.clone())
+            .await?;
 
-        // Link dentry via upsert_dentry
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             parent_id,
             name.clone(),
             DentryTarget::IndexNodeId(new_id),
+            parent_rev,
             txn.txid(),
             ctx.clone(),
         )
@@ -1299,10 +1302,12 @@ impl FSMetaService {
             ));
         }
 
-        self.handle_upsert_dentry(
+        self.handle_replace_target(
             parent_id,
             dir_name,
+            DentryTarget::IndexNodeId(dir_inode_id),
             DentryTarget::ObjId(new_dir_obj_id),
+            parent_rev0,
             txn.txid(),
             ctx.clone(),
         )
@@ -1311,13 +1316,15 @@ impl FSMetaService {
         let children_in_tx = self
             .handle_list_dentries(dir_inode_id, txn.txid(), ctx.clone())
             .await?;
+        let mut dir_rev = dir_rev0;
         for child in children_in_tx {
             if let DentryTarget::IndexNodeId(child_inode_id) = child.target {
                 self.handle_remove_inode(child_inode_id, txn.txid(), ctx.clone())
                     .await?;
             }
-            self.handle_remove_dentry_row(dir_inode_id, child.name, txn.txid(), ctx.clone())
+            self.handle_delete_dentry(dir_inode_id, child.name, dir_rev, txn.txid(), ctx.clone())
                 .await?;
+            dir_rev += 1;
         }
 
         self.handle_remove_inode(dir_inode_id, txn.txid(), ctx.clone())
@@ -1357,17 +1364,20 @@ impl FSMetaService {
             .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("failed to alloc inode: {}", e)))?;
+        let parent_rev = self
+            .get_inode_rev(parent_id, txn.txid(), ctx.clone())
+            .await?;
 
-        // Update dentry to point to the new inode
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             parent_id,
             name,
             DentryTarget::IndexNodeId(new_id),
+            parent_rev,
             txn.txid(),
             ctx.clone(),
         )
         .await
-        .map_err(|e| RPCErrors::ReasonError(format!("failed to upsert dentry: {}", e)))?;
+        .map_err(|e| RPCErrors::ReasonError(format!("failed to upsert dentry target: {}", e)))?;
 
         txn.commit()
             .await
@@ -1431,10 +1441,14 @@ impl FSMetaService {
         let new_id = self
             .handle_alloc_inode(node, txn.txid(), ctx.clone())
             .await?;
-        self.handle_upsert_dentry(
+        let parent_rev = self
+            .get_inode_rev(parent_id, txn.txid(), ctx.clone())
+            .await?;
+        self.upsert_dentry_with_parent_rev(
             parent_id,
             name.to_string(),
             DentryTarget::IndexNodeId(new_id),
+            parent_rev,
             txn.txid(),
             ctx.clone(),
         )
@@ -1521,8 +1535,9 @@ impl FSMetaService {
             .get_object(base_obj_id)
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
-        let base_dir: DirObject = load_named_obj(base_obj_str.as_str())
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e)))?;
+        let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
+            RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e))
+        })?;
         for (name, item) in base_dir.iter() {
             let (obj_id, obj_str) = item
                 .get_obj_id()
@@ -1860,10 +1875,10 @@ impl FSMetaService {
             return Err(RPCErrors::ReasonError("conflict".to_string()));
         }
 
-        // Set tombstone at source
-        self.handle_set_tombstone(
+        self.set_tombstone_with_parent_rev(
             plan.src_parent,
             plan.src_name,
+            plan.src_rev0,
             txn.txid(),
             ctx.clone(),
         )
@@ -1875,10 +1890,16 @@ impl FSMetaService {
             MoveSource::Base { obj_id, .. } => DentryTarget::ObjId(obj_id),
         };
 
-        self.handle_upsert_dentry(
+        let dst_expected_rev = if plan.src_parent == plan.dst_parent {
+            plan.src_rev0 + 1
+        } else {
+            plan.dst_rev0
+        };
+        self.upsert_dentry_with_parent_rev(
             plan.dst_parent,
             plan.dst_name,
             target,
+            dst_expected_rev,
             txn.txid(),
             ctx.clone(),
         )
@@ -2100,6 +2121,67 @@ impl FSMetaService {
         .await
     }
 
+    async fn get_inode_rev(
+        &self,
+        inode_id: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<u64, RPCErrors> {
+        let node = self
+            .handle_get_inode(inode_id, txid, ctx)
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+        Ok(node.rev.unwrap_or(0))
+    }
+
+    async fn upsert_dentry_with_parent_rev(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        target: DentryTarget,
+        expected_parent_rev: u64,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        if let Some(existing) = self
+            .handle_get_dentry(parent, name.clone(), txid.clone(), ctx.clone())
+            .await?
+        {
+            self.handle_replace_target(
+                parent,
+                name,
+                existing.target,
+                target,
+                expected_parent_rev,
+                txid,
+                ctx,
+            )
+            .await
+        } else {
+            self.handle_create_dentry(parent, name, target, expected_parent_rev, txid, ctx)
+                .await
+        }
+    }
+
+    async fn set_tombstone_with_parent_rev(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        expected_parent_rev: u64,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        self.upsert_dentry_with_parent_rev(
+            parent,
+            name,
+            DentryTarget::Tombstone,
+            expected_parent_rev,
+            txid,
+            ctx,
+        )
+        .await
+    }
+
     async fn handle_remove_inode(
         &self,
         id: IndexNodeId,
@@ -2250,9 +2332,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                         let parent_node = self
                             .handle_get_inode(current_id, None, ctx.clone())
                             .await
-                            .map_err(|e| {
-                                NdnError::Internal(format!("failed to get inode: {}", e))
-                            })?
+                            .map_err(|e| NdnError::Internal(format!("failed to get inode: {}", e)))?
                             .ok_or_else(|| {
                                 NdnError::Internal("parent inode not found".to_string())
                             })?;
@@ -2260,9 +2340,12 @@ impl ndm::FsMetaHandler for FSMetaService {
                             return Ok(None);
                         }
 
-                        match self.lookup_base_child(&parent_node, &name).await.map_err(|e| {
-                            NdnError::Internal(format!("failed to lookup base child: {}", e))
-                        })? {
+                        match self
+                            .lookup_base_child(&parent_node, &name)
+                            .await
+                            .map_err(|e| {
+                                NdnError::Internal(format!("failed to lookup base child: {}", e))
+                            })? {
                             BaseChildLookup::Missing => return Ok(None),
                             BaseChildLookup::DirObj(obj_id)
                             | BaseChildLookup::NonDirObj(obj_id) => DentryTarget::ObjId(obj_id),
@@ -2690,7 +2773,9 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        let dentries = self.list_merged_dentries(parent, txid.clone(), ctx.clone()).await?;
+        let dentries = self
+            .list_merged_dentries(parent, txid.clone(), ctx.clone())
+            .await?;
         let mut entries = BTreeMap::new();
         for dentry in dentries {
             let target = dentry.target.clone();
@@ -2746,95 +2831,64 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_upsert_dentry(
+    async fn handle_create_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
         target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
         let changed = self.with_conn(txid.as_deref(), move |conn| {
-            conn.execute_batch("SAVEPOINT fsmeta_upsert_dentry")
+            conn.execute_batch("SAVEPOINT fsmeta_create_dentry")
                 .map_err(map_db_err)?;
             let result = (|| -> Result<bool, RPCErrors> {
                 let now = unix_timestamp() as i64;
-                let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
-                let old = conn
+                let parent_rev = conn
                     .query_row(
-                        "SELECT dentry_id, target_type, target_inode_id, target_obj_id
-                         FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
-                        params![parent as i64, &name],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, Option<i64>>(2)?,
-                                row.get::<_, Option<Vec<u8>>>(3)?,
-                            ))
-                        },
+                        "SELECT COALESCE(rev, 0) FROM nodes WHERE inode_id = ?1",
+                        params![parent as i64],
+                        |row| row.get::<_, i64>(0),
                     )
                     .optional()
-                    .map_err(map_db_err)?;
-
-                let changed =
-                    old.as_ref().map_or(true, |(_, old_type, old_inode_id, old_obj_id)| {
-                        *old_type != target_type
-                            || *old_inode_id != target_inode_id
-                            || *old_obj_id != target_obj_id
-                    });
-
-                let dentry_id = if let Some((existing_id, _, _, _)) = old.as_ref() {
-                    conn.execute(
-                        "UPDATE dentries
-                         SET target_type = ?2,
-                             target_inode_id = ?3,
-                             target_obj_id = ?4,
-                             mtime = ?5
-                         WHERE dentry_id = ?1",
-                        params![
-                            *existing_id,
-                            target_type,
-                            target_inode_id,
-                            target_obj_id,
-                            now,
-                        ],
-                    )
-                    .map_err(map_db_err)?;
-                    *existing_id as u64
-                } else {
-                    conn.execute(
-                        "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            parent as i64,
-                            name,
-                            target_type,
-                            target_inode_id,
-                            target_obj_id,
-                            now,
-                        ],
-                    )
-                    .map_err(map_db_err)?;
-                    conn.last_insert_rowid() as u64
-                };
-
-                if let Some((_, old_target_type, old_target_inode_id, _)) = old.as_ref() {
-                    if *old_target_type == DENTRY_TARGET_INODE
-                        && *old_target_inode_id != target_inode_id
-                    {
-                        if let Some(old_inode_id) = old_target_inode_id {
-                            conn.execute(
-                                "UPDATE nodes
-                                 SET ref_by = NULL, updated_at = ?2
-                                 WHERE inode_id = ?1 AND ref_by = ?3",
-                                params![*old_inode_id, now, dentry_id as i64],
-                            )
-                            .map_err(map_db_err)?;
-                        }
-                    }
+                    .map_err(map_db_err)?
+                    .ok_or_else(|| {
+                        RPCErrors::ReasonError("parent inode not found".to_string())
+                    })? as u64;
+                if parent_rev != expected_parent_rev {
+                    return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
                 }
+
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                        params![parent as i64, &name],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?
+                    .is_some();
+                if exists {
+                    return Err(RPCErrors::ReasonError("dentry already exists".to_string()));
+                }
+
+                let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
+                conn.execute(
+                    "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        parent as i64,
+                        name,
+                        target_type,
+                        target_inode_id,
+                        target_obj_id,
+                        now,
+                    ],
+                )
+                .map_err(map_db_err)?;
+                let dentry_id = conn.last_insert_rowid() as u64;
 
                 if let Some(new_inode_id) = target_inode_id {
                     let updated = conn
@@ -2868,29 +2922,27 @@ impl ndm::FsMetaHandler for FSMetaService {
                     }
                 }
 
-                if changed {
-                    // Any effective child-item change bumps parent directory rev.
-                    conn.execute(
-                        "UPDATE nodes
-                         SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
-                         WHERE inode_id = ?1",
-                        params![parent as i64, now],
-                    )
-                    .map_err(map_db_err)?;
-                }
-                Ok(changed)
+                conn.execute(
+                    "UPDATE nodes
+                     SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                     WHERE inode_id = ?1",
+                    params![parent as i64, now],
+                )
+                .map_err(map_db_err)?;
+
+                Ok(true)
             })();
 
             match result {
                 Ok(changed) => {
-                    conn.execute_batch("RELEASE SAVEPOINT fsmeta_upsert_dentry")
+                    conn.execute_batch("RELEASE SAVEPOINT fsmeta_create_dentry")
                         .map_err(map_db_err)?;
                     Ok(changed)
                 }
                 Err(e) => {
                     let _ = conn.execute_batch(
-                        "ROLLBACK TO SAVEPOINT fsmeta_upsert_dentry;
-                         RELEASE SAVEPOINT fsmeta_upsert_dentry;",
+                        "ROLLBACK TO SAVEPOINT fsmeta_create_dentry;
+                         RELEASE SAVEPOINT fsmeta_create_dentry;",
                     );
                     Err(e)
                 }
@@ -2916,20 +2968,36 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_remove_dentry_row(
+    async fn handle_delete_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_parent_rev: u64,
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
         let changed = self
             .with_conn(txid.as_deref(), move |conn| {
-                conn.execute_batch("SAVEPOINT fsmeta_remove_dentry")
+                conn.execute_batch("SAVEPOINT fsmeta_delete_dentry")
                     .map_err(map_db_err)?;
                 let result = (|| -> Result<bool, RPCErrors> {
                     let now = unix_timestamp() as i64;
+                    let parent_rev = conn
+                        .query_row(
+                            "SELECT COALESCE(rev, 0) FROM nodes WHERE inode_id = ?1",
+                            params![parent as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| {
+                            RPCErrors::ReasonError("parent inode not found".to_string())
+                        })? as u64;
+                    if parent_rev != expected_parent_rev {
+                        return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+                    }
+
                     let old = conn
                         .query_row(
                             "SELECT dentry_id, target_type, target_inode_id
@@ -2965,7 +3033,6 @@ impl ndm::FsMetaHandler for FSMetaService {
                                 }
                             }
                         }
-                        // Any effective child-item change bumps parent directory rev.
                         conn.execute(
                             "UPDATE nodes
                              SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
@@ -2978,14 +3045,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                 })();
                 match result {
                     Ok(changed) => {
-                        conn.execute_batch("RELEASE SAVEPOINT fsmeta_remove_dentry")
+                        conn.execute_batch("RELEASE SAVEPOINT fsmeta_delete_dentry")
                             .map_err(map_db_err)?;
                         Ok(changed)
                     }
                     Err(e) => {
                         let _ = conn.execute_batch(
-                            "ROLLBACK TO SAVEPOINT fsmeta_remove_dentry;
-                             RELEASE SAVEPOINT fsmeta_remove_dentry;",
+                            "ROLLBACK TO SAVEPOINT fsmeta_delete_dentry;
+                             RELEASE SAVEPOINT fsmeta_delete_dentry;",
                         );
                         Err(e)
                     }
@@ -3011,15 +3078,173 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_set_tombstone(
+    async fn handle_replace_target(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_old_target: DentryTarget,
+        new_target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
-        ctx: RPCContext,
+        _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.handle_upsert_dentry(parent, name, DentryTarget::Tombstone, txid, ctx)
-            .await
+        let name_for_invalidate = name.clone();
+        let changed = self
+            .with_conn(txid.as_deref(), move |conn| {
+                conn.execute_batch("SAVEPOINT fsmeta_replace_target")
+                    .map_err(map_db_err)?;
+                let result = (|| -> Result<bool, RPCErrors> {
+                    let now = unix_timestamp() as i64;
+                    let parent_rev = conn
+                        .query_row(
+                            "SELECT COALESCE(rev, 0) FROM nodes WHERE inode_id = ?1",
+                            params![parent as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| {
+                            RPCErrors::ReasonError("parent inode not found".to_string())
+                        })? as u64;
+                    if parent_rev != expected_parent_rev {
+                        return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+                    }
+
+                    let old = conn
+                        .query_row(
+                            "SELECT dentry_id, target_type, target_inode_id, target_obj_id
+                         FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                            params![parent as i64, &name],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, Option<i64>>(2)?,
+                                    row.get::<_, Option<Vec<u8>>>(3)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(map_db_err)?
+                        .ok_or_else(|| RPCErrors::ReasonError("dentry not found".to_string()))?;
+
+                    let (expected_old_type, expected_old_inode_id, expected_old_obj_id) =
+                        dentry_target_cols(&expected_old_target)?;
+                    if old.1 != expected_old_type
+                        || old.2 != expected_old_inode_id
+                        || old.3 != expected_old_obj_id
+                    {
+                        return Err(RPCErrors::ReasonError("dentry target mismatch".to_string()));
+                    }
+
+                    let (new_type, new_inode_id, new_obj_id) = dentry_target_cols(&new_target)?;
+                    let changed = old.1 != new_type || old.2 != new_inode_id || old.3 != new_obj_id;
+                    if !changed {
+                        return Ok(false);
+                    }
+
+                    conn.execute(
+                        "UPDATE dentries
+                     SET target_type = ?2,
+                         target_inode_id = ?3,
+                         target_obj_id = ?4,
+                         mtime = ?5
+                     WHERE dentry_id = ?1",
+                        params![old.0, new_type, new_inode_id, new_obj_id, now],
+                    )
+                    .map_err(map_db_err)?;
+                    let dentry_id = old.0 as u64;
+
+                    if old.1 == DENTRY_TARGET_INODE && old.2 != new_inode_id {
+                        if let Some(old_inode_id) = old.2 {
+                            conn.execute(
+                                "UPDATE nodes
+                             SET ref_by = NULL, updated_at = ?2
+                             WHERE inode_id = ?1 AND ref_by = ?3",
+                                params![old_inode_id, now, dentry_id as i64],
+                            )
+                            .map_err(map_db_err)?;
+                        }
+                    }
+
+                    if let Some(new_inode_id) = new_inode_id {
+                        let updated = conn
+                            .execute(
+                                "UPDATE nodes
+                             SET ref_by = ?2, updated_at = ?3
+                             WHERE inode_id = ?1 AND (ref_by IS NULL OR ref_by = ?2)",
+                                params![new_inode_id, dentry_id as i64, now],
+                            )
+                            .map_err(map_db_err)?;
+                        if updated == 0 {
+                            let existing_ref = conn
+                                .query_row(
+                                    "SELECT ref_by FROM nodes WHERE inode_id = ?1",
+                                    params![new_inode_id],
+                                    |row| row.get::<_, Option<i64>>(0),
+                                )
+                                .optional()
+                                .map_err(map_db_err)?;
+                            match existing_ref {
+                                None => {
+                                    return Err(RPCErrors::ReasonError(
+                                        "inode not found".to_string(),
+                                    ));
+                                }
+                                Some(Some(ref_by)) if ref_by != dentry_id as i64 => {
+                                    return Err(RPCErrors::ReasonError(
+                                        "inode already referenced by another dentry".to_string(),
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    conn.execute(
+                        "UPDATE nodes
+                     SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                     WHERE inode_id = ?1",
+                        params![parent as i64, now],
+                    )
+                    .map_err(map_db_err)?;
+
+                    Ok(true)
+                })();
+
+                match result {
+                    Ok(changed) => {
+                        conn.execute_batch("RELEASE SAVEPOINT fsmeta_replace_target")
+                            .map_err(map_db_err)?;
+                        Ok(changed)
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch(
+                            "ROLLBACK TO SAVEPOINT fsmeta_replace_target;
+                         RELEASE SAVEPOINT fsmeta_replace_target;",
+                        );
+                        Err(e)
+                    }
+                }
+            })
+            .await?;
+
+        if changed {
+            if let Some(txid) = txid {
+                let entry = self.get_txn_entry(&txid)?;
+                entry
+                    .touched_edges
+                    .lock()
+                    .map_err(|e| {
+                        RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
+                    })?
+                    .insert((parent, name_for_invalidate));
+            } else if let Ok(mut cache) = self.resolve_path_cache.write() {
+                cache.invalidate_by_edge(parent, &name_for_invalidate);
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_bump_dir_rev(
@@ -3143,7 +3368,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         ttl: Duration,
         _ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        self.acquire_file_lease_inner(node_id, session, ttl, None).await
+        self.acquire_file_lease_inner(node_id, session, ttl, None)
+            .await
     }
 
     async fn handle_renew_file_lease(
@@ -3345,10 +3571,11 @@ impl ndm::FsMetaHandler for FSMetaService {
         )
         .await?;
 
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             parent,
             name,
             DentryTarget::ObjId(obj_id.clone()),
+            parent_node.rev.unwrap_or(0),
             txn.txid(),
             ctx.clone(),
         )
@@ -3403,10 +3630,11 @@ impl ndm::FsMetaHandler for FSMetaService {
         )
         .await?;
 
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             parent,
             name,
             DentryTarget::ObjId(dir_obj_id.clone()),
+            parent_node.rev.unwrap_or(0),
             txn.txid(),
             ctx.clone(),
         )
@@ -3426,8 +3654,8 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         let parent_id = self.ensure_dir_inode(&parent_path).await?;
 
-        // Set tombstone instead of deleting (overlay semantics)
-        self.handle_set_tombstone(parent_id, name, None, ctx)
+        let parent_rev = self.get_inode_rev(parent_id, None, ctx.clone()).await?;
+        self.set_tombstone_with_parent_rev(parent_id, name, parent_rev, None, ctx)
             .await?;
 
         Ok(())
@@ -3568,10 +3796,11 @@ impl ndm::FsMetaHandler for FSMetaService {
         )
         .await?;
 
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             link_parent_id,
             link_name,
             link_target,
+            parent_node.rev.unwrap_or(0),
             txn.txid(),
             ctx.clone(),
         )
@@ -3631,10 +3860,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
             .await?;
 
-        self.handle_upsert_dentry(
+        self.upsert_dentry_with_parent_rev(
             parent_id,
             name,
             DentryTarget::IndexNodeId(new_id),
+            parent_node.rev.unwrap_or(0),
             txn.txid(),
             ctx.clone(),
         )
@@ -3750,10 +3980,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                 let fid = self
                     .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
                     .await?;
-                self.handle_upsert_dentry(
+                self.upsert_dentry_with_parent_rev(
                     parent_id,
                     name.clone(),
                     DentryTarget::IndexNodeId(fid),
+                    parent_node.rev.unwrap_or(0),
                     txn.txid(),
                     ctx.clone(),
                 )
@@ -3779,10 +4010,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                 let fid = self
                     .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
                     .await?;
-                self.handle_upsert_dentry(
+                self.upsert_dentry_with_parent_rev(
                     parent_id,
                     name.clone(),
                     DentryTarget::IndexNodeId(fid),
+                    parent_node.rev.unwrap_or(0),
                     txn.txid(),
                     ctx.clone(),
                 )
@@ -3808,10 +4040,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                 let fid = self
                     .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
                     .await?;
-                self.handle_upsert_dentry(
+                self.upsert_dentry_with_parent_rev(
                     parent_id,
                     name.clone(),
                     DentryTarget::IndexNodeId(fid),
+                    parent_node.rev.unwrap_or(0),
                     txn.txid(),
                     ctx.clone(),
                 )
@@ -3874,10 +4107,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                 let fid = self
                     .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
                     .await?;
-                self.handle_upsert_dentry(
+                self.upsert_dentry_with_parent_rev(
                     parent_id,
                     name.clone(),
                     DentryTarget::IndexNodeId(fid),
+                    parent_node.rev.unwrap_or(0),
                     txn.txid(),
                     ctx.clone(),
                 )
@@ -3997,8 +4231,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     RPCErrors::ReasonError("inode not found for truncate".to_string())
                 })?;
             node.base_obj_id = None;
-            self.handle_set_inode(node, txn.txid(), ctx.clone())
-                .await?;
+            self.handle_set_inode(node, txn.txid(), ctx.clone()).await?;
         }
 
         self.handle_update_inode_state(

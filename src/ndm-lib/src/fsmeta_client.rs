@@ -92,9 +92,7 @@ impl NodeRecord {
     pub fn get_node_kind(&self) -> NodeKind {
         match &self.state {
             NodeState::DirNormal | NodeState::DirOverlay => NodeKind::Dir,
-            NodeState::FileNormal | NodeState::Working(_) | NodeState::Cooling(_) => {
-                NodeKind::File
-            }
+            NodeState::FileNormal | NodeState::Working(_) | NodeState::Cooling(_) => NodeKind::File,
             NodeState::Linked(s) => {
                 if s.obj_id.is_dir_object() {
                     NodeKind::Dir
@@ -118,7 +116,7 @@ impl NodeRecord {
 }
 
 /// Dentry target (Strategy B)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DentryTarget {
     IndexNodeId(IndexNodeId),
     SymLink(String),
@@ -454,69 +452,100 @@ impl FsMetaStopListReq {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsMetaUpsertDentryReq {
+pub struct FsMetaCreateDentryReq {
     pub parent: IndexNodeId,
     pub name: String,
     pub target: DentryTarget,
+    pub expected_parent_rev: u64,
     pub txid: Option<String>,
 }
 
-impl FsMetaUpsertDentryReq {
+impl FsMetaCreateDentryReq {
     pub fn new(
         parent: IndexNodeId,
         name: String,
         target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
     ) -> Self {
         Self {
             parent,
             name,
             target,
+            expected_parent_rev,
             txid,
         }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaUpsertDentryReq: {}", e))
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaCreateDentryReq: {}", e))
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsMetaRemoveDentryRowReq {
+pub struct FsMetaDeleteDentryReq {
     pub parent: IndexNodeId,
     pub name: String,
+    pub expected_parent_rev: u64,
     pub txid: Option<String>,
 }
 
-impl FsMetaRemoveDentryRowReq {
-    pub fn new(parent: IndexNodeId, name: String, txid: Option<String>) -> Self {
-        Self { parent, name, txid }
+impl FsMetaDeleteDentryReq {
+    pub fn new(
+        parent: IndexNodeId,
+        name: String,
+        expected_parent_rev: u64,
+        txid: Option<String>,
+    ) -> Self {
+        Self {
+            parent,
+            name,
+            expected_parent_rev,
+            txid,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaRemoveDentryRowReq: {}", e))
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaDeleteDentryReq: {}", e))
         })
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsMetaSetTombstoneReq {
+pub struct FsMetaReplaceTargetReq {
     pub parent: IndexNodeId,
     pub name: String,
+    pub expected_old_target: DentryTarget,
+    pub new_target: DentryTarget,
+    pub expected_parent_rev: u64,
     pub txid: Option<String>,
 }
 
-impl FsMetaSetTombstoneReq {
-    pub fn new(parent: IndexNodeId, name: String, txid: Option<String>) -> Self {
-        Self { parent, name, txid }
+impl FsMetaReplaceTargetReq {
+    pub fn new(
+        parent: IndexNodeId,
+        name: String,
+        expected_old_target: DentryTarget,
+        new_target: DentryTarget,
+        expected_parent_rev: u64,
+        txid: Option<String>,
+    ) -> Self {
+        Self {
+            parent,
+            name,
+            expected_old_target,
+            new_target,
+            expected_parent_rev,
+            txid,
+        }
     }
 
     pub fn from_json(value: serde_json::Value) -> Result<Self, RPCErrors> {
         serde_json::from_value(value).map_err(|e| {
-            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaSetTombstoneReq: {}", e))
+            RPCErrors::ParseRequestError(format!("Failed to parse FsMetaReplaceTargetReq: {}", e))
         })
     }
 }
@@ -1077,27 +1106,29 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn upsert_dentry(
+    pub async fn create_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
         target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
     ) -> Result<(), RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
                 handler
-                    .handle_upsert_dentry(parent, name, target, txid, ctx)
+                    .handle_create_dentry(parent, name, target, expected_parent_rev, txid, ctx)
                     .await
             }
             Self::KRPC(client) => {
-                let req = FsMetaUpsertDentryReq::new(parent, name, target, txid);
+                let req =
+                    FsMetaCreateDentryReq::new(parent, name, target, expected_parent_rev, txid);
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
                 })?;
 
-                let result = client.call("upsert_dentry", req_json).await?;
+                let result = client.call("create_dentry", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
                     RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
                 })
@@ -1105,26 +1136,27 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn remove_dentry_row(
+    pub async fn delete_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_parent_rev: u64,
         txid: Option<String>,
     ) -> Result<(), RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
                 handler
-                    .handle_remove_dentry_row(parent, name, txid, ctx)
+                    .handle_delete_dentry(parent, name, expected_parent_rev, txid, ctx)
                     .await
             }
             Self::KRPC(client) => {
-                let req = FsMetaRemoveDentryRowReq::new(parent, name, txid);
+                let req = FsMetaDeleteDentryReq::new(parent, name, expected_parent_rev, txid);
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
                 })?;
 
-                let result = client.call("remove_dentry_row", req_json).await?;
+                let result = client.call("delete_dentry", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
                     RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
                 })
@@ -1132,24 +1164,44 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn set_tombstone(
+    pub async fn replace_target(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_old_target: DentryTarget,
+        new_target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
     ) -> Result<(), RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
-                handler.handle_set_tombstone(parent, name, txid, ctx).await
+                handler
+                    .handle_replace_target(
+                        parent,
+                        name,
+                        expected_old_target,
+                        new_target,
+                        expected_parent_rev,
+                        txid,
+                        ctx,
+                    )
+                    .await
             }
             Self::KRPC(client) => {
-                let req = FsMetaSetTombstoneReq::new(parent, name, txid);
+                let req = FsMetaReplaceTargetReq::new(
+                    parent,
+                    name,
+                    expected_old_target,
+                    new_target,
+                    expected_parent_rev,
+                    txid,
+                );
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
                 })?;
 
-                let result = client.call("set_tombstone", req_json).await?;
+                let result = client.call("replace_target", req_json).await?;
                 serde_json::from_value(result).map_err(|e| {
                     RPCErrors::ParserResponseError(format!("Expected () result: {}", e))
                 })
@@ -1639,27 +1691,32 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_upsert_dentry(
+    async fn handle_create_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
         target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_remove_dentry_row(
+    async fn handle_delete_dentry(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_parent_rev: u64,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_set_tombstone(
+    async fn handle_replace_target(
         &self,
         parent: IndexNodeId,
         name: String,
+        expected_old_target: DentryTarget,
+        new_target: DentryTarget,
+        expected_parent_rev: u64,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
@@ -1683,7 +1740,7 @@ pub trait FsMetaHandler: Send + Sync {
         ttl: Duration,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
-    
+
     async fn handle_renew_file_lease(
         &self,
         node_id: IndexNodeId,
@@ -1730,7 +1787,7 @@ pub trait FsMetaHandler: Send + Sync {
     ) -> Result<bool, RPCErrors>;
 
     //------下面向是业务的高阶接口(减少调用fsmeta rpc的次数)------
-    
+
     async fn handle_resolve_path_ex(
         &self,
         path: &NdmPath,
@@ -1899,27 +1956,48 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                 let result = self.0.handle_stop_list(req.list_session_id, ctx).await?;
                 RPCResult::Success(serde_json::json!(result))
             }
-            "upsert_dentry" => {
-                let req = FsMetaUpsertDentryReq::from_json(req.params)?;
+            "create_dentry" => {
+                let req = FsMetaCreateDentryReq::from_json(req.params)?;
                 let result = self
                     .0
-                    .handle_upsert_dentry(req.parent, req.name, req.target, req.txid, ctx)
+                    .handle_create_dentry(
+                        req.parent,
+                        req.name,
+                        req.target,
+                        req.expected_parent_rev,
+                        req.txid,
+                        ctx,
+                    )
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
-            "remove_dentry_row" => {
-                let req = FsMetaRemoveDentryRowReq::from_json(req.params)?;
+            "delete_dentry" => {
+                let req = FsMetaDeleteDentryReq::from_json(req.params)?;
                 let result = self
                     .0
-                    .handle_remove_dentry_row(req.parent, req.name, req.txid, ctx)
+                    .handle_delete_dentry(
+                        req.parent,
+                        req.name,
+                        req.expected_parent_rev,
+                        req.txid,
+                        ctx,
+                    )
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
-            "set_tombstone" => {
-                let req = FsMetaSetTombstoneReq::from_json(req.params)?;
+            "replace_target" => {
+                let req = FsMetaReplaceTargetReq::from_json(req.params)?;
                 let result = self
                     .0
-                    .handle_set_tombstone(req.parent, req.name, req.txid, ctx)
+                    .handle_replace_target(
+                        req.parent,
+                        req.name,
+                        req.expected_old_target,
+                        req.new_target,
+                        req.expected_parent_rev,
+                        req.txid,
+                        ctx,
+                    )
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
@@ -2338,20 +2416,31 @@ mod tests {
             Ok(())
         }
 
-        async fn handle_upsert_dentry(
+        async fn handle_create_dentry(
             &self,
             parent: IndexNodeId,
             name: String,
             target: DentryTarget,
+            expected_parent_rev: u64,
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             let mut state = self.state.lock().unwrap();
-            let old = state.dentries.get(&(parent, name.clone())).cloned();
-            let dentry_id = old.as_ref().map(|d| d.id).unwrap_or_else(|| {
-                state.next_dentry += 1;
-                state.next_dentry
-            });
+            let parent_rev = state
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?
+                .rev
+                .unwrap_or(0);
+            if parent_rev != expected_parent_rev {
+                return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+            }
+            if state.dentries.contains_key(&(parent, name.clone())) {
+                return Err(RPCErrors::ReasonError("dentry already exists".to_string()));
+            }
+
+            state.next_dentry += 1;
+            let dentry_id = state.next_dentry;
             let record = DentryRecord {
                 id: dentry_id,
                 parent,
@@ -2360,15 +2449,6 @@ mod tests {
                 mtime: None,
             };
             state.dentries.insert((parent, name), record);
-            if let Some(old_dentry) = old {
-                if let DentryTarget::IndexNodeId(old_inode_id) = old_dentry.target {
-                    if let Some(node) = state.inodes.get_mut(&old_inode_id) {
-                        if node.ref_by == Some(old_dentry.id) {
-                            node.ref_by = None;
-                        }
-                    }
-                }
-            }
             if let DentryTarget::IndexNodeId(new_inode_id) = target {
                 let node = state
                     .inodes
@@ -2383,17 +2463,31 @@ mod tests {
                 }
                 node.ref_by = Some(dentry_id);
             }
+            if let Some(parent_node) = state.inodes.get_mut(&parent) {
+                parent_node.rev = Some(parent_rev + 1);
+            }
             Ok(())
         }
 
-        async fn handle_remove_dentry_row(
+        async fn handle_delete_dentry(
             &self,
             parent: IndexNodeId,
             name: String,
+            expected_parent_rev: u64,
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             let mut state = self.state.lock().unwrap();
+            let parent_rev = state
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?
+                .rev
+                .unwrap_or(0);
+            if parent_rev != expected_parent_rev {
+                return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+            }
+
             if let Some(record) = state.dentries.remove(&(parent, name)) {
                 if let DentryTarget::IndexNodeId(inode_id) = record.target {
                     if let Some(node) = state.inodes.get_mut(&inode_id) {
@@ -2402,39 +2496,75 @@ mod tests {
                         }
                     }
                 }
+                if let Some(parent_node) = state.inodes.get_mut(&parent) {
+                    parent_node.rev = Some(parent_rev + 1);
+                }
             }
             Ok(())
         }
 
-        async fn handle_set_tombstone(
+        async fn handle_replace_target(
             &self,
             parent: IndexNodeId,
             name: String,
+            expected_old_target: DentryTarget,
+            new_target: DentryTarget,
+            expected_parent_rev: u64,
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             let mut state = self.state.lock().unwrap();
-            let old = state.dentries.get(&(parent, name.clone())).cloned();
-            let dentry_id = old.as_ref().map(|d| d.id).unwrap_or_else(|| {
-                state.next_dentry += 1;
-                state.next_dentry
-            });
-            let record = DentryRecord {
-                id: dentry_id,
-                parent,
-                name: name.clone(),
-                target: DentryTarget::Tombstone,
-                mtime: None,
-            };
-            state.dentries.insert((parent, name), record);
-            if let Some(old_dentry) = old {
-                if let DentryTarget::IndexNodeId(old_inode_id) = old_dentry.target {
-                    if let Some(node) = state.inodes.get_mut(&old_inode_id) {
-                        if node.ref_by == Some(old_dentry.id) {
-                            node.ref_by = None;
-                        }
+            let parent_rev = state
+                .inodes
+                .get(&parent)
+                .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?
+                .rev
+                .unwrap_or(0);
+            if parent_rev != expected_parent_rev {
+                return Err(RPCErrors::ReasonError("rev mismatch".to_string()));
+            }
+
+            let key = (parent, name.clone());
+            let mut record = state
+                .dentries
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| RPCErrors::ReasonError("dentry not found".to_string()))?;
+            if record.target != expected_old_target {
+                return Err(RPCErrors::ReasonError("dentry target mismatch".to_string()));
+            }
+
+            if record.target == new_target {
+                return Ok(());
+            }
+
+            let old_target = record.target.clone();
+            record.target = new_target.clone();
+            state.dentries.insert(key, record.clone());
+
+            if let DentryTarget::IndexNodeId(old_inode_id) = old_target {
+                if let Some(node) = state.inodes.get_mut(&old_inode_id) {
+                    if node.ref_by == Some(record.id) {
+                        node.ref_by = None;
                     }
                 }
+            }
+            if let DentryTarget::IndexNodeId(new_inode_id) = new_target {
+                let node = state
+                    .inodes
+                    .get_mut(&new_inode_id)
+                    .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                if let Some(existing) = node.ref_by {
+                    if existing != record.id {
+                        return Err(RPCErrors::ReasonError(
+                            "inode already referenced by another dentry".to_string(),
+                        ));
+                    }
+                }
+                node.ref_by = Some(record.id);
+            }
+            if let Some(parent_node) = state.inodes.get_mut(&parent) {
+                parent_node.rev = Some(parent_rev + 1);
             }
             Ok(())
         }
@@ -2834,7 +2964,13 @@ mod tests {
         assert_eq!(got.inode_id, 7);
 
         client
-            .upsert_dentry(7, "hello".to_string(), DentryTarget::IndexNodeId(7), None)
+            .create_dentry(
+                7,
+                "hello".to_string(),
+                DentryTarget::IndexNodeId(7),
+                0,
+                None,
+            )
             .await
             .unwrap();
         let dent = client

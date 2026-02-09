@@ -145,6 +145,65 @@ mod tests {
         }
     }
 
+    async fn parent_rev(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> u64 {
+        svc.handle_get_inode(parent, txid, ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .rev
+            .unwrap_or(0)
+    }
+
+    async fn upsert_dentry_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        target: DentryTarget,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        let rev = parent_rev(svc, parent, txid.clone(), ctx.clone()).await;
+        let existing = svc
+            .handle_get_dentry(parent, name.clone(), txid.clone(), ctx.clone())
+            .await?;
+        match existing {
+            Some(dentry) => {
+                svc.handle_replace_target(parent, name, dentry.target, target, rev, txid, ctx)
+                    .await
+            }
+            None => {
+                svc.handle_create_dentry(parent, name, target, rev, txid, ctx)
+                    .await
+            }
+        }
+    }
+
+    async fn set_tombstone_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        upsert_dentry_auto(svc, parent, name, DentryTarget::Tombstone, txid, ctx).await
+    }
+
+    async fn delete_dentry_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        let rev = parent_rev(svc, parent, txid.clone(), ctx.clone()).await;
+        svc.handle_delete_dentry(parent, name, rev, txid, ctx).await
+    }
+
     // ==================== Root Dir Tests ====================
 
     #[tokio::test]
@@ -330,7 +389,8 @@ mod tests {
             .unwrap();
 
         // Link dentry
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "subdir".to_string(),
             DentryTarget::IndexNodeId(400),
@@ -352,7 +412,11 @@ mod tests {
             _ => panic!("expected IndexNodeId target"),
         }
         assert!(dentry.id > 0);
-        let inode = svc.handle_get_inode(400, None, ctx.clone()).await.unwrap().unwrap();
+        let inode = svc
+            .handle_get_inode(400, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(inode.ref_by, Some(dentry.id));
     }
 
@@ -363,11 +427,16 @@ mod tests {
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
         let inode_a = create_dir_node(410);
-        svc.handle_set_inode(inode_a, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(inode_a, None, ctx.clone())
+            .await
+            .unwrap();
         let inode_b = create_dir_node(411);
-        svc.handle_set_inode(inode_b, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(inode_b, None, ctx.clone())
+            .await
+            .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "swap".to_string(),
             DentryTarget::IndexNodeId(410),
@@ -381,10 +450,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let inode_a = svc.handle_get_inode(410, None, ctx.clone()).await.unwrap().unwrap();
+        let inode_a = svc
+            .handle_get_inode(410, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(inode_a.ref_by, Some(first.id));
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "swap".to_string(),
             DentryTarget::IndexNodeId(411),
@@ -400,9 +474,17 @@ mod tests {
             .unwrap();
         assert_eq!(first.id, second.id);
 
-        let inode_a = svc.handle_get_inode(410, None, ctx.clone()).await.unwrap().unwrap();
+        let inode_a = svc
+            .handle_get_inode(410, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(inode_a.ref_by, None);
-        let inode_b = svc.handle_get_inode(411, None, ctx.clone()).await.unwrap().unwrap();
+        let inode_b = svc
+            .handle_get_inode(411, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(inode_b.ref_by, Some(second.id));
     }
 
@@ -413,8 +495,11 @@ mod tests {
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
         let inode = create_dir_node(412);
-        svc.handle_set_inode(inode, None, ctx.clone()).await.unwrap();
-        svc.handle_upsert_dentry(
+        svc.handle_set_inode(inode, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
             root,
             "to_remove_ref".to_string(),
             DentryTarget::IndexNodeId(412),
@@ -423,13 +508,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let linked = svc.handle_get_inode(412, None, ctx.clone()).await.unwrap().unwrap();
+        let linked = svc
+            .handle_get_inode(412, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(linked.ref_by.is_some());
 
-        svc.handle_remove_dentry_row(root, "to_remove_ref".to_string(), None, ctx.clone())
+        delete_dentry_auto(&svc, root, "to_remove_ref".to_string(), None, ctx.clone())
             .await
             .unwrap();
-        let unlinked = svc.handle_get_inode(412, None, ctx.clone()).await.unwrap().unwrap();
+        let unlinked = svc
+            .handle_get_inode(412, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(unlinked.ref_by, None);
     }
 
@@ -443,7 +536,8 @@ mod tests {
         svc.handle_set_inode(target, None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "target_file".to_string(),
             DentryTarget::IndexNodeId(401),
@@ -493,7 +587,8 @@ mod tests {
         svc.handle_set_inode(target, None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "target_file_2".to_string(),
             DentryTarget::IndexNodeId(402),
@@ -594,7 +689,8 @@ mod tests {
             .unwrap();
         svc.handle_set_inode(file, None, ctx.clone()).await.unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::IndexNodeId(620),
@@ -603,7 +699,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             620,
             "x".to_string(),
             DentryTarget::IndexNodeId(621),
@@ -612,7 +709,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             620,
             "y".to_string(),
             DentryTarget::IndexNodeId(622),
@@ -621,7 +719,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             622,
             "file".to_string(),
             DentryTarget::IndexNodeId(623),
@@ -683,7 +782,8 @@ mod tests {
             svc.handle_set_inode(child.clone(), None, ctx.clone())
                 .await
                 .unwrap();
-            svc.handle_upsert_dentry(
+            upsert_dentry_auto(
+                &svc,
                 root,
                 format!("child_{}", i),
                 DentryTarget::IndexNodeId(500 + i),
@@ -709,7 +809,8 @@ mod tests {
             svc.handle_set_inode(child.clone(), None, ctx.clone())
                 .await
                 .unwrap();
-            svc.handle_upsert_dentry(
+            upsert_dentry_auto(
+                &svc,
                 root,
                 format!("entry_{}", i),
                 DentryTarget::IndexNodeId(550 + i),
@@ -797,7 +898,8 @@ mod tests {
         svc.handle_set_inode(overlay_inode, None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::IndexNodeId(900),
@@ -811,10 +913,11 @@ mod tests {
         svc.handle_set_inode(upper_child, None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_set_tombstone(900, "base_dir".to_string(), None, ctx.clone())
+        set_tombstone_auto(&svc, 900, "base_dir".to_string(), None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             900,
             "upper_dir".to_string(),
             DentryTarget::IndexNodeId(901),
@@ -825,7 +928,10 @@ mod tests {
         .unwrap();
 
         let list_id = svc.handle_start_list(900, None, ctx.clone()).await.unwrap();
-        let entries = svc.handle_list_next(list_id, 100, ctx.clone()).await.unwrap();
+        let entries = svc
+            .handle_list_next(list_id, 100, ctx.clone())
+            .await
+            .unwrap();
         svc.handle_stop_list(list_id, ctx).await.unwrap();
 
         assert!(entries.contains_key("base_file"));
@@ -842,7 +948,8 @@ mod tests {
             .await
             .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "to_remove".to_string(),
             DentryTarget::IndexNodeId(600),
@@ -852,7 +959,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_remove_dentry_row(root, "to_remove".to_string(), None, ctx.clone())
+        delete_dentry_auto(&svc, root, "to_remove".to_string(), None, ctx.clone())
             .await
             .unwrap();
 
@@ -869,7 +976,7 @@ mod tests {
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
-        svc.handle_set_tombstone(root, "deleted".to_string(), None, ctx.clone())
+        set_tombstone_auto(&svc, root, "deleted".to_string(), None, ctx.clone())
             .await
             .unwrap();
 
@@ -933,7 +1040,8 @@ mod tests {
         assert_eq!(root_node0.rev, Some(0));
 
         // Insert dentry => rev +1
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "rev_case".to_string(),
             DentryTarget::IndexNodeId(990),
@@ -950,7 +1058,8 @@ mod tests {
         assert_eq!(root_node1.rev, Some(1));
 
         // Same upsert (no effective change) => rev unchanged
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "rev_case".to_string(),
             DentryTarget::IndexNodeId(990),
@@ -967,7 +1076,7 @@ mod tests {
         assert_eq!(root_node2.rev, Some(1));
 
         // Target change to tombstone => rev +1
-        svc.handle_set_tombstone(root, "rev_case".to_string(), None, ctx.clone())
+        set_tombstone_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
             .await
             .unwrap();
         let root_node3 = svc
@@ -978,7 +1087,7 @@ mod tests {
         assert_eq!(root_node3.rev, Some(2));
 
         // Same tombstone again (no effective change) => rev unchanged
-        svc.handle_set_tombstone(root, "rev_case".to_string(), None, ctx.clone())
+        set_tombstone_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
             .await
             .unwrap();
         let root_node4 = svc
@@ -989,7 +1098,7 @@ mod tests {
         assert_eq!(root_node4.rev, Some(2));
 
         // Delete existing dentry row => rev +1
-        svc.handle_remove_dentry_row(root, "rev_case".to_string(), None, ctx.clone())
+        delete_dentry_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
             .await
             .unwrap();
         let root_node5 = svc
@@ -1000,7 +1109,7 @@ mod tests {
         assert_eq!(root_node5.rev, Some(3));
 
         // Delete non-existing dentry row => rev unchanged
-        svc.handle_remove_dentry_row(root, "rev_case".to_string(), None, ctx.clone())
+        delete_dentry_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
             .await
             .unwrap();
         let root_node6 = svc
@@ -1009,6 +1118,70 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(root_node6.rev, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_create_dentry_requires_expected_parent_rev() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(991);
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let err = svc
+            .handle_create_dentry(
+                root,
+                "rev_lock".to_string(),
+                DentryTarget::IndexNodeId(991),
+                9_999,
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rev mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_replace_target_requires_expected_old_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let a = create_dir_node(992);
+        let b = create_dir_node(993);
+        svc.handle_set_inode(a, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(b, None, ctx.clone()).await.unwrap();
+
+        let rev0 = parent_rev(&svc, root, None, ctx.clone()).await;
+        svc.handle_create_dentry(
+            root,
+            "cas_target".to_string(),
+            DentryTarget::IndexNodeId(992),
+            rev0,
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev1 = parent_rev(&svc, root, None, ctx.clone()).await;
+        let err = svc
+            .handle_replace_target(
+                root,
+                "cas_target".to_string(),
+                DentryTarget::Tombstone,
+                DentryTarget::IndexNodeId(993),
+                rev1,
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dentry target mismatch"));
     }
 
     // ==================== Transaction Tests ====================
@@ -1667,7 +1840,8 @@ mod tests {
 
         let obj_id = create_obj_id(50);
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "linked_file".to_string(),
             DentryTarget::ObjId(obj_id.clone()),
@@ -1744,7 +1918,8 @@ mod tests {
             .await
             .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::IndexNodeId(a.inode_id),
@@ -1753,7 +1928,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             a.inode_id,
             "b".to_string(),
             DentryTarget::IndexNodeId(b1.inode_id),
@@ -1762,7 +1938,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             b1.inode_id,
             "c".to_string(),
             DentryTarget::IndexNodeId(c.inode_id),
@@ -1788,7 +1965,8 @@ mod tests {
         svc.handle_set_inode(b2.clone(), None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             a.inode_id,
             "b".to_string(),
             DentryTarget::IndexNodeId(b2.inode_id),
@@ -1825,7 +2003,8 @@ mod tests {
             .await
             .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::IndexNodeId(a.inode_id),
@@ -1834,7 +2013,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             a.inode_id,
             "b".to_string(),
             DentryTarget::IndexNodeId(b1.inode_id),
@@ -1843,7 +2023,8 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             b1.inode_id,
             "c".to_string(),
             DentryTarget::IndexNodeId(c.inode_id),
@@ -1870,7 +2051,8 @@ mod tests {
         svc.handle_set_inode(b2.clone(), Some(txid.clone()), ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             a.inode_id,
             "b".to_string(),
             DentryTarget::IndexNodeId(b2.inode_id),
@@ -1922,7 +2104,8 @@ mod tests {
             .await
             .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id.clone()),
@@ -2062,7 +2245,8 @@ mod tests {
         svc.handle_set_inode(overlay_inode, None, ctx.clone())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::IndexNodeId(910),
@@ -2109,7 +2293,8 @@ mod tests {
             .await
             .unwrap();
 
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id),
@@ -2194,7 +2379,8 @@ mod tests {
             .put_object(&a_obj_id, a_obj_str.as_str())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id),
@@ -2231,7 +2417,8 @@ mod tests {
             .put_object(&a_obj_id, a_obj_str.as_str())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id),
@@ -2258,7 +2445,8 @@ mod tests {
 
         let dir_obj = DirObject::new(Some("a".to_string()));
         let (dir_obj_id, _) = dir_obj.gen_obj_id().unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(dir_obj_id),
@@ -2305,7 +2493,8 @@ mod tests {
             .put_object(&a_obj_id, a_obj_str.as_str())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id),
@@ -2352,7 +2541,8 @@ mod tests {
             .put_object(&a_obj_id, a_obj_str.as_str())
             .await
             .unwrap();
-        svc.handle_upsert_dentry(
+        upsert_dentry_auto(
+            &svc,
             root,
             "a".to_string(),
             DentryTarget::ObjId(a_obj_id),
@@ -2400,8 +2590,11 @@ mod tests {
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
         let child = create_dir_node(920);
-        svc.handle_set_inode(child, None, ctx.clone()).await.unwrap();
-        svc.handle_upsert_dentry(
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
             root,
             "left".to_string(),
             DentryTarget::IndexNodeId(920),
@@ -2411,16 +2604,16 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_upsert_dentry(
-                root,
-                "right".to_string(),
-                DentryTarget::IndexNodeId(920),
-                None,
-                ctx,
-            )
-            .await
-            .unwrap_err();
+        let err = upsert_dentry_auto(
+            &svc,
+            root,
+            "right".to_string(),
+            DentryTarget::IndexNodeId(920),
+            None,
+            ctx,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("UNIQUE"));
     }
 }
