@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 log = { workspace = true }
 tokio = { workspace = true }
+buckyos-kit = {workspace = true}
 fuser = "0.14"
 libc = "0.2"
 env_logger = "0.11"

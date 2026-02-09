@@ -61,7 +61,7 @@ fn parse_args() -> Result<FsDaemonRunOptions, String> {
 }
 
 fn main() {
-    env_logger::init();
+    buckyos_kit::init_logging("cyfs", true);
     let options = match parse_args() {
         Ok(v) => v,
         Err(msg) => {
