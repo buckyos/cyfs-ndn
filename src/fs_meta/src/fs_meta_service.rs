@@ -268,7 +268,7 @@ pub struct FSMetaService {
     /// Instance identifier for lease session naming (required for high-level file operations)
     instance: Option<NdmInstanceId>,
     /// File buffer service for managing write buffers (required for high-level file operations)
-    buffer: Option<Arc<dyn FileBufferService>>,
+    fb_service: Option<Arc<dyn FileBufferService>>,
     /// Named store manager for resolving base DirObject children
     store_mgr: Option<Arc<NamedStoreMgr>>,
     /// Background task manager for deferred operations (finalize/lazy migration)
@@ -316,7 +316,7 @@ impl FSMetaService {
             resolve_path_cache: Arc::new(RwLock::new(PathResolveCache::default())),
             list_cache: Arc::new(Mutex::new(ListCache::default())),
             instance: None,
-            buffer: None,
+            fb_service: None,
             store_mgr: None,
             background_mgr: Arc::new(Mutex::new(BackgroundMgr::default())),
         })
@@ -329,7 +329,7 @@ impl FSMetaService {
         buffer: Arc<dyn FileBufferService>,
     ) -> Self {
         self.instance = Some(instance);
-        self.buffer = Some(buffer);
+        self.fb_service = Some(buffer);
         self
     }
 
@@ -4150,7 +4150,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             parent_id, name, flag, expected_size
         );
         let buffer = self
-            .buffer
+            .fb_service
             .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("buffer service not configured".to_string()))?;
         let instance = self
@@ -4550,7 +4550,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let buffer = self
-            .buffer
+            .fb_service
             .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("buffer service not configured".to_string()))?;
 

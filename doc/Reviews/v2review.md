@@ -30,28 +30,10 @@
 * **B. 操作扫描/遍历大（会造成 p99/p999 抖动）**
 * **C. 跨服务组合步骤多（失败回滚复杂、容易留下中间态）**
 
-### 1.1 目录 list 被用于写前去重：**高风险长事务（B）**
 
-你明确写了：
+### 1.2 ensure_path（mkdir -p 语义）：**典型逻辑长事务（C + A）** 
 
-这在“build 大量创建小文件”的场景会非常致命：
-
-* 热目录（比如 `bazel-out/`、`target/`）会出现**高并发 create**
-* 如果每次 create 都先 list 全目录做去重，目录越大越慢，冲突越多越慢
-* 最终会把“目录写”变成 **O(N)** 的扫描，尾延迟爆炸
-
-**建议（强烈）：去重不要依赖 list，全靠 DB 唯一约束 + 条件写入。**
-
-* 给 `dentries(parent, name)` 加 **唯一索引**
-* create 走：
-
-  * `INSERT ...`（冲突则失败或 do nothing）
-  * 或 `INSERT ... ON CONFLICT DO NOTHING RETURNING ...`
-* 冲突处理走“读回/返回 AlreadyExists”，完全不需要 list
-
-> 这样你目录写冲突的控制点就从“全量 list + 客户端判断”转成“DB 原子保证唯一性”，性能和正确性都更强。
-
-### 1.2 ensure_path（mkdir -p 语义）：**典型逻辑长事务（C + A）**
+OK 已经迁移到客户端
 
 `ensure_path(path)` 的内核困难在于：
 
