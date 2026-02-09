@@ -106,6 +106,24 @@ struct TxnEntry {
     touched_edges: Arc<Mutex<HashSet<(IndexNodeId, String)>>>,
 }
 
+/// Tracks one in-flight transaction operation and decrements counter on drop.
+struct InFlightGuard {
+    counter: Arc<AtomicU64>,
+}
+
+impl InFlightGuard {
+    fn enter(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// A transaction guard that automatically rolls back if not committed.
 ///
 /// When dropped without calling `commit()`, the transaction is automatically
@@ -736,9 +754,6 @@ impl FSMetaService {
         if let Some(txid) = txid {
             let entry = self.get_txn_entry(txid)?;
 
-            // Increment in-flight counter
-            entry.in_flight.fetch_add(1, Ordering::SeqCst);
-
             // Update last_used_at
             if let Ok(mut last_used) = entry.last_used_at.lock() {
                 *last_used = Instant::now();
@@ -748,14 +763,11 @@ impl FSMetaService {
             let in_flight = entry.in_flight.clone();
 
             let result = tokio::task::spawn_blocking(move || {
+                let _in_flight = InFlightGuard::enter(in_flight);
                 let conn_guard = conn
                     .lock()
                     .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
-                let result = f(&conn_guard);
-                drop(conn_guard);
-                // Decrement in-flight counter
-                in_flight.fetch_sub(1, Ordering::SeqCst);
-                result
+                f(&conn_guard)
             })
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("db task join failed: {}", e)))?;
