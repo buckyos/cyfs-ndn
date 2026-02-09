@@ -1457,7 +1457,7 @@ impl FSMetaService {
         Ok(new_id)
     }
 
-    async fn lookup_base_child(
+    async fn lookup_base_dirobj_child(
         &self,
         dir_node: &NodeRecord,
         name: &str,
@@ -1477,32 +1477,16 @@ impl FSMetaService {
                 "named store manager not configured for DirObject traversal".to_string(),
             )
         })?;
-
-        let base_obj_str = store_mgr
-            .get_object(base_obj_id)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
-        let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
-            RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e))
-        })?;
-
-        let Some(item) = base_dir.get(name) else {
-            return Ok(BaseChildLookup::Missing);
+        let child_obj_id = match store_mgr.get_dir_child(base_obj_id, name).await {
+            Ok(obj_id) => obj_id,
+            Err(NdnError::NotFound(_)) => return Ok(BaseChildLookup::Missing),
+            Err(e) => {
+                return Err(RPCErrors::ReasonError(format!(
+                    "failed to lookup base DirObject child: {}",
+                    e
+                )))
+            }
         };
-
-        let (child_obj_id, child_obj_str) = item
-            .get_obj_id()
-            .map_err(|e| RPCErrors::ReasonError(format!("invalid base child entry: {}", e)))?;
-
-        // Persist embedded object forms (Object/ObjectJwt) so later lookups by obj_id can reuse store APIs.
-        if !child_obj_str.is_empty() {
-            store_mgr
-                .put_object(&child_obj_id, child_obj_str.as_str())
-                .await
-                .map_err(|e| {
-                    RPCErrors::ReasonError(format!("failed to cache embedded child object: {}", e))
-                })?;
-        }
 
         if child_obj_id.obj_type == OBJ_TYPE_DIR {
             Ok(BaseChildLookup::DirObj(child_obj_id))
@@ -1635,7 +1619,7 @@ impl FSMetaService {
             None => {}
         }
 
-        match self.lookup_base_child(parent_node, name).await? {
+        match self.lookup_base_dirobj_child(parent_node, name).await? {
             BaseChildLookup::Missing => Ok(()),
             BaseChildLookup::DirObj(_) | BaseChildLookup::NonDirObj(_) => Err(
                 RPCErrors::ReasonError(format!("path {} already exists", path_desc)),
@@ -1816,7 +1800,7 @@ impl FSMetaService {
                         )));
                     }
 
-                    match self.lookup_base_child(&parent_node, component).await? {
+                    match self.lookup_base_dirobj_child(&parent_node, component).await? {
                         BaseChildLookup::DirObj(child_dir_obj) => {
                             self.materialize_dir_from_obj(
                                 current_id,
@@ -2334,7 +2318,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                         }
 
                         match self
-                            .lookup_base_child(&parent_node, &name)
+                            .lookup_base_dirobj_child(&parent_node, &name)
                             .await
                             .map_err(|e| {
                                 NdnError::Internal(format!("failed to lookup base child: {}", e))
@@ -3901,7 +3885,7 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         let mut visible_base_obj: Option<ObjId> = None;
         if dentry.is_none() {
-            match self.lookup_base_child(&parent_node, &name).await {
+            match self.lookup_base_dirobj_child(&parent_node, &name).await {
                 Ok(BaseChildLookup::Missing) => {}
                 Ok(BaseChildLookup::DirObj(_)) => {
                     return Err(RPCErrors::ReasonError("path is a directory".to_string()));

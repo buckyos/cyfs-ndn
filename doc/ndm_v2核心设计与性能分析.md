@@ -172,6 +172,7 @@ FileBuffer Service提供可靠的系统写入/读取缓存，配合客户端逻�
 }
 
 ##### FileBuffer Service的接口
+
 - alloc(inode_id,filesize,base_chunk_list,token),//申请filebuffer 通常由fsmeta调用
 - get_filebuffer(inode_id) -> filebuffer_handle 
 - open_writer(filebuffer_handle,token)
@@ -181,10 +182,12 @@ FileBuffer Service提供可靠的系统写入/读取缓存，配合客户端逻�
 - clone_filebuffer(src_handle,dest_filenode_id)
 
 #### 运维接口，通常内部调用
+
 - cacl_name(inode_id)
 - finalize(inode_id) 
 
 #### 高阶业务接口
+
 原理上高阶业务接口，通过上述基础接口+事务都能在客户端实现。
 高阶业务接口的目
 - 减少RPC的次数+本地事务，提高整体性能。

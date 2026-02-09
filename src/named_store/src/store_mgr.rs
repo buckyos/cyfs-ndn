@@ -336,6 +336,31 @@ impl NamedStoreMgr {
         }
     }
 
+    /// Resolve one child from a DirObject by name.
+    ///
+    /// For embedded child objects (Object/ObjectJwt), this method persists the
+    /// generated object data into store so later lookups by `obj_id` can use
+    /// regular `get_object` APIs.
+    pub async fn get_dir_child(&self, dir_obj_id: &ObjId, item_name: &str) -> NdnResult<ObjId> {
+        if !dir_obj_id.is_dir_object() {
+            return Err(NdnError::InvalidObjType("must be dirobject".to_string()));
+        }
+
+        let dir_obj_str = self.get_object(dir_obj_id).await?;
+        let dir_obj: DirObject = load_named_obj(dir_obj_str.as_str())?;
+        let item = dir_obj.get(item_name).ok_or_else(|| {
+            NdnError::NotFound(format!(
+                "child {} not found in dir {}",
+                item_name, dir_obj_id
+            ))
+        })?;
+        let (obj_id, obj_str) = item.get_obj_id()?;
+        if !obj_str.is_empty() {
+            self.put_object(&obj_id, obj_str.as_str()).await?;
+        }
+        Ok(obj_id)
+    }
+
     /// Select primary store for a new object (uses current layout)
     pub async fn select_store_for_write(
         &self,
