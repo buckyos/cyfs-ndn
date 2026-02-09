@@ -521,27 +521,30 @@ impl FSMetaService {
                 linked_at INTEGER,
                 finalized_obj_id BLOB,
                 finalized_at INTEGER,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                ref_by INTEGER
             );
 
             CREATE INDEX IF NOT EXISTS idx_nodes_cooling ON nodes(state, closed_at);
             CREATE INDEX IF NOT EXISTS idx_nodes_linked ON nodes(state, linked_at);
+            CREATE INDEX IF NOT EXISTS idx_nodes_ref_by ON nodes(ref_by);
 
             CREATE TABLE IF NOT EXISTS dentries (
+                dentry_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 parent_inode_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
                 target_type INTEGER NOT NULL,
                 target_inode_id INTEGER,
                 target_obj_id BLOB,
                 mtime INTEGER,
-                PRIMARY KEY (parent_inode_id, name),
+                UNIQUE (parent_inode_id, name),
                 CHECK (
                     (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
                     (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
                     (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
                     (target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL)
                 )
-            ) WITHOUT ROWID;
+            );
 
             CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
             CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
@@ -564,6 +567,25 @@ impl FSMetaService {
     }
 
     fn migrate_schema(conn: &Connection) -> Result<(), RPCErrors> {
+        let has_nodes_ref_by = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('nodes') WHERE name = 'ref_by' LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_db_err)?
+            .is_some();
+        if !has_nodes_ref_by {
+            conn.execute("ALTER TABLE nodes ADD COLUMN ref_by INTEGER", [])
+                .map_err(map_db_err)?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_ref_by ON nodes(ref_by)",
+            [],
+        )
+        .map_err(map_db_err)?;
+
         let dentry_ddl = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dentries'",
@@ -577,56 +599,72 @@ impl FSMetaService {
             return Ok(());
         };
 
-        if ddl.contains("target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL")
-        {
-            return Ok(());
+        let has_dentry_id = ddl.contains("dentry_id INTEGER PRIMARY KEY");
+        let has_symlink_constraint =
+            ddl.contains("target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL");
+        if !has_dentry_id || !has_symlink_constraint {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE dentries RENAME TO dentries_old;
+                 CREATE TABLE dentries (
+                    dentry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_inode_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    target_type INTEGER NOT NULL,
+                    target_inode_id INTEGER,
+                    target_obj_id BLOB,
+                    mtime INTEGER,
+                    UNIQUE (parent_inode_id, name),
+                    CHECK (
+                        (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
+                        (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
+                        (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
+                        (target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL)
+                    )
+                 );
+                 INSERT INTO dentries(parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
+                    SELECT
+                        parent_inode_id,
+                        name,
+                        target_type,
+                        CASE
+                            WHEN target_type = 3 THEN NULL
+                            ELSE target_inode_id
+                        END AS target_inode_id,
+                        CASE
+                            WHEN target_type = 3 AND target_obj_id IS NULL AND target_inode_id IS NOT NULL
+                                THEN CAST(printf('legacy-inode:%lld', target_inode_id) AS BLOB)
+                            WHEN target_type = 3
+                                THEN target_obj_id
+                            ELSE target_obj_id
+                        END AS target_obj_id,
+                        mtime
+                    FROM dentries_old;
+                 DROP TABLE dentries_old;
+                 CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
+                 CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
+                 CREATE UNIQUE INDEX IF NOT EXISTS uniq_inode_target
+                    ON dentries(target_inode_id)
+                    WHERE target_type = 0;
+                 COMMIT;",
+            )
+            .map_err(|e| RPCErrors::ReasonError(format!("migrate schema failed: {}", e)))?;
         }
 
-        conn.execute_batch(
-            "BEGIN IMMEDIATE;
-             ALTER TABLE dentries RENAME TO dentries_old;
-             CREATE TABLE dentries (
-                parent_inode_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                target_type INTEGER NOT NULL,
-                target_inode_id INTEGER,
-                target_obj_id BLOB,
-                mtime INTEGER,
-                PRIMARY KEY (parent_inode_id, name),
-                CHECK (
-                    (target_type = 0 AND target_inode_id IS NOT NULL AND target_obj_id IS NULL) OR
-                    (target_type = 1 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL) OR
-                    (target_type = 2 AND target_inode_id IS NULL AND target_obj_id IS NULL) OR
-                    (target_type = 3 AND target_inode_id IS NULL AND target_obj_id IS NOT NULL)
-                )
-             ) WITHOUT ROWID;
-             INSERT INTO dentries(parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
-                SELECT
-                    parent_inode_id,
-                    name,
-                    target_type,
-                    CASE
-                        WHEN target_type = 3 THEN NULL
-                        ELSE target_inode_id
-                    END AS target_inode_id,
-                    CASE
-                        WHEN target_type = 3 AND target_obj_id IS NULL AND target_inode_id IS NOT NULL
-                            THEN CAST(printf('legacy-inode:%lld', target_inode_id) AS BLOB)
-                        WHEN target_type = 3
-                            THEN target_obj_id
-                        ELSE target_obj_id
-                    END AS target_obj_id,
-                    mtime
-                FROM dentries_old;
-             DROP TABLE dentries_old;
-             CREATE INDEX IF NOT EXISTS idx_dentries_target_inode ON dentries(target_inode_id);
-             CREATE INDEX IF NOT EXISTS idx_dentries_target_obj ON dentries(target_obj_id);
-             CREATE UNIQUE INDEX IF NOT EXISTS uniq_inode_target
-                ON dentries(target_inode_id)
-                WHERE target_type = 0;
-             COMMIT;",
+        conn.execute("UPDATE nodes SET ref_by = NULL", [])
+            .map_err(map_db_err)?;
+        conn.execute(
+            "UPDATE nodes
+             SET ref_by = (
+                SELECT dentry_id
+                FROM dentries d
+                WHERE d.target_type = ?1
+                  AND d.target_inode_id = nodes.inode_id
+                LIMIT 1
+             )",
+            params![DENTRY_TARGET_INODE],
         )
-        .map_err(|e| RPCErrors::ReasonError(format!("migrate schema failed: {}", e)))?;
+        .map_err(map_db_err)?;
 
         Ok(())
     }
@@ -651,8 +689,8 @@ impl FSMetaService {
                 lease_client_session, lease_seq, lease_expire_at,
                 fb_handle, last_write_at, closed_at,
                 linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
-                finalized_obj_id, finalized_at, updated_at
-            ) VALUES (?1, 0, NULL, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?4)",
+                finalized_obj_id, finalized_at, updated_at, ref_by
+            ) VALUES (?1, 0, NULL, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?4, NULL)",
             params![
                 1i64,
                 NODE_STATE_DIR_NORMAL,
@@ -848,6 +886,7 @@ impl FSMetaService {
         let lease_client_session: Option<String> = row.get(6).map_err(map_db_err)?;
         let lease_seq: Option<i64> = row.get(7).map_err(map_db_err)?;
         let lease_expire_at: Option<i64> = row.get(8).map_err(map_db_err)?;
+        let ref_by: Option<i64> = row.get(18).map_err(map_db_err)?;
 
         let state = Self::parse_node_state(row)?;
         let base_obj_id = match base_obj_id {
@@ -864,6 +903,7 @@ impl FSMetaService {
 
         Ok(NodeRecord {
             inode_id: inode_id as IndexNodeId,
+            ref_by: ref_by.map(|v| v as u64),
             read_only: read_only != 0,
             base_obj_id,
             state,
@@ -931,6 +971,7 @@ impl FSMetaService {
 
         let new_node = NodeRecord {
             inode_id: 0,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -1301,6 +1342,7 @@ impl FSMetaService {
         // Create new directory inode with base_obj_id pointing to the DirObject
         let new_node = NodeRecord {
             inode_id: 0,
+            ref_by: None,
             read_only: false,
             base_obj_id: Some(dir_obj_id.clone()),
             state: NodeState::DirOverlay, // Overlay mode: upper layer changes on top of base DirObject
@@ -1375,6 +1417,7 @@ impl FSMetaService {
 
         let node = NodeRecord {
             inode_id: 0,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -1521,6 +1564,7 @@ impl FSMetaService {
             merged.insert(
                 name.clone(),
                 DentryRecord {
+                    id: 0,
                     parent,
                     name,
                     target: DentryTarget::ObjId(obj_id),
@@ -2337,7 +2381,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                             lease_client_session, lease_seq, lease_expire_at,
                             fb_handle, last_write_at, closed_at,
                             linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
-                            finalized_obj_id, finalized_at
+                            finalized_obj_id, finalized_at, ref_by
                      FROM nodes WHERE inode_id = ?1",
                 )
                 .map_err(map_db_err)?;
@@ -2372,8 +2416,8 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_client_session, lease_seq, lease_expire_at,
                     fb_handle, last_write_at, closed_at,
                     linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
-                    finalized_obj_id, finalized_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                    finalized_obj_id, finalized_at, updated_at, ref_by
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 ON CONFLICT(inode_id) DO UPDATE SET
                     read_only = excluded.read_only,
                     base_obj_id = excluded.base_obj_id,
@@ -2392,7 +2436,8 @@ impl ndm::FsMetaHandler for FSMetaService {
                     linked_at = excluded.linked_at,
                     finalized_obj_id = excluded.finalized_obj_id,
                     finalized_at = excluded.finalized_at,
-                    updated_at = excluded.updated_at",
+                    updated_at = excluded.updated_at,
+                    ref_by = excluded.ref_by",
                 params![
                     node.inode_id as i64,
                     if node.read_only { 1i64 } else { 0i64 },
@@ -2413,6 +2458,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     cols.finalized_obj_id,
                     cols.finalized_at.map(|v| v as i64),
                     now,
+                    node.ref_by.map(|v| v as i64),
                 ],
             )
             .map_err(map_db_err)?;
@@ -2526,8 +2572,8 @@ impl ndm::FsMetaHandler for FSMetaService {
                         lease_client_session, lease_seq, lease_expire_at,
                         fb_handle, last_write_at, closed_at,
                         linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
-                        finalized_obj_id, finalized_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                        finalized_obj_id, finalized_at, updated_at, ref_by
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                     params![
                         if node.read_only { 1i64 } else { 0i64 },
                         node.base_obj_id.as_ref().map(obj_id_to_blob),
@@ -2547,6 +2593,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                         cols.finalized_obj_id,
                         cols.finalized_at.map(|v| v as i64),
                         now,
+                        node.ref_by.map(|v| v as i64),
                     ],
                 )
                 .map_err(map_db_err)?;
@@ -2559,8 +2606,8 @@ impl ndm::FsMetaHandler for FSMetaService {
                         lease_client_session, lease_seq, lease_expire_at,
                         fb_handle, last_write_at, closed_at,
                         linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
-                        finalized_obj_id, finalized_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                        finalized_obj_id, finalized_at, updated_at, ref_by
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
                     params![
                         node.inode_id as i64,
                         if node.read_only { 1i64 } else { 0i64 },
@@ -2581,6 +2628,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                         cols.finalized_obj_id,
                         cols.finalized_at.map(|v| v as i64),
                         now,
+                        node.ref_by.map(|v| v as i64),
                     ],
                 )
                 .map_err(map_db_err)?;
@@ -2600,7 +2648,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(txid.as_deref(), move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                    "SELECT dentry_id, parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
                      FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
                 )
                 .map_err(map_db_err)?;
@@ -2622,7 +2670,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(txid.as_deref(), move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
+                    "SELECT dentry_id, parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime
                      FROM dentries WHERE parent_inode_id = ?1",
                 )
                 .map_err(map_db_err)?;
@@ -2708,42 +2756,145 @@ impl ndm::FsMetaHandler for FSMetaService {
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
         let changed = self.with_conn(txid.as_deref(), move |conn| {
-            let now = unix_timestamp() as i64;
-            let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
-            let updated = conn
-                .execute(
-                "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(parent_inode_id, name) DO UPDATE SET
-                    target_type = excluded.target_type,
-                    target_inode_id = excluded.target_inode_id,
-                    target_obj_id = excluded.target_obj_id,
-                    mtime = excluded.mtime
-                 WHERE
-                    dentries.target_type IS NOT excluded.target_type OR
-                    dentries.target_inode_id IS NOT excluded.target_inode_id OR
-                    dentries.target_obj_id IS NOT excluded.target_obj_id",
-                params![
-                    parent as i64,
-                    name,
-                    target_type,
-                    target_inode_id,
-                    target_obj_id,
-                    now,
-                ],
-            )
-            .map_err(map_db_err)?;
-            if updated > 0 {
-                // Any effective child-item change bumps parent directory rev.
-                conn.execute(
-                    "UPDATE nodes
-                     SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
-                     WHERE inode_id = ?1",
-                    params![parent as i64, now],
-                )
+            conn.execute_batch("SAVEPOINT fsmeta_upsert_dentry")
                 .map_err(map_db_err)?;
+            let result = (|| -> Result<bool, RPCErrors> {
+                let now = unix_timestamp() as i64;
+                let (target_type, target_inode_id, target_obj_id) = dentry_target_cols(&target)?;
+                let old = conn
+                    .query_row(
+                        "SELECT dentry_id, target_type, target_inode_id, target_obj_id
+                         FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                        params![parent as i64, &name],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<i64>>(2)?,
+                                row.get::<_, Option<Vec<u8>>>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(map_db_err)?;
+
+                let changed =
+                    old.as_ref().map_or(true, |(_, old_type, old_inode_id, old_obj_id)| {
+                        *old_type != target_type
+                            || *old_inode_id != target_inode_id
+                            || *old_obj_id != target_obj_id
+                    });
+
+                let dentry_id = if let Some((existing_id, _, _, _)) = old.as_ref() {
+                    conn.execute(
+                        "UPDATE dentries
+                         SET target_type = ?2,
+                             target_inode_id = ?3,
+                             target_obj_id = ?4,
+                             mtime = ?5
+                         WHERE dentry_id = ?1",
+                        params![
+                            *existing_id,
+                            target_type,
+                            target_inode_id,
+                            target_obj_id,
+                            now,
+                        ],
+                    )
+                    .map_err(map_db_err)?;
+                    *existing_id as u64
+                } else {
+                    conn.execute(
+                        "INSERT INTO dentries (parent_inode_id, name, target_type, target_inode_id, target_obj_id, mtime)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            parent as i64,
+                            name,
+                            target_type,
+                            target_inode_id,
+                            target_obj_id,
+                            now,
+                        ],
+                    )
+                    .map_err(map_db_err)?;
+                    conn.last_insert_rowid() as u64
+                };
+
+                if let Some((_, old_target_type, old_target_inode_id, _)) = old.as_ref() {
+                    if *old_target_type == DENTRY_TARGET_INODE
+                        && *old_target_inode_id != target_inode_id
+                    {
+                        if let Some(old_inode_id) = old_target_inode_id {
+                            conn.execute(
+                                "UPDATE nodes
+                                 SET ref_by = NULL, updated_at = ?2
+                                 WHERE inode_id = ?1 AND ref_by = ?3",
+                                params![*old_inode_id, now, dentry_id as i64],
+                            )
+                            .map_err(map_db_err)?;
+                        }
+                    }
+                }
+
+                if let Some(new_inode_id) = target_inode_id {
+                    let updated = conn
+                        .execute(
+                            "UPDATE nodes
+                             SET ref_by = ?2, updated_at = ?3
+                             WHERE inode_id = ?1 AND (ref_by IS NULL OR ref_by = ?2)",
+                            params![new_inode_id, dentry_id as i64, now],
+                        )
+                        .map_err(map_db_err)?;
+                    if updated == 0 {
+                        let existing_ref = conn
+                            .query_row(
+                                "SELECT ref_by FROM nodes WHERE inode_id = ?1",
+                                params![new_inode_id],
+                                |row| row.get::<_, Option<i64>>(0),
+                            )
+                            .optional()
+                            .map_err(map_db_err)?;
+                        match existing_ref {
+                            None => {
+                                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                            }
+                            Some(Some(ref_by)) if ref_by != dentry_id as i64 => {
+                                return Err(RPCErrors::ReasonError(
+                                    "inode already referenced by another dentry".to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                if changed {
+                    // Any effective child-item change bumps parent directory rev.
+                    conn.execute(
+                        "UPDATE nodes
+                         SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                         WHERE inode_id = ?1",
+                        params![parent as i64, now],
+                    )
+                    .map_err(map_db_err)?;
+                }
+                Ok(changed)
+            })();
+
+            match result {
+                Ok(changed) => {
+                    conn.execute_batch("RELEASE SAVEPOINT fsmeta_upsert_dentry")
+                        .map_err(map_db_err)?;
+                    Ok(changed)
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT fsmeta_upsert_dentry;
+                         RELEASE SAVEPOINT fsmeta_upsert_dentry;",
+                    );
+                    Err(e)
+                }
             }
-            Ok(updated > 0)
         })
         .await?;
 
@@ -2775,24 +2926,70 @@ impl ndm::FsMetaHandler for FSMetaService {
         let name_for_invalidate = name.clone();
         let changed = self
             .with_conn(txid.as_deref(), move |conn| {
-                let now = unix_timestamp() as i64;
-                let removed = conn
-                    .execute(
-                        "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
-                        params![parent as i64, name],
-                    )
+                conn.execute_batch("SAVEPOINT fsmeta_remove_dentry")
                     .map_err(map_db_err)?;
-                if removed > 0 {
-                    // Any effective child-item change bumps parent directory rev.
-                    conn.execute(
-                        "UPDATE nodes
-                         SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
-                         WHERE inode_id = ?1",
-                        params![parent as i64, now],
-                    )
-                    .map_err(map_db_err)?;
+                let result = (|| -> Result<bool, RPCErrors> {
+                    let now = unix_timestamp() as i64;
+                    let old = conn
+                        .query_row(
+                            "SELECT dentry_id, target_type, target_inode_id
+                             FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                            params![parent as i64, &name],
+                            |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, i64>(1)?,
+                                    row.get::<_, Option<i64>>(2)?,
+                                ))
+                            },
+                        )
+                        .optional()
+                        .map_err(map_db_err)?;
+                    let removed = conn
+                        .execute(
+                            "DELETE FROM dentries WHERE parent_inode_id = ?1 AND name = ?2",
+                            params![parent as i64, name],
+                        )
+                        .map_err(map_db_err)?;
+                    if removed > 0 {
+                        if let Some((dentry_id, target_type, target_inode_id)) = old {
+                            if target_type == DENTRY_TARGET_INODE {
+                                if let Some(inode_id) = target_inode_id {
+                                    conn.execute(
+                                        "UPDATE nodes
+                                         SET ref_by = NULL, updated_at = ?2
+                                         WHERE inode_id = ?1 AND ref_by = ?3",
+                                        params![inode_id, now, dentry_id],
+                                    )
+                                    .map_err(map_db_err)?;
+                                }
+                            }
+                        }
+                        // Any effective child-item change bumps parent directory rev.
+                        conn.execute(
+                            "UPDATE nodes
+                             SET rev = COALESCE(rev, 0) + 1, updated_at = ?2
+                             WHERE inode_id = ?1",
+                            params![parent as i64, now],
+                        )
+                        .map_err(map_db_err)?;
+                    }
+                    Ok(removed > 0)
+                })();
+                match result {
+                    Ok(changed) => {
+                        conn.execute_batch("RELEASE SAVEPOINT fsmeta_remove_dentry")
+                            .map_err(map_db_err)?;
+                        Ok(changed)
+                    }
+                    Err(e) => {
+                        let _ = conn.execute_batch(
+                            "ROLLBACK TO SAVEPOINT fsmeta_remove_dentry;
+                             RELEASE SAVEPOINT fsmeta_remove_dentry;",
+                        );
+                        Err(e)
+                    }
                 }
-                Ok(removed > 0)
             })
             .await?;
 
@@ -3419,6 +3616,7 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         let new_node = NodeRecord {
             inode_id: 0, // Will be assigned by alloc
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -3539,6 +3737,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             None if visible_base_obj.is_none() => {
                 let new_node = NodeRecord {
                     inode_id: 0,
+                    ref_by: None,
                     read_only: false,
                     base_obj_id: None,
                     state: NodeState::FileNormal,
@@ -3567,6 +3766,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .ok_or_else(|| RPCErrors::ReasonError("base object missing".to_string()))?;
                 let new_node = NodeRecord {
                     inode_id: 0,
+                    ref_by: None,
                     read_only: false,
                     base_obj_id: Some(base_oid.clone()),
                     state: NodeState::FileNormal,
@@ -3595,6 +3795,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             }) => {
                 let new_node = NodeRecord {
                     inode_id: 0,
+                    ref_by: None,
                     read_only: false,
                     base_obj_id: None,
                     state: NodeState::FileNormal,
@@ -3660,6 +3861,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 }
                 let new_node = NodeRecord {
                     inode_id: 0,
+                    ref_by: None,
                     read_only: false,
                     base_obj_id: Some(oid.clone()),
                     state: NodeState::FileNormal,
@@ -4030,12 +4232,13 @@ fn dentry_target_cols(
 }
 
 fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
-    let parent: i64 = row.get(0).map_err(map_db_err)?;
-    let name: String = row.get(1).map_err(map_db_err)?;
-    let target_type: i64 = row.get(2).map_err(map_db_err)?;
-    let target_inode_id: Option<i64> = row.get(3).map_err(map_db_err)?;
-    let target_obj_id: Option<Vec<u8>> = row.get(4).map_err(map_db_err)?;
-    let mtime: Option<i64> = row.get(5).map_err(map_db_err)?;
+    let dentry_id: i64 = row.get(0).map_err(map_db_err)?;
+    let parent: i64 = row.get(1).map_err(map_db_err)?;
+    let name: String = row.get(2).map_err(map_db_err)?;
+    let target_type: i64 = row.get(3).map_err(map_db_err)?;
+    let target_inode_id: Option<i64> = row.get(4).map_err(map_db_err)?;
+    let target_obj_id: Option<Vec<u8>> = row.get(5).map_err(map_db_err)?;
+    let mtime: Option<i64> = row.get(6).map_err(map_db_err)?;
     let target = match target_type {
         DENTRY_TARGET_INODE => DentryTarget::IndexNodeId(
             target_inode_id
@@ -4063,6 +4266,7 @@ fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
         _ => return Err(RPCErrors::ReasonError("invalid dentry target".to_string())),
     };
     Ok(DentryRecord {
+        id: dentry_id as u64,
         parent: parent as IndexNodeId,
         name,
         target,

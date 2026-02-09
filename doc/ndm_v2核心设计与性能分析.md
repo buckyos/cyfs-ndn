@@ -55,7 +55,6 @@ pub enum NodeState {
 
 pub struct NodeRecord {
     pub inode_id: IndexNodeId,
-    pub kind: NodeKind,//TODO：似乎没有必要，完全可以从NodeState推导出来
     pub state: NodeState,
     pub read_only: bool,
     pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)

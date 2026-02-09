@@ -74,6 +74,7 @@ pub enum NodeState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub inode_id: IndexNodeId,
+    pub ref_by: Option<u64>,
     pub state: NodeState,
     pub read_only: bool,
     pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)
@@ -127,6 +128,7 @@ pub enum DentryTarget {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DentryRecord {
+    pub id: u64,
     pub parent: IndexNodeId,
     pub name: String,
     pub target: DentryTarget,
@@ -2036,6 +2038,7 @@ mod tests {
         root_dir: IndexNodeId,
         next_txn: u64,
         next_inode: IndexNodeId,
+        next_dentry: u64,
         inodes: HashMap<IndexNodeId, NodeRecord>,
         dentries: HashMap<(IndexNodeId, String), DentryRecord>,
         next_list_session: u64,
@@ -2052,6 +2055,7 @@ mod tests {
                     root_dir: 1,
                     next_txn: 0,
                     next_inode: 1,
+                    next_dentry: 0,
                     inodes: HashMap::new(),
                     dentries: HashMap::new(),
                     next_list_session: 0,
@@ -2342,17 +2346,43 @@ mod tests {
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
+            let mut state = self.state.lock().unwrap();
+            let old = state.dentries.get(&(parent, name.clone())).cloned();
+            let dentry_id = old.as_ref().map(|d| d.id).unwrap_or_else(|| {
+                state.next_dentry += 1;
+                state.next_dentry
+            });
             let record = DentryRecord {
+                id: dentry_id,
                 parent,
                 name: name.clone(),
-                target,
+                target: target.clone(),
                 mtime: None,
             };
-            self.state
-                .lock()
-                .unwrap()
-                .dentries
-                .insert((parent, name), record);
+            state.dentries.insert((parent, name), record);
+            if let Some(old_dentry) = old {
+                if let DentryTarget::IndexNodeId(old_inode_id) = old_dentry.target {
+                    if let Some(node) = state.inodes.get_mut(&old_inode_id) {
+                        if node.ref_by == Some(old_dentry.id) {
+                            node.ref_by = None;
+                        }
+                    }
+                }
+            }
+            if let DentryTarget::IndexNodeId(new_inode_id) = target {
+                let node = state
+                    .inodes
+                    .get_mut(&new_inode_id)
+                    .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                if let Some(existing) = node.ref_by {
+                    if existing != dentry_id {
+                        return Err(RPCErrors::ReasonError(
+                            "inode already referenced by another dentry".to_string(),
+                        ));
+                    }
+                }
+                node.ref_by = Some(dentry_id);
+            }
             Ok(())
         }
 
@@ -2363,7 +2393,16 @@ mod tests {
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
-            self.state.lock().unwrap().dentries.remove(&(parent, name));
+            let mut state = self.state.lock().unwrap();
+            if let Some(record) = state.dentries.remove(&(parent, name)) {
+                if let DentryTarget::IndexNodeId(inode_id) = record.target {
+                    if let Some(node) = state.inodes.get_mut(&inode_id) {
+                        if node.ref_by == Some(record.id) {
+                            node.ref_by = None;
+                        }
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -2374,17 +2413,29 @@ mod tests {
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
+            let mut state = self.state.lock().unwrap();
+            let old = state.dentries.get(&(parent, name.clone())).cloned();
+            let dentry_id = old.as_ref().map(|d| d.id).unwrap_or_else(|| {
+                state.next_dentry += 1;
+                state.next_dentry
+            });
             let record = DentryRecord {
+                id: dentry_id,
                 parent,
                 name: name.clone(),
                 target: DentryTarget::Tombstone,
                 mtime: None,
             };
-            self.state
-                .lock()
-                .unwrap()
-                .dentries
-                .insert((parent, name), record);
+            state.dentries.insert((parent, name), record);
+            if let Some(old_dentry) = old {
+                if let DentryTarget::IndexNodeId(old_inode_id) = old_dentry.target {
+                    if let Some(node) = state.inodes.get_mut(&old_inode_id) {
+                        if node.ref_by == Some(old_dentry.id) {
+                            node.ref_by = None;
+                        }
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -2746,6 +2797,7 @@ mod tests {
     fn sample_node(inode_id: IndexNodeId) -> NodeRecord {
         NodeRecord {
             inode_id,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::FileNormal,

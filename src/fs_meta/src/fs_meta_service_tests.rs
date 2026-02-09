@@ -115,6 +115,7 @@ mod tests {
     fn create_dir_node(inode_id: IndexNodeId) -> NodeRecord {
         NodeRecord {
             inode_id,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -129,6 +130,7 @@ mod tests {
     fn create_file_node_working(inode_id: IndexNodeId, fb_handle: &str) -> NodeRecord {
         NodeRecord {
             inode_id,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Working(ndm::FileWorkingState {
@@ -339,7 +341,7 @@ mod tests {
         .unwrap();
 
         let dentry = svc
-            .handle_get_dentry(root, "subdir".to_string(), None, ctx)
+            .handle_get_dentry(root, "subdir".to_string(), None, ctx.clone())
             .await
             .unwrap()
             .unwrap();
@@ -349,6 +351,86 @@ mod tests {
             DentryTarget::IndexNodeId(id) => assert_eq!(id, 400),
             _ => panic!("expected IndexNodeId target"),
         }
+        assert!(dentry.id > 0);
+        let inode = svc.handle_get_inode(400, None, ctx.clone()).await.unwrap().unwrap();
+        assert_eq!(inode.ref_by, Some(dentry.id));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_dentry_updates_inode_ref_by() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let inode_a = create_dir_node(410);
+        svc.handle_set_inode(inode_a, None, ctx.clone()).await.unwrap();
+        let inode_b = create_dir_node(411);
+        svc.handle_set_inode(inode_b, None, ctx.clone()).await.unwrap();
+
+        svc.handle_upsert_dentry(
+            root,
+            "swap".to_string(),
+            DentryTarget::IndexNodeId(410),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let first = svc
+            .handle_get_dentry(root, "swap".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_a = svc.handle_get_inode(410, None, ctx.clone()).await.unwrap().unwrap();
+        assert_eq!(inode_a.ref_by, Some(first.id));
+
+        svc.handle_upsert_dentry(
+            root,
+            "swap".to_string(),
+            DentryTarget::IndexNodeId(411),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let second = svc
+            .handle_get_dentry(root, "swap".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, second.id);
+
+        let inode_a = svc.handle_get_inode(410, None, ctx.clone()).await.unwrap().unwrap();
+        assert_eq!(inode_a.ref_by, None);
+        let inode_b = svc.handle_get_inode(411, None, ctx.clone()).await.unwrap().unwrap();
+        assert_eq!(inode_b.ref_by, Some(second.id));
+    }
+
+    #[tokio::test]
+    async fn test_remove_dentry_clears_inode_ref_by() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let inode = create_dir_node(412);
+        svc.handle_set_inode(inode, None, ctx.clone()).await.unwrap();
+        svc.handle_upsert_dentry(
+            root,
+            "to_remove_ref".to_string(),
+            DentryTarget::IndexNodeId(412),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let linked = svc.handle_get_inode(412, None, ctx.clone()).await.unwrap().unwrap();
+        assert!(linked.ref_by.is_some());
+
+        svc.handle_remove_dentry_row(root, "to_remove_ref".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let unlinked = svc.handle_get_inode(412, None, ctx.clone()).await.unwrap().unwrap();
+        assert_eq!(unlinked.ref_by, None);
     }
 
     #[tokio::test]
@@ -702,6 +784,7 @@ mod tests {
 
         let overlay_inode = NodeRecord {
             inode_id: 900,
+            ref_by: None,
             read_only: false,
             base_obj_id: Some(base_dir_id),
             state: NodeState::DirOverlay,
@@ -755,6 +838,9 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+        svc.handle_set_inode(create_dir_node(600), None, ctx.clone())
+            .await
+            .unwrap();
 
         svc.handle_upsert_dentry(
             root,
@@ -1440,6 +1526,7 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 900,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Linked(ndm::FileLinkedState {
@@ -1478,6 +1565,7 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 901,
+            ref_by: None,
             read_only: true,
             base_obj_id: None,
             state: NodeState::Finalized(ndm::FinalizedObjState {
@@ -1517,6 +1605,7 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 902,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -1543,6 +1632,7 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 903,
+            ref_by: None,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Working(ndm::FileWorkingState {
@@ -1959,6 +2049,7 @@ mod tests {
 
         let overlay_inode = NodeRecord {
             inode_id: 910,
+            ref_by: None,
             read_only: false,
             base_obj_id: Some(base_dir_id),
             state: NodeState::DirOverlay,
