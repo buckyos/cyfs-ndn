@@ -1589,17 +1589,17 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+    pub async fn symlink(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
                 handler
-                    .handle_make_link(link_path, target, ctx)
+                    .handle_symlink(link_path, target, ctx)
                     .await
-                    .map_err(|e| NdnError::Internal(format!("make_link failed: {}", e)))
+                    .map_err(|e| NdnError::Internal(format!("symlink failed: {}", e)))
             }
             Self::KRPC(_) => Err(NdnError::Unsupported(
-                "make_link is not supported in kRPC client".to_string(),
+                "symlink is not supported in kRPC client".to_string(),
             )),
         }
     }
@@ -1819,7 +1819,7 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_make_link(
+    async fn handle_symlink(
         &self,
         link_path: &NdmPath,
         target: &NdmPath,
@@ -2751,7 +2751,7 @@ mod tests {
             Ok(())
         }
 
-        async fn handle_make_link(
+        async fn handle_symlink(
             &self,
             _link_path: &NdmPath,
             _target: &NdmPath,

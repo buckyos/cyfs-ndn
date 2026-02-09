@@ -337,8 +337,8 @@ impl NamedDataMgr {
 
     //创建软链接(symlink)，目标保存为路径（可相对路径）
     //SYMLINK: link_path -> target_path
-    pub async fn make_link(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        self.fsmeta.make_link(link_path, target).await
+    pub async fn symlink(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+        self.fsmeta.symlink(link_path, target).await
     }
 
     pub async fn copy_file(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {

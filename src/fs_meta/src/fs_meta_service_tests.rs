@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_link_creates_symlink_target() {
+    async fn test_symlink_creates_symlink_target() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
@@ -547,7 +547,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_make_link(
+        svc.handle_symlink(
             &NdmPath::new("/link_file"),
             &NdmPath::new("/target_file"),
             ctx.clone(),
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_link_accepts_symlink_target_path() {
+    async fn test_symlink_accepts_symlink_target_path() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
@@ -598,7 +598,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_make_link(
+        svc.handle_symlink(
             &NdmPath::new("/link_a"),
             &NdmPath::new("/target_file_2"),
             ctx.clone(),
@@ -606,7 +606,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_make_link(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
+        svc.handle_symlink(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
             .await
             .unwrap();
 
@@ -622,12 +622,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_make_link_accepts_relative_target_path() {
+    async fn test_symlink_accepts_relative_target_path() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
-        svc.handle_make_link(&NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
+        svc.handle_symlink(&NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
             .await
             .unwrap();
 
@@ -647,7 +647,7 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        svc.handle_make_link(
+        svc.handle_symlink(
             &NdmPath::new("/link_a"),
             &NdmPath::new("/target_a"),
             ctx.clone(),
@@ -730,7 +730,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_make_link(&NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
+        svc.handle_symlink(&NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
             .await
             .unwrap();
 

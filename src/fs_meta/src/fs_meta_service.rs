@@ -3751,7 +3751,7 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     // 创建软链接(symlink)，目标保存为路径（可相对路径）
     // SYMLINK: link_path -> target_path
-    async fn handle_make_link(
+    async fn handle_symlink(
         &self,
         link_path: &NdmPath,
         target: &NdmPath,

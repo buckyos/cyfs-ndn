@@ -49,8 +49,8 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 ## Link Semantics
 
 - Local filesystem hardlink/symlink creation must be rejected.
-- NDM can create internal links (e.g., `make_link`), which may be exposed via a dedicated command or extended API.
-- TODO: Decide if/when to map FUSE `link`/`symlink` to NDM `make_link`.
+- NDM can create internal links (e.g., `symlink`), which may be exposed via a dedicated command or extended API.
+- TODO: Decide if/when to map FUSE `link`/`symlink` to NDM `symlink`.
 
 ## Unsupported Operations (Current)
 
