@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::fs_meta_service::FSMetaService;
+    use buckyos_kit::init_logging;
     use fs_buffer::{LocalFileBufferService, SessionId};
     use krpc::{RPCContext, RPCErrors};
     use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
@@ -12,7 +13,6 @@ mod tests {
     use std::sync::{Arc, Once};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
-    use buckyos_kit::init_logging;
 
     fn ensure_test_logging_once() {
         static INIT: Once = Once::new();
@@ -686,9 +686,14 @@ mod tests {
         .await
         .unwrap();
 
-        handle_symlink_path(&svc, &NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
-            .await
-            .unwrap();
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_b"),
+            &NdmPath::new("/link_a"),
+            ctx,
+        )
+        .await
+        .unwrap();
 
         let dentry = svc
             .handle_get_dentry(root, "link_b".to_string(), None, dummy_ctx())
@@ -707,9 +712,14 @@ mod tests {
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
-        handle_symlink_path(&svc, &NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
-            .await
-            .unwrap();
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_rel"),
+            &NdmPath::new("../a/b"),
+            ctx,
+        )
+        .await
+        .unwrap();
 
         let dentry = svc
             .handle_get_dentry(root, "link_rel".to_string(), None, dummy_ctx())
@@ -811,9 +821,14 @@ mod tests {
         .await
         .unwrap();
 
-        handle_symlink_path(&svc, &NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
-            .await
-            .unwrap();
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/a/x/l"),
+            &NdmPath::new("../y"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
 
         let unresolved = svc
             .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 0, ctx.clone())
@@ -2400,9 +2415,14 @@ mod tests {
             .await
             .unwrap();
 
-        handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(11), ctx.clone())
-            .await
-            .unwrap();
+        handle_set_file_path(
+            &svc,
+            &NdmPath::new("/a/file"),
+            create_obj_id(11),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
 
         let err = handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(12), ctx)
             .await
@@ -2539,8 +2559,8 @@ mod tests {
             None,
             ctx,
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("directory"));
     }
 
@@ -2587,8 +2607,8 @@ mod tests {
             None,
             ctx,
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
@@ -2635,8 +2655,8 @@ mod tests {
             None,
             ctx.clone(),
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
 
         let err_msg = err.to_string();
         assert!(!err_msg.contains("file not found"), "err={}", err_msg);
@@ -2654,8 +2674,8 @@ mod tests {
             None,
             ctx,
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(!handle.is_empty());
     }
 

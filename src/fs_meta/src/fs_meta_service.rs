@@ -2338,12 +2338,13 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
 
             let comp_refs: Vec<&str> = components.iter().map(|s| s.as_str()).collect();
-            if let Some(hit) = self
+            let log_path = join_components(&components).unwrap_or_else(|| "/".to_string());
+            let terminal_cache_hit = self
                 .resolve_path_cache
                 .write()
                 .ok()
-                .and_then(|mut cache| cache.get_terminal_for_path(&comp_refs))
-            {
+                .and_then(|mut cache| cache.get_terminal_for_path(&comp_refs));
+            if let Some(hit) = terminal_cache_hit {
                 let tail = components[hit.matched_len..].to_vec();
                 match hit.value {
                     PathResolveTerminalValue::ObjId(obj_id) => {
@@ -2368,6 +2369,8 @@ impl ndm::FsMetaHandler for FSMetaService {
                         continue;
                     }
                 }
+            } else {
+                warn!("fsmeta resolve_path terminal cache miss: path={}", log_path);
             }
 
             let cached_prefix_ids = self
@@ -2375,6 +2378,9 @@ impl ndm::FsMetaHandler for FSMetaService {
                 .write()
                 .ok()
                 .and_then(|mut cache| cache.get_longest_prefix_ids_for_path(&comp_refs));
+            if cached_prefix_ids.is_none() {
+                warn!("fsmeta resolve_path prefix cache miss: path={}", log_path);
+            }
 
             let (mut ids, mut current_id, start_idx) = if let Some(prefix_ids) = cached_prefix_ids {
                 let matched_len = prefix_ids.len().saturating_sub(1);
@@ -2446,6 +2452,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                             if let Some(inode) = node {
                                 if let Ok(mut cache) = self.resolve_path_cache.write() {
                                     cache.put_ids_for_path(components.clone(), ids.clone());
+                                    info!(
+                                        "fsmeta resolve_path cache put ids: path={}, depth={}",
+                                        log_path,
+                                        ids.len()
+                                    );
                                 }
                                 return Ok(Some(FsMetaResolvePathResp {
                                     item: FsMetaResolvePathItem::Inode {
@@ -2465,6 +2476,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                                 ids.clone(),
                                 PathResolveTerminalValue::ObjId(obj_id.clone()),
                             );
+                            info!(
+                                "fsmeta resolve_path cache put terminal obj: path={}, matched_len={}",
+                                log_path,
+                                i + 1
+                            );
                         }
                         return Ok(Some(FsMetaResolvePathResp {
                             item: FsMetaResolvePathItem::ObjId(obj_id),
@@ -2477,6 +2493,11 @@ impl ndm::FsMetaHandler for FSMetaService {
                                 components[..=i].to_vec(),
                                 ids.clone(),
                                 PathResolveTerminalValue::SymLink(target_path.clone()),
+                            );
+                            info!(
+                                "fsmeta resolve_path cache put terminal symlink: path={}, matched_len={}",
+                                log_path,
+                                i + 1
                             );
                         }
                         let tail = components[i + 1..].to_vec();
@@ -2917,7 +2938,13 @@ impl ndm::FsMetaHandler for FSMetaService {
             .list_cache
             .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
-        Ok(cache.start_session(entries))
+        let entry_count = entries.len();
+        let session_id = cache.start_session(entries);
+        info!(
+            "fsmeta list cache put session: session_id={}, entry_count={}, parent={}",
+            session_id, entry_count, parent
+        );
+        Ok(session_id)
     }
 
     async fn handle_list_next(
@@ -2930,9 +2957,15 @@ impl ndm::FsMetaHandler for FSMetaService {
             .list_cache
             .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
-        cache
-            .list_next(list_session_id, page_size)
-            .ok_or_else(|| RPCErrors::ReasonError("list session not found".to_string()))
+        if let Some(page) = cache.list_next(list_session_id, page_size) {
+            Ok(page)
+        } else {
+            warn!(
+                "fsmeta list cache miss: session_id={}, page_size={}",
+                list_session_id, page_size
+            );
+            Err(RPCErrors::ReasonError("list session not found".to_string()))
+        }
     }
 
     async fn handle_stop_list(
@@ -2944,7 +2977,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             .list_cache
             .lock()
             .map_err(|e| RPCErrors::ReasonError(format!("list cache lock poisoned: {}", e)))?;
-        cache.stop_session(list_session_id);
+        let removed = cache.stop_session(list_session_id);
+        info!(
+            "fsmeta list cache stop session: session_id={}, removed={}",
+            list_session_id, removed
+        );
         Ok(())
     }
 
