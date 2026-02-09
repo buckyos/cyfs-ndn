@@ -1,6 +1,6 @@
 use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
-use log::{info, warn};
+use log::{debug, info, warn};
 use named_store::NamedStoreMgr;
 use ndm::{
     ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry,
@@ -335,6 +335,7 @@ impl FSMetaService {
 
     /// Set named store manager for DirObject child resolution.
     pub fn with_named_store(mut self, store_mgr: Arc<NamedStoreMgr>) -> Self {
+        debug!("fsmeta configured named_store manager");
         self.store_mgr = Some(store_mgr);
         self
     }
@@ -1140,7 +1141,18 @@ impl FSMetaService {
                     base_obj_id.obj_type
                 )));
             }
+            debug!(
+                "fsmeta named_store get_object for finalize_dir: dir_path={}, base_obj_id={}",
+                dir_path.as_str(),
+                base_obj_id
+            );
             let base_obj_str = store_mgr.get_object(base_obj_id).await.map_err(|e| {
+                warn!(
+                    "fsmeta named_store get_object failed for finalize_dir: dir_path={}, base_obj_id={}, err={}",
+                    dir_path.as_str(),
+                    base_obj_id,
+                    e
+                );
                 RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e))
             })?;
             let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
@@ -1151,10 +1163,23 @@ impl FSMetaService {
                     .get_obj_id()
                     .map_err(|e| RPCErrors::ReasonError(format!("invalid base child: {}", e)))?;
                 if !obj_str.is_empty() {
+                    debug!(
+                        "fsmeta named_store put_object embedded base child: dir_path={}, child_name={}, child_obj_id={}",
+                        dir_path.as_str(),
+                        base_name,
+                        obj_id
+                    );
                     store_mgr
                         .put_object(&obj_id, obj_str.as_str())
                         .await
                         .map_err(|e| {
+                            warn!(
+                                "fsmeta named_store put_object failed for embedded base child: dir_path={}, child_name={}, child_obj_id={}, err={}",
+                                dir_path.as_str(),
+                                base_name,
+                                obj_id,
+                                e
+                            );
                             RPCErrors::ReasonError(format!(
                                 "failed to cache embedded base child object: {}",
                                 e
@@ -1236,10 +1261,23 @@ impl FSMetaService {
         let (new_dir_obj_id, new_dir_obj_str) = new_dir_obj
             .gen_obj_id()
             .map_err(|e| RPCErrors::ReasonError(format!("build dir object failed: {}", e)))?;
+        debug!(
+            "fsmeta named_store put_object for finalized dir: dir_path={}, dir_obj_id={}",
+            dir_path.as_str(),
+            new_dir_obj_id
+        );
         store_mgr
             .put_object(&new_dir_obj_id, new_dir_obj_str.as_str())
             .await
-            .map_err(|e| RPCErrors::ReasonError(format!("store dir object failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "fsmeta named_store put_object failed for finalized dir: dir_path={}, dir_obj_id={}, err={}",
+                    dir_path.as_str(),
+                    new_dir_obj_id,
+                    e
+                );
+                RPCErrors::ReasonError(format!("store dir object failed: {}", e))
+            })?;
 
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
@@ -1306,7 +1344,7 @@ impl FSMetaService {
             parent_id,
             dir_name,
             DentryTarget::IndexNodeId(dir_inode_id),
-            DentryTarget::ObjId(new_dir_obj_id),
+            DentryTarget::ObjId(new_dir_obj_id.clone()),
             parent_rev0,
             txn.txid(),
             ctx.clone(),
@@ -1331,6 +1369,13 @@ impl FSMetaService {
             .await?;
 
         txn.commit().await?;
+        info!(
+            "fsmeta write finalized dir: path={}, parent_inode={}, dir_inode={}, dir_obj_id={}",
+            dir_path.as_str(),
+            parent_id,
+            dir_inode_id,
+            new_dir_obj_id
+        );
         Ok(true)
     }
 
@@ -1477,16 +1522,36 @@ impl FSMetaService {
                 "named store manager not configured for DirObject traversal".to_string(),
             )
         })?;
+        debug!(
+            "fsmeta named_store get_dir_child: base_obj_id={}, child_name={}",
+            base_obj_id, name
+        );
         let child_obj_id = match store_mgr.get_dir_child(base_obj_id, name).await {
             Ok(obj_id) => obj_id,
-            Err(NdnError::NotFound(_)) => return Ok(BaseChildLookup::Missing),
+            Err(NdnError::NotFound(_)) => {
+                debug!(
+                    "fsmeta named_store get_dir_child miss: base_obj_id={}, child_name={}",
+                    base_obj_id, name
+                );
+                return Ok(BaseChildLookup::Missing);
+            }
             Err(e) => {
+                warn!(
+                    "fsmeta named_store get_dir_child failed: base_obj_id={}, child_name={}, err={}",
+                    base_obj_id,
+                    name,
+                    e
+                );
                 return Err(RPCErrors::ReasonError(format!(
                     "failed to lookup base DirObject child: {}",
                     e
-                )))
+                )));
             }
         };
+        debug!(
+            "fsmeta named_store get_dir_child hit: base_obj_id={}, child_name={}, child_obj_id={}",
+            base_obj_id, name, child_obj_id
+        );
 
         if child_obj_id.obj_type == OBJ_TYPE_DIR {
             Ok(BaseChildLookup::DirObj(child_obj_id))
@@ -1515,10 +1580,21 @@ impl FSMetaService {
                 "named store manager not configured for DirObject traversal".to_string(),
             )
         })?;
+        debug!(
+            "fsmeta named_store get_object for load_base_dir_children: base_obj_id={}",
+            base_obj_id
+        );
         let base_obj_str = store_mgr
             .get_object(base_obj_id)
             .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "fsmeta named_store get_object failed for load_base_dir_children: base_obj_id={}, err={}",
+                    base_obj_id,
+                    e
+                );
+                RPCErrors::ReasonError(format!("failed to load base DirObject: {}", e))
+            })?;
         let base_dir: DirObject = load_named_obj(base_obj_str.as_str()).map_err(|e| {
             RPCErrors::ReasonError(format!("failed to parse base DirObject: {}", e))
         })?;
@@ -1527,10 +1603,23 @@ impl FSMetaService {
                 .get_obj_id()
                 .map_err(|e| RPCErrors::ReasonError(format!("invalid base child entry: {}", e)))?;
             if !obj_str.is_empty() {
+                debug!(
+                    "fsmeta named_store put_object embedded child: base_obj_id={}, child_name={}, child_obj_id={}",
+                    base_obj_id,
+                    name,
+                    obj_id
+                );
                 store_mgr
                     .put_object(&obj_id, obj_str.as_str())
                     .await
                     .map_err(|e| {
+                        warn!(
+                            "fsmeta named_store put_object failed for embedded child: base_obj_id={}, child_name={}, child_obj_id={}, err={}",
+                            base_obj_id,
+                            name,
+                            obj_id,
+                            e
+                        );
                         RPCErrors::ReasonError(format!(
                             "failed to cache embedded child object: {}",
                             e
@@ -1800,7 +1889,10 @@ impl FSMetaService {
                         )));
                     }
 
-                    match self.lookup_base_dirobj_child(&parent_node, component).await? {
+                    match self
+                        .lookup_base_dirobj_child(&parent_node, component)
+                        .await?
+                    {
                         BaseChildLookup::DirObj(child_dir_obj) => {
                             self.materialize_dir_from_obj(
                                 current_id,
@@ -2171,16 +2263,28 @@ impl FSMetaService {
             ));
         }
 
-        self.with_conn(txid.as_deref(), move |conn| {
-            let removed = conn
-                .execute("DELETE FROM nodes WHERE inode_id = ?1", params![id as i64])
-                .map_err(map_db_err)?;
-            if removed == 0 {
-                return Err(RPCErrors::ReasonError("inode not found".to_string()));
-            }
-            Ok(())
-        })
-        .await
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                let removed = conn
+                    .execute("DELETE FROM nodes WHERE inode_id = ?1", params![id as i64])
+                    .map_err(map_db_err)?;
+                if removed == 0 {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
+                Ok(())
+            })
+            .await;
+        match &result {
+            Ok(_) => info!(
+                "fsmeta write remove inode: inode_id={}, txid={:?}",
+                id, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta remove inode failed: inode_id={}, txid={:?}, err={}",
+                id, txid, e
+            ),
+        }
+        result
     }
 }
 
@@ -2460,7 +2564,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
+        let inode_id = node.inode_id;
+        let result = self.with_conn(txid.as_deref(), move |conn| {
             let cols = Self::node_state_cols(&node.state);
             let now = unix_timestamp() as i64;
             let meta_json = node
@@ -2524,7 +2629,18 @@ impl ndm::FsMetaHandler for FSMetaService {
             .map_err(map_db_err)?;
             Ok(())
         })
-        .await
+        .await;
+        match &result {
+            Ok(_) => info!(
+                "fsmeta write set inode: inode_id={}, txid={:?}",
+                inode_id, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta set inode failed: inode_id={}, txid={:?}, err={}",
+                inode_id, txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_update_inode_state(
@@ -2535,13 +2651,14 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
-            let new_cols = Self::node_state_cols(&new_state);
-            let old_cols = Self::node_state_cols(&old_state);
-            let now = unix_timestamp() as i64;
-            let updated = conn
-                .execute(
-                    "UPDATE nodes SET
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                let new_cols = Self::node_state_cols(&new_state);
+                let old_cols = Self::node_state_cols(&old_state);
+                let now = unix_timestamp() as i64;
+                let updated = conn
+                    .execute(
+                        "UPDATE nodes SET
                         state = ?1,
                         fb_handle = ?2,
                         last_write_at = ?3,
@@ -2564,49 +2681,60 @@ impl ndm::FsMetaHandler for FSMetaService {
                        AND linked_at IS ?20
                        AND finalized_obj_id IS ?21
                        AND finalized_at IS ?22",
-                    params![
-                        new_cols.state,
-                        new_cols.fb_handle,
-                        new_cols.last_write_at.map(|v| v as i64),
-                        new_cols.closed_at.map(|v| v as i64),
-                        new_cols.linked_obj_id,
-                        new_cols.linked_qcid,
-                        new_cols.linked_filebuffer_id,
-                        new_cols.linked_at.map(|v| v as i64),
-                        new_cols.finalized_obj_id,
-                        new_cols.finalized_at.map(|v| v as i64),
-                        now,
-                        node_id as i64,
-                        old_cols.state,
-                        old_cols.fb_handle,
-                        old_cols.last_write_at.map(|v| v as i64),
-                        old_cols.closed_at.map(|v| v as i64),
-                        old_cols.linked_obj_id,
-                        old_cols.linked_qcid,
-                        old_cols.linked_filebuffer_id,
-                        old_cols.linked_at.map(|v| v as i64),
-                        old_cols.finalized_obj_id,
-                        old_cols.finalized_at.map(|v| v as i64),
-                    ],
-                )
-                .map_err(map_db_err)?;
-            if updated == 0 {
-                let exists = conn
-                    .query_row(
-                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
-                        params![node_id as i64],
-                        |row| row.get::<_, i64>(0),
+                        params![
+                            new_cols.state,
+                            new_cols.fb_handle,
+                            new_cols.last_write_at.map(|v| v as i64),
+                            new_cols.closed_at.map(|v| v as i64),
+                            new_cols.linked_obj_id,
+                            new_cols.linked_qcid,
+                            new_cols.linked_filebuffer_id,
+                            new_cols.linked_at.map(|v| v as i64),
+                            new_cols.finalized_obj_id,
+                            new_cols.finalized_at.map(|v| v as i64),
+                            now,
+                            node_id as i64,
+                            old_cols.state,
+                            old_cols.fb_handle,
+                            old_cols.last_write_at.map(|v| v as i64),
+                            old_cols.closed_at.map(|v| v as i64),
+                            old_cols.linked_obj_id,
+                            old_cols.linked_qcid,
+                            old_cols.linked_filebuffer_id,
+                            old_cols.linked_at.map(|v| v as i64),
+                            old_cols.finalized_obj_id,
+                            old_cols.finalized_at.map(|v| v as i64),
+                        ],
                     )
-                    .optional()
                     .map_err(map_db_err)?;
-                if exists.is_none() {
-                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                if updated == 0 {
+                    let exists = conn
+                        .query_row(
+                            "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                            params![node_id as i64],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(map_db_err)?;
+                    if exists.is_none() {
+                        return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                    }
+                    return Err(RPCErrors::ReasonError("inode state conflict".to_string()));
                 }
-                return Err(RPCErrors::ReasonError("inode state conflict".to_string()));
-            }
-            Ok(())
-        })
-        .await
+                Ok(())
+            })
+            .await;
+        match &result {
+            Ok(_) => info!(
+                "fsmeta write update inode state: inode_id={}, txid={:?}",
+                node_id, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta update inode state failed: inode_id={}, txid={:?}, err={}",
+                node_id, txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_alloc_inode(
@@ -2615,7 +2743,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<IndexNodeId, RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
+        let requested_inode_id = node.inode_id;
+        let result = self.with_conn(txid.as_deref(), move |conn| {
             let cols = Self::node_state_cols(&node.state);
             let now = unix_timestamp() as i64;
             let meta_json = node
@@ -2695,7 +2824,18 @@ impl ndm::FsMetaHandler for FSMetaService {
                 Ok(node.inode_id)
             }
         })
-        .await
+        .await;
+        match &result {
+            Ok(inode_id) => info!(
+                "fsmeta write alloc inode: inode_id={}, requested_inode_id={}, txid={:?}",
+                inode_id, requested_inode_id, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta alloc inode failed: requested_inode_id={}, txid={:?}, err={}",
+                requested_inode_id, txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_get_dentry(
@@ -2818,7 +2958,8 @@ impl ndm::FsMetaHandler for FSMetaService {
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let name_for_invalidate = name.clone();
-        let changed = self.with_conn(txid.as_deref(), move |conn| {
+        let changed = self
+            .with_conn(txid.as_deref(), move |conn| {
             conn.execute_batch("SAVEPOINT fsmeta_create_dentry")
                 .map_err(map_db_err)?;
             let result = (|| -> Result<bool, RPCErrors> {
@@ -2925,7 +3066,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                 }
             }
         })
-        .await?;
+            .await
+            .map_err(|e| {
+                warn!(
+                    "fsmeta create dentry failed: parent_inode={}, name={}, err={}",
+                    parent, name_for_invalidate, e
+                );
+                e
+            })?;
 
         if changed {
             if let Some(txid) = txid {
@@ -2936,10 +3084,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .map_err(|e| {
                         RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
                     })?
-                    .insert((parent, name_for_invalidate));
+                    .insert((parent, name_for_invalidate.clone()));
             } else if let Ok(mut cache) = self.resolve_path_cache.write() {
                 cache.invalidate_by_edge(parent, &name_for_invalidate);
             }
+            info!(
+                "fsmeta write create dentry: parent_inode={}, name={}",
+                parent, name_for_invalidate
+            );
         }
 
         Ok(())
@@ -3035,7 +3187,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     }
                 }
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                warn!(
+                    "fsmeta delete dentry failed: parent_inode={}, name={}, err={}",
+                    parent, name_for_invalidate, e
+                );
+                e
+            })?;
 
         if changed {
             if let Some(txid) = txid {
@@ -3046,10 +3205,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .map_err(|e| {
                         RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
                     })?
-                    .insert((parent, name_for_invalidate));
+                    .insert((parent, name_for_invalidate.clone()));
             } else if let Ok(mut cache) = self.resolve_path_cache.write() {
                 cache.invalidate_by_edge(parent, &name_for_invalidate);
             }
+            info!(
+                "fsmeta write delete dentry: parent_inode={}, name={}",
+                parent, name_for_invalidate
+            );
         }
 
         Ok(())
@@ -3204,7 +3367,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     }
                 }
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                warn!(
+                    "fsmeta replace dentry target failed: parent_inode={}, name={}, err={}",
+                    parent, name_for_invalidate, e
+                );
+                e
+            })?;
 
         if changed {
             if let Some(txid) = txid {
@@ -3215,10 +3385,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .map_err(|e| {
                         RPCErrors::ReasonError(format!("touched_edges lock poisoned: {}", e))
                     })?
-                    .insert((parent, name_for_invalidate));
+                    .insert((parent, name_for_invalidate.clone()));
             } else if let Ok(mut cache) = self.resolve_path_cache.write() {
                 cache.invalidate_by_edge(parent, &name_for_invalidate);
             }
+            info!(
+                "fsmeta write replace dentry target: parent_inode={}, name={}",
+                parent, name_for_invalidate
+            );
         }
 
         Ok(())
@@ -3231,24 +3405,36 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
-            let now = unix_timestamp() as i64;
-            // Use COALESCE to handle NULL rev (treat as 0), also update updated_at
-            let updated = conn
-                .execute(
-                    "UPDATE nodes SET rev = COALESCE(rev, 0) + 1, updated_at = ?3 
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                let now = unix_timestamp() as i64;
+                // Use COALESCE to handle NULL rev (treat as 0), also update updated_at
+                let updated = conn
+                    .execute(
+                        "UPDATE nodes SET rev = COALESCE(rev, 0) + 1, updated_at = ?3 
                      WHERE inode_id = ?1 AND COALESCE(rev, 0) = ?2",
-                    params![dir as i64, expected_rev as i64, now],
-                )
-                .map_err(map_db_err)?;
-            if updated == 0 {
-                return Err(RPCErrors::ReasonError(
-                    "rev mismatch or inode not found".to_string(),
-                ));
-            }
-            Ok(expected_rev + 1)
-        })
-        .await
+                        params![dir as i64, expected_rev as i64, now],
+                    )
+                    .map_err(map_db_err)?;
+                if updated == 0 {
+                    return Err(RPCErrors::ReasonError(
+                        "rev mismatch or inode not found".to_string(),
+                    ));
+                }
+                Ok(expected_rev + 1)
+            })
+            .await;
+        match &result {
+            Ok(new_rev) => info!(
+                "fsmeta write bump dir rev: inode_id={}, old_rev={}, new_rev={}, txid={:?}",
+                dir, expected_rev, new_rev, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta bump dir rev failed: inode_id={}, expected_rev={}, txid={:?}, err={}",
+                dir, expected_rev, txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_commit(&self, txid: Option<String>, _ctx: RPCContext) -> Result<(), RPCErrors> {
@@ -3324,6 +3510,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
         }
 
+        info!("fsmeta write commit transaction: txid={}", txid);
         Ok(commit_result)
     }
 
@@ -3335,7 +3522,15 @@ impl ndm::FsMetaHandler for FSMetaService {
         let Some(txid) = txid else {
             return Ok(());
         };
-        rollback_txn_by_arcs(self.txns.clone(), txid).await
+        let result = rollback_txn_by_arcs(self.txns.clone(), txid.clone()).await;
+        match &result {
+            Ok(_) => info!("fsmeta write rollback transaction: txid={}", txid),
+            Err(e) => warn!(
+                "fsmeta rollback transaction failed: txid={}, err={}",
+                txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_acquire_file_lease(
@@ -3409,29 +3604,31 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<u64, RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
-            let now = unix_timestamp() as i64;
-            let obj_blob = obj_id_to_blob(&obj_id);
+        let obj_id_for_log = obj_id.clone();
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                let now = unix_timestamp() as i64;
+                let obj_blob = obj_id_to_blob(&obj_id);
 
-            if delta > 0 {
-                // Positive delta: use atomic INSERT ... ON CONFLICT DO UPDATE
-                // This handles both new records and existing records atomically
-                conn.execute(
-                    "INSERT INTO obj_stat (obj_id, ref_count, zero_since, updated_at) 
+                if delta > 0 {
+                    // Positive delta: use atomic INSERT ... ON CONFLICT DO UPDATE
+                    // This handles both new records and existing records atomically
+                    conn.execute(
+                        "INSERT INTO obj_stat (obj_id, ref_count, zero_since, updated_at) 
                      VALUES (?1, ?2, NULL, ?3)
                      ON CONFLICT(obj_id) DO UPDATE SET 
                         ref_count = ref_count + excluded.ref_count,
                         zero_since = NULL,
                         updated_at = excluded.updated_at",
-                    params![obj_blob.clone(), delta, now],
-                )
-                .map_err(map_db_err)?;
-            } else {
-                // Negative or zero delta: use atomic conditional UPDATE
-                // Only update if the result would be non-negative
-                let updated = conn
-                    .execute(
-                        "UPDATE obj_stat SET 
+                        params![obj_blob.clone(), delta, now],
+                    )
+                    .map_err(map_db_err)?;
+                } else {
+                    // Negative or zero delta: use atomic conditional UPDATE
+                    // Only update if the result would be non-negative
+                    let updated = conn
+                        .execute(
+                            "UPDATE obj_stat SET 
                             ref_count = ref_count + ?2,
                             zero_since = CASE 
                                 WHEN ref_count + ?2 = 0 THEN COALESCE(zero_since, ?3)
@@ -3439,30 +3636,41 @@ impl ndm::FsMetaHandler for FSMetaService {
                             END,
                             updated_at = ?3
                          WHERE obj_id = ?1 AND ref_count + ?2 >= 0",
-                        params![obj_blob.clone(), delta, now],
+                            params![obj_blob.clone(), delta, now],
+                        )
+                        .map_err(map_db_err)?;
+
+                    if updated == 0 {
+                        // Either record doesn't exist or would become negative
+                        return Err(RPCErrors::ReasonError(
+                            "ref_count would be negative".to_string(),
+                        ));
+                    }
+                }
+
+                // Get the new ref_count
+                let new_ref_count: i64 = conn
+                    .query_row(
+                        "SELECT ref_count FROM obj_stat WHERE obj_id = ?1",
+                        params![obj_blob],
+                        |row| row.get(0),
                     )
                     .map_err(map_db_err)?;
 
-                if updated == 0 {
-                    // Either record doesn't exist or would become negative
-                    return Err(RPCErrors::ReasonError(
-                        "ref_count would be negative".to_string(),
-                    ));
-                }
-            }
-
-            // Get the new ref_count
-            let new_ref_count: i64 = conn
-                .query_row(
-                    "SELECT ref_count FROM obj_stat WHERE obj_id = ?1",
-                    params![obj_blob],
-                    |row| row.get(0),
-                )
-                .map_err(map_db_err)?;
-
-            Ok(new_ref_count as u64)
-        })
-        .await
+                Ok(new_ref_count as u64)
+            })
+            .await;
+        match &result {
+            Ok(new_ref_count) => info!(
+                "fsmeta write obj_stat bump: obj_id={}, delta={}, new_ref_count={}, txid={:?}",
+                obj_id_for_log, delta, new_ref_count, txid
+            ),
+            Err(e) => warn!(
+                "fsmeta obj_stat bump failed: obj_id={}, delta={}, txid={:?}, err={}",
+                obj_id_for_log, delta, txid, e
+            ),
+        }
+        result
     }
 
     async fn handle_obj_stat_list_zero(
@@ -3498,17 +3706,31 @@ impl ndm::FsMetaHandler for FSMetaService {
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<bool, RPCErrors> {
-        self.with_conn(txid.as_deref(), move |conn| {
-            let obj_blob = obj_id_to_blob(&obj_id);
-            let removed = conn
-                .execute(
-                    "DELETE FROM obj_stat WHERE obj_id = ?1 AND ref_count = 0",
-                    params![obj_blob],
-                )
-                .map_err(map_db_err)?;
-            Ok(removed > 0)
-        })
-        .await
+        let obj_id_for_log = obj_id.clone();
+        let result = self
+            .with_conn(txid.as_deref(), move |conn| {
+                let obj_blob = obj_id_to_blob(&obj_id);
+                let removed = conn
+                    .execute(
+                        "DELETE FROM obj_stat WHERE obj_id = ?1 AND ref_count = 0",
+                        params![obj_blob],
+                    )
+                    .map_err(map_db_err)?;
+                Ok(removed > 0)
+            })
+            .await;
+        match &result {
+            Ok(true) => info!(
+                "fsmeta write obj_stat delete-if-zero: obj_id={}, txid={:?}",
+                obj_id_for_log, txid
+            ),
+            Ok(false) => {}
+            Err(e) => warn!(
+                "fsmeta obj_stat delete-if-zero failed: obj_id={}, txid={:?}, err={}",
+                obj_id_for_log, txid, e
+            ),
+        }
+        result
     }
 
     //----------------------------------高阶业务操作----------------------------------
@@ -3520,6 +3742,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
+        let name_for_log = name.clone();
         if name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid path".to_string()));
         }
@@ -3561,6 +3784,10 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?;
 
         txn.commit().await?;
+        info!(
+            "fsmeta write set file: parent_inode={}, name={}",
+            parent, name_for_log
+        );
 
         Ok(String::new())
     }
@@ -3572,6 +3799,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         dir_obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
+        let name_for_log = name.clone();
         if name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid path".to_string()));
         }
@@ -3617,6 +3845,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         .await?;
 
         txn.commit().await?;
+        info!(
+            "fsmeta write set dir: parent_inode={}, name={}, dir_obj_id={}",
+            parent, name_for_log, dir_obj_id
+        );
 
         // TODO: update ref_count for dir and its children
 
@@ -3629,6 +3861,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         name: String,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
+        let name_for_log = name.clone();
         if name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid path".to_string()));
         }
@@ -3636,6 +3869,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         let parent_rev = self.get_inode_rev(parent, None, ctx.clone()).await?;
         self.set_tombstone_with_parent_rev(parent, name, parent_rev, None, ctx)
             .await?;
+        info!(
+            "fsmeta write delete path: parent_inode={}, name={}",
+            parent, name_for_log
+        );
 
         Ok(())
     }
@@ -3715,7 +3952,18 @@ impl ndm::FsMetaHandler for FSMetaService {
         };
 
         // Apply in transaction
-        self.apply_move_plan_txn(plan, opts, ctx).await
+        let result = self.apply_move_plan_txn(plan, opts, ctx).await;
+        match &result {
+            Ok(_) => info!(
+                "fsmeta write move path: src=#{}:{}, dst=#{}:{}",
+                src_parent, src_name, dst_parent, dst_name
+            ),
+            Err(e) => warn!(
+                "fsmeta move path failed: src=#{}:{}, dst=#{}:{}, err={}",
+                src_parent, src_name, dst_parent, dst_name, e
+            ),
+        }
+        result
     }
 
     // 创建软链接(symlink)，目标保存为路径（可相对路径）
@@ -3727,6 +3975,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         target: String,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
+        let link_name_for_log = link_name.clone();
         if link_name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid link path".to_string()));
         }
@@ -3771,6 +4020,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         .await?;
 
         txn.commit().await?;
+        info!(
+            "fsmeta write create symlink: parent_inode={}, name={}",
+            link_parent, link_name_for_log
+        );
 
         Ok(())
     }
@@ -3781,6 +4034,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         name: String,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
+        let name_for_log = name.clone();
         if name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid path".to_string()));
         }
@@ -3838,6 +4092,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         .await?;
 
         txn.commit().await?;
+        info!(
+            "fsmeta write create dir: parent_inode={}, name={}, inode_id={}",
+            parent, name_for_log, new_id
+        );
 
         Ok(())
     }
@@ -3850,6 +4108,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         expected_size: Option<u64>,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
+        debug!(
+            "fsmeta open_file_writer request: parent_inode={}, name={}, flag={:?}, expected_size={:?}",
+            parent_id, name, flag, expected_size
+        );
         let buffer = self
             .buffer
             .as_ref()
@@ -4121,7 +4383,15 @@ impl ndm::FsMetaHandler for FSMetaService {
         };
 
         if let Some(handle) = resume_handle {
+            debug!(
+                "fsmeta sbuffer get_buffer for ContinueWrite: file_inode={}, handle={}",
+                file_id, handle
+            );
             buffer.get_buffer(&handle).await.map_err(|_| {
+                warn!(
+                    "fsmeta sbuffer get_buffer failed for ContinueWrite: file_inode={}, handle={}",
+                    file_id, handle
+                );
                 RPCErrors::ReasonError(format!(
                     "buffer {} not found for ContinueWrite, may have been cleaned up",
                     handle
@@ -4155,6 +4425,10 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?;
             txn.commit().await?;
             let _ = (session, lease_seq);
+            info!(
+                "fsmeta write open file writer (continue): parent_inode={}, name={}, file_inode={}, handle={}",
+                parent_id, name, file_id, handle
+            );
             return Ok(handle);
         }
 
@@ -4173,6 +4447,10 @@ impl ndm::FsMetaHandler for FSMetaService {
             session_seq: lease_seq,
             expires_at: 0,
         };
+        debug!(
+            "fsmeta sbuffer alloc_buffer: file_inode={}, path={}, expected_size={:?}",
+            file_id, fb_path, expected_size
+        );
         let fb = buffer
             .alloc_buffer(
                 &fs_buffer::NdmPath(fb_path),
@@ -4182,7 +4460,17 @@ impl ndm::FsMetaHandler for FSMetaService {
                 expected_size,
             )
             .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to alloc buffer: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "fsmeta sbuffer alloc_buffer failed: file_inode={}, err={}",
+                    file_id, e
+                );
+                RPCErrors::ReasonError(format!("failed to alloc buffer: {}", e))
+            })?;
+        debug!(
+            "fsmeta sbuffer alloc_buffer success: file_inode={}, handle={}",
+            file_id, fb.handle_id
+        );
 
         let working_state = NodeState::Working(ndm::FileWorkingState {
             fb_handle: fb.handle_id.clone(),
@@ -4211,6 +4499,10 @@ impl ndm::FsMetaHandler for FSMetaService {
         )
         .await?;
         txn.commit().await?;
+        info!(
+            "fsmeta write open file writer: parent_inode={}, name={}, file_inode={}, handle={}, flag={:?}",
+            parent_id, name, file_id, fb.handle_id, flag
+        );
 
         Ok(fb.handle_id)
     }
@@ -4249,14 +4541,24 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
         };
 
-        let fb = buffer
-            .get_buffer(&fb_handle)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to get buffer: {}", e)))?;
-        buffer
-            .close(&fb)
-            .await
-            .map_err(|e| RPCErrors::ReasonError(format!("failed to close buffer: {}", e)))?;
+        let fb = buffer.get_buffer(&fb_handle).await.map_err(|e| {
+            warn!(
+                "fsmeta sbuffer get_buffer failed on close: file_inode={}, handle={}, err={}",
+                file_inode_id, fb_handle, e
+            );
+            RPCErrors::ReasonError(format!("failed to get buffer: {}", e))
+        })?;
+        debug!(
+            "fsmeta sbuffer close buffer: file_inode={}, handle={}",
+            file_inode_id, fb_handle
+        );
+        buffer.close(&fb).await.map_err(|e| {
+            warn!(
+                "fsmeta sbuffer close failed: file_inode={}, handle={}, err={}",
+                file_inode_id, fb_handle, e
+            );
+            RPCErrors::ReasonError(format!("failed to close buffer: {}", e))
+        })?;
 
         let cooling_state = NodeState::Cooling(ndm::FileCoolingState {
             fb_handle: fb_handle.clone(),
@@ -4279,6 +4581,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             self.handle_release_file_lease(file_inode_id, session, seq, ctx)
                 .await?;
         }
+
+        info!(
+            "fsmeta write close file writer: file_inode={}, handle={}",
+            file_inode_id, fb_handle
+        );
 
         Ok(())
     }
@@ -4460,5 +4767,6 @@ fn parse_dentry(row: &rusqlite::Row<'_>) -> Result<DentryRecord, RPCErrors> {
 }
 
 fn map_db_err(err: rusqlite::Error) -> RPCErrors {
+    warn!("fsmeta db error: {}", err);
     RPCErrors::ReasonError(format!("db error: {}", err))
 }
