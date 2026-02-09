@@ -1,0 +1,43 @@
+[package]
+name = "ndn-toolkit"
+version = "0.5.1"
+edition = "2021"
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+fs_extra = "*"
+futures-util = { workspace = true }
+futures = { workspace = true }
+regex = "*"
+async-recursion = "*"
+version-compare = "*"
+semver = "*"
+toml = "*"
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simplelog = "*"
+dirs = "*"
+async-trait = { workspace = true }
+tempfile = { workspace = true }
+warp = "*"
+rusqlite = { workspace = true }
+async-fd-lock = "*"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+tokio-tar = "*"
+ndn-lib = { path = "../ndn-lib" }
+named_store = { path = "../named_store" }
+ndm = { path = "../ndm" }
+ndm-lib= {path="../ndm-lib"}
+name-lib = { workspace = true }
+name-client = { workspace = true }
+buckyos-kit = { workspace = true }
+[dev-dependencies]
+tempfile = { workspace = true }

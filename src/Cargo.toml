@@ -9,7 +9,8 @@ members = [
     "./fs_buffer",
     "./ndm",
     "./fs_meta",
-    "./fs_daemon"
+    "./fs_daemon",
+    "./ndn-toolkit"
 ]
 
 [workspace.dependencies]
