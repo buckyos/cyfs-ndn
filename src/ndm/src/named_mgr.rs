@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fs_buffer::{FileBufferBaseReader, FileBufferDiffState, FileBufferRecord, FileBufferService};
-use log::warn;
+use log::{debug, info, warn};
 use named_store::{
     DiffChunkList, DiffChunkListReader, DiffChunkListWriter, DiffChunkListWriterOptions,
     DiffChunkListWriterState, NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout,
@@ -94,16 +94,40 @@ impl NdmFileWriter {
     }
 
     pub async fn flush(&mut self) -> NdnResult<()> {
-        let writer_state = self.writer.close().await?;
+        let writer_state = self.writer.close().await.map_err(|e| {
+            warn!(
+                "NdmFileWriter::flush: close writer failed, inode_id={}, err={}",
+                self.fb.file_inode_id, e
+            );
+            e
+        })?;
         let diff_state = NamedDataMgr::diff_state_from_writer_state(&writer_state);
-        let mut state =
-            self.fb.diff_state.write().map_err(|_| {
-                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
-            })?;
+        let mut state = self.fb.diff_state.write().map_err(|_| {
+            warn!(
+                "NdmFileWriter::flush: diff_state lock poisoned, inode_id={}",
+                self.fb.file_inode_id
+            );
+            NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+        })?;
         *state = diff_state;
         drop(state);
 
-        self.fsbuffer.flush(&self.fb).await?;
+        debug!(
+            "NdmFileWriter::flush: fsbuffer.flush, inode_id={}, diff_file={}",
+            self.fb.file_inode_id,
+            self.fb.diff_file_path.display()
+        );
+        self.fsbuffer.flush(&self.fb).await.map_err(|e| {
+            warn!(
+                "NdmFileWriter::flush: fsbuffer.flush failed, inode_id={}, err={}",
+                self.fb.file_inode_id, e
+            );
+            e
+        })?;
+        info!(
+            "NdmFileWriter::flush: writer state flushed, inode_id={}, total_size={}",
+            self.fb.file_inode_id, writer_state.total_size
+        );
         Ok(())
     }
 }
@@ -269,7 +293,18 @@ impl NamedDataMgr {
     // ========== Basic Operations ==========
 
     pub async fn stat(&self, path: &NdmPath) -> NdnResult<PathStat> {
-        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        debug!(
+            "NamedDataMgr::stat: fsmeta.resolve_path_ex, path={}",
+            path.as_str()
+        );
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::stat: fsmeta.resolve_path_ex failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
         match resolved {
             None => Ok(PathStat {
                 kind: PathKind::NotFound,
@@ -300,11 +335,21 @@ impl NamedDataMgr {
     }
 
     pub async fn stat_by_objid(&self, obj_id: &ObjId) -> NdnResult<ObjStat> {
+        debug!(
+            "NamedDataMgr::stat_by_objid: fsmeta.obj_stat_get, obj_id={}",
+            obj_id
+        );
         let stat = self
             .fsmeta
             .obj_stat_get(obj_id.clone())
             .await
-            .map_err(|e| NdnError::Internal(format!("failed to get obj stat: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::stat_by_objid: fsmeta.obj_stat_get failed, obj_id={}, err={}",
+                    obj_id, e
+                );
+                NdnError::Internal(format!("failed to get obj stat: {}", e))
+            })?;
 
         stat.ok_or_else(|| NdnError::NotFound(format!("object {} not found", obj_id)))
     }
@@ -312,7 +357,29 @@ impl NamedDataMgr {
     // ========== Write Operations ==========
 
     pub async fn set_file(&self, path: &NdmPath, obj_id: ObjId) -> NdnResult<()> {
-        self.fsmeta.set_file(path, obj_id).await
+        debug!(
+            "NamedDataMgr::set_file: fsmeta.set_file, path={}, obj_id={}",
+            path.as_str(),
+            obj_id
+        );
+        self.fsmeta
+            .set_file(path, obj_id.clone())
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::set_file: fsmeta.set_file failed, path={}, obj_id={}, err={}",
+                    path.as_str(),
+                    obj_id,
+                    e
+                );
+                e
+            })?;
+        info!(
+            "NamedDataMgr::set_file: set file object, path={}, obj_id={}",
+            path.as_str(),
+            obj_id
+        );
+        Ok(())
     }
 
     pub async fn set_file_with_body(&self, path: &NdmPath, obj_data: String) -> NdnResult<()> {
@@ -323,22 +390,82 @@ impl NamedDataMgr {
     }
 
     pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
-        self.fsmeta.set_dir(path, dir_obj_id).await
+        debug!(
+            "NamedDataMgr::set_dir: fsmeta.set_dir, path={}, obj_id={}",
+            path.as_str(),
+            dir_obj_id
+        );
+        self.fsmeta
+            .set_dir(path, dir_obj_id.clone())
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::set_dir: fsmeta.set_dir failed, path={}, obj_id={}, err={}",
+                    path.as_str(),
+                    dir_obj_id,
+                    e
+                );
+                e
+            })?;
+        info!(
+            "NamedDataMgr::set_dir: set directory object, path={}, obj_id={}",
+            path.as_str(),
+            dir_obj_id
+        );
+        Ok(())
     }
 
     pub async fn delete(&self, path: &NdmPath) -> NdnResult<()> {
-        self.fsmeta.delete(path).await
+        debug!(
+            "NamedDataMgr::delete: fsmeta.delete, path={}",
+            path.as_str()
+        );
+        self.fsmeta.delete(path).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::delete: fsmeta.delete failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
+        info!("NamedDataMgr::delete: path deleted, path={}", path.as_str());
+        Ok(())
     }
 
     pub async fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
         self.move_path_with_opts(old_path, new_path, MoveOptions::default())
-            .await
+            .await?;
+        info!(
+            "NamedDataMgr::move_path: move completed, old_path={}, new_path={}",
+            old_path.as_str(),
+            new_path.as_str()
+        );
+        Ok(())
     }
 
     //创建软链接(symlink)，目标保存为路径（可相对路径）
     //SYMLINK: link_path -> target_path
     pub async fn symlink(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
-        self.fsmeta.symlink(link_path, target).await
+        debug!(
+            "NamedDataMgr::symlink: fsmeta.symlink, link_path={}, target={}",
+            link_path.as_str(),
+            target.as_str()
+        );
+        self.fsmeta.symlink(link_path, target).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::symlink: fsmeta.symlink failed, link_path={}, target={}, err={}",
+                link_path.as_str(),
+                target.as_str(),
+                e
+            );
+            e
+        })?;
+        info!(
+            "NamedDataMgr::symlink: symlink created, link_path={}, target={}",
+            link_path.as_str(),
+            target.as_str()
+        );
+        Ok(())
     }
 
     pub async fn copy_file(&self, src: &NdmPath, target: &NdmPath) -> NdnResult<()> {
@@ -383,12 +510,39 @@ impl NamedDataMgr {
 
     // ========== Directory Operations ==========
     pub async fn create_dir(&self, path: &NdmPath) -> NdnResult<()> {
-        self.fsmeta.create_dir(path).await
+        debug!(
+            "NamedDataMgr::create_dir: fsmeta.create_dir, path={}",
+            path.as_str()
+        );
+        self.fsmeta.create_dir(path).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::create_dir: fsmeta.create_dir failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
+        info!(
+            "NamedDataMgr::create_dir: directory created, path={}",
+            path.as_str()
+        );
+        Ok(())
     }
 
     //return list_session_id
     pub async fn start_list(&self, path: &NdmPath) -> NdnResult<u64> {
-        if let Some(resp) = self.fsmeta.resolve_path_ex(path, 0).await? {
+        debug!(
+            "NamedDataMgr::start_list: fsmeta.resolve_path_ex, path={}",
+            path.as_str()
+        );
+        if let Some(resp) = self.fsmeta.resolve_path_ex(path, 0).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::start_list: fsmeta.resolve_path_ex failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })? {
             if let FsMetaResolvePathItem::Inode {
                 inode_id: dir_id,
                 inode: dir_node,
@@ -498,7 +652,13 @@ impl NamedDataMgr {
             self.fsmeta
                 .stop_list(fsmeta_list_session_id)
                 .await
-                .map_err(|e| NdnError::Internal(format!("stop_list failed: {}", e)))?;
+                .map_err(|e| {
+                    warn!(
+                        "NamedDataMgr::stop_list: fsmeta.stop_list failed, list_session_id={}, fsmeta_session_id={}, err={}",
+                        list_session_id, fsmeta_list_session_id, e
+                    );
+                    NdnError::Internal(format!("stop_list failed: {}", e))
+                })?;
         }
 
         Ok(())
@@ -546,7 +706,13 @@ impl NamedDataMgr {
             .fsmeta
             .list_next(passthrough_fsmeta_session, page_size)
             .await
-            .map_err(|e| NdnError::Internal(format!("list_next failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::list_next: fsmeta.list_next failed, fsmeta_session_id={}, page_size={}, err={}",
+                    passthrough_fsmeta_session, page_size, e
+                );
+                NdnError::Internal(format!("list_next failed: {}", e))
+            })?;
         self.path_stats_from_fsmeta_entries(fsmeta_page).await
     }
 
@@ -592,6 +758,10 @@ impl NamedDataMgr {
                     let node = match inode {
                         Some(node) => Some(node),
                         None => self.fsmeta.get_inode(id, None).await.map_err(|e| {
+                            warn!(
+                                "NamedDataMgr::build_merged_dir_entries: fsmeta.get_inode failed, inode_id={}, err={}",
+                                id, e
+                            );
                             NdnError::Internal(format!("failed to get inode: {}", e))
                         })?,
                     };
@@ -616,7 +786,18 @@ impl NamedDataMgr {
         &self,
         path: &NdmPath,
     ) -> NdnResult<Option<BTreeMap<String, PathStat>>> {
-        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        debug!(
+            "NamedDataMgr::load_obj_dir_entries: fsmeta.resolve_path_ex, path={}",
+            path.as_str()
+        );
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::load_obj_dir_entries: fsmeta.resolve_path_ex failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
         let Some(resp) = resolved else {
             return Ok(None);
         };
@@ -714,6 +895,10 @@ impl NamedDataMgr {
                     let node = match entry.inode {
                         Some(node) => Some(node),
                         None => self.fsmeta.get_inode(id, None).await.map_err(|e| {
+                            warn!(
+                                "NamedDataMgr::path_stats_from_fsmeta_entries: fsmeta.get_inode failed, inode_id={}, err={}",
+                                id, e
+                            );
                             NdnError::Internal(format!("failed to get inode: {}", e))
                         })?,
                     };
@@ -738,10 +923,31 @@ impl NamedDataMgr {
         path: &NdmPath,
         _opts: ReadOptions,
     ) -> NdnResult<(Box<dyn tokio::io::AsyncRead + Send + Unpin>, u64)> {
-        let resp = self.fsmeta.open_file_reader(path).await?;
+        debug!(
+            "NamedDataMgr::open_reader: fsmeta.open_file_reader, path={}",
+            path.as_str()
+        );
+        let resp = self.fsmeta.open_file_reader(path).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::open_reader: fsmeta.open_file_reader failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
         match resp {
             crate::OpenFileReaderResp::FileBufferId(handle_id) => {
-                let fb = self.fsbuffer.get_buffer(&handle_id).await?;
+                debug!(
+                    "NamedDataMgr::open_reader: fsbuffer.get_buffer, handle_id={}",
+                    handle_id
+                );
+                let fb = self.fsbuffer.get_buffer(&handle_id).await.map_err(|e| {
+                    warn!(
+                        "NamedDataMgr::open_reader: fsbuffer.get_buffer failed, handle_id={}, err={}",
+                        handle_id, e
+                    );
+                    e
+                })?;
                 let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
                     NdnError::NotFound("store layout manager not configured".to_string())
                 })?;
@@ -817,18 +1023,19 @@ impl NamedDataMgr {
     }
 
     pub async fn get_dir_child(&self, dir_obj_id: &ObjId, item_name: &str) -> NdnResult<ObjId> {
-        let dir_obj = self.load_dir_object(dir_obj_id).await.map_err(|e| match e {
-            NdnError::NotFound(_) => NdnError::NotReady(format!(
-                "dir object {} not ready or not pulled",
-                dir_obj_id
-            )),
-            _ => e,
-        })?;
+        let dir_obj = self
+            .load_dir_object(dir_obj_id)
+            .await
+            .map_err(|e| match e {
+                NdnError::NotFound(_) => {
+                    NdnError::NotReady(format!("dir object {} not ready or not pulled", dir_obj_id))
+                }
+                _ => e,
+            })?;
         let item = dir_obj.get(item_name).ok_or_else(|| {
             NdnError::NotFound(format!(
                 "child {} not found in dir {}",
-                item_name,
-                dir_obj_id
+                item_name, dir_obj_id
             ))
         })?;
         let (obj_id, _) = item.get_obj_id()?;
@@ -1146,22 +1353,55 @@ impl NamedDataMgr {
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
     ) -> NdnResult<(NdmFileWriter, IndexNodeId)> {
+        debug!(
+            "NamedDataMgr::open_file_writer: fsmeta.open_file_writer, path={}, flag={:?}, expected_size={:?}",
+            path.as_str(),
+            flag,
+            expected_size
+        );
         let file_handle_id = self
             .fsmeta
             .open_file_writer(path, flag, expected_size)
-            .await?;
-        let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await?;
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::open_file_writer: fsmeta.open_file_writer failed, path={}, err={}",
+                    path.as_str(),
+                    e
+                );
+                e
+            })?;
+        debug!(
+            "NamedDataMgr::open_file_writer: fsbuffer.get_buffer, file_handle_id={}",
+            file_handle_id
+        );
+        let file_handle = self.fsbuffer.get_buffer(&file_handle_id).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::open_file_writer: fsbuffer.get_buffer failed, file_handle_id={}, err={}",
+                file_handle_id, e
+            );
+            e
+        })?;
         let inode_id = file_handle.file_inode_id;
-        let layout_mgr = self
-            .layout_mgr
-            .as_ref()
-            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            warn!(
+                "NamedDataMgr::open_file_writer: store layout manager not configured, path={}",
+                path.as_str()
+            );
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
         let base_chunk_list = Self::base_simple_chunk_list(&file_handle)?;
         let base_chunk_list_id = Self::simple_chunk_list_id(&base_chunk_list);
         let diff_state = file_handle
             .diff_state
             .read()
-            .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
+            .map_err(|_| {
+                warn!(
+                    "NamedDataMgr::open_file_writer: diff_state lock poisoned, inode_id={}",
+                    inode_id
+                );
+                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+            })?
             .clone();
 
         let writer = if Self::has_writer_state(&diff_state) {
@@ -1176,7 +1416,16 @@ impl NamedDataMgr {
                 writer_state,
                 None,
             )
-            .await?
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::open_file_writer: open_from_state failed, path={}, inode_id={}, err={}",
+                    path.as_str(),
+                    inode_id,
+                    e
+                );
+                e
+            })?
         } else {
             let mut options = DiffChunkListWriterOptions::default();
             if let Some(fixed_chunk_size) = diff_state.fixed_chunk_size {
@@ -1193,9 +1442,23 @@ impl NamedDataMgr {
                 &file_handle.diff_file_path,
                 options,
             )
-            .await?
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::open_file_writer: new writer failed, path={}, inode_id={}, err={}",
+                    path.as_str(),
+                    inode_id,
+                    e
+                );
+                e
+            })?
         };
 
+        info!(
+            "NamedDataMgr::open_file_writer: writer opened, path={}, inode_id={}",
+            path.as_str(),
+            inode_id
+        );
         Ok((
             NdmFileWriter {
                 writer,
@@ -1209,16 +1472,86 @@ impl NamedDataMgr {
     pub async fn append(&self, path: &NdmPath, data: &[u8]) -> NdnResult<()> {
         let (mut writer, inode_id) = self
             .open_file_writer(path, OpenWriteFlag::CreateOrAppend, None)
-            .await?;
-        writer.seek(SeekFrom::End(0)).await?;
-        writer.write_all(data).await?;
-        writer.flush().await?;
-        self.fsmeta.close_file_writer(inode_id).await?;
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::append: open_file_writer failed, path={}, err={}",
+                    path.as_str(),
+                    e
+                );
+                e
+            })?;
+        writer.seek(SeekFrom::End(0)).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::append: seek failed, path={}, inode_id={}, err={}",
+                path.as_str(),
+                inode_id,
+                e
+            );
+            e
+        })?;
+        writer.write_all(data).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::append: write_all failed, path={}, inode_id={}, bytes={}, err={}",
+                path.as_str(),
+                inode_id,
+                data.len(),
+                e
+            );
+            e
+        })?;
+        writer.flush().await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::append: writer.flush failed, path={}, inode_id={}, err={}",
+                path.as_str(),
+                inode_id,
+                e
+            );
+            e
+        })?;
+        debug!(
+            "NamedDataMgr::append: fsmeta.close_file_writer, inode_id={}",
+            inode_id
+        );
+        self.fsmeta.close_file_writer(inode_id).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::append: close_file_writer failed, path={}, inode_id={}, err={}",
+                path.as_str(),
+                inode_id,
+                e
+            );
+            e
+        })?;
+        info!(
+            "NamedDataMgr::append: append completed, path={}, inode_id={}, bytes={}",
+            path.as_str(),
+            inode_id,
+            data.len()
+        );
         Ok(())
     }
 
     pub async fn close_file(&self, file_inode_id: IndexNodeId) -> NdnResult<()> {
-        self.fsmeta.close_file_writer(file_inode_id).await
+        debug!(
+            "NamedDataMgr::close_file: fsmeta.close_file_writer, inode_id={}",
+            file_inode_id
+        );
+        self.fsmeta
+            .close_file_writer(file_inode_id)
+            .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::close_file: fsmeta.close_file_writer failed, inode_id={}, err={}",
+                    file_inode_id,
+                    e
+                );
+                e
+            })?;
+        info!(
+            "NamedDataMgr::close_file: file writer closed, inode_id={}",
+            file_inode_id
+        );
+        Ok(())
     }
 
     // ========== Pull Operations,need more think ==========
@@ -1344,12 +1677,26 @@ impl NamedDataMgr {
     // ========== Helper Methods ==========
     // 手工物化一个目录，把目录的objid设置为path的objid，并设置为readonly
     pub async fn publish_dir(&self, path: &NdmPath) -> NdnResult<ObjId> {
-        let layout_mgr = self
-            .layout_mgr
-            .as_ref()
-            .ok_or_else(|| NdnError::NotFound("store layout manager not configured".to_string()))?;
+        let layout_mgr = self.layout_mgr.as_ref().ok_or_else(|| {
+            warn!(
+                "NamedDataMgr::publish_dir: store layout manager not configured, path={}",
+                path.as_str()
+            );
+            NdnError::NotFound("store layout manager not configured".to_string())
+        })?;
 
-        let resolved = self.fsmeta.resolve_path_ex(path, 0).await?;
+        debug!(
+            "NamedDataMgr::publish_dir: fsmeta.resolve_path_ex, path={}",
+            path.as_str()
+        );
+        let resolved = self.fsmeta.resolve_path_ex(path, 0).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::publish_dir: fsmeta.resolve_path_ex failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            e
+        })?;
         let dir_id = match resolved {
             None => return Err(NdnError::NotFound("path not found".to_string())),
             Some(resp) => match (resp.item, resp.inner_path) {
@@ -1383,17 +1730,30 @@ impl NamedDataMgr {
             },
         };
 
-        let txid = self
-            .fsmeta
-            .begin_txn()
-            .await
-            .map_err(|e| NdnError::Internal(format!("begin_txn failed: {}", e)))?;
+        let txid = self.fsmeta.begin_txn().await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::publish_dir: fsmeta.begin_txn failed, path={}, err={}",
+                path.as_str(),
+                e
+            );
+            NdnError::Internal(format!("begin_txn failed: {}", e))
+        })?;
 
+        debug!(
+            "NamedDataMgr::publish_dir: fsmeta.get_inode, dir_id={}, txid={}",
+            dir_id, txid
+        );
         let mut node = match self
             .fsmeta
             .get_inode(dir_id, Some(txid.clone()))
             .await
-            .map_err(|e| NdnError::Internal(format!("get_inode failed: {}", e)))?
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::publish_dir: fsmeta.get_inode failed, dir_id={}, txid={}, err={}",
+                    dir_id, txid, e
+                );
+                NdnError::Internal(format!("get_inode failed: {}", e))
+            })?
         {
             Some(node) => node,
             None => {
@@ -1425,7 +1785,13 @@ impl NamedDataMgr {
             .fsmeta
             .list_dentries(dir_id, Some(txid.clone()))
             .await
-            .map_err(|e| NdnError::Internal(format!("list_dentries failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::publish_dir: fsmeta.list_dentries failed, dir_id={}, txid={}, err={}",
+                    dir_id, txid, e
+                );
+                NdnError::Internal(format!("list_dentries failed: {}", e))
+            })?;
 
         let mut upper_map: HashMap<String, DentryRecord> = HashMap::new();
         for dentry in upper_dentries.iter() {
@@ -1455,11 +1821,21 @@ impl NamedDataMgr {
             let obj_id = match dentry.target {
                 DentryTarget::ObjId(obj_id) => obj_id,
                 DentryTarget::IndexNodeId(inode_id) => {
+                    debug!(
+                        "NamedDataMgr::publish_dir: fsmeta.get_inode(child), inode_id={}, txid={}",
+                        inode_id, txid
+                    );
                     let child = self
                         .fsmeta
                         .get_inode(inode_id, Some(txid.clone()))
                         .await
-                        .map_err(|e| NdnError::Internal(format!("get_inode failed: {}", e)))?;
+                        .map_err(|e| {
+                            warn!(
+                                "NamedDataMgr::publish_dir: fsmeta.get_inode(child) failed, inode_id={}, txid={}, err={}",
+                                inode_id, txid, e
+                            );
+                            NdnError::Internal(format!("get_inode failed: {}", e))
+                        })?;
                     let child = match child {
                         Some(c) => c,
                         None => {
@@ -1507,23 +1883,47 @@ impl NamedDataMgr {
         let (dir_obj_id, dir_obj_str) = dir_obj.gen_obj_id()?;
         layout_mgr.put_object(&dir_obj_id, &dir_obj_str).await?;
 
+        debug!(
+            "NamedDataMgr::publish_dir: fsmeta.bump_dir_rev, dir_id={}, rev0={}, txid={}",
+            dir_id, rev0, txid
+        );
         let new_rev = self
             .fsmeta
             .bump_dir_rev(dir_id, rev0, Some(txid.clone()))
             .await
-            .map_err(|e| NdnError::Internal(format!("bump_dir_rev failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::publish_dir: fsmeta.bump_dir_rev failed, dir_id={}, rev0={}, txid={}, err={}",
+                    dir_id, rev0, txid, e
+                );
+                NdnError::Internal(format!("bump_dir_rev failed: {}", e))
+            })?;
 
         node.base_obj_id = Some(dir_obj_id.clone());
         node.state = NodeState::DirOverlay;
         node.rev = Some(new_rev);
 
+        debug!(
+            "NamedDataMgr::publish_dir: fsmeta.set_inode, dir_id={}, new_rev={}, txid={}",
+            dir_id, new_rev, txid
+        );
         self.fsmeta
             .set_inode(node, Some(txid.clone()))
             .await
-            .map_err(|e| NdnError::Internal(format!("set_inode failed: {}", e)))?;
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::publish_dir: fsmeta.set_inode failed, dir_id={}, new_rev={}, txid={}, err={}",
+                    dir_id, new_rev, txid, e
+                );
+                NdnError::Internal(format!("set_inode failed: {}", e))
+            })?;
 
         let mut dir_rev_for_delete = new_rev;
         for dentry in upper_dentries.iter() {
+            debug!(
+                "NamedDataMgr::publish_dir: fsmeta.delete_dentry, dir_id={}, name={}, rev={}, txid={}",
+                dir_id, dentry.name, dir_rev_for_delete, txid
+            );
             self.fsmeta
                 .delete_dentry(
                     dir_id,
@@ -1532,15 +1932,31 @@ impl NamedDataMgr {
                     Some(txid.clone()),
                 )
                 .await
-                .map_err(|e| NdnError::Internal(format!("remove_dentry failed: {}", e)))?;
+                .map_err(|e| {
+                    warn!(
+                        "NamedDataMgr::publish_dir: fsmeta.delete_dentry failed, dir_id={}, name={}, rev={}, txid={}, err={}",
+                        dir_id, dentry.name, dir_rev_for_delete, txid, e
+                    );
+                    NdnError::Internal(format!("remove_dentry failed: {}", e))
+                })?;
             dir_rev_for_delete += 1;
         }
 
-        self.fsmeta
-            .commit(Some(txid.clone()))
-            .await
-            .map_err(|e| NdnError::Internal(format!("commit failed: {}", e)))?;
+        debug!("NamedDataMgr::publish_dir: fsmeta.commit, txid={}", txid);
+        self.fsmeta.commit(Some(txid.clone())).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::publish_dir: fsmeta.commit failed, txid={}, err={}",
+                txid, e
+            );
+            NdnError::Internal(format!("commit failed: {}", e))
+        })?;
 
+        info!(
+            "NamedDataMgr::publish_dir: directory published, path={}, dir_id={}, obj_id={}",
+            path.as_str(),
+            dir_id,
+            dir_obj_id
+        );
         Ok(dir_obj_id)
     }
 
@@ -1550,9 +1966,23 @@ impl NamedDataMgr {
         new_path: &NdmPath,
         opts: MoveOptions,
     ) -> NdnResult<()> {
+        debug!(
+            "NamedDataMgr::move_path_with_opts: fsmeta.move_path_with_opts, old_path={}, new_path={}",
+            old_path.as_str(),
+            new_path.as_str()
+        );
         self.fsmeta
             .move_path_with_opts(old_path, new_path, opts)
             .await
+            .map_err(|e| {
+                warn!(
+                    "NamedDataMgr::move_path_with_opts: fsmeta.move_path_with_opts failed, old_path={}, new_path={}, err={}",
+                    old_path.as_str(),
+                    new_path.as_str(),
+                    e
+                );
+                e
+            })
     }
 }
 
