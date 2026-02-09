@@ -105,6 +105,149 @@ struct TxnEntry {
     touched_edges: Arc<Mutex<HashSet<(IndexNodeId, String)>>>,
 }
 
+/// A transaction guard that automatically rolls back if not committed.
+///
+/// When dropped without calling `commit()`, the transaction is automatically
+/// rolled back (via a spawned async task). This eliminates the need for the
+/// `rollback_and_err!` macro pattern — simply use the `?` operator and the
+/// guard ensures cleanup on any early return.
+///
+/// # Usage
+///
+/// ```ignore
+/// let txn = TxnGuard::begin(self, ctx.clone()).await?;
+///
+/// // Use txn.txid() for operations — any `?` early-return triggers auto-rollback
+/// self.handle_alloc_inode(node, txn.txid(), ctx.clone()).await?;
+/// self.handle_upsert_dentry(parent, name, target, txn.txid(), ctx.clone()).await?;
+///
+/// // Commit on success — consumes the guard, preventing auto-rollback
+/// txn.commit().await?;
+/// ```
+pub(crate) struct TxnGuard<'a> {
+    service: &'a FSMetaService,
+    txid: Option<String>,
+    ctx: RPCContext,
+    /// Cloned from service for use in Drop (async rollback via tokio::spawn)
+    txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
+}
+
+impl<'a> TxnGuard<'a> {
+    /// Begin a new transaction and return a guard.
+    pub async fn begin(service: &'a FSMetaService, ctx: RPCContext) -> Result<Self, RPCErrors> {
+        let txid = service.handle_begin_txn(ctx.clone()).await?;
+        Ok(Self {
+            service,
+            txid: Some(txid),
+            ctx,
+            txns: service.txns.clone(),
+        })
+    }
+
+    /// Get the transaction id as `Option<String>` for passing to handle_* methods.
+    #[inline]
+    pub fn txid(&self) -> Option<String> {
+        self.txid.clone()
+    }
+
+    /// Commit the transaction. Consumes the guard, preventing auto-rollback on drop.
+    pub async fn commit(mut self) -> Result<(), RPCErrors> {
+        if let Some(txid) = self.txid.take() {
+            self.service
+                .handle_commit(Some(txid), self.ctx.clone())
+                .await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Explicitly rollback the transaction. Consumes the guard.
+    #[allow(dead_code)]
+    pub async fn rollback(mut self) -> Result<(), RPCErrors> {
+        if let Some(txid) = self.txid.take() {
+            self.service
+                .handle_rollback(Some(txid), self.ctx.clone())
+                .await
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for TxnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(txid) = self.txid.take() {
+            warn!(
+                "TxnGuard: txid={} dropped without commit, spawning async rollback",
+                txid
+            );
+            let txns = self.txns.clone();
+            tokio::spawn(async move {
+                if let Err(e) = rollback_txn_by_arcs(txns, txid).await {
+                    warn!("TxnGuard auto-rollback failed: {}", e);
+                }
+            });
+        }
+    }
+}
+
+/// Standalone rollback implementation using Arc-based fields.
+/// Used by both `FSMetaService::handle_rollback` and `TxnGuard::drop`.
+async fn rollback_txn_by_arcs(
+    txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
+    txid: String,
+) -> Result<(), RPCErrors> {
+    // Step 1: Mark as closing (but don't remove yet)
+    let entry = {
+        let txns_guard = txns
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
+        let entry = txns_guard
+            .get(&txid)
+            .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
+
+        // Mark as closing - new operations will be rejected
+        if entry.closing.swap(true, Ordering::SeqCst) {
+            // Already being closed by another path (e.g. explicit rollback racing with Drop)
+            return Ok(());
+        }
+        entry.clone()
+    };
+
+    // Step 2: Wait for in-flight operations to complete
+    let wait_start = Instant::now();
+    while entry.in_flight.load(Ordering::SeqCst) > 0 {
+        if wait_start.elapsed() > Duration::from_secs(30) {
+            warn!(
+                "rollback: timeout waiting for in-flight ops for txid={}",
+                txid
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Step 3: Execute ROLLBACK
+    let conn = entry.conn.clone();
+    tokio::task::spawn_blocking(move || {
+        let conn_guard = conn
+            .lock()
+            .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
+        conn_guard
+            .execute_batch("ROLLBACK")
+            .map_err(|e| RPCErrors::ReasonError(format!("rollback failed: {}", e)))
+    })
+    .await
+    .map_err(|e| RPCErrors::ReasonError(format!("rollback join failed: {}", e)))??;
+
+    // Step 4: Remove from map only after successful rollback
+    txns.lock()
+        .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
+        .remove(&txid);
+
+    Ok(())
+}
+
 pub struct FSMetaService {
     db_path: String,
     conn: Arc<Mutex<Connection>>,
@@ -783,7 +926,7 @@ impl FSMetaService {
         }
 
         // Create directory inode
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let new_node = NodeRecord {
             inode_id: 0,
@@ -799,7 +942,7 @@ impl FSMetaService {
         };
 
         let new_id = self
-            .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
+            .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
             .await?;
 
         // Link dentry via upsert_dentry
@@ -807,12 +950,12 @@ impl FSMetaService {
             parent_id,
             name.clone(),
             DentryTarget::IndexNodeId(new_id),
-            Some(txid.clone()),
+            txn.txid(),
             ctx.clone(),
         )
         .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         Ok(())
     }
@@ -1054,128 +1197,92 @@ impl FSMetaService {
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("store dir object failed: {}", e)))?;
 
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        let parent_now = match self
-            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "parent inode missing during finalize".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_now = self
+            .handle_get_inode(parent_id, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("parent inode missing during finalize".to_string())
+            })?;
         if parent_now.rev.unwrap_or(0) != parent_rev0 {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent rev changed during finalize".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent rev changed during finalize".to_string(),
             ));
         }
 
-        let current_dentry = match self
-            .handle_get_dentry(parent_id, dir_name.clone(), Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(d)) => d,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "directory dentry missing during finalize".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let current_dentry = self
+            .handle_get_dentry(parent_id, dir_name.clone(), txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("directory dentry missing during finalize".to_string())
+            })?;
         match current_dentry.target {
             DentryTarget::ObjId(obj_id) => {
                 if obj_id.obj_type == OBJ_TYPE_DIR {
-                    let _ = self.handle_rollback(Some(txid), ctx).await;
+                    // Already finalized — guard auto-rollbacks on drop
                     return Ok(true);
                 }
-                rollback_and_err!(RPCErrors::ReasonError(
-                    "path is not a directory".to_string()
+                return Err(RPCErrors::ReasonError(
+                    "path is not a directory".to_string(),
                 ));
             }
             DentryTarget::IndexNodeId(id) => {
                 if id != dir_inode_id {
-                    rollback_and_err!(RPCErrors::ReasonError(
-                        "directory target changed during finalize".to_string()
+                    return Err(RPCErrors::ReasonError(
+                        "directory target changed during finalize".to_string(),
                     ));
                 }
             }
-            DentryTarget::SymLink(_) | DentryTarget::Tombstone => rollback_and_err!(
-                RPCErrors::ReasonError("directory target changed during finalize".to_string())
-            ),
+            DentryTarget::SymLink(_) | DentryTarget::Tombstone => {
+                return Err(RPCErrors::ReasonError(
+                    "directory target changed during finalize".to_string(),
+                ));
+            }
         }
 
-        let dir_now = match self
-            .handle_get_inode(dir_inode_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "directory inode missing during finalize".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let dir_now = self
+            .handle_get_inode(dir_inode_id, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| {
+                RPCErrors::ReasonError("directory inode missing during finalize".to_string())
+            })?;
         if dir_now.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "path is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "path is not a directory".to_string(),
             ));
         }
         if dir_now.rev.unwrap_or(0) != dir_rev0 {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "directory rev changed during finalize".to_string()
+            return Err(RPCErrors::ReasonError(
+                "directory rev changed during finalize".to_string(),
             ));
         }
 
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                parent_id,
-                dir_name,
-                DentryTarget::ObjId(new_dir_obj_id),
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_upsert_dentry(
+            parent_id,
+            dir_name,
+            DentryTarget::ObjId(new_dir_obj_id),
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        let children_in_tx = match self
-            .handle_list_dentries(dir_inode_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(items) => items,
-            Err(e) => rollback_and_err!(e),
-        };
+        let children_in_tx = self
+            .handle_list_dentries(dir_inode_id, txn.txid(), ctx.clone())
+            .await?;
         for child in children_in_tx {
             if let DentryTarget::IndexNodeId(child_inode_id) = child.target {
-                if let Err(e) = self
-                    .handle_remove_inode(child_inode_id, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    rollback_and_err!(e);
-                }
+                self.handle_remove_inode(child_inode_id, txn.txid(), ctx.clone())
+                    .await?;
             }
-            if let Err(e) = self
-                .handle_remove_dentry_row(dir_inode_id, child.name, Some(txid.clone()), ctx.clone())
-                .await
-            {
-                rollback_and_err!(e);
-            }
+            self.handle_remove_dentry_row(dir_inode_id, child.name, txn.txid(), ctx.clone())
+                .await?;
         }
 
-        if let Err(e) = self
-            .handle_remove_inode(dir_inode_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_remove_inode(dir_inode_id, txn.txid(), ctx.clone())
+            .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
         Ok(true)
     }
 
@@ -1189,15 +1296,7 @@ impl FSMetaService {
         dir_obj_id: &ObjId,
     ) -> Result<IndexNodeId, RPCErrors> {
         let ctx = RPCContext::default();
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
-
-        // Helper macro for rollback on error (similar to open_file_writer)
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         // Create new directory inode with base_obj_id pointing to the DirObject
         let new_node = NodeRecord {
@@ -1213,37 +1312,23 @@ impl FSMetaService {
             lease_expire_at: None,
         };
 
-        let new_id = match self
-            .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
+        let new_id = self
+            .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
             .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                rollback_and_err!(RPCErrors::ReasonError(format!(
-                    "failed to alloc inode: {}",
-                    e
-                )));
-            }
-        };
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to alloc inode: {}", e)))?;
 
         // Update dentry to point to the new inode
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                parent_id,
-                name,
-                DentryTarget::IndexNodeId(new_id),
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(RPCErrors::ReasonError(format!(
-                "failed to upsert dentry: {}",
-                e
-            )));
-        }
+        self.handle_upsert_dentry(
+            parent_id,
+            name,
+            DentryTarget::IndexNodeId(new_id),
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await
+        .map_err(|e| RPCErrors::ReasonError(format!("failed to upsert dentry: {}", e)))?;
 
-        self.handle_commit(Some(txid), ctx)
+        txn.commit()
             .await
             .map_err(|e| RPCErrors::ReasonError(format!("failed to commit: {}", e)))?;
 
@@ -1256,39 +1341,32 @@ impl FSMetaService {
         name: &str,
         ctx: RPCContext,
     ) -> Result<IndexNodeId, RPCErrors> {
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
-
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let existing = self
-            .handle_get_dentry(parent_id, name.to_string(), Some(txid.clone()), ctx.clone())
+            .handle_get_dentry(parent_id, name.to_string(), txn.txid(), ctx.clone())
             .await?;
         if let Some(d) = existing {
             match d.target {
                 DentryTarget::IndexNodeId(id) => {
                     let node = self
-                        .handle_get_inode(id, Some(txid.clone()), ctx.clone())
+                        .handle_get_inode(id, txn.txid(), ctx.clone())
                         .await?
                         .ok_or_else(|| {
                             RPCErrors::ReasonError("existing inode not found".to_string())
                         })?;
                     if node.kind != NodeKind::Dir {
-                        rollback_and_err!(RPCErrors::ReasonError(format!(
+                        return Err(RPCErrors::ReasonError(format!(
                             "{} exists and is not a directory",
                             name
                         )));
                     }
-                    self.handle_commit(Some(txid), ctx).await?;
+                    txn.commit().await?;
                     return Ok(id);
                 }
                 DentryTarget::Tombstone => {}
                 DentryTarget::ObjId(_) | DentryTarget::SymLink(_) => {
-                    rollback_and_err!(RPCErrors::ReasonError(format!(
+                    return Err(RPCErrors::ReasonError(format!(
                         "{} exists and is not a directory",
                         name
                     )));
@@ -1310,17 +1388,17 @@ impl FSMetaService {
         };
 
         let new_id = self
-            .handle_alloc_inode(node, Some(txid.clone()), ctx.clone())
+            .handle_alloc_inode(node, txn.txid(), ctx.clone())
             .await?;
         self.handle_upsert_dentry(
             parent_id,
             name.to_string(),
             DentryTarget::IndexNodeId(new_id),
-            Some(txid.clone()),
+            txn.txid(),
             ctx.clone(),
         )
         .await?;
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
         Ok(new_id)
     }
 
@@ -1723,21 +1801,20 @@ impl FSMetaService {
         _opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         // Verify revisions haven't changed (OCC)
         let src_dir = self
-            .handle_get_inode(plan.src_parent, Some(txid.clone()), ctx.clone())
+            .handle_get_inode(plan.src_parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
         let dst_dir = self
-            .handle_get_inode(plan.dst_parent, Some(txid.clone()), ctx.clone())
+            .handle_get_inode(plan.dst_parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
         if src_dir.rev.unwrap_or(0) != plan.src_rev0 || dst_dir.rev.unwrap_or(0) != plan.dst_rev0 {
-            let _ = self.handle_rollback(Some(txid), ctx.clone()).await;
             return Err(RPCErrors::ReasonError("conflict".to_string()));
         }
 
@@ -1745,7 +1822,7 @@ impl FSMetaService {
         self.handle_set_tombstone(
             plan.src_parent,
             plan.src_name,
-            Some(txid.clone()),
+            txn.txid(),
             ctx.clone(),
         )
         .await?;
@@ -1760,12 +1837,12 @@ impl FSMetaService {
             plan.dst_parent,
             plan.dst_name,
             target,
-            Some(txid.clone()),
+            txn.txid(),
             ctx.clone(),
         )
         .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         Ok(())
     }
@@ -2832,59 +2909,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         let Some(txid) = txid else {
             return Ok(());
         };
-
-        // Step 1: Mark as closing (but don't remove yet)
-        let entry = {
-            let txns = self
-                .txns
-                .lock()
-                .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?;
-            let entry = txns
-                .get(&txid)
-                .ok_or_else(|| RPCErrors::ReasonError("txid not found".to_string()))?;
-
-            // Mark as closing - new operations will be rejected
-            if entry.closing.swap(true, Ordering::SeqCst) {
-                return Err(RPCErrors::ReasonError(
-                    "transaction already closing".to_string(),
-                ));
-            }
-            entry.clone()
-        };
-
-        // Step 2: Wait for in-flight operations to complete
-        let wait_start = Instant::now();
-        while entry.in_flight.load(Ordering::SeqCst) > 0 {
-            if wait_start.elapsed() > Duration::from_secs(30) {
-                warn!(
-                    "rollback: timeout waiting for in-flight ops for txid={}",
-                    txid
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-
-        // Step 3: Execute ROLLBACK
-        let conn = entry.conn.clone();
-        let rollback_result = tokio::task::spawn_blocking(move || {
-            let conn_guard = conn
-                .lock()
-                .map_err(|e| RPCErrors::ReasonError(format!("conn lock poisoned: {}", e)))?;
-            conn_guard
-                .execute_batch("ROLLBACK")
-                .map_err(|e| RPCErrors::ReasonError(format!("rollback failed: {}", e)))
-        })
-        .await
-        .map_err(|e| RPCErrors::ReasonError(format!("rollback join failed: {}", e)))??;
-
-        // Step 4: Remove from map only after successful rollback
-        self.txns
-            .lock()
-            .map_err(|e| RPCErrors::ReasonError(format!("txns lock poisoned: {}", e)))?
-            .remove(&txid);
-
-        Ok(rollback_result)
+        rollback_txn_by_arcs(self.txns.clone(), txid).await
     }
 
     async fn handle_acquire_file_lease(
@@ -3072,68 +3097,43 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
 
         let parent = self.ensure_dir_inode(&parent_path).await?;
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
-
-        let parent_node = match self
-            .handle_get_inode(parent, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "parent directory not found".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_node = self
+            .handle_get_inode(parent, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
             ));
         }
         if parent_node.read_only {
-            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
-        if let Err(e) = self
-            .ensure_name_absent_for_create(
-                parent,
-                &parent_node,
-                &name,
-                path,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.ensure_name_absent_for_create(
+            parent,
+            &parent_node,
+            &name,
+            path,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                parent,
-                name,
-                DentryTarget::ObjId(obj_id.clone()),
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_upsert_dentry(
+            parent,
+            name,
+            DentryTarget::ObjId(obj_id.clone()),
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        if let Err(e) = self
-            .handle_obj_stat_bump(obj_id, 1, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_obj_stat_bump(obj_id, 1, txn.txid(), ctx.clone())
+            .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         Ok(String::new())
     }
@@ -3155,61 +3155,40 @@ impl ndm::FsMetaHandler for FSMetaService {
         }
 
         let parent = self.ensure_dir_inode(&parent_path).await?;
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
-
-        let parent_node = match self
-            .handle_get_inode(parent, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "parent directory not found".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_node = self
+            .handle_get_inode(parent, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
             ));
         }
         if parent_node.read_only {
-            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
-        if let Err(e) = self
-            .ensure_name_absent_for_create(
-                parent,
-                &parent_node,
-                &name,
-                path,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.ensure_name_absent_for_create(
+            parent,
+            &parent_node,
+            &name,
+            path,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                parent,
-                name,
-                DentryTarget::ObjId(dir_obj_id.clone()),
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_upsert_dentry(
+            parent,
+            name,
+            DentryTarget::ObjId(dir_obj_id.clone()),
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         // TODO: update ref_count for dir and its children
 
@@ -3340,62 +3319,41 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid link path".to_string()))?;
 
         let link_parent_id = self.ensure_dir_inode(&link_parent_path).await?;
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
-
-        let parent_node = match self
-            .handle_get_inode(link_parent_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "parent directory not found".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_node = self
+            .handle_get_inode(link_parent_id, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
             ));
         }
         if parent_node.read_only {
-            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
 
-        if let Err(e) = self
-            .ensure_name_absent_for_create(
-                link_parent_id,
-                &parent_node,
-                &link_name,
-                link_path,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.ensure_name_absent_for_create(
+            link_parent_id,
+            &parent_node,
+            &link_name,
+            link_path,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                link_parent_id,
-                link_name,
-                link_target,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_upsert_dentry(
+            link_parent_id,
+            link_name,
+            link_target,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         Ok(())
     }
@@ -3408,46 +3366,29 @@ impl ndm::FsMetaHandler for FSMetaService {
         let parent_id = self.ensure_dir_inode(&parent_path).await?;
 
         // Create directory inode
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
-
-        let parent_node = match self
-            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                "parent directory not found".to_string()
-            )),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_node = self
+            .handle_get_inode(parent_id, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
             ));
         }
         if parent_node.read_only {
-            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
-        if let Err(e) = self
-            .ensure_name_absent_for_create(
-                parent_id,
-                &parent_node,
-                &name,
-                path,
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.ensure_name_absent_for_create(
+            parent_id,
+            &parent_node,
+            &name,
+            path,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
         let new_node = NodeRecord {
             inode_id: 0, // Will be assigned by alloc
@@ -3462,28 +3403,20 @@ impl ndm::FsMetaHandler for FSMetaService {
             lease_expire_at: None,
         };
 
-        let new_id = match self
-            .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => rollback_and_err!(e),
-        };
+        let new_id = self
+            .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
+            .await?;
 
-        if let Err(e) = self
-            .handle_upsert_dentry(
-                parent_id,
-                name,
-                DentryTarget::IndexNodeId(new_id),
-                Some(txid.clone()),
-                ctx.clone(),
-            )
-            .await
-        {
-            rollback_and_err!(e);
-        }
+        self.handle_upsert_dentry(
+            parent_id,
+            name,
+            DentryTarget::IndexNodeId(new_id),
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
 
-        self.handle_commit(Some(txid), ctx).await?;
+        txn.commit().await?;
 
         Ok(())
     }
@@ -3509,50 +3442,36 @@ impl ndm::FsMetaHandler for FSMetaService {
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
         let parent_id: u64 = self.ensure_dir_inode(&parent_path).await?;
 
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
-        macro_rules! rollback_and_err {
-            ($err:expr) => {{
-                let _ = self.handle_rollback(Some(txid.clone()), ctx.clone()).await;
-                return Err($err);
-            }};
-        }
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
-        let parent_node = match self
-            .handle_get_inode(parent_id, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(Some(node)) => node,
-            Ok(None) => rollback_and_err!(RPCErrors::ReasonError("parent not found".to_string())),
-            Err(e) => rollback_and_err!(e),
-        };
+        let parent_node = self
+            .handle_get_inode(parent_id, txn.txid(), ctx.clone())
+            .await?
+            .ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
         if parent_node.kind != NodeKind::Dir {
-            rollback_and_err!(RPCErrors::ReasonError(
-                "parent is not a directory".to_string()
+            return Err(RPCErrors::ReasonError(
+                "parent is not a directory".to_string(),
             ));
         }
         if parent_node.read_only {
-            rollback_and_err!(RPCErrors::ReasonError("parent is read-only".to_string()));
+            return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
 
-        let dentry = match self
-            .handle_get_dentry(parent_id, name.clone(), Some(txid.clone()), ctx.clone())
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => rollback_and_err!(e),
-        };
+        let dentry = self
+            .handle_get_dentry(parent_id, name.clone(), txn.txid(), ctx.clone())
+            .await?;
 
         let mut visible_base_obj: Option<ObjId> = None;
         if dentry.is_none() {
             match self.lookup_base_child(&parent_node, &name).await {
                 Ok(BaseChildLookup::Missing) => {}
                 Ok(BaseChildLookup::DirObj(_)) => {
-                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                    return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
                 Ok(BaseChildLookup::NonDirObj(obj_id)) => {
                     visible_base_obj = Some(obj_id);
                 }
-                Err(e) => rollback_and_err!(e),
+                Err(e) => return Err(e),
             }
         }
 
@@ -3573,7 +3492,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         match flag {
             OpenWriteFlag::Append | OpenWriteFlag::ContinueWrite => {
                 if !file_exists {
-                    rollback_and_err!(RPCErrors::ReasonError(format!(
+                    return Err(RPCErrors::ReasonError(format!(
                         "file not found for {:?}: {}",
                         flag, path.0
                     )));
@@ -3581,7 +3500,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
             OpenWriteFlag::CreateExclusive => {
                 if file_exists {
-                    rollback_and_err!(RPCErrors::ReasonError(format!(
+                    return Err(RPCErrors::ReasonError(format!(
                         "file already exists: {}",
                         path.0
                     )));
@@ -3604,34 +3523,23 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-                let fid = match self
-                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => rollback_and_err!(e),
-                };
-                if let Err(e) = self
-                    .handle_upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                        ctx.clone(),
-                    )
-                    .await
-                {
-                    rollback_and_err!(e);
-                }
+                let fid = self
+                    .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
+                    .await?;
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    txn.txid(),
+                    ctx.clone(),
+                )
+                .await?;
                 (fid, None, NodeState::DirNormal)
             }
             None => {
-                let base_oid = match visible_base_obj.take() {
-                    Some(v) => v,
-                    None => rollback_and_err!(RPCErrors::ReasonError(
-                        "base object missing".to_string()
-                    )),
-                };
+                let base_oid = visible_base_obj
+                    .take()
+                    .ok_or_else(|| RPCErrors::ReasonError("base object missing".to_string()))?;
                 let new_node = NodeRecord {
                     inode_id: 0,
                     kind: NodeKind::File,
@@ -3644,25 +3552,17 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-                let fid = match self
-                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => rollback_and_err!(e),
-                };
-                if let Err(e) = self
-                    .handle_upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                        ctx.clone(),
-                    )
-                    .await
-                {
-                    rollback_and_err!(e);
-                }
+                let fid = self
+                    .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
+                    .await?;
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    txn.txid(),
+                    ctx.clone(),
+                )
+                .await?;
                 (fid, Some(base_oid), NodeState::DirNormal)
             }
             Some(DentryRecord {
@@ -3681,58 +3581,44 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-                let fid = match self
-                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => rollback_and_err!(e),
-                };
-                if let Err(e) = self
-                    .handle_upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                        ctx.clone(),
-                    )
-                    .await
-                {
-                    rollback_and_err!(e);
-                }
+                let fid = self
+                    .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
+                    .await?;
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    txn.txid(),
+                    ctx.clone(),
+                )
+                .await?;
                 (fid, None, NodeState::DirNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::IndexNodeId(fid),
                 ..
             }) => {
-                let node = match self
-                    .handle_get_inode(fid, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    Ok(Some(node)) => node,
-                    Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                        "inode not found".to_string()
-                    )),
-                    Err(e) => rollback_and_err!(e),
-                };
+                let node = self
+                    .handle_get_inode(fid, txn.txid(), ctx.clone())
+                    .await?
+                    .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
                 if node.kind == NodeKind::Dir {
-                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                    return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
                 if node.kind != NodeKind::File {
-                    rollback_and_err!(RPCErrors::ReasonError("path is not a file".to_string()));
+                    return Err(RPCErrors::ReasonError("path is not a file".to_string()));
                 }
                 match (&flag, &node.state) {
                     (OpenWriteFlag::ContinueWrite, NodeState::Working(_))
                     | (OpenWriteFlag::ContinueWrite, NodeState::Cooling(_)) => {}
                     (_, NodeState::Working(_)) => {
-                        rollback_and_err!(RPCErrors::ReasonError(
-                            "file is already being written".to_string()
+                        return Err(RPCErrors::ReasonError(
+                            "file is already being written".to_string(),
                         ));
                     }
                     (OpenWriteFlag::ContinueWrite, _) => {
-                        rollback_and_err!(RPCErrors::ReasonError(format!(
+                        return Err(RPCErrors::ReasonError(format!(
                             "ContinueWrite requires Working or Cooling state, current: {:?}",
                             node.state
                         )));
@@ -3747,7 +3633,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 ..
             }) => {
                 if oid.obj_type == OBJ_TYPE_DIR {
-                    rollback_and_err!(RPCErrors::ReasonError("path is a directory".to_string()));
+                    return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
                 let new_node = NodeRecord {
                     inode_id: 0,
@@ -3761,33 +3647,25 @@ impl ndm::FsMetaHandler for FSMetaService {
                     lease_seq: None,
                     lease_expire_at: None,
                 };
-                let fid = match self
-                    .handle_alloc_inode(new_node, Some(txid.clone()), ctx.clone())
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => rollback_and_err!(e),
-                };
-                if let Err(e) = self
-                    .handle_upsert_dentry(
-                        parent_id,
-                        name.clone(),
-                        DentryTarget::IndexNodeId(fid),
-                        Some(txid.clone()),
-                        ctx.clone(),
-                    )
-                    .await
-                {
-                    rollback_and_err!(e);
-                }
+                let fid = self
+                    .handle_alloc_inode(new_node, txn.txid(), ctx.clone())
+                    .await?;
+                self.handle_upsert_dentry(
+                    parent_id,
+                    name.clone(),
+                    DentryTarget::IndexNodeId(fid),
+                    txn.txid(),
+                    ctx.clone(),
+                )
+                .await?;
                 (fid, Some(oid), NodeState::DirNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::SymLink(_),
                 ..
             }) => {
-                rollback_and_err!(RPCErrors::ReasonError(
-                    "path is a symbolic link".to_string()
+                return Err(RPCErrors::ReasonError(
+                    "path is a symbolic link".to_string(),
                 ));
             }
         };
@@ -3808,34 +3686,30 @@ impl ndm::FsMetaHandler for FSMetaService {
                 NodeState::Working(ws) => (false, vec![], Some(ws.fb_handle)),
                 NodeState::Cooling(cs) => (false, vec![], Some(cs.fb_handle)),
                 _ => {
-                    rollback_and_err!(RPCErrors::ReasonError(
-                        "unexpected state for ContinueWrite".to_string()
+                    return Err(RPCErrors::ReasonError(
+                        "unexpected state for ContinueWrite".to_string(),
                     ));
                 }
             },
         };
 
         if let Some(handle) = resume_handle {
-            if let Err(_e) = buffer.get_buffer(&handle).await {
-                rollback_and_err!(RPCErrors::ReasonError(format!(
+            buffer.get_buffer(&handle).await.map_err(|_| {
+                RPCErrors::ReasonError(format!(
                     "buffer {} not found for ContinueWrite, may have been cleaned up",
                     handle
-                )));
-            }
+                ))
+            })?;
 
             let session = SessionId(format!("{}:{}", instance, file_id));
-            let lease_seq = match self
+            let lease_seq = self
                 .acquire_file_lease_inner(
                     file_id,
                     session.clone(),
                     Duration::from_secs(WRITE_LEASE_TTL_SECS),
-                    Some(txid.clone()),
+                    txn.txid(),
                 )
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => rollback_and_err!(e),
-            };
+                .await?;
 
             let working_state = NodeState::Working(ndm::FileWorkingState {
                 fb_handle: handle.clone(),
@@ -3844,39 +3718,29 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .unwrap_or_default()
                     .as_secs(),
             });
-            if let Err(e) = self
-                .handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
-                .await
-            {
-                rollback_and_err!(e);
-            }
-            if let Err(e) = self.handle_commit(Some(txid.clone()), ctx.clone()).await {
-                rollback_and_err!(e);
-            }
+            self.handle_update_inode_state(file_id, working_state, txn.txid(), ctx.clone())
+                .await?;
+            txn.commit().await?;
             let _ = (session, lease_seq);
             return Ok(handle);
         }
 
         let session = SessionId(format!("{}:{}", instance, file_id));
-        let lease_seq = match self
+        let lease_seq = self
             .acquire_file_lease_inner(
                 file_id,
                 session.clone(),
                 Duration::from_secs(WRITE_LEASE_TTL_SECS),
-                Some(txid.clone()),
+                txn.txid(),
             )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => rollback_and_err!(e),
-        };
+            .await?;
 
         let lease = fs_buffer::WriteLease {
             session: session.clone(),
             session_seq: lease_seq,
             expires_at: 0,
         };
-        let fb = match buffer
+        let fb = buffer
             .alloc_buffer(
                 &fs_buffer::NdmPath(path.0.clone()),
                 file_id,
@@ -3885,13 +3749,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 expected_size,
             )
             .await
-        {
-            Ok(v) => v,
-            Err(e) => rollback_and_err!(RPCErrors::ReasonError(format!(
-                "failed to alloc buffer: {}",
-                e
-            ))),
-        };
+            .map_err(|e| RPCErrors::ReasonError(format!("failed to alloc buffer: {}", e)))?;
 
         let working_state = NodeState::Working(ndm::FileWorkingState {
             fb_handle: fb.handle_id.clone(),
@@ -3901,34 +3759,20 @@ impl ndm::FsMetaHandler for FSMetaService {
                 .as_secs(),
         });
         if should_truncate && existing_base_obj.is_some() {
-            let mut node = match self
-                .handle_get_inode(file_id, Some(txid.clone()), ctx.clone())
-                .await
-            {
-                Ok(Some(node)) => node,
-                Ok(None) => rollback_and_err!(RPCErrors::ReasonError(
-                    "inode not found for truncate".to_string()
-                )),
-                Err(e) => rollback_and_err!(e),
-            };
+            let mut node = self
+                .handle_get_inode(file_id, txn.txid(), ctx.clone())
+                .await?
+                .ok_or_else(|| {
+                    RPCErrors::ReasonError("inode not found for truncate".to_string())
+                })?;
             node.base_obj_id = None;
-            if let Err(e) = self
-                .handle_set_inode(node, Some(txid.clone()), ctx.clone())
-                .await
-            {
-                rollback_and_err!(e);
-            }
+            self.handle_set_inode(node, txn.txid(), ctx.clone())
+                .await?;
         }
 
-        if let Err(e) = self
-            .handle_update_inode_state(file_id, working_state, Some(txid.clone()), ctx.clone())
-            .await
-        {
-            rollback_and_err!(e);
-        }
-        if let Err(e) = self.handle_commit(Some(txid.clone()), ctx.clone()).await {
-            rollback_and_err!(e);
-        }
+        self.handle_update_inode_state(file_id, working_state, txn.txid(), ctx.clone())
+            .await?;
+        txn.commit().await?;
 
         Ok(fb.handle_id)
     }
@@ -3943,15 +3787,14 @@ impl ndm::FsMetaHandler for FSMetaService {
             .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("buffer service not configured".to_string()))?;
 
-        let txid = self.handle_begin_txn(ctx.clone()).await?;
+        let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let node = self
-            .handle_get_inode(file_inode_id, Some(txid.clone()), ctx.clone())
+            .handle_get_inode(file_inode_id, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
         if node.kind != NodeKind::File {
-            let _ = self.handle_rollback(Some(txid), ctx.clone()).await;
             return Err(RPCErrors::ReasonError("not a file".to_string()));
         }
 
@@ -3964,7 +3807,6 @@ impl ndm::FsMetaHandler for FSMetaService {
             NodeState::Working(ws) => ws.fb_handle.clone(),
             NodeState::Cooling(cs) => cs.fb_handle.clone(),
             _ => {
-                let _ = self.handle_rollback(Some(txid), ctx.clone()).await;
                 return Err(RPCErrors::ReasonError("file is not writable".to_string()));
             }
         };
@@ -3986,12 +3828,12 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.handle_update_inode_state(
             file_inode_id,
             cooling_state,
-            Some(txid.clone()),
+            txn.txid(),
             ctx.clone(),
         )
         .await?;
 
-        self.handle_commit(Some(txid), ctx.clone()).await?;
+        txn.commit().await?;
 
         if let (Some(session), Some(seq)) = (node.lease_client_session, node.lease_seq) {
             let session = SessionId(session.0);

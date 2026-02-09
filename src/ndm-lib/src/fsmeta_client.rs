@@ -1531,13 +1531,10 @@ impl FsMetaClient {
 // ========== Kernel : FsMetaHandler ==========
 #[async_trait::async_trait]
 pub trait FsMetaHandler: Send + Sync {
+    //这里是区分不同namespace的起点
+    //对大部分的MetaClient来说，这个值都是可以缓存下来用的
     async fn handle_root_dir(&self, ctx: RPCContext) -> Result<IndexNodeId, RPCErrors>;
-    async fn handle_resolve_path_ex(
-        &self,
-        path: &NdmPath,
-        sym_count: u32,
-        ctx: RPCContext,
-    ) -> NdnResult<Option<FsMetaResolvePathResp>>;
+
     async fn handle_begin_txn(&self, ctx: RPCContext) -> Result<String, RPCErrors>;
     async fn handle_get_inode(
         &self,
@@ -1551,6 +1548,7 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+    //TODO 这里需要CAS
     async fn handle_update_inode_state(
         &self,
         node_id: IndexNodeId,
@@ -1558,12 +1556,14 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_alloc_inode(
         &self,
         node: NodeRecord,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<IndexNodeId, RPCErrors>;
+
     async fn handle_get_dentry(
         &self,
         parent: IndexNodeId,
@@ -1571,29 +1571,34 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<Option<DentryRecord>, RPCErrors>;
+
     async fn handle_list_dentries(
         &self,
         parent: IndexNodeId,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<Vec<DentryRecord>, RPCErrors>;
+
     async fn handle_start_list(
         &self,
         parent: IndexNodeId,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
+
     async fn handle_list_next(
         &self,
         list_session_id: u64,
         page_size: u32,
         ctx: RPCContext,
     ) -> Result<BTreeMap<String, FsMetaListEntry>, RPCErrors>;
+
     async fn handle_stop_list(
         &self,
         list_session_id: u64,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_upsert_dentry(
         &self,
         parent: IndexNodeId,
@@ -1602,6 +1607,7 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_remove_dentry_row(
         &self,
         parent: IndexNodeId,
@@ -1609,6 +1615,7 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_set_tombstone(
         &self,
         parent: IndexNodeId,
@@ -1616,6 +1623,7 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_bump_dir_rev(
         &self,
         dir: IndexNodeId,
@@ -1623,9 +1631,11 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
+
     async fn handle_commit(&self, txid: Option<String>, ctx: RPCContext) -> Result<(), RPCErrors>;
     async fn handle_rollback(&self, txid: Option<String>, ctx: RPCContext)
         -> Result<(), RPCErrors>;
+
     async fn handle_acquire_file_lease(
         &self,
         node_id: IndexNodeId,
@@ -1633,6 +1643,7 @@ pub trait FsMetaHandler: Send + Sync {
         ttl: Duration,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
+    
     async fn handle_renew_file_lease(
         &self,
         node_id: IndexNodeId,
@@ -1641,6 +1652,7 @@ pub trait FsMetaHandler: Send + Sync {
         ttl: Duration,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_release_file_lease(
         &self,
         node_id: IndexNodeId,
@@ -1648,11 +1660,13 @@ pub trait FsMetaHandler: Send + Sync {
         lease_seq: u64,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
+
     async fn handle_obj_stat_get(
         &self,
         obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<Option<ObjStat>, RPCErrors>;
+
     async fn handle_obj_stat_bump(
         &self,
         obj_id: ObjId,
@@ -1660,12 +1674,14 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<u64, RPCErrors>;
+
     async fn handle_obj_stat_list_zero(
         &self,
         older_than_ts: u64,
         limit: u32,
         ctx: RPCContext,
     ) -> Result<Vec<ObjId>, RPCErrors>;
+
     async fn handle_obj_stat_delete_if_zero(
         &self,
         obj_id: ObjId,
@@ -1673,7 +1689,15 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<bool, RPCErrors>;
 
-    //下面向是业务的高阶接口(减少调用fsmeta rpc的次数)
+    //------下面向是业务的高阶接口(减少调用fsmeta rpc的次数)------
+    
+    async fn handle_resolve_path_ex(
+        &self,
+        path: &NdmPath,
+        sym_count: u32,
+        ctx: RPCContext,
+    ) -> NdnResult<Option<FsMetaResolvePathResp>>;
+
     async fn handle_set_file(
         &self,
         path: &NdmPath,
