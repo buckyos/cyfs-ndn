@@ -35,27 +35,12 @@ const DENTRY_TARGET_OBJ: i64 = 1;
 const DENTRY_TARGET_TOMBSTONE: i64 = 2;
 const DENTRY_TARGET_SYMLINK: i64 = 3;
 
+#[allow(dead_code)]
 const DEFAULT_SYMLINK_COUNT: u32 = 40;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ObjectKind {
-    File,
-    Dir,
-    Unknown,
-}
 
 #[derive(Clone, Debug)]
 enum MoveSource {
-    Upper {
-        target: DentryTarget,
-        kind_hint: ObjectKind,
-    },
-    Base {
-        obj_id: ObjId,
-        kind: ObjectKind,
-        src_parent_rev0: u64,
-        src_parent_base0: Option<ObjId>,
-    },
+    Upper { target: DentryTarget },
 }
 
 #[derive(Clone, Debug)]
@@ -273,8 +258,6 @@ pub struct FSMetaService {
     txns: Arc<Mutex<HashMap<String, TxnEntry>>>,
     root_inode: IndexNodeId,
     txn_seq: AtomicU64,
-    /// Transaction timeout in seconds
-    txn_timeout_secs: u64,
     /// Handle to stop the transaction cleanup task on drop
     txn_cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Handle to stop the write lease cleanup task on drop
@@ -328,7 +311,6 @@ impl FSMetaService {
             txns,
             root_inode,
             txn_seq: AtomicU64::new(1),
-            txn_timeout_secs,
             txn_cleanup_handle: Some(txn_cleanup_handle),
             lease_cleanup_handle: Some(lease_cleanup_handle),
             resolve_path_cache: Arc::new(RwLock::new(PathResolveCache::default())),
@@ -355,12 +337,6 @@ impl FSMetaService {
     pub fn with_named_store(mut self, store_mgr: Arc<NamedStoreMgr>) -> Self {
         debug!("fsmeta configured named_store manager");
         self.store_mgr = Some(store_mgr);
-        self
-    }
-
-    /// Set background manager for deferred tasks.
-    pub fn with_background_mgr(mut self, background_mgr: Arc<Mutex<BackgroundMgr>>) -> Self {
-        self.background_mgr = background_mgr;
         self
     }
 
@@ -930,6 +906,7 @@ impl FSMetaService {
 
     /// Internal directory creation that doesn't recursively call ensure_dir_inode.
     /// Assumes parent directory already exists.
+    #[allow(dead_code)]
     async fn create_dir_internal(&self, path: &NdmPath) -> Result<(), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
@@ -1017,6 +994,7 @@ impl FSMetaService {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn join_child_path(parent: &NdmPath, name: &str) -> NdmPath {
         let parent_str = parent.as_str().trim_end_matches('/');
         if parent_str.is_empty() || parent_str == "/" {
@@ -1026,6 +1004,7 @@ impl FSMetaService {
         }
     }
 
+    #[allow(dead_code)]
     async fn resolve_symlink_child_as_obj(
         &self,
         child_path: &NdmPath,
@@ -1057,6 +1036,7 @@ impl FSMetaService {
         }
     }
 
+    #[allow(dead_code)]
     fn enqueue_finalize_tasks(&self, pending_paths: Vec<String>) -> Result<(), RPCErrors> {
         let mut mgr = self
             .background_mgr
@@ -1069,6 +1049,7 @@ impl FSMetaService {
     }
 
     //如果finalize_dir成功，则返回true,如果dir不满足finalzie条件，需要先finalzie child,返回false
+    #[allow(dead_code)]
     async fn try_finalize_dir(&self, dir_path: &NdmPath) -> Result<bool, RPCErrors> {
         /*
         finalize_dir是系统减少元数据的重要方法。
@@ -1981,8 +1962,7 @@ impl FSMetaService {
 
         // Upsert dentry at destination
         let target = match plan.source {
-            MoveSource::Upper { target, .. } => target,
-            MoveSource::Base { obj_id, .. } => DentryTarget::ObjId(obj_id),
+            MoveSource::Upper { target } => target,
         };
 
         let dst_expected_rev = if plan.src_parent == plan.dst_parent {
@@ -2009,8 +1989,6 @@ impl FSMetaService {
         &self,
         src_parent: IndexNodeId,
         src_name: &str,
-        src_dir_node: &NodeRecord,
-        _src_rev0: u64,
         ctx: RPCContext,
     ) -> Result<MoveSource, RPCErrors> {
         // Check upper first
@@ -2022,39 +2000,24 @@ impl FSMetaService {
             return match d.target {
                 DentryTarget::Tombstone => Err(RPCErrors::ReasonError("not found".to_string())),
                 DentryTarget::IndexNodeId(fid) => {
-                    let inode = self
+                    self
                         .handle_get_inode(fid, None, ctx.clone())
                         .await?
                         .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
-                    let kind_hint = match inode.get_node_kind() {
-                        NodeKind::Dir => ObjectKind::Dir,
-                        NodeKind::File => ObjectKind::File,
-                        NodeKind::Object => ObjectKind::Unknown,
-                    };
                     Ok(MoveSource::Upper {
                         target: DentryTarget::IndexNodeId(fid),
-                        kind_hint,
                     })
                 }
                 DentryTarget::SymLink(target_path) => Ok(MoveSource::Upper {
                     target: DentryTarget::SymLink(target_path),
-                    kind_hint: ObjectKind::Unknown,
                 }),
                 DentryTarget::ObjId(oid) => Ok(MoveSource::Upper {
                     target: DentryTarget::ObjId(oid),
-                    kind_hint: ObjectKind::Unknown,
                 }),
             };
         }
 
-        // Upper miss => check base
-        let base0 = src_dir_node.base_obj_id.clone();
-        let _base_oid = base0
-            .clone()
-            .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
-
-        // TODO: look up child in base DirObject
-        // For now, return NotFound
+        // Source dentry does not exist in upper layer.
         Err(RPCErrors::ReasonError("not found".to_string()))
     }
 
@@ -2277,6 +2240,7 @@ impl FSMetaService {
         .await
     }
 
+    #[allow(dead_code)]
     async fn handle_remove_inode(
         &self,
         id: IndexNodeId,
@@ -3979,7 +3943,7 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         // Build move plan
         let source = self
-            .plan_move_source(src_parent, &src_name, &src_dir, src_rev0, ctx.clone())
+            .plan_move_source(src_parent, &src_name, ctx.clone())
             .await?;
 
         // Full cycle prevention by path has moved to client-side path API.
