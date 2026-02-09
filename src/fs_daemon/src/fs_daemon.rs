@@ -611,8 +611,11 @@ impl FsDaemon {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.move_path(&NdmPath::new(old_path.clone()), &NdmPath::new(new_path.clone()))
-                    .await
+                mgr.move_path(
+                    &NdmPath::new(old_path.clone()),
+                    &NdmPath::new(new_path.clone()),
+                )
+                .await
             })
             .map_err(map_ndn_err)?;
 

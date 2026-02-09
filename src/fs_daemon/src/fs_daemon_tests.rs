@@ -143,6 +143,8 @@ fn test_rename_dir_keeps_child_visible() {
 
     daemon.rename_path(1, "src", 1, "dst").expect("rename dir");
     let (dst_ino, _) = daemon.lookup_entry(1, "dst").expect("lookup dst");
-    let (_child_ino, child_attr) = daemon.lookup_entry(dst_ino, "nested").expect("lookup child");
+    let (_child_ino, child_attr) = daemon
+        .lookup_entry(dst_ino, "nested")
+        .expect("lookup child");
     assert_eq!(child_attr.kind, FileType::Directory);
 }

@@ -24,7 +24,7 @@ use ndn_lib::{
 
 use crate::{
     DentryRecord, DentryTarget, FsMetaClient, FsMetaListEntry, FsMetaResolvePathItem, IndexNodeId,
-    MoveOptions, NodeKind, NodeRecord, NodeState, ObjStat, OpenWriteFlag,
+    NodeKind, NodeRecord, NodeState, ObjStat, OpenWriteFlag,
 };
 
 // ------------------------------
@@ -433,8 +433,20 @@ impl NamedDataMgr {
     }
 
     pub async fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
-        self.move_path_with_opts(old_path, new_path, MoveOptions::default())
-            .await?;
+        debug!(
+            "NamedDataMgr::move_path: fsmeta.move_path, old_path={}, new_path={}",
+            old_path.as_str(),
+            new_path.as_str()
+        );
+        self.fsmeta.move_path(old_path, new_path).await.map_err(|e| {
+            warn!(
+                "NamedDataMgr::move_path: fsmeta.move_path failed, old_path={}, new_path={}, err={}",
+                old_path.as_str(),
+                new_path.as_str(),
+                e
+            );
+            e
+        })?;
         info!(
             "NamedDataMgr::move_path: move completed, old_path={}, new_path={}",
             old_path.as_str(),
@@ -1958,31 +1970,6 @@ impl NamedDataMgr {
             dir_obj_id
         );
         Ok(dir_obj_id)
-    }
-
-    async fn move_path_with_opts(
-        &self,
-        old_path: &NdmPath,
-        new_path: &NdmPath,
-        opts: MoveOptions,
-    ) -> NdnResult<()> {
-        debug!(
-            "NamedDataMgr::move_path_with_opts: fsmeta.move_path_with_opts, old_path={}, new_path={}",
-            old_path.as_str(),
-            new_path.as_str()
-        );
-        self.fsmeta
-            .move_path_with_opts(old_path, new_path, opts)
-            .await
-            .map_err(|e| {
-                warn!(
-                    "NamedDataMgr::move_path_with_opts: fsmeta.move_path_with_opts failed, old_path={}, new_path={}, err={}",
-                    old_path.as_str(),
-                    new_path.as_str(),
-                    e
-                );
-                e
-            })
     }
 }
 

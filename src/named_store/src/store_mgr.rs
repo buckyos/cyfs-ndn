@@ -1056,8 +1056,11 @@ impl NamedStoreMgr {
                 path: current_path.clone(),
             });
 
-            let (next_obj_id, next_path, next_obj_str) =
-                Self::resolve_next_obj_once(&current_obj_id, current_obj_str.as_str(), current_path.as_str())?;
+            let (next_obj_id, next_path, next_obj_str) = Self::resolve_next_obj_once(
+                &current_obj_id,
+                current_obj_str.as_str(),
+                current_path.as_str(),
+            )?;
 
             if let Some(rest_path) = next_path {
                 let next_obj_str_for_next = match next_obj_str {

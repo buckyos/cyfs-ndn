@@ -2680,6 +2680,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_move_path_overwrites_existing_target_same_parent() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let src_obj = create_obj_id(61);
+        let dst_obj = create_obj_id(62);
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "src".to_string(),
+            DentryTarget::ObjId(src_obj.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "dst".to_string(),
+            DentryTarget::ObjId(dst_obj),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev0 = parent_rev(&svc, root, None, ctx.clone()).await;
+        svc.handle_move_path(
+            root,
+            "src".to_string(),
+            root,
+            "dst".to_string(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev1 = parent_rev(&svc, root, None, ctx.clone()).await;
+        assert_eq!(rev1, rev0 + 2);
+
+        let src = svc
+            .handle_get_dentry(root, "src".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(src.target, DentryTarget::Tombstone));
+
+        let dst = svc
+            .handle_get_dentry(root, "dst".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(dst.target, DentryTarget::ObjId(obj) if obj == src_obj));
+    }
+
+    #[tokio::test]
+    async fn test_move_path_cross_parent_overwrite_updates_both_revs() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        handle_create_dir_path(&svc, &NdmPath::new("/left"), ctx.clone())
+            .await
+            .unwrap();
+        handle_create_dir_path(&svc, &NdmPath::new("/right"), ctx.clone())
+            .await
+            .unwrap();
+        let left = svc.ensure_dir_inode(&NdmPath::new("/left")).await.unwrap();
+        let right = svc.ensure_dir_inode(&NdmPath::new("/right")).await.unwrap();
+
+        let src_obj = create_obj_id(71);
+        let dst_obj = create_obj_id(72);
+        upsert_dentry_auto(
+            &svc,
+            right,
+            "src".to_string(),
+            DentryTarget::ObjId(src_obj.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            left,
+            "dst".to_string(),
+            DentryTarget::ObjId(dst_obj),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let left_rev0 = parent_rev(&svc, left, None, ctx.clone()).await;
+        let right_rev0 = parent_rev(&svc, right, None, ctx.clone()).await;
+
+        svc.handle_move_path(
+            right,
+            "src".to_string(),
+            left,
+            "dst".to_string(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let left_rev1 = parent_rev(&svc, left, None, ctx.clone()).await;
+        let right_rev1 = parent_rev(&svc, right, None, ctx.clone()).await;
+        assert_eq!(left_rev1, left_rev0 + 1);
+        assert_eq!(right_rev1, right_rev0 + 1);
+
+        let src = svc
+            .handle_get_dentry(right, "src".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(src.target, DentryTarget::Tombstone));
+
+        let dst = svc
+            .handle_get_dentry(left, "dst".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(dst.target, DentryTarget::ObjId(obj) if obj == src_obj));
+    }
+
+    #[tokio::test]
     async fn test_strong_tree_unique_inode_target_constraint() {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();

@@ -1,11 +1,11 @@
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
+use buckyos_kit::get_by_json_path;
 use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, FileObject, NdnError,
-    NdnResult, ObjId, OBJ_TYPE_FILE,extract_objid_by_path
+    caculate_qcid_from_file, extract_objid_by_path, ChunkHasher, ChunkId, ChunkReader, ChunkWriter,
+    FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_FILE,
 };
-use buckyos_kit::get_by_json_path;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -184,10 +184,7 @@ impl NamedLocalStore {
     }
 
     // 直接寻址得到对象内容，返回String是为了兼容JWT
-    pub async fn get_object(
-        &self,
-        obj_id: &ObjId,
-    ) -> NdnResult<String> {
+    pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<String> {
         if obj_id.is_chunk() {
             return Err(NdnError::InvalidObjType(obj_id.to_string()));
         }
@@ -684,8 +681,6 @@ impl NamedLocalStore {
         }
     }
 
-
-
     async fn verify_local_link(&self, chunk_id: &ChunkId, info: &ChunkLocalInfo) -> NdnResult<()> {
         if info.qcid.is_empty() {
             return Err(NdnError::InvalidLink(format!(
@@ -777,7 +772,6 @@ mod tests {
         reader.read_to_end(&mut read_back).await.unwrap();
         assert_eq!(read_back, data);
     }
-
 
     #[tokio::test]
     async fn test_local_link_qcid_ok() {

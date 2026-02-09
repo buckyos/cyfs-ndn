@@ -4,8 +4,8 @@ use log::{debug, info, warn};
 use named_store::NamedStoreMgr;
 use ndm::{
     ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry,
-    FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, MoveOptions, NdmInstanceId,
-    NodeKind, NodeRecord, NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
+    FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, NdmInstanceId, NodeKind, NodeRecord,
+    NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
 use ndn_lib::{
     load_named_obj, ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, SimpleMapItem,
@@ -1738,42 +1738,51 @@ impl FSMetaService {
         Ok(Vec::new())
     }
 
-    async fn check_dest_conflict_pre(
+    async fn lock_move_parents_in_order(
         &self,
+        src_parent: IndexNodeId,
+        src_rev0: u64,
         dst_parent: IndexNodeId,
-        dst_name: &str,
-        dst_dir_node: &NodeRecord,
-        opts: MoveOptions,
-        ctx: RPCContext,
+        dst_rev0: u64,
+        txid: Option<String>,
     ) -> Result<(), RPCErrors> {
-        // Check upper layer
-        let dentry = self
-            .handle_get_dentry(dst_parent, dst_name.to_string(), None, ctx)
-            .await?;
+        let mut ordered = vec![(src_parent, src_rev0)];
+        if dst_parent != src_parent {
+            ordered.push((dst_parent, dst_rev0));
+            ordered.sort_by_key(|(inode_id, _)| *inode_id);
+        }
 
-        if let Some(d) = dentry {
-            match d.target {
-                DentryTarget::Tombstone => { /* treat as not-exists */ }
-                DentryTarget::IndexNodeId(_)
-                | DentryTarget::SymLink(_)
-                | DentryTarget::ObjId(_) => {
-                    if !opts.overwrite_upper {
-                        return Err(RPCErrors::ReasonError("already exists".to_string()));
+        self.with_conn(txid.as_deref(), move |conn| {
+            for (inode_id, expected_rev) in ordered.iter().copied() {
+                // Lock parent rows in deterministic order to prevent ABBA deadlocks
+                // on backends with row-level locking.
+                let updated = conn
+                    .execute(
+                        "UPDATE nodes
+                         SET updated_at = updated_at
+                         WHERE inode_id = ?1 AND COALESCE(rev, 0) = ?2",
+                        params![inode_id as i64, expected_rev as i64],
+                    )
+                    .map_err(map_db_err)?;
+                if updated == 0 {
+                    let exists = conn
+                        .query_row(
+                            "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                            params![inode_id as i64],
+                            |_| Ok(true),
+                        )
+                        .optional()
+                        .map_err(map_db_err)?
+                        .unwrap_or(false);
+                    if !exists {
+                        return Err(RPCErrors::ReasonError("not found".to_string()));
                     }
+                    return Err(RPCErrors::ReasonError("conflict".to_string()));
                 }
             }
-        }
-
-        if !opts.strict_check_base {
-            return Ok(());
-        }
-
-        // Check base if strict mode
-        if dst_dir_node.base_obj_id.is_some() {
-            // TODO: check children in base DirObject if store access is available
-        }
-
-        Ok(())
+            Ok(())
+        })
+        .await
     }
     /// Ensure directory inode exists at path, creating parent directories as needed.
     /// Uses iterative approach to avoid async recursion.
@@ -1933,22 +1942,18 @@ impl FSMetaService {
         Ok(current_id)
     }
 
-    async fn apply_move_plan_txn(
-        &self,
-        plan: MovePlan,
-        _opts: MoveOptions,
-        ctx: RPCContext,
-    ) -> Result<(), RPCErrors> {
+    async fn apply_move_plan_txn(&self, plan: MovePlan, ctx: RPCContext) -> Result<(), RPCErrors> {
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
+        let txid = txn.txid();
 
         // Verify revisions haven't changed (OCC)
         let src_dir = self
-            .handle_get_inode(plan.src_parent, txn.txid(), ctx.clone())
+            .handle_get_inode(plan.src_parent, txid.clone(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
         let dst_dir = self
-            .handle_get_inode(plan.dst_parent, txn.txid(), ctx.clone())
+            .handle_get_inode(plan.dst_parent, txid.clone(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
@@ -1956,11 +1961,20 @@ impl FSMetaService {
             return Err(RPCErrors::ReasonError("conflict".to_string()));
         }
 
+        self.lock_move_parents_in_order(
+            plan.src_parent,
+            plan.src_rev0,
+            plan.dst_parent,
+            plan.dst_rev0,
+            txid.clone(),
+        )
+        .await?;
+
         self.set_tombstone_with_parent_rev(
             plan.src_parent,
             plan.src_name,
             plan.src_rev0,
-            txn.txid(),
+            txid.clone(),
             ctx.clone(),
         )
         .await?;
@@ -1981,7 +1995,7 @@ impl FSMetaService {
             plan.dst_name,
             target,
             dst_expected_rev,
-            txn.txid(),
+            txid,
             ctx.clone(),
         )
         .await?;
@@ -1996,7 +2010,7 @@ impl FSMetaService {
         src_parent: IndexNodeId,
         src_name: &str,
         src_dir_node: &NodeRecord,
-        src_rev0: u64,
+        _src_rev0: u64,
         ctx: RPCContext,
     ) -> Result<MoveSource, RPCErrors> {
         // Check upper first
@@ -3926,13 +3940,12 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_move_path_with_opts(
+    async fn handle_move_path(
         &self,
         src_parent: IndexNodeId,
         src_name: String,
         dst_parent: IndexNodeId,
         dst_name: String,
-        opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         if src_name.is_empty() || dst_name.is_empty() {
@@ -3985,10 +3998,6 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
         }
 
-        // Check destination conflict
-        self.check_dest_conflict_pre(dst_parent, &dst_name, &dst_dir, opts, ctx.clone())
-            .await?;
-
         // Build plan
         let plan = MovePlan {
             src_parent,
@@ -4001,7 +4010,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         };
 
         // Apply in transaction
-        let result = self.apply_move_plan_txn(plan, opts, ctx).await;
+        let result = self.apply_move_plan_txn(plan, ctx).await;
         match &result {
             Ok(_) => info!(
                 "fsmeta write move path: src=#{}:{}, dst=#{}:{}",

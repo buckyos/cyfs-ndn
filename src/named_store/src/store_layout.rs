@@ -298,7 +298,6 @@ impl StoreLayout {
     }
 }
 
-
 /// Version info for a store layout
 #[derive(Debug, Clone)]
 pub struct LayoutVersion {

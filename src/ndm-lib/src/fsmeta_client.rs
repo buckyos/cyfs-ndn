@@ -198,15 +198,6 @@ pub enum OpenFileReaderResp {
     FileBufferId(String),
 }
 
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
-pub struct MoveOptions {
-    /// Whether to overwrite destination if destination is visible in Upper layer.
-    pub overwrite_upper: bool,
-    /// If true: also check destination Base (merged view no-clobber).
-    /// This requires Base materialized, otherwise NEED_PULL.
-    pub strict_check_base: bool,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsMetaRootDirReq;
 
@@ -853,7 +844,10 @@ impl FsMetaClient {
         rest.starts_with('/')
     }
 
-    async fn parent_and_name_for_path(&self, path: &NdmPath) -> Result<(IndexNodeId, String), RPCErrors> {
+    async fn parent_and_name_for_path(
+        &self,
+        path: &NdmPath,
+    ) -> Result<(IndexNodeId, String), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -876,9 +870,13 @@ impl FsMetaClient {
                 let parent_node = self
                     .get_inode(parent_id, txid_opt.clone())
                     .await?
-                    .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+                    .ok_or_else(|| {
+                        RPCErrors::ReasonError("parent directory not found".to_string())
+                    })?;
                 if parent_node.get_node_kind() != NodeKind::Dir {
-                    return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+                    return Err(RPCErrors::ReasonError(
+                        "parent is not a directory".to_string(),
+                    ));
                 }
                 if parent_node.read_only {
                     return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
@@ -899,7 +897,9 @@ impl FsMetaClient {
                             .await?
                             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
                         if node.get_node_kind() != NodeKind::Dir {
-                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                            return Err(RPCErrors::ReasonError(
+                                "path is not a directory".to_string(),
+                            ));
                         }
                         Ok(id)
                     }
@@ -908,7 +908,9 @@ impl FsMetaClient {
                         ..
                     }) => {
                         if obj_id.obj_type != OBJ_TYPE_DIR {
-                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                            return Err(RPCErrors::ReasonError(
+                                "path is not a directory".to_string(),
+                            ));
                         }
                         let new_node = NodeRecord {
                             inode_id: 0,
@@ -962,7 +964,9 @@ impl FsMetaClient {
                         .await?;
                         Ok(new_id)
                     }
-                    Some(_) => Err(RPCErrors::ReasonError("path is not a directory".to_string())),
+                    Some(_) => Err(RPCErrors::ReasonError(
+                        "path is not a directory".to_string(),
+                    )),
                     None => {
                         let new_node = NodeRecord {
                             inode_id: 0,
@@ -1018,7 +1022,9 @@ impl FsMetaClient {
         base_obj_id: &ObjId,
     ) -> Result<IndexNodeId, RPCErrors> {
         if base_obj_id.obj_type != OBJ_TYPE_DIR {
-            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+            return Err(RPCErrors::ReasonError(
+                "path is not a directory".to_string(),
+            ));
         }
 
         for _ in 0..Self::ENSURE_DIR_RETRY_LIMIT {
@@ -1028,9 +1034,13 @@ impl FsMetaClient {
                 let parent_node = self
                     .get_inode(parent_id, txid_opt.clone())
                     .await?
-                    .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+                    .ok_or_else(|| {
+                        RPCErrors::ReasonError("parent directory not found".to_string())
+                    })?;
                 if parent_node.get_node_kind() != NodeKind::Dir {
-                    return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+                    return Err(RPCErrors::ReasonError(
+                        "parent is not a directory".to_string(),
+                    ));
                 }
                 if parent_node.read_only {
                     return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
@@ -1051,7 +1061,9 @@ impl FsMetaClient {
                             .await?
                             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
                         if node.get_node_kind() != NodeKind::Dir {
-                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                            return Err(RPCErrors::ReasonError(
+                                "path is not a directory".to_string(),
+                            ));
                         }
                         Ok(id)
                     }
@@ -1060,7 +1072,9 @@ impl FsMetaClient {
                         ..
                     }) => {
                         if existing_obj.obj_type != OBJ_TYPE_DIR {
-                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                            return Err(RPCErrors::ReasonError(
+                                "path is not a directory".to_string(),
+                            ));
                         }
                         let new_node = NodeRecord {
                             inode_id: 0,
@@ -1090,7 +1104,9 @@ impl FsMetaClient {
                         target: DentryTarget::Tombstone,
                         ..
                     }) => Err(RPCErrors::ReasonError("path not found".to_string())),
-                    Some(_) => Err(RPCErrors::ReasonError("path is not a directory".to_string())),
+                    Some(_) => Err(RPCErrors::ReasonError(
+                        "path is not a directory".to_string(),
+                    )),
                     None => {
                         let new_node = NodeRecord {
                             inode_id: 0,
@@ -1209,11 +1225,7 @@ impl FsMetaClient {
 
                     match resolved {
                         Some(FsMetaResolvePathResp {
-                            item:
-                                FsMetaResolvePathItem::Inode {
-                                    inode_id,
-                                    inode,
-                                },
+                            item: FsMetaResolvePathItem::Inode { inode_id, inode },
                             inner_path: _,
                         }) => {
                             if inode.get_node_kind() != NodeKind::Dir {
@@ -2043,20 +2055,16 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn move_path_with_opts(
-        &self,
-        old_path: &NdmPath,
-        new_path: &NdmPath,
-        opts: MoveOptions,
-    ) -> NdnResult<()> {
+    pub async fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (src_parent_path, src_name) = old_path
                     .split_parent_name()
                     .ok_or_else(|| NdnError::InvalidParam("invalid source path".to_string()))?;
-                let (dst_parent_path, dst_name) = new_path.split_parent_name().ok_or_else(|| {
-                    NdnError::InvalidParam("invalid destination path".to_string())
-                })?;
+                let (dst_parent_path, dst_name) =
+                    new_path.split_parent_name().ok_or_else(|| {
+                        NdnError::InvalidParam("invalid destination path".to_string())
+                    })?;
                 if src_name.is_empty() || dst_name.is_empty() {
                     return Err(NdnError::InvalidParam("invalid path".to_string()));
                 }
@@ -2073,9 +2081,7 @@ impl FsMetaClient {
                 }
                 let ctx = RPCContext::default();
                 handler
-                    .handle_move_path_with_opts(
-                        src_parent, src_name, dst_parent, dst_name, opts, ctx,
-                    )
+                    .handle_move_path(src_parent, src_name, dst_parent, dst_name, ctx)
                     .await
                     .map_err(|e| NdnError::Internal(format!("move_path failed: {}", e)))
             }
@@ -2322,13 +2328,12 @@ pub trait FsMetaHandler: Send + Sync {
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_move_path_with_opts(
+    async fn handle_move_path(
         &self,
         src_parent: IndexNodeId,
         src_name: String,
         dst_parent: IndexNodeId,
         dst_name: String,
-        opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
@@ -3267,13 +3272,12 @@ mod tests {
             Ok(())
         }
 
-        async fn handle_move_path_with_opts(
+        async fn handle_move_path(
             &self,
             _src_parent: IndexNodeId,
             _src_name: String,
             _dst_parent: IndexNodeId,
             _dst_name: String,
-            _opts: MoveOptions,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             Ok(())
