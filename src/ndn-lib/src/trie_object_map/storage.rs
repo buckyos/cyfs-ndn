@@ -145,7 +145,7 @@ pub trait HashFromSlice: Sized {
 
 impl<N> HashFromSlice for GenericArray<u8, N>
 where
-    N: ArrayLength<u8>,
+    N: ArrayLength,
 {
     fn from_slice(data: &[u8]) -> NdnResult<Self> {
         if data.len() != N::to_usize() {
