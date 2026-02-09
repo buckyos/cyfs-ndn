@@ -2,7 +2,7 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EBADF, EINVAL, EIO, ENOENT, ENOSYS, EPERM};
+use libc::{EAGAIN, EBADF, EINVAL, EIO, ENOENT, ENOSYS, EPERM};
 use log::{error, info};
 use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
 use ndm::{
@@ -639,6 +639,7 @@ impl Filesystem for FsDaemon {
 fn map_ndn_err(err: NdnError) -> i32 {
     match err {
         NdnError::NotFound(_) => ENOENT,
+        NdnError::NotReady(_) => EAGAIN,
         NdnError::AlreadyExists(_) => libc::EEXIST,
         NdnError::InvalidParam(_) => EINVAL,
         NdnError::InvalidState(_) => EIO,

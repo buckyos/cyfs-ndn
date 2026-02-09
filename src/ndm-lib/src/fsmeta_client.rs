@@ -3,7 +3,7 @@
 /// ------------------------------
 use crate::{OpenWriteFlag, SessionId};
 use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId};
+use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
@@ -768,15 +768,22 @@ impl FsMetaObjStatDeleteIfZeroReq {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FsMetaOpenFileWriterReq {
-    pub path: String,
+    pub parent: IndexNodeId,
+    pub name: String,
     pub flag: OpenWriteFlag,
     pub expected_size: Option<u64>,
 }
 
 impl FsMetaOpenFileWriterReq {
-    pub fn new(path: String, flag: OpenWriteFlag, expected_size: Option<u64>) -> Self {
+    pub fn new(
+        parent: IndexNodeId,
+        name: String,
+        flag: OpenWriteFlag,
+        expected_size: Option<u64>,
+    ) -> Self {
         Self {
-            path,
+            parent,
+            name,
             flag,
             expected_size,
         }
@@ -795,6 +802,9 @@ pub enum FsMetaClient {
 }
 
 impl FsMetaClient {
+    const DEFAULT_CLIENT_SYMLINK_COUNT: u32 = 40;
+    const ENSURE_DIR_RETRY_LIMIT: usize = 8;
+
     pub fn new_in_process(handler: Box<dyn FsMetaHandler>) -> Self {
         Self::InProcess(handler)
     }
@@ -805,6 +815,453 @@ impl FsMetaClient {
 
     pub async fn set_context(&self, _context: RPCContext) {
         // TODO: kRPC client does not support context propagation yet.
+    }
+
+    fn is_retryable_conflict(err: &RPCErrors) -> bool {
+        match err {
+            RPCErrors::ReasonError(msg) => {
+                msg.contains("rev mismatch")
+                    || msg.contains("already exists")
+                    || msg.contains("conflict")
+            }
+            _ => false,
+        }
+    }
+
+    fn join_child_path(parent: &NdmPath, name: &str) -> NdmPath {
+        let parent_str = parent.as_str().trim_end_matches('/');
+        if parent_str.is_empty() || parent_str == "/" {
+            NdmPath::new(format!("/{}", name))
+        } else {
+            NdmPath::new(format!("{}/{}", parent_str, name))
+        }
+    }
+
+    fn is_descendant_path(path: &NdmPath, ancestor: &NdmPath) -> bool {
+        let path_str = path.as_str().trim_end_matches('/');
+        let ancestor_str = ancestor.as_str().trim_end_matches('/');
+        if ancestor_str.is_empty() {
+            return false;
+        }
+        if path_str == ancestor_str {
+            return false;
+        }
+        if !path_str.starts_with(ancestor_str) {
+            return false;
+        }
+        let rest = &path_str[ancestor_str.len()..];
+        rest.starts_with('/')
+    }
+
+    async fn parent_and_name_for_path(&self, path: &NdmPath) -> Result<(IndexNodeId, String), RPCErrors> {
+        let (parent_path, name) = path
+            .split_parent_name()
+            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
+        let parent_id = self.ensure_dir_inode(&parent_path).await?;
+        Ok((parent_id, name))
+    }
+
+    async fn create_dir_under_parent(
+        &self,
+        parent_id: IndexNodeId,
+        name: &str,
+    ) -> Result<IndexNodeId, RPCErrors> {
+        for _ in 0..Self::ENSURE_DIR_RETRY_LIMIT {
+            let txid = self.begin_txn().await?;
+            let txid_opt = Some(txid.clone());
+            let result: Result<IndexNodeId, RPCErrors> = async {
+                let parent_node = self
+                    .get_inode(parent_id, txid_opt.clone())
+                    .await?
+                    .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+                if parent_node.get_node_kind() != NodeKind::Dir {
+                    return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+                }
+                if parent_node.read_only {
+                    return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+                }
+
+                let parent_rev = parent_node.rev.unwrap_or(0);
+                let current = self
+                    .get_dentry(parent_id, name.to_string(), txid_opt.clone())
+                    .await?;
+
+                match current {
+                    Some(DentryRecord {
+                        target: DentryTarget::IndexNodeId(id),
+                        ..
+                    }) => {
+                        let node = self
+                            .get_inode(id, txid_opt.clone())
+                            .await?
+                            .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                        if node.get_node_kind() != NodeKind::Dir {
+                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                        }
+                        Ok(id)
+                    }
+                    Some(DentryRecord {
+                        target: DentryTarget::ObjId(obj_id),
+                        ..
+                    }) => {
+                        if obj_id.obj_type != OBJ_TYPE_DIR {
+                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                        }
+                        let new_node = NodeRecord {
+                            inode_id: 0,
+                            ref_by: None,
+                            read_only: false,
+                            base_obj_id: Some(obj_id.clone()),
+                            state: NodeState::DirOverlay,
+                            rev: Some(0),
+                            meta: None,
+                            lease_client_session: None,
+                            lease_seq: None,
+                            lease_expire_at: None,
+                        };
+                        let new_id = self.alloc_inode(new_node, txid_opt.clone()).await?;
+                        self.replace_target(
+                            parent_id,
+                            name.to_string(),
+                            DentryTarget::ObjId(obj_id),
+                            DentryTarget::IndexNodeId(new_id),
+                            parent_rev,
+                            txid_opt.clone(),
+                        )
+                        .await?;
+                        Ok(new_id)
+                    }
+                    Some(DentryRecord {
+                        target: DentryTarget::Tombstone,
+                        ..
+                    }) => {
+                        let new_node = NodeRecord {
+                            inode_id: 0,
+                            ref_by: None,
+                            read_only: false,
+                            base_obj_id: None,
+                            state: NodeState::DirNormal,
+                            rev: Some(0),
+                            meta: None,
+                            lease_client_session: None,
+                            lease_seq: None,
+                            lease_expire_at: None,
+                        };
+                        let new_id = self.alloc_inode(new_node, txid_opt.clone()).await?;
+                        self.replace_target(
+                            parent_id,
+                            name.to_string(),
+                            DentryTarget::Tombstone,
+                            DentryTarget::IndexNodeId(new_id),
+                            parent_rev,
+                            txid_opt.clone(),
+                        )
+                        .await?;
+                        Ok(new_id)
+                    }
+                    Some(_) => Err(RPCErrors::ReasonError("path is not a directory".to_string())),
+                    None => {
+                        let new_node = NodeRecord {
+                            inode_id: 0,
+                            ref_by: None,
+                            read_only: false,
+                            base_obj_id: None,
+                            state: NodeState::DirNormal,
+                            rev: Some(0),
+                            meta: None,
+                            lease_client_session: None,
+                            lease_seq: None,
+                            lease_expire_at: None,
+                        };
+                        let new_id = self.alloc_inode(new_node, txid_opt.clone()).await?;
+                        self.create_dentry(
+                            parent_id,
+                            name.to_string(),
+                            DentryTarget::IndexNodeId(new_id),
+                            parent_rev,
+                            txid_opt,
+                        )
+                        .await?;
+                        Ok(new_id)
+                    }
+                }
+            }
+            .await;
+
+            match result {
+                Ok(dir_id) => {
+                    self.commit(Some(txid)).await?;
+                    return Ok(dir_id);
+                }
+                Err(e) => {
+                    let _ = self.rollback(Some(txid)).await;
+                    if Self::is_retryable_conflict(&e) {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(RPCErrors::ReasonError(
+            "conflict while creating directory".to_string(),
+        ))
+    }
+
+    async fn materialize_dir_from_obj(
+        &self,
+        parent_id: IndexNodeId,
+        name: &str,
+        base_obj_id: &ObjId,
+    ) -> Result<IndexNodeId, RPCErrors> {
+        if base_obj_id.obj_type != OBJ_TYPE_DIR {
+            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+        }
+
+        for _ in 0..Self::ENSURE_DIR_RETRY_LIMIT {
+            let txid = self.begin_txn().await?;
+            let txid_opt = Some(txid.clone());
+            let result: Result<IndexNodeId, RPCErrors> = async {
+                let parent_node = self
+                    .get_inode(parent_id, txid_opt.clone())
+                    .await?
+                    .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
+                if parent_node.get_node_kind() != NodeKind::Dir {
+                    return Err(RPCErrors::ReasonError("parent is not a directory".to_string()));
+                }
+                if parent_node.read_only {
+                    return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
+                }
+
+                let parent_rev = parent_node.rev.unwrap_or(0);
+                let current = self
+                    .get_dentry(parent_id, name.to_string(), txid_opt.clone())
+                    .await?;
+
+                match current {
+                    Some(DentryRecord {
+                        target: DentryTarget::IndexNodeId(id),
+                        ..
+                    }) => {
+                        let node = self
+                            .get_inode(id, txid_opt.clone())
+                            .await?
+                            .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                        if node.get_node_kind() != NodeKind::Dir {
+                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                        }
+                        Ok(id)
+                    }
+                    Some(DentryRecord {
+                        target: DentryTarget::ObjId(existing_obj),
+                        ..
+                    }) => {
+                        if existing_obj.obj_type != OBJ_TYPE_DIR {
+                            return Err(RPCErrors::ReasonError("path is not a directory".to_string()));
+                        }
+                        let new_node = NodeRecord {
+                            inode_id: 0,
+                            ref_by: None,
+                            read_only: false,
+                            base_obj_id: Some(existing_obj.clone()),
+                            state: NodeState::DirOverlay,
+                            rev: Some(0),
+                            meta: None,
+                            lease_client_session: None,
+                            lease_seq: None,
+                            lease_expire_at: None,
+                        };
+                        let new_id = self.alloc_inode(new_node, txid_opt.clone()).await?;
+                        self.replace_target(
+                            parent_id,
+                            name.to_string(),
+                            DentryTarget::ObjId(existing_obj),
+                            DentryTarget::IndexNodeId(new_id),
+                            parent_rev,
+                            txid_opt.clone(),
+                        )
+                        .await?;
+                        Ok(new_id)
+                    }
+                    Some(DentryRecord {
+                        target: DentryTarget::Tombstone,
+                        ..
+                    }) => Err(RPCErrors::ReasonError("path not found".to_string())),
+                    Some(_) => Err(RPCErrors::ReasonError("path is not a directory".to_string())),
+                    None => {
+                        let new_node = NodeRecord {
+                            inode_id: 0,
+                            ref_by: None,
+                            read_only: false,
+                            base_obj_id: Some(base_obj_id.clone()),
+                            state: NodeState::DirOverlay,
+                            rev: Some(0),
+                            meta: None,
+                            lease_client_session: None,
+                            lease_seq: None,
+                            lease_expire_at: None,
+                        };
+                        let new_id = self.alloc_inode(new_node, txid_opt.clone()).await?;
+                        self.create_dentry(
+                            parent_id,
+                            name.to_string(),
+                            DentryTarget::IndexNodeId(new_id),
+                            parent_rev,
+                            txid_opt,
+                        )
+                        .await?;
+                        Ok(new_id)
+                    }
+                }
+            }
+            .await;
+
+            match result {
+                Ok(dir_id) => {
+                    self.commit(Some(txid)).await?;
+                    return Ok(dir_id);
+                }
+                Err(e) => {
+                    let _ = self.rollback(Some(txid)).await;
+                    if Self::is_retryable_conflict(&e) {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Err(RPCErrors::ReasonError(
+            "conflict while materializing directory".to_string(),
+        ))
+    }
+
+    pub async fn ensure_dir_inode(&self, path: &NdmPath) -> Result<IndexNodeId, RPCErrors> {
+        if path.is_root() {
+            return self.root_dir().await;
+        }
+
+        let components = path.components();
+        if components.is_empty() {
+            return self.root_dir().await;
+        }
+
+        let mut current_id = self.root_dir().await?;
+        let mut current_path = NdmPath::new("/".to_string());
+
+        for component in components {
+            let child_path = Self::join_child_path(&current_path, &component);
+            let dentry = self
+                .get_dentry(current_id, component.to_string(), None)
+                .await?;
+
+            let next_id = match dentry {
+                Some(DentryRecord {
+                    target: DentryTarget::IndexNodeId(id),
+                    ..
+                }) => {
+                    let inode = self
+                        .get_inode(id, None)
+                        .await?
+                        .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
+                    if inode.get_node_kind() != NodeKind::Dir {
+                        return Err(RPCErrors::ReasonError(format!(
+                            "{} is not a directory",
+                            child_path.as_str()
+                        )));
+                    }
+                    id
+                }
+                Some(DentryRecord {
+                    target: DentryTarget::ObjId(obj_id),
+                    ..
+                }) => {
+                    if obj_id.obj_type != OBJ_TYPE_DIR {
+                        return Err(RPCErrors::ReasonError(format!(
+                            "{} is not a directory",
+                            child_path.as_str()
+                        )));
+                    }
+                    self.materialize_dir_from_obj(current_id, component, &obj_id)
+                        .await?
+                }
+                Some(DentryRecord {
+                    target: DentryTarget::Tombstone,
+                    ..
+                }) => self.create_dir_under_parent(current_id, component).await?,
+                Some(DentryRecord {
+                    target: DentryTarget::SymLink(_),
+                    ..
+                }) => {
+                    return Err(RPCErrors::ReasonError(format!(
+                        "{} is not a directory",
+                        child_path.as_str()
+                    )));
+                }
+                None => {
+                    let resolved = self
+                        .resolve_path_ex(&child_path, Self::DEFAULT_CLIENT_SYMLINK_COUNT)
+                        .await
+                        .map_err(|e| RPCErrors::ReasonError(e.to_string()))?;
+
+                    match resolved {
+                        Some(FsMetaResolvePathResp {
+                            item:
+                                FsMetaResolvePathItem::Inode {
+                                    inode_id,
+                                    inode,
+                                },
+                            inner_path: _,
+                        }) => {
+                            if inode.get_node_kind() != NodeKind::Dir {
+                                return Err(RPCErrors::ReasonError(format!(
+                                    "{} is not a directory",
+                                    child_path.as_str()
+                                )));
+                            }
+                            inode_id
+                        }
+                        Some(FsMetaResolvePathResp {
+                            item: FsMetaResolvePathItem::ObjId(obj_id),
+                            inner_path,
+                        }) => {
+                            if obj_id.obj_type != OBJ_TYPE_DIR {
+                                return Err(RPCErrors::ReasonError(format!(
+                                    "{} is not a directory",
+                                    child_path.as_str()
+                                )));
+                            }
+                            if inner_path.is_some() {
+                                return Err(RPCErrors::ReasonError(format!(
+                                    "{} is not a directory inode",
+                                    child_path.as_str()
+                                )));
+                            }
+                            self.materialize_dir_from_obj(current_id, component, &obj_id)
+                                .await?
+                        }
+                        Some(FsMetaResolvePathResp {
+                            item: FsMetaResolvePathItem::SymLink(_),
+                            inner_path: _,
+                        }) => {
+                            return Err(RPCErrors::ReasonError(format!(
+                                "{} is not a directory",
+                                child_path.as_str()
+                            )));
+                        }
+                        None => self.create_dir_under_parent(current_id, component).await?,
+                    }
+                }
+            };
+
+            current_id = next_id;
+            current_path = child_path;
+        }
+
+        Ok(current_id)
     }
 
     pub async fn root_dir(&self) -> Result<IndexNodeId, RPCErrors> {
@@ -1464,16 +1921,21 @@ impl FsMetaClient {
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
     ) -> NdnResult<String> {
+        let (parent, name) = self
+            .parent_and_name_for_path(path)
+            .await
+            .map_err(|e| NdnError::Internal(format!("open_file_writer failed: {}", e)))?;
+
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
                 handler
-                    .handle_open_file_writer(path, flag, expected_size, ctx)
+                    .handle_open_file_writer(parent, name.clone(), flag, expected_size, ctx)
                     .await
                     .map_err(|e| NdnError::Internal(format!("open_file_writer failed: {}", e)))
             }
             Self::KRPC(client) => {
-                let req = FsMetaOpenFileWriterReq::new(path.0.clone(), flag, expected_size);
+                let req = FsMetaOpenFileWriterReq::new(parent, name, flag, expected_size);
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     NdnError::Internal(format!("Failed to serialize request: {}", e))
                 })?;
@@ -1525,9 +1987,13 @@ impl FsMetaClient {
     pub async fn set_file(&self, path: &NdmPath, obj_id: ObjId) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (parent, name) = self
+                    .parent_and_name_for_path(path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("set_file failed: {}", e)))?;
                 let ctx = RPCContext::default();
                 handler
-                    .handle_set_file(path, obj_id, ctx)
+                    .handle_set_file(parent, name, obj_id, ctx)
                     .await
                     .map(|_| ())
                     .map_err(|e| NdnError::Internal(format!("set_file failed: {}", e)))
@@ -1541,9 +2007,13 @@ impl FsMetaClient {
     pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (parent, name) = self
+                    .parent_and_name_for_path(path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("set_dir failed: {}", e)))?;
                 let ctx = RPCContext::default();
                 handler
-                    .handle_set_dir(path, dir_obj_id, ctx)
+                    .handle_set_dir(parent, name, dir_obj_id, ctx)
                     .await
                     .map(|_| ())
                     .map_err(|e| NdnError::Internal(format!("set_dir failed: {}", e)))
@@ -1557,9 +2027,13 @@ impl FsMetaClient {
     pub async fn delete(&self, path: &NdmPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (parent, name) = self
+                    .parent_and_name_for_path(path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("delete failed: {}", e)))?;
                 let ctx = RPCContext::default();
                 handler
-                    .handle_delete(path, ctx)
+                    .handle_delete(parent, name, ctx)
                     .await
                     .map_err(|e| NdnError::Internal(format!("delete failed: {}", e)))
             }
@@ -1577,9 +2051,31 @@ impl FsMetaClient {
     ) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (src_parent_path, src_name) = old_path
+                    .split_parent_name()
+                    .ok_or_else(|| NdnError::InvalidParam("invalid source path".to_string()))?;
+                let (dst_parent_path, dst_name) = new_path.split_parent_name().ok_or_else(|| {
+                    NdnError::InvalidParam("invalid destination path".to_string())
+                })?;
+                if src_name.is_empty() || dst_name.is_empty() {
+                    return Err(NdnError::InvalidParam("invalid path".to_string()));
+                }
+                let src_parent = self
+                    .ensure_dir_inode(&src_parent_path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("move_path failed: {}", e)))?;
+                let dst_parent = self
+                    .ensure_dir_inode(&dst_parent_path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("move_path failed: {}", e)))?;
+                if Self::is_descendant_path(new_path, old_path) {
+                    return Err(NdnError::InvalidParam("invalid name".to_string()));
+                }
                 let ctx = RPCContext::default();
                 handler
-                    .handle_move_path_with_opts(old_path, new_path, opts, ctx)
+                    .handle_move_path_with_opts(
+                        src_parent, src_name, dst_parent, dst_name, opts, ctx,
+                    )
                     .await
                     .map_err(|e| NdnError::Internal(format!("move_path failed: {}", e)))
             }
@@ -1592,9 +2088,13 @@ impl FsMetaClient {
     pub async fn symlink(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (link_parent, link_name) = self
+                    .parent_and_name_for_path(link_path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("symlink failed: {}", e)))?;
                 let ctx = RPCContext::default();
                 handler
-                    .handle_symlink(link_path, target, ctx)
+                    .handle_symlink(link_parent, link_name, target.as_str().to_string(), ctx)
                     .await
                     .map_err(|e| NdnError::Internal(format!("symlink failed: {}", e)))
             }
@@ -1607,9 +2107,13 @@ impl FsMetaClient {
     pub async fn create_dir(&self, path: &NdmPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
+                let (parent, name) = self
+                    .parent_and_name_for_path(path)
+                    .await
+                    .map_err(|e| NdnError::Internal(format!("create_dir failed: {}", e)))?;
                 let ctx = RPCContext::default();
                 handler
-                    .handle_create_dir(path, ctx)
+                    .handle_create_dir(parent, name, ctx)
                     .await
                     .map_err(|e| NdnError::Internal(format!("create_dir failed: {}", e)))
             }
@@ -1797,41 +2301,57 @@ pub trait FsMetaHandler: Send + Sync {
 
     async fn handle_set_file(
         &self,
-        path: &NdmPath,
+        parent: IndexNodeId,
+        name: String,
         obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors>;
 
     async fn handle_set_dir(
         &self,
-        path: &NdmPath,
+        parent: IndexNodeId,
+        name: String,
         dir_obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors>;
 
-    async fn handle_delete(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors>;
+    async fn handle_delete(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
 
     async fn handle_move_path_with_opts(
         &self,
-        old_path: &NdmPath,
-        new_path: &NdmPath,
+        src_parent: IndexNodeId,
+        src_name: String,
+        dst_parent: IndexNodeId,
+        dst_name: String,
         opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
     async fn handle_symlink(
         &self,
-        link_path: &NdmPath,
-        target: &NdmPath,
+        link_parent: IndexNodeId,
+        link_name: String,
+        target: String,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
 
-    async fn handle_create_dir(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors>;
+    async fn handle_create_dir(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors>;
 
     //return FileHandleId,which is a unique identifier for the file buffer
     async fn handle_open_file_writer(
         &self,
-        path: &NdmPath,
+        parent: IndexNodeId,
+        name: String,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
         ctx: RPCContext,
@@ -2074,10 +2594,9 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
             }
             "open_file_writer" => {
                 let req = FsMetaOpenFileWriterReq::from_json(req.params)?;
-                let path = NdmPath::new(req.path);
                 let result = self
                     .0
-                    .handle_open_file_writer(&path, req.flag, req.expected_size, ctx)
+                    .handle_open_file_writer(req.parent, req.name, req.flag, req.expected_size, ctx)
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
@@ -2721,7 +3240,8 @@ mod tests {
 
         async fn handle_set_file(
             &self,
-            _path: &NdmPath,
+            _parent: IndexNodeId,
+            _name: String,
             _obj_id: ObjId,
             _ctx: RPCContext,
         ) -> Result<String, RPCErrors> {
@@ -2730,21 +3250,29 @@ mod tests {
 
         async fn handle_set_dir(
             &self,
-            _path: &NdmPath,
+            _parent: IndexNodeId,
+            _name: String,
             _dir_obj_id: ObjId,
             _ctx: RPCContext,
         ) -> Result<String, RPCErrors> {
             Ok(String::new())
         }
 
-        async fn handle_delete(&self, _path: &NdmPath, _ctx: RPCContext) -> Result<(), RPCErrors> {
+        async fn handle_delete(
+            &self,
+            _parent: IndexNodeId,
+            _name: String,
+            _ctx: RPCContext,
+        ) -> Result<(), RPCErrors> {
             Ok(())
         }
 
         async fn handle_move_path_with_opts(
             &self,
-            _old_path: &NdmPath,
-            _new_path: &NdmPath,
+            _src_parent: IndexNodeId,
+            _src_name: String,
+            _dst_parent: IndexNodeId,
+            _dst_name: String,
             _opts: MoveOptions,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
@@ -2753,8 +3281,9 @@ mod tests {
 
         async fn handle_symlink(
             &self,
-            _link_path: &NdmPath,
-            _target: &NdmPath,
+            _link_parent: IndexNodeId,
+            _link_name: String,
+            _target: String,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             Ok(())
@@ -2762,7 +3291,8 @@ mod tests {
 
         async fn handle_create_dir(
             &self,
-            _path: &NdmPath,
+            _parent: IndexNodeId,
+            _name: String,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             Ok(())
@@ -2770,7 +3300,8 @@ mod tests {
 
         async fn handle_open_file_writer(
             &self,
-            _path: &NdmPath,
+            _parent: IndexNodeId,
+            _name: String,
             _flag: OpenWriteFlag,
             _expected_size: Option<u64>,
             _ctx: RPCContext,

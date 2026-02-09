@@ -2,7 +2,7 @@
 mod tests {
     use crate::fs_meta_service::FSMetaService;
     use fs_buffer::{LocalFileBufferService, SessionId};
-    use krpc::RPCContext;
+    use krpc::{RPCContext, RPCErrors};
     use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
     use ndm::{
         ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
@@ -110,6 +110,72 @@ mod tests {
 
     fn dummy_ctx() -> RPCContext {
         RPCContext::default()
+    }
+
+    async fn split_parent_name_with_ensure(
+        svc: &FSMetaService,
+        path: &NdmPath,
+    ) -> Result<(IndexNodeId, String), RPCErrors> {
+        let (parent_path, name) = path
+            .split_parent_name()
+            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
+        let parent = svc.ensure_dir_inode(&parent_path).await?;
+        Ok((parent, name))
+    }
+
+    async fn handle_create_dir_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_create_dir(parent, name, ctx).await
+    }
+
+    async fn handle_set_file_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_set_file(parent, name, obj_id, ctx).await
+    }
+
+    async fn handle_set_dir_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        dir_obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_set_dir(parent, name, dir_obj_id, ctx).await
+    }
+
+    async fn handle_symlink_path(
+        svc: &FSMetaService,
+        link_path: &NdmPath,
+        target: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, link_path).await?;
+        svc.handle_symlink(parent, name, target.as_str().to_string(), ctx)
+            .await
+    }
+
+    async fn handle_open_file_writer_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        flag: OpenWriteFlag,
+        expected_size: Option<u64>,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_open_file_writer(parent, name, flag, expected_size, ctx)
+            .await
     }
 
     fn create_dir_node(inode_id: IndexNodeId) -> NodeRecord {
@@ -547,7 +613,8 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_symlink(
+        handle_symlink_path(
+            &svc,
             &NdmPath::new("/link_file"),
             &NdmPath::new("/target_file"),
             ctx.clone(),
@@ -598,7 +665,8 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_symlink(
+        handle_symlink_path(
+            &svc,
             &NdmPath::new("/link_a"),
             &NdmPath::new("/target_file_2"),
             ctx.clone(),
@@ -606,7 +674,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_symlink(&NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
+        handle_symlink_path(&svc, &NdmPath::new("/link_b"), &NdmPath::new("/link_a"), ctx)
             .await
             .unwrap();
 
@@ -627,7 +695,7 @@ mod tests {
         let ctx = dummy_ctx();
         let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
 
-        svc.handle_symlink(&NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
+        handle_symlink_path(&svc, &NdmPath::new("/link_rel"), &NdmPath::new("../a/b"), ctx)
             .await
             .unwrap();
 
@@ -647,7 +715,8 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        svc.handle_symlink(
+        handle_symlink_path(
+            &svc,
             &NdmPath::new("/link_a"),
             &NdmPath::new("/target_a"),
             ctx.clone(),
@@ -730,7 +799,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_symlink(&NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
+        handle_symlink_path(&svc, &NdmPath::new("/a/x/l"), &NdmPath::new("../y"), ctx.clone())
             .await
             .unwrap();
 
@@ -2115,7 +2184,7 @@ mod tests {
         .await
         .unwrap();
 
-        svc.handle_create_dir(&NdmPath::new("/a/b/c/new"), ctx.clone())
+        handle_create_dir_path(&svc, &NdmPath::new("/a/b/c/new"), ctx.clone())
             .await
             .unwrap();
 
@@ -2304,8 +2373,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_create_dir(&NdmPath::new("/a/leaf/new"), ctx)
+        let err = handle_create_dir_path(&svc, &NdmPath::new("/a/leaf/new"), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a directory"));
@@ -2316,16 +2384,15 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        svc.handle_create_dir(&NdmPath::new("/a"), ctx.clone())
+        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
             .await
             .unwrap();
 
-        svc.handle_set_file(&NdmPath::new("/a/file"), create_obj_id(11), ctx.clone())
+        handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(11), ctx.clone())
             .await
             .unwrap();
 
-        let err = svc
-            .handle_set_file(&NdmPath::new("/a/file"), create_obj_id(12), ctx)
+        let err = handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(12), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2336,20 +2403,19 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        svc.handle_create_dir(&NdmPath::new("/a"), ctx.clone())
+        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
             .await
             .unwrap();
 
         let dir1 = DirObject::new(Some("d1".to_string()));
         let (dir1_id, _) = dir1.gen_obj_id().unwrap();
-        svc.handle_set_dir(&NdmPath::new("/a/dir"), dir1_id, ctx.clone())
+        handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir1_id, ctx.clone())
             .await
             .unwrap();
 
         let dir2 = DirObject::new(Some("d2".to_string()));
         let (dir2_id, _) = dir2.gen_obj_id().unwrap();
-        let err = svc
-            .handle_set_dir(&NdmPath::new("/a/dir"), dir2_id, ctx)
+        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir2_id, ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2390,8 +2456,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_set_file(&NdmPath::new("/a/leaf"), create_obj_id(33), ctx)
+        let err = handle_set_file_path(&svc, &NdmPath::new("/a/leaf"), create_obj_id(33), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2430,8 +2495,7 @@ mod tests {
 
         let dir_new = DirObject::new(Some("new".to_string()));
         let (dir_new_id, _) = dir_new.gen_obj_id().unwrap();
-        let err = svc
-            .handle_set_dir(&NdmPath::new("/a/sub"), dir_new_id, ctx)
+        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/sub"), dir_new_id, ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2456,13 +2520,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_open_file_writer(
-                &NdmPath::new("/a"),
-                OpenWriteFlag::CreateOrTruncate,
-                None,
-                ctx,
-            )
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a"),
+            OpenWriteFlag::CreateOrTruncate,
+            None,
+            ctx,
+        )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("directory"));
@@ -2504,13 +2568,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_open_file_writer(
-                &NdmPath::new("/a/leaf"),
-                OpenWriteFlag::CreateExclusive,
-                None,
-                ctx,
-            )
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a/leaf"),
+            OpenWriteFlag::CreateExclusive,
+            None,
+            ctx,
+        )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2552,13 +2616,13 @@ mod tests {
         .await
         .unwrap();
 
-        let err = svc
-            .handle_open_file_writer(
-                &NdmPath::new("/a/leaf"),
-                OpenWriteFlag::ContinueWrite,
-                None,
-                ctx.clone(),
-            )
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a/leaf"),
+            OpenWriteFlag::ContinueWrite,
+            None,
+            ctx.clone(),
+        )
             .await
             .unwrap_err();
 
@@ -2571,13 +2635,13 @@ mod tests {
         let (svc, _meta_tmp, _fb_tmp) = create_test_service_with_buffer();
         let ctx = dummy_ctx();
 
-        let handle = svc
-            .handle_open_file_writer(
-                &NdmPath::new("/new_file"),
-                OpenWriteFlag::CreateExclusive,
-                None,
-                ctx,
-            )
+        let handle = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/new_file"),
+            OpenWriteFlag::CreateExclusive,
+            None,
+            ctx,
+        )
             .await
             .unwrap();
         assert!(!handle.is_empty());

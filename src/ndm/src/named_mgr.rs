@@ -816,6 +816,25 @@ impl NamedDataMgr {
         Ok(obj)
     }
 
+    pub async fn get_dir_child(&self, dir_obj_id: &ObjId, item_name: &str) -> NdnResult<ObjId> {
+        let dir_obj = self.load_dir_object(dir_obj_id).await.map_err(|e| match e {
+            NdnError::NotFound(_) => NdnError::NotReady(format!(
+                "dir object {} not ready or not pulled",
+                dir_obj_id
+            )),
+            _ => e,
+        })?;
+        let item = dir_obj.get(item_name).ok_or_else(|| {
+            NdnError::NotFound(format!(
+                "child {} not found in dir {}",
+                item_name,
+                dir_obj_id
+            ))
+        })?;
+        let (obj_id, _) = item.get_obj_id()?;
+        Ok(obj_id)
+    }
+
     /// Internal method to get object with multi-version layout fallback
     ///
     /// If layout_mgr is set:

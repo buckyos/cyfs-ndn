@@ -45,6 +45,8 @@ pub enum NdnError {
     InvalidLink(String),
     #[error("object not found: {0}")]
     NotFound(String),
+    #[error("object not ready: {0}")]
+    NotReady(String),
     #[error("already exists: {0}")]
     AlreadyExists(String),
     #[error("verify chunk error: {0}")]

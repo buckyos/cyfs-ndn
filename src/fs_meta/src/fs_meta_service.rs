@@ -1610,7 +1610,7 @@ impl FSMetaService {
         parent_id: IndexNodeId,
         parent_node: &NodeRecord,
         name: &str,
-        path: &NdmPath,
+        path_desc: &str,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
@@ -1629,7 +1629,7 @@ impl FSMetaService {
             Some(_) => {
                 return Err(RPCErrors::ReasonError(format!(
                     "path {} already exists",
-                    path.as_str()
+                    path_desc
                 )));
             }
             None => {}
@@ -1638,7 +1638,7 @@ impl FSMetaService {
         match self.lookup_base_child(parent_node, name).await? {
             BaseChildLookup::Missing => Ok(()),
             BaseChildLookup::DirObj(_) | BaseChildLookup::NonDirObj(_) => Err(
-                RPCErrors::ReasonError(format!("path {} already exists", path.as_str())),
+                RPCErrors::ReasonError(format!("path {} already exists", path_desc)),
             ),
         }
     }
@@ -1696,7 +1696,7 @@ impl FSMetaService {
     /// This method handles the case where the path passes through a DirObject:
     /// - When a dentry points to ObjId (DirObject) instead of IndexNodeId
     /// - It materializes the directory by creating inode with base_obj_id pointing to the DirObject
-    async fn ensure_dir_inode(&self, path: &NdmPath) -> Result<IndexNodeId, RPCErrors> {
+    pub(crate) async fn ensure_dir_inode(&self, path: &NdmPath) -> Result<IndexNodeId, RPCErrors> {
         if path.is_root() {
             return Ok(self.root_inode);
         }
@@ -1843,13 +1843,6 @@ impl FSMetaService {
         }
 
         Ok(current_id)
-    }
-
-    fn is_dir_like(src: &MoveSource) -> bool {
-        match src {
-            MoveSource::Upper { kind_hint, .. } => *kind_hint == ObjectKind::Dir,
-            MoveSource::Base { kind, .. } => *kind == ObjectKind::Dir,
-        }
     }
 
     async fn apply_move_plan_txn(
@@ -3538,15 +3531,14 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     async fn handle_set_file(
         &self,
-        path: &NdmPath,
+        parent: IndexNodeId,
+        name: String,
         obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
-
-        let parent = self.ensure_dir_inode(&parent_path).await?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let parent_node = self
@@ -3565,7 +3557,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             parent,
             &parent_node,
             &name,
-            path,
+            &format!("#{}/{}", parent, name),
             txn.txid(),
             ctx.clone(),
         )
@@ -3591,13 +3583,14 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     async fn handle_set_dir(
         &self,
-        path: &NdmPath,
+        parent: IndexNodeId,
+        name: String,
         dir_obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
 
         if dir_obj_id.obj_type != OBJ_TYPE_DIR {
             return Err(RPCErrors::ReasonError(
@@ -3605,7 +3598,6 @@ impl ndm::FsMetaHandler for FSMetaService {
             ));
         }
 
-        let parent = self.ensure_dir_inode(&parent_path).await?;
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let parent_node = self
@@ -3624,7 +3616,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             parent,
             &parent_node,
             &name,
-            path,
+            &format!("#{}/{}", parent, name),
             txn.txid(),
             ctx.clone(),
         )
@@ -3647,15 +3639,18 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(String::new())
     }
 
-    async fn handle_delete(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+    async fn handle_delete(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
 
-        let parent_id = self.ensure_dir_inode(&parent_path).await?;
-
-        let parent_rev = self.get_inode_rev(parent_id, None, ctx.clone()).await?;
-        self.set_tombstone_with_parent_rev(parent_id, name, parent_rev, None, ctx)
+        let parent_rev = self.get_inode_rev(parent, None, ctx.clone()).await?;
+        self.set_tombstone_with_parent_rev(parent, name, parent_rev, None, ctx)
             .await?;
 
         Ok(())
@@ -3663,39 +3658,20 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     async fn handle_move_path_with_opts(
         &self,
-        old_path: &NdmPath,
-        new_path: &NdmPath,
+        src_parent: IndexNodeId,
+        src_name: String,
+        dst_parent: IndexNodeId,
+        dst_name: String,
         opts: MoveOptions,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        // Normalize and validate
-        if old_path.is_root() {
-            return Err(RPCErrors::ReasonError("invalid name".to_string()));
-        }
-
-        let old_normalized = old_path.as_str().trim_end_matches('/');
-        let new_normalized = new_path.as_str().trim_end_matches('/');
-
-        if old_normalized == new_normalized {
-            return Ok(()); // No-op
-        }
-
-        // Parse paths
-        let (src_parent_path, src_name) = old_path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid name".to_string()))?;
-        let (dst_parent_path, dst_name) = new_path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid name".to_string()))?;
-
-        // Validate names
         if src_name.is_empty() || dst_name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid name".to_string()));
         }
 
-        // Ensure parent directories exist
-        let src_parent = self.ensure_dir_inode(&src_parent_path).await?;
-        let dst_parent = self.ensure_dir_inode(&dst_parent_path).await?;
+        if src_parent == dst_parent && src_name == dst_name {
+            return Ok(());
+        }
 
         // Get parent nodes
         let src_dir = self
@@ -3723,9 +3699,18 @@ impl ndm::FsMetaHandler for FSMetaService {
             .plan_move_source(src_parent, &src_name, &src_dir, src_rev0, ctx.clone())
             .await?;
 
-        // Cycle prevention for directories
-        if Self::is_dir_like(&source) {
-            if is_descendant_path(new_path, old_path) {
+        // Full cycle prevention by path has moved to client-side path API.
+        // Keep a minimal guard for obvious self-parent moves when source is a directory inode.
+        if let MoveSource::Upper {
+            target: DentryTarget::IndexNodeId(id),
+            ..
+        } = &source
+        {
+            let node = self
+                .handle_get_inode(*id, None, ctx.clone())
+                .await?
+                .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
+            if node.get_node_kind() == NodeKind::Dir && *id == dst_parent {
                 return Err(RPCErrors::ReasonError("invalid name".to_string()));
             }
         }
@@ -3753,28 +3738,23 @@ impl ndm::FsMetaHandler for FSMetaService {
     // SYMLINK: link_path -> target_path
     async fn handle_symlink(
         &self,
-        link_path: &NdmPath,
-        target: &NdmPath,
+        link_parent: IndexNodeId,
+        link_name: String,
+        target: String,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
-        if link_path.is_root() {
+        if link_name.is_empty() {
             return Err(RPCErrors::ReasonError("invalid link path".to_string()));
         }
 
-        if target.as_str().is_empty() {
+        if target.is_empty() {
             return Err(RPCErrors::ReasonError("invalid target path".to_string()));
         }
-        let link_target = DentryTarget::SymLink(target.as_str().to_string());
-
-        let (link_parent_path, link_name) = link_path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid link path".to_string()))?;
-
-        let link_parent_id = self.ensure_dir_inode(&link_parent_path).await?;
+        let link_target = DentryTarget::SymLink(target);
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let parent_node = self
-            .handle_get_inode(link_parent_id, txn.txid(), ctx.clone())
+            .handle_get_inode(link_parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.get_node_kind() != NodeKind::Dir {
@@ -3787,17 +3767,17 @@ impl ndm::FsMetaHandler for FSMetaService {
         }
 
         self.ensure_name_absent_for_create(
-            link_parent_id,
+            link_parent,
             &parent_node,
             &link_name,
-            link_path,
+            &format!("#{}/{}", link_parent, link_name),
             txn.txid(),
             ctx.clone(),
         )
         .await?;
 
         self.upsert_dentry_with_parent_rev(
-            link_parent_id,
+            link_parent,
             link_name,
             link_target,
             parent_node.rev.unwrap_or(0),
@@ -3811,18 +3791,21 @@ impl ndm::FsMetaHandler for FSMetaService {
         Ok(())
     }
 
-    async fn handle_create_dir(&self, path: &NdmPath, ctx: RPCContext) -> Result<(), RPCErrors> {
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
-
-        let parent_id = self.ensure_dir_inode(&parent_path).await?;
+    async fn handle_create_dir(
+        &self,
+        parent: IndexNodeId,
+        name: String,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
 
         // Create directory inode
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
         let parent_node = self
-            .handle_get_inode(parent_id, txn.txid(), ctx.clone())
+            .handle_get_inode(parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
         if parent_node.get_node_kind() != NodeKind::Dir {
@@ -3834,10 +3817,10 @@ impl ndm::FsMetaHandler for FSMetaService {
             return Err(RPCErrors::ReasonError("parent is read-only".to_string()));
         }
         self.ensure_name_absent_for_create(
-            parent_id,
+            parent,
             &parent_node,
             &name,
-            path,
+            &format!("#{}/{}", parent, name),
             txn.txid(),
             ctx.clone(),
         )
@@ -3861,7 +3844,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?;
 
         self.upsert_dentry_with_parent_rev(
-            parent_id,
+            parent,
             name,
             DentryTarget::IndexNodeId(new_id),
             parent_node.rev.unwrap_or(0),
@@ -3877,7 +3860,8 @@ impl ndm::FsMetaHandler for FSMetaService {
 
     async fn handle_open_file_writer(
         &self,
-        path: &NdmPath,
+        parent_id: IndexNodeId,
+        name: String,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
         ctx: RPCContext,
@@ -3890,11 +3874,11 @@ impl ndm::FsMetaHandler for FSMetaService {
             .instance
             .as_ref()
             .ok_or_else(|| RPCErrors::ReasonError("instance not configured".to_string()))?;
-
-        let (parent_path, name) = path
-            .split_parent_name()
-            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
-        let parent_id: u64 = self.ensure_dir_inode(&parent_path).await?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
+        let path_desc = format!("#{}/{}", parent_id, name);
+        let fb_path = format!("/__inode_parent_{}/{}", parent_id, name);
 
         let txn = TxnGuard::begin(self, ctx.clone()).await?;
 
@@ -3948,7 +3932,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 if !file_exists {
                     return Err(RPCErrors::ReasonError(format!(
                         "file not found for {:?}: {}",
-                        flag, path.0
+                        flag, path_desc
                     )));
                 }
             }
@@ -3956,7 +3940,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 if file_exists {
                     return Err(RPCErrors::ReasonError(format!(
                         "file already exists: {}",
-                        path.0
+                        path_desc
                     )));
                 }
             }
@@ -4207,7 +4191,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         };
         let fb = buffer
             .alloc_buffer(
-                &fs_buffer::NdmPath(path.0.clone()),
+                &fs_buffer::NdmPath(fb_path),
                 file_id,
                 existing_chunks,
                 &lease,
@@ -4380,22 +4364,6 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn is_descendant_path(path: &NdmPath, ancestor: &NdmPath) -> bool {
-    let path_str = path.as_str().trim_end_matches('/');
-    let ancestor_str = ancestor.as_str().trim_end_matches('/');
-    if ancestor_str.is_empty() {
-        return false;
-    }
-    if path_str == ancestor_str {
-        return false;
-    }
-    if !path_str.starts_with(ancestor_str) {
-        return false;
-    }
-    let rest = &path_str[ancestor_str.len()..];
-    rest.starts_with('/')
 }
 
 fn join_components(components: &[String]) -> Option<String> {
