@@ -394,11 +394,11 @@ impl NamedDataMgr {
                 inode: dir_node,
             } = resp.item
             {
-                if dir_node.kind != NodeKind::Dir {
+                if dir_node.get_node_kind() != NodeKind::Dir {
                     warn!(
                         "NamedDataMgr::start_list: path is not a directory, path={}, kind={:?}",
                         path.as_str(),
-                        dir_node.kind
+                        dir_node.get_node_kind()
                     );
                     return Err(NdnError::InvalidParam(
                         "path is not a directory".to_string(),
@@ -885,7 +885,7 @@ impl NamedDataMgr {
     }
 
     async fn path_stat_from_inode_node(&self, inode_id: IndexNodeId, node: NodeRecord) -> PathStat {
-        let kind = match node.kind {
+        let kind = match node.get_node_kind() {
             NodeKind::File => PathKind::File,
             NodeKind::Dir => PathKind::Dir,
             NodeKind::Object => PathKind::File,
@@ -1335,7 +1335,7 @@ impl NamedDataMgr {
             None => return Err(NdnError::NotFound("path not found".to_string())),
             Some(resp) => match (resp.item, resp.inner_path) {
                 (FsMetaResolvePathItem::Inode { inode_id, inode }, _) => {
-                    if inode.kind != NodeKind::Dir {
+                    if inode.get_node_kind() != NodeKind::Dir {
                         return Err(NdnError::InvalidParam(
                             "path is not a directory".to_string(),
                         ));
@@ -1388,11 +1388,11 @@ impl NamedDataMgr {
             }
         };
 
-        if node.kind != NodeKind::Dir {
+        if node.get_node_kind() != NodeKind::Dir {
             warn!(
                 "NamedDataMgr::publish_dir: path is not a directory, path={}, kind={:?}",
                 path.as_str(),
-                node.kind
+                node.get_node_kind()
             );
             let _ = self.fsmeta.rollback(Some(txid.clone())).await;
             return Err(NdnError::InvalidParam(

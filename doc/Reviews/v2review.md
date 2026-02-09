@@ -34,9 +34,6 @@
 
 你明确写了：
 
-> 添加 DentryRecord（在目录中添加一个新 item）涉及去重处理，都会需要 list
-> list = `select * from dentries where parent=dirnode` 是 fsmeta 最慢操作
-
 这在“build 大量创建小文件”的场景会非常致命：
 
 * 热目录（比如 `bazel-out/`、`target/`）会出现**高并发 create**

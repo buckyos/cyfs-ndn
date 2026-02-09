@@ -18,19 +18,19 @@ pub enum NodeKind {
     Object, //Other Object,immutable object
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileWorkingState {
     pub fb_handle: String,
     pub last_write_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileCoolingState {
     pub fb_handle: String,
     pub closed_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FileLinkedState {
     pub obj_id: ObjId,
     pub qcid: ObjId,
@@ -38,7 +38,7 @@ pub struct FileLinkedState {
     pub linked_at: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FinalizedObjState {
     pub obj_id: ObjId,
     pub finalized_at: u64,
@@ -54,11 +54,13 @@ pub struct ObjStat {
 
 pub type IndexNodeId = u64;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NodeState {
     /// Directory node (usually committed; delta lives in dentries)
     DirNormal,
     DirOverlay, // overlay mode (upper layer only)
+    /// File node: idle state (not currently opened for write)
+    FileNormal,
     /// File node: currently writable, bound to FileBuffer
     Working(FileWorkingState),
     /// File node: closed, waiting to stabilize (debounce)
@@ -72,7 +74,6 @@ pub enum NodeState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub inode_id: IndexNodeId,
-    pub kind: NodeKind,
     pub state: NodeState,
     pub read_only: bool,
     pub base_obj_id: Option<ObjId>, // committed base snapshot (file or dir)
@@ -84,6 +85,35 @@ pub struct NodeRecord {
     pub lease_client_session: Option<ClientSessionId>,
     pub lease_seq: Option<u64>,
     pub lease_expire_at: Option<u64>,
+}
+
+impl NodeRecord {
+    pub fn get_node_kind(&self) -> NodeKind {
+        match &self.state {
+            NodeState::DirNormal | NodeState::DirOverlay => NodeKind::Dir,
+            NodeState::FileNormal | NodeState::Working(_) | NodeState::Cooling(_) => {
+                NodeKind::File
+            }
+            NodeState::Linked(s) => {
+                if s.obj_id.is_dir_object() {
+                    NodeKind::Dir
+                } else if s.obj_id.is_file_object() {
+                    NodeKind::File
+                } else {
+                    NodeKind::Object
+                }
+            }
+            NodeState::Finalized(s) => {
+                if s.obj_id.is_dir_object() {
+                    NodeKind::Dir
+                } else if s.obj_id.is_file_object() {
+                    NodeKind::File
+                } else {
+                    NodeKind::Object
+                }
+            }
+        }
+    }
 }
 
 /// Dentry target (Strategy B)
@@ -281,14 +311,21 @@ impl FsMetaSetInodeReq {
 pub struct FsMetaUpdateInodeStateReq {
     pub node_id: IndexNodeId,
     pub new_state: NodeState,
+    pub old_state: NodeState,
     pub txid: Option<String>,
 }
 
 impl FsMetaUpdateInodeStateReq {
-    pub fn new(node_id: IndexNodeId, new_state: NodeState, txid: Option<String>) -> Self {
+    pub fn new(
+        node_id: IndexNodeId,
+        new_state: NodeState,
+        old_state: NodeState,
+        txid: Option<String>,
+    ) -> Self {
         Self {
             node_id,
             new_state,
+            old_state,
             txid,
         }
     }
@@ -862,17 +899,18 @@ impl FsMetaClient {
         &self,
         node_id: IndexNodeId,
         new_state: NodeState,
+        old_state: NodeState,
         txid: Option<String>,
     ) -> Result<(), RPCErrors> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
                 handler
-                    .handle_update_inode_state(node_id, new_state, txid, ctx)
+                    .handle_update_inode_state(node_id, new_state, old_state, txid, ctx)
                     .await
             }
             Self::KRPC(client) => {
-                let req = FsMetaUpdateInodeStateReq::new(node_id, new_state, txid);
+                let req = FsMetaUpdateInodeStateReq::new(node_id, new_state, old_state, txid);
                 let req_json = serde_json::to_value(&req).map_err(|e| {
                     RPCErrors::ReasonError(format!("Failed to serialize request: {}", e))
                 })?;
@@ -1548,11 +1586,11 @@ pub trait FsMetaHandler: Send + Sync {
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
-    //TODO 这里需要CAS
     async fn handle_update_inode_state(
         &self,
         node_id: IndexNodeId,
         new_state: NodeState,
+        old_state: NodeState,
         txid: Option<String>,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors>;
@@ -1810,7 +1848,13 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
                 let req = FsMetaUpdateInodeStateReq::from_json(req.params)?;
                 let result = self
                     .0
-                    .handle_update_inode_state(req.node_id, req.new_state, req.txid, ctx)
+                    .handle_update_inode_state(
+                        req.node_id,
+                        req.new_state,
+                        req.old_state,
+                        req.txid,
+                        ctx,
+                    )
                     .await?;
                 RPCResult::Success(serde_json::json!(result))
             }
@@ -2146,12 +2190,16 @@ mod tests {
             &self,
             node_id: IndexNodeId,
             new_state: NodeState,
+            old_state: NodeState,
             _txid: Option<String>,
             _ctx: RPCContext,
         ) -> Result<(), RPCErrors> {
             let mut state = self.state.lock().unwrap();
             match state.inodes.get_mut(&node_id) {
                 Some(node) => {
+                    if node.state != old_state {
+                        return Err(RPCErrors::ReasonError("inode state conflict".to_string()));
+                    }
                     node.state = new_state;
                     Ok(())
                 }
@@ -2698,10 +2746,9 @@ mod tests {
     fn sample_node(inode_id: IndexNodeId) -> NodeRecord {
         NodeRecord {
             inode_id,
-            kind: NodeKind::File,
             read_only: false,
             base_obj_id: None,
-            state: NodeState::DirNormal,
+            state: NodeState::FileNormal,
             rev: None,
             meta: Some(json!({"k":"v"})),
             lease_client_session: None,

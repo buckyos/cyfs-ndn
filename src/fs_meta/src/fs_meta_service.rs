@@ -28,6 +28,7 @@ const NODE_STATE_WORKING: i64 = 2;
 const NODE_STATE_COOLING: i64 = 3;
 const NODE_STATE_LINKED: i64 = 4;
 const NODE_STATE_FINALIZED: i64 = 5;
+const NODE_STATE_FILE_NORMAL: i64 = 6;
 
 const DENTRY_TARGET_INODE: i64 = 0;
 const DENTRY_TARGET_OBJ: i64 = 1;
@@ -503,7 +504,6 @@ impl FSMetaService {
 
             CREATE TABLE IF NOT EXISTS nodes (
                 inode_id INTEGER PRIMARY KEY,
-                kind INTEGER NOT NULL,
                 read_only INTEGER NOT NULL DEFAULT 0,
                 base_obj_id BLOB,
                 state INTEGER NOT NULL,
@@ -524,7 +524,6 @@ impl FSMetaService {
                 updated_at INTEGER NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_nodes_kind_state ON nodes(kind, state);
             CREATE INDEX IF NOT EXISTS idx_nodes_cooling ON nodes(state, closed_at);
             CREATE INDEX IF NOT EXISTS idx_nodes_linked ON nodes(state, linked_at);
 
@@ -648,15 +647,14 @@ impl FSMetaService {
         let now = unix_timestamp();
         conn.execute(
             "INSERT INTO nodes (
-                inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                inode_id, read_only, base_obj_id, state, rev, meta_json,
                 lease_client_session, lease_seq, lease_expire_at,
                 fb_handle, last_write_at, closed_at,
                 linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
                 finalized_obj_id, finalized_at, updated_at
-            ) VALUES (?1, ?2, 0, NULL, ?3, ?4, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?5)",
+            ) VALUES (?1, 0, NULL, ?2, ?3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?4)",
             params![
                 1i64,
-                node_kind_to_int(NodeKind::Dir),
                 NODE_STATE_DIR_NORMAL,
                 0i64,
                 now as i64
@@ -762,6 +760,10 @@ impl FSMetaService {
                 state: NODE_STATE_DIR_OVERLAY,
                 ..NodeStateCols::default()
             },
+            NodeState::FileNormal => NodeStateCols {
+                state: NODE_STATE_FILE_NORMAL,
+                ..NodeStateCols::default()
+            },
             NodeState::Working(s) => NodeStateCols {
                 state: NODE_STATE_WORKING,
                 fb_handle: Some(s.fb_handle.clone()),
@@ -792,31 +794,32 @@ impl FSMetaService {
     }
 
     fn parse_node_state(row: &rusqlite::Row<'_>) -> Result<NodeState, RPCErrors> {
-        let state = row.get::<_, i64>(4).map_err(map_db_err)?;
+        let state = row.get::<_, i64>(3).map_err(map_db_err)?;
         match state {
             NODE_STATE_DIR_NORMAL => Ok(NodeState::DirNormal),
             NODE_STATE_DIR_OVERLAY => Ok(NodeState::DirOverlay),
+            NODE_STATE_FILE_NORMAL => Ok(NodeState::FileNormal),
             NODE_STATE_WORKING => {
-                let fb_handle: String = row.get(10).map_err(map_db_err)?;
-                let last_write_at: i64 = row.get(11).map_err(map_db_err)?;
+                let fb_handle: String = row.get(9).map_err(map_db_err)?;
+                let last_write_at: i64 = row.get(10).map_err(map_db_err)?;
                 Ok(NodeState::Working(ndm::FileWorkingState {
                     fb_handle,
                     last_write_at: last_write_at as u64,
                 }))
             }
             NODE_STATE_COOLING => {
-                let fb_handle: String = row.get(10).map_err(map_db_err)?;
-                let closed_at: i64 = row.get(12).map_err(map_db_err)?;
+                let fb_handle: String = row.get(9).map_err(map_db_err)?;
+                let closed_at: i64 = row.get(11).map_err(map_db_err)?;
                 Ok(NodeState::Cooling(ndm::FileCoolingState {
                     fb_handle,
                     closed_at: closed_at as u64,
                 }))
             }
             NODE_STATE_LINKED => {
-                let obj_blob: Vec<u8> = row.get(13).map_err(map_db_err)?;
-                let qcid_blob: Vec<u8> = row.get(14).map_err(map_db_err)?;
-                let filebuffer_id: String = row.get(15).map_err(map_db_err)?;
-                let linked_at: i64 = row.get(16).map_err(map_db_err)?;
+                let obj_blob: Vec<u8> = row.get(12).map_err(map_db_err)?;
+                let qcid_blob: Vec<u8> = row.get(13).map_err(map_db_err)?;
+                let filebuffer_id: String = row.get(14).map_err(map_db_err)?;
+                let linked_at: i64 = row.get(15).map_err(map_db_err)?;
                 Ok(NodeState::Linked(ndm::FileLinkedState {
                     obj_id: obj_id_from_blob(obj_blob)?,
                     qcid: obj_id_from_blob(qcid_blob)?,
@@ -825,8 +828,8 @@ impl FSMetaService {
                 }))
             }
             NODE_STATE_FINALIZED => {
-                let obj_blob: Vec<u8> = row.get(17).map_err(map_db_err)?;
-                let finalized_at: i64 = row.get(18).map_err(map_db_err)?;
+                let obj_blob: Vec<u8> = row.get(16).map_err(map_db_err)?;
+                let finalized_at: i64 = row.get(17).map_err(map_db_err)?;
                 Ok(NodeState::Finalized(ndm::FinalizedObjState {
                     obj_id: obj_id_from_blob(obj_blob)?,
                     finalized_at: finalized_at as u64,
@@ -838,14 +841,13 @@ impl FSMetaService {
 
     fn parse_node(row: &rusqlite::Row<'_>) -> Result<NodeRecord, RPCErrors> {
         let inode_id: i64 = row.get(0).map_err(map_db_err)?;
-        let kind: i64 = row.get(1).map_err(map_db_err)?;
-        let read_only: i64 = row.get(2).map_err(map_db_err)?;
-        let base_obj_id: Option<Vec<u8>> = row.get(3).map_err(map_db_err)?;
-        let rev: Option<i64> = row.get(5).map_err(map_db_err)?;
-        let meta_json: Option<String> = row.get(6).map_err(map_db_err)?;
-        let lease_client_session: Option<String> = row.get(7).map_err(map_db_err)?;
-        let lease_seq: Option<i64> = row.get(8).map_err(map_db_err)?;
-        let lease_expire_at: Option<i64> = row.get(9).map_err(map_db_err)?;
+        let read_only: i64 = row.get(1).map_err(map_db_err)?;
+        let base_obj_id: Option<Vec<u8>> = row.get(2).map_err(map_db_err)?;
+        let rev: Option<i64> = row.get(4).map_err(map_db_err)?;
+        let meta_json: Option<String> = row.get(5).map_err(map_db_err)?;
+        let lease_client_session: Option<String> = row.get(6).map_err(map_db_err)?;
+        let lease_seq: Option<i64> = row.get(7).map_err(map_db_err)?;
+        let lease_expire_at: Option<i64> = row.get(8).map_err(map_db_err)?;
 
         let state = Self::parse_node_state(row)?;
         let base_obj_id = match base_obj_id {
@@ -862,7 +864,6 @@ impl FSMetaService {
 
         Ok(NodeRecord {
             inode_id: inode_id as IndexNodeId,
-            kind: node_kind_from_int(kind)?,
             read_only: read_only != 0,
             base_obj_id,
             state,
@@ -898,7 +899,7 @@ impl FSMetaService {
                         },
                     inner_path: _,
                 }) => {
-                    if parent_node.kind != NodeKind::Dir {
+                    if parent_node.get_node_kind() != NodeKind::Dir {
                         return Err(RPCErrors::ReasonError(
                             "parent is not a directory".to_string(),
                         ));
@@ -930,11 +931,10 @@ impl FSMetaService {
 
         let new_node = NodeRecord {
             inode_id: 0,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
-            rev: None,
+            rev: Some(0),
             meta: None,
             lease_client_session: None,
             lease_seq: None,
@@ -1045,7 +1045,7 @@ impl FSMetaService {
             .handle_get_inode(parent_id, None, ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -1081,7 +1081,7 @@ impl FSMetaService {
             .handle_get_inode(dir_inode_id, None, ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("directory inode not found".to_string()))?;
-        if dir_node.kind != NodeKind::Dir {
+        if dir_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "path is not a directory".to_string(),
             ));
@@ -1143,7 +1143,7 @@ impl FSMetaService {
                                 child_inode_id
                             ))
                         })?;
-                    match child_inode.kind {
+                    match child_inode.get_node_kind() {
                         NodeKind::Dir => {
                             let child_path = Self::join_child_path(dir_path, &child.name);
                             pending_finalize_paths.push(child_path.as_str().to_string());
@@ -1247,7 +1247,7 @@ impl FSMetaService {
             .ok_or_else(|| {
                 RPCErrors::ReasonError("directory inode missing during finalize".to_string())
             })?;
-        if dir_now.kind != NodeKind::Dir {
+        if dir_now.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "path is not a directory".to_string(),
             ));
@@ -1301,7 +1301,6 @@ impl FSMetaService {
         // Create new directory inode with base_obj_id pointing to the DirObject
         let new_node = NodeRecord {
             inode_id: 0,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: Some(dir_obj_id.clone()),
             state: NodeState::DirOverlay, // Overlay mode: upper layer changes on top of base DirObject
@@ -1355,7 +1354,7 @@ impl FSMetaService {
                         .ok_or_else(|| {
                             RPCErrors::ReasonError("existing inode not found".to_string())
                         })?;
-                    if node.kind != NodeKind::Dir {
+                    if node.get_node_kind() != NodeKind::Dir {
                         return Err(RPCErrors::ReasonError(format!(
                             "{} exists and is not a directory",
                             name
@@ -1376,7 +1375,6 @@ impl FSMetaService {
 
         let node = NodeRecord {
             inode_id: 0,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -1512,7 +1510,7 @@ impl FSMetaService {
             .handle_get_inode(parent, txid.clone(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent inode not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -1660,7 +1658,7 @@ impl FSMetaService {
                     },
                 inner_path: _,
             }) => {
-                if node.kind != NodeKind::Dir {
+                if node.get_node_kind() != NodeKind::Dir {
                     return Err(RPCErrors::ReasonError(format!(
                         "{} is not a directory",
                         path.as_str()
@@ -1715,7 +1713,7 @@ impl FSMetaService {
                             .await?
                             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
-                        if node.kind != NodeKind::Dir {
+                        if node.get_node_kind() != NodeKind::Dir {
                             return Err(RPCErrors::ReasonError(format!(
                                 "{} is not a directory",
                                 components[..=i].join("/")
@@ -1752,7 +1750,7 @@ impl FSMetaService {
                         .ok_or_else(|| {
                             RPCErrors::ReasonError("parent inode not found".to_string())
                         })?;
-                    if parent_node.kind != NodeKind::Dir {
+                    if parent_node.get_node_kind() != NodeKind::Dir {
                         return Err(RPCErrors::ReasonError(format!(
                             "{} is not a directory",
                             components[..i].join("/")
@@ -1868,7 +1866,7 @@ impl FSMetaService {
                         .handle_get_inode(fid, None, ctx.clone())
                         .await?
                         .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
-                    let kind_hint = match inode.kind {
+                    let kind_hint = match inode.get_node_kind() {
                         NodeKind::Dir => ObjectKind::Dir,
                         NodeKind::File => ObjectKind::File,
                         NodeKind::Object => ObjectKind::Unknown,
@@ -2214,7 +2212,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                             .ok_or_else(|| {
                                 NdnError::Internal("parent inode not found".to_string())
                             })?;
-                        if parent_node.kind != NodeKind::Dir {
+                        if parent_node.get_node_kind() != NodeKind::Dir {
                             return Ok(None);
                         }
 
@@ -2335,7 +2333,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.with_conn(txid.as_deref(), move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                    "SELECT inode_id, read_only, base_obj_id, state, rev, meta_json,
                             lease_client_session, lease_seq, lease_expire_at,
                             fb_handle, last_write_at, closed_at,
                             linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
@@ -2370,14 +2368,13 @@ impl ndm::FsMetaHandler for FSMetaService {
 
             conn.execute(
                 "INSERT INTO nodes (
-                    inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                    inode_id, read_only, base_obj_id, state, rev, meta_json,
                     lease_client_session, lease_seq, lease_expire_at,
                     fb_handle, last_write_at, closed_at,
                     linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
                     finalized_obj_id, finalized_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT(inode_id) DO UPDATE SET
-                    kind = excluded.kind,
                     read_only = excluded.read_only,
                     base_obj_id = excluded.base_obj_id,
                     state = excluded.state,
@@ -2398,7 +2395,6 @@ impl ndm::FsMetaHandler for FSMetaService {
                     updated_at = excluded.updated_at",
                 params![
                     node.inode_id as i64,
-                    node_kind_to_int(node.kind),
                     if node.read_only { 1i64 } else { 0i64 },
                     node.base_obj_id.as_ref().map(obj_id_to_blob),
                     cols.state,
@@ -2429,11 +2425,13 @@ impl ndm::FsMetaHandler for FSMetaService {
         &self,
         node_id: IndexNodeId,
         new_state: NodeState,
+        old_state: NodeState,
         txid: Option<String>,
         _ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         self.with_conn(txid.as_deref(), move |conn| {
-            let cols = Self::node_state_cols(&new_state);
+            let new_cols = Self::node_state_cols(&new_state);
+            let old_cols = Self::node_state_cols(&old_state);
             let now = unix_timestamp() as i64;
             let updated = conn
                 .execute(
@@ -2449,25 +2447,56 @@ impl ndm::FsMetaHandler for FSMetaService {
                         finalized_obj_id = ?9,
                         finalized_at = ?10,
                         updated_at = ?11
-                     WHERE inode_id = ?12",
+                     WHERE inode_id = ?12
+                       AND state = ?13
+                       AND fb_handle IS ?14
+                       AND last_write_at IS ?15
+                       AND closed_at IS ?16
+                       AND linked_obj_id IS ?17
+                       AND linked_qcid IS ?18
+                       AND linked_filebuffer_id IS ?19
+                       AND linked_at IS ?20
+                       AND finalized_obj_id IS ?21
+                       AND finalized_at IS ?22",
                     params![
-                        cols.state,
-                        cols.fb_handle,
-                        cols.last_write_at.map(|v| v as i64),
-                        cols.closed_at.map(|v| v as i64),
-                        cols.linked_obj_id,
-                        cols.linked_qcid,
-                        cols.linked_filebuffer_id,
-                        cols.linked_at.map(|v| v as i64),
-                        cols.finalized_obj_id,
-                        cols.finalized_at.map(|v| v as i64),
+                        new_cols.state,
+                        new_cols.fb_handle,
+                        new_cols.last_write_at.map(|v| v as i64),
+                        new_cols.closed_at.map(|v| v as i64),
+                        new_cols.linked_obj_id,
+                        new_cols.linked_qcid,
+                        new_cols.linked_filebuffer_id,
+                        new_cols.linked_at.map(|v| v as i64),
+                        new_cols.finalized_obj_id,
+                        new_cols.finalized_at.map(|v| v as i64),
                         now,
                         node_id as i64,
+                        old_cols.state,
+                        old_cols.fb_handle,
+                        old_cols.last_write_at.map(|v| v as i64),
+                        old_cols.closed_at.map(|v| v as i64),
+                        old_cols.linked_obj_id,
+                        old_cols.linked_qcid,
+                        old_cols.linked_filebuffer_id,
+                        old_cols.linked_at.map(|v| v as i64),
+                        old_cols.finalized_obj_id,
+                        old_cols.finalized_at.map(|v| v as i64),
                     ],
                 )
                 .map_err(map_db_err)?;
             if updated == 0 {
-                return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM nodes WHERE inode_id = ?1",
+                        params![node_id as i64],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(map_db_err)?;
+                if exists.is_none() {
+                    return Err(RPCErrors::ReasonError("inode not found".to_string()));
+                }
+                return Err(RPCErrors::ReasonError("inode state conflict".to_string()));
             }
             Ok(())
         })
@@ -2493,14 +2522,13 @@ impl ndm::FsMetaHandler for FSMetaService {
             if node.inode_id == 0 {
                 conn.execute(
                     "INSERT INTO nodes (
-                        kind, read_only, base_obj_id, state, rev, meta_json,
+                        read_only, base_obj_id, state, rev, meta_json,
                         lease_client_session, lease_seq, lease_expire_at,
                         fb_handle, last_write_at, closed_at,
                         linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
                         finalized_obj_id, finalized_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
                     params![
-                        node_kind_to_int(node.kind),
                         if node.read_only { 1i64 } else { 0i64 },
                         node.base_obj_id.as_ref().map(obj_id_to_blob),
                         cols.state,
@@ -2527,15 +2555,14 @@ impl ndm::FsMetaHandler for FSMetaService {
             } else {
                 conn.execute(
                     "INSERT INTO nodes (
-                        inode_id, kind, read_only, base_obj_id, state, rev, meta_json,
+                        inode_id, read_only, base_obj_id, state, rev, meta_json,
                         lease_client_session, lease_seq, lease_expire_at,
                         fb_handle, last_write_at, closed_at,
                         linked_obj_id, linked_qcid, linked_filebuffer_id, linked_at,
                         finalized_obj_id, finalized_at, updated_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                     params![
                         node.inode_id as i64,
-                        node_kind_to_int(node.kind),
                         if node.read_only { 1i64 } else { 0i64 },
                         node.base_obj_id.as_ref().map(obj_id_to_blob),
                         cols.state,
@@ -3103,7 +3130,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_inode(parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -3161,7 +3188,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_inode(parent, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -3255,7 +3282,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
 
-        if src_dir.kind != NodeKind::Dir || dst_dir.kind != NodeKind::Dir {
+        if src_dir.get_node_kind() != NodeKind::Dir || dst_dir.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError("not found".to_string()));
         }
 
@@ -3325,7 +3352,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_inode(link_parent_id, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -3372,7 +3399,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_inode(parent_id, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent directory not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -3392,7 +3419,6 @@ impl ndm::FsMetaHandler for FSMetaService {
 
         let new_node = NodeRecord {
             inode_id: 0, // Will be assigned by alloc
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -3448,7 +3474,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .handle_get_inode(parent_id, txn.txid(), ctx.clone())
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("parent not found".to_string()))?;
-        if parent_node.kind != NodeKind::Dir {
+        if parent_node.get_node_kind() != NodeKind::Dir {
             return Err(RPCErrors::ReasonError(
                 "parent is not a directory".to_string(),
             ));
@@ -3513,10 +3539,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             None if visible_base_obj.is_none() => {
                 let new_node = NodeRecord {
                     inode_id: 0,
-                    kind: NodeKind::File,
                     read_only: false,
                     base_obj_id: None,
-                    state: NodeState::DirNormal,
+                    state: NodeState::FileNormal,
                     rev: None,
                     meta: None,
                     lease_client_session: None,
@@ -3534,7 +3559,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     ctx.clone(),
                 )
                 .await?;
-                (fid, None, NodeState::DirNormal)
+                (fid, None, NodeState::FileNormal)
             }
             None => {
                 let base_oid = visible_base_obj
@@ -3542,10 +3567,9 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .ok_or_else(|| RPCErrors::ReasonError("base object missing".to_string()))?;
                 let new_node = NodeRecord {
                     inode_id: 0,
-                    kind: NodeKind::File,
                     read_only: false,
                     base_obj_id: Some(base_oid.clone()),
-                    state: NodeState::DirNormal,
+                    state: NodeState::FileNormal,
                     rev: None,
                     meta: None,
                     lease_client_session: None,
@@ -3563,7 +3587,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     ctx.clone(),
                 )
                 .await?;
-                (fid, Some(base_oid), NodeState::DirNormal)
+                (fid, Some(base_oid), NodeState::FileNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::Tombstone,
@@ -3571,10 +3595,9 @@ impl ndm::FsMetaHandler for FSMetaService {
             }) => {
                 let new_node = NodeRecord {
                     inode_id: 0,
-                    kind: NodeKind::File,
                     read_only: false,
                     base_obj_id: None,
-                    state: NodeState::DirNormal,
+                    state: NodeState::FileNormal,
                     rev: None,
                     meta: None,
                     lease_client_session: None,
@@ -3592,7 +3615,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     ctx.clone(),
                 )
                 .await?;
-                (fid, None, NodeState::DirNormal)
+                (fid, None, NodeState::FileNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::IndexNodeId(fid),
@@ -3603,10 +3626,10 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .await?
                     .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
-                if node.kind == NodeKind::Dir {
+                if node.get_node_kind() == NodeKind::Dir {
                     return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
-                if node.kind != NodeKind::File {
+                if node.get_node_kind() != NodeKind::File {
                     return Err(RPCErrors::ReasonError("path is not a file".to_string()));
                 }
                 match (&flag, &node.state) {
@@ -3637,10 +3660,9 @@ impl ndm::FsMetaHandler for FSMetaService {
                 }
                 let new_node = NodeRecord {
                     inode_id: 0,
-                    kind: NodeKind::File,
                     read_only: false,
                     base_obj_id: Some(oid.clone()),
-                    state: NodeState::DirNormal,
+                    state: NodeState::FileNormal,
                     rev: None,
                     meta: None,
                     lease_client_session: None,
@@ -3658,7 +3680,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     ctx.clone(),
                 )
                 .await?;
-                (fid, Some(oid), NodeState::DirNormal)
+                (fid, Some(oid), NodeState::FileNormal)
             }
             Some(DentryRecord {
                 target: DentryTarget::SymLink(_),
@@ -3670,6 +3692,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             }
         };
 
+        let expected_state = existing_state.clone();
         let (should_truncate, existing_chunks, resume_handle) = match flag {
             OpenWriteFlag::CreateExclusive | OpenWriteFlag::CreateOrTruncate => {
                 (true, vec![], None)
@@ -3682,9 +3705,9 @@ impl ndm::FsMetaHandler for FSMetaService {
                 };
                 (false, chunks, None)
             }
-            OpenWriteFlag::ContinueWrite => match existing_state {
-                NodeState::Working(ws) => (false, vec![], Some(ws.fb_handle)),
-                NodeState::Cooling(cs) => (false, vec![], Some(cs.fb_handle)),
+            OpenWriteFlag::ContinueWrite => match &expected_state {
+                NodeState::Working(ws) => (false, vec![], Some(ws.fb_handle.clone())),
+                NodeState::Cooling(cs) => (false, vec![], Some(cs.fb_handle.clone())),
                 _ => {
                     return Err(RPCErrors::ReasonError(
                         "unexpected state for ContinueWrite".to_string(),
@@ -3718,8 +3741,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                     .unwrap_or_default()
                     .as_secs(),
             });
-            self.handle_update_inode_state(file_id, working_state, txn.txid(), ctx.clone())
-                .await?;
+            self.handle_update_inode_state(
+                file_id,
+                working_state,
+                expected_state.clone(),
+                txn.txid(),
+                ctx.clone(),
+            )
+            .await?;
             txn.commit().await?;
             let _ = (session, lease_seq);
             return Ok(handle);
@@ -3770,8 +3799,14 @@ impl ndm::FsMetaHandler for FSMetaService {
                 .await?;
         }
 
-        self.handle_update_inode_state(file_id, working_state, txn.txid(), ctx.clone())
-            .await?;
+        self.handle_update_inode_state(
+            file_id,
+            working_state,
+            expected_state,
+            txn.txid(),
+            ctx.clone(),
+        )
+        .await?;
         txn.commit().await?;
 
         Ok(fb.handle_id)
@@ -3794,7 +3829,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             .await?
             .ok_or_else(|| RPCErrors::ReasonError("inode not found".to_string()))?;
 
-        if node.kind != NodeKind::File {
+        if node.get_node_kind() != NodeKind::File {
             return Err(RPCErrors::ReasonError("not a file".to_string()));
         }
 
@@ -3828,6 +3863,7 @@ impl ndm::FsMetaHandler for FSMetaService {
         self.handle_update_inode_state(
             file_inode_id,
             cooling_state,
+            node.state.clone(),
             txn.txid(),
             ctx.clone(),
         )
@@ -3868,7 +3904,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 Ok(OpenFileReaderResp::Object(obj_id, resolved.inner_path))
             }
             FsMetaResolvePathItem::Inode { inode, .. } => {
-                if inode.kind == NodeKind::Dir {
+                if inode.get_node_kind() == NodeKind::Dir {
                     return Err(RPCErrors::ReasonError("path is a directory".to_string()));
                 }
 
@@ -3877,7 +3913,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                     NodeState::Cooling(cs) => Ok(OpenFileReaderResp::FileBufferId(cs.fb_handle)),
                     NodeState::Linked(ls) => Ok(OpenFileReaderResp::Object(ls.obj_id, None)),
                     NodeState::Finalized(fs) => Ok(OpenFileReaderResp::Object(fs.obj_id, None)),
-                    NodeState::DirNormal | NodeState::DirOverlay => {
+                    NodeState::DirNormal | NodeState::DirOverlay | NodeState::FileNormal => {
                         if let Some(obj_id) = inode.base_obj_id {
                             Ok(OpenFileReaderResp::Object(obj_id, None))
                         } else {
@@ -3976,23 +4012,6 @@ fn symlink_path_to_blob(path: &str) -> Vec<u8> {
 fn symlink_path_from_blob(blob: Vec<u8>) -> Result<String, RPCErrors> {
     String::from_utf8(blob)
         .map_err(|e| RPCErrors::ReasonError(format!("invalid symlink path bytes: {}", e)))
-}
-
-fn node_kind_to_int(kind: NodeKind) -> i64 {
-    match kind {
-        NodeKind::File => 0,
-        NodeKind::Dir => 1,
-        NodeKind::Object => 2,
-    }
-}
-
-fn node_kind_from_int(value: i64) -> Result<NodeKind, RPCErrors> {
-    match value {
-        0 => Ok(NodeKind::File),
-        1 => Ok(NodeKind::Dir),
-        2 => Ok(NodeKind::Object),
-        _ => Err(RPCErrors::ReasonError("invalid node kind".to_string())),
-    }
 }
 
 fn dentry_target_cols(

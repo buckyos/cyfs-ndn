@@ -870,6 +870,13 @@ impl LocalFileBufferService {
             return Ok(());
         };
 
+        let old_state = client
+            .get_inode(file_inode_id, None)
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("fsmeta get inode failed: {}", e)))?
+            .ok_or_else(|| NdnError::RemoteError("fsmeta inode not found".to_string()))?
+            .state;
+
         client
             .update_inode_state(
                 file_inode_id,
@@ -879,6 +886,7 @@ impl LocalFileBufferService {
                     filebuffer_id: fb_handle,
                     linked_at,
                 }),
+                old_state,
                 None,
             )
             .await
@@ -895,6 +903,13 @@ impl LocalFileBufferService {
             return Ok(());
         };
 
+        let old_state = client
+            .get_inode(file_inode_id, None)
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("fsmeta get inode failed: {}", e)))?
+            .ok_or_else(|| NdnError::RemoteError("fsmeta inode not found".to_string()))?
+            .state;
+
         client
             .update_inode_state(
                 file_inode_id,
@@ -902,6 +917,7 @@ impl LocalFileBufferService {
                     obj_id: file_obj_id,
                     finalized_at,
                 }),
+                old_state,
                 None,
             )
             .await

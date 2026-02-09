@@ -115,7 +115,6 @@ mod tests {
     fn create_dir_node(inode_id: IndexNodeId) -> NodeRecord {
         NodeRecord {
             inode_id,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -130,7 +129,6 @@ mod tests {
     fn create_file_node_working(inode_id: IndexNodeId, fb_handle: &str) -> NodeRecord {
         NodeRecord {
             inode_id,
-            kind: NodeKind::File,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Working(ndm::FileWorkingState {
@@ -165,7 +163,7 @@ mod tests {
         assert!(node.is_some());
         let node = node.unwrap();
         assert_eq!(node.inode_id, root);
-        assert_eq!(node.kind, NodeKind::Dir);
+        assert_eq!(node.get_node_kind(), NodeKind::Dir);
     }
 
     #[tokio::test]
@@ -187,7 +185,7 @@ mod tests {
 
         let fetched = svc.handle_get_inode(100, None, ctx).await.unwrap().unwrap();
         assert_eq!(fetched.inode_id, 100);
-        assert_eq!(fetched.kind, NodeKind::Dir);
+        assert_eq!(fetched.get_node_kind(), NodeKind::Dir);
         assert!(!fetched.read_only);
     }
 
@@ -258,7 +256,7 @@ mod tests {
             fb_handle: "fb-001".to_string(),
             closed_at: 2000,
         });
-        svc.handle_update_inode_state(300, new_state, None, ctx.clone())
+        svc.handle_update_inode_state(300, new_state, node.state, None, ctx.clone())
             .await
             .unwrap();
 
@@ -276,9 +274,43 @@ mod tests {
     async fn test_update_inode_state_not_found() {
         let (svc, _tmp) = create_test_service();
         let result = svc
-            .handle_update_inode_state(9999, NodeState::DirNormal, None, dummy_ctx())
+            .handle_update_inode_state(
+                9999,
+                NodeState::DirNormal,
+                NodeState::DirNormal,
+                None,
+                dummy_ctx(),
+            )
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_inode_state_conflict() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(301, "fb-002");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let result = svc
+            .handle_update_inode_state(
+                301,
+                NodeState::Cooling(ndm::FileCoolingState {
+                    fb_handle: "fb-002".to_string(),
+                    closed_at: 2000,
+                }),
+                NodeState::FileNormal,
+                None,
+                ctx.clone(),
+            )
+            .await;
+        assert!(result.is_err());
+
+        let fetched = svc.handle_get_inode(301, None, ctx).await.unwrap().unwrap();
+        assert!(matches!(fetched.state, NodeState::Working(_)));
     }
 
     // ==================== Dentry Tests ====================
@@ -670,7 +702,6 @@ mod tests {
 
         let overlay_inode = NodeRecord {
             inode_id: 900,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: Some(base_dir_id),
             state: NodeState::DirOverlay,
@@ -1409,7 +1440,6 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 900,
-            kind: NodeKind::File,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Linked(ndm::FileLinkedState {
@@ -1448,7 +1478,6 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 901,
-            kind: NodeKind::File,
             read_only: true,
             base_obj_id: None,
             state: NodeState::Finalized(ndm::FinalizedObjState {
@@ -1488,7 +1517,6 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 902,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: None,
             state: NodeState::DirNormal,
@@ -1515,7 +1543,6 @@ mod tests {
 
         let node = NodeRecord {
             inode_id: 903,
-            kind: NodeKind::File,
             read_only: false,
             base_obj_id: None,
             state: NodeState::Working(ndm::FileWorkingState {
@@ -1932,7 +1959,6 @@ mod tests {
 
         let overlay_inode = NodeRecord {
             inode_id: 910,
-            kind: NodeKind::Dir,
             read_only: false,
             base_obj_id: Some(base_dir_id),
             state: NodeState::DirOverlay,
