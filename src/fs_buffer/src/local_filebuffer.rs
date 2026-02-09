@@ -204,6 +204,10 @@ impl LocalFileBufferService {
 
         let records = match db.load_all() {
             Ok(loaded) => {
+                log::debug!(
+                    "load filebuffer records from db succeed, record_count={}",
+                    loaded.len()
+                );
                 let mut map = HashMap::new();
                 for record in loaded {
                     let handle_id = record.handle_id.clone();
@@ -211,7 +215,13 @@ impl LocalFileBufferService {
                 }
                 RwLock::new(map)
             }
-            Err(_) => RwLock::new(HashMap::new()),
+            Err(e) => {
+                log::warn!(
+                    "load filebuffer records from db failed, use empty cache, error={}",
+                    e
+                );
+                RwLock::new(HashMap::new())
+            }
         };
 
         Self {
@@ -987,176 +997,491 @@ impl FileBufferService for LocalFileBufferService {
         _lease: &WriteLease,
         expected_size: Option<u64>,
     ) -> NdnResult<FileBufferRecord> {
-        if self.size_limit > 0 {
-            if let Some(expect) = expected_size {
-                let mut used = self.size_used.write().unwrap();
-                if *used + expect > self.size_limit {
-                    return Err(NdnError::InvalidState(
-                        "buffer capacity exceeded".to_string(),
-                    ));
+        let has_base_chunk_list = !base_chunk_list.is_empty();
+        log::debug!(
+            "alloc buffer start, inode={}, expected_size={:?}, has_base_chunk_list={}",
+            file_inode_id,
+            expected_size,
+            has_base_chunk_list
+        );
+
+        let result: NdnResult<FileBufferRecord> = async {
+            if self.size_limit > 0 {
+                if let Some(expect) = expected_size {
+                    let mut used = self.size_used.write().unwrap();
+                    if *used + expect > self.size_limit {
+                        return Err(NdnError::InvalidState(
+                            "buffer capacity exceeded".to_string(),
+                        ));
+                    }
+                    *used += expect;
                 }
-                *used += expect;
+            }
+
+            fs::create_dir_all(&self.base_dir).await?;
+            fs::create_dir_all(&self.buffer_dir).await?;
+
+            let handle_id = Self::next_handle_id();
+            let file_path = self.buffer_path_by_id(&handle_id);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .await?;
+
+            let base_reader = if base_chunk_list.is_empty() {
+                FileBufferBaseReader::None
+            } else {
+                FileBufferBaseReader::BaseChunkList(base_chunk_list)
+            };
+
+            let record = FileBufferRecord {
+                handle_id: handle_id.clone(),
+                file_inode_id,
+                base_reader,
+                read_only: false,
+                diff_file_path: file_path,
+                diff_state: Arc::new(RwLock::new(FileBufferDiffState::default())),
+            };
+
+            let db = self.db.clone();
+            let record_meta = record.to_meta();
+            tokio::task::spawn_blocking(move || {
+                let record = FileBufferRecord::from_meta(record_meta);
+                db.add_buffer(&record)
+            })
+            .await
+            .map_err(|e| NdnError::IoError(format!("add buffer join error: {}", e)))??;
+
+            self.insert_record(record)?;
+            let arc_record = self.get_record(&handle_id)?;
+            self.snapshot_record(&arc_record)
+        }
+        .await;
+
+        match &result {
+            Ok(record) => {
+                log::info!(
+                    "alloc buffer succeed, handle={}, inode={}, diff_file_path={}",
+                    record.handle_id,
+                    record.file_inode_id,
+                    record.diff_file_path.display()
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    "alloc buffer failed, inode={}, expected_size={:?}, has_base_chunk_list={}, error={}",
+                    file_inode_id,
+                    expected_size,
+                    has_base_chunk_list,
+                    e
+                );
             }
         }
 
-        fs::create_dir_all(&self.base_dir).await?;
-        fs::create_dir_all(&self.buffer_dir).await?;
-
-        let handle_id = Self::next_handle_id();
-        let file_path = self.buffer_path_by_id(&handle_id);
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&file_path)
-            .await?;
-
-        let base_reader = if base_chunk_list.is_empty() {
-            FileBufferBaseReader::None
-        } else {
-            FileBufferBaseReader::BaseChunkList(base_chunk_list)
-        };
-
-        let record = FileBufferRecord {
-            handle_id: handle_id.clone(),
-            file_inode_id,
-            base_reader,
-            read_only: false,
-            diff_file_path: file_path,
-            diff_state: Arc::new(RwLock::new(FileBufferDiffState::default())),
-        };
-
-        let db = self.db.clone();
-        let record_meta = record.to_meta();
-        tokio::task::spawn_blocking(move || {
-            let record = FileBufferRecord::from_meta(record_meta);
-            db.add_buffer(&record)
-        })
-        .await
-        .map_err(|e| NdnError::IoError(format!("add buffer join error: {}", e)))??;
-
-        self.insert_record(record)?;
-        let arc_record = self.get_record(&handle_id)?;
-        self.snapshot_record(&arc_record)
+        result
     }
 
     async fn get_buffer(&self, handle_id: &str) -> NdnResult<FileBufferRecord> {
-        if let Ok(arc_record) = self.get_record(handle_id) {
-            return self.snapshot_record(&arc_record);
+        log::debug!("get buffer start, handle={}", handle_id);
+        let result: NdnResult<FileBufferRecord> = async {
+            if let Ok(arc_record) = self.get_record(handle_id) {
+                log::debug!("get buffer hit memory cache, handle={}", handle_id);
+                return self.snapshot_record(&arc_record);
+            }
+            log::debug!(
+                "get buffer miss memory cache, load from db, handle={}",
+                handle_id
+            );
+
+            let db = self.db.clone();
+            let handle_id_owned = handle_id.to_string();
+            let record = tokio::task::spawn_blocking(move || db.get_buffer(&handle_id_owned))
+                .await
+                .map_err(|e| NdnError::IoError(format!("get buffer join error: {}", e)))??;
+
+            self.insert_record(record)?;
+            let arc_record = self.get_record(handle_id)?;
+            self.snapshot_record(&arc_record)
+        }
+        .await;
+
+        match &result {
+            Ok(record) => {
+                log::debug!(
+                    "get buffer succeed, handle={}, inode={}, read_only={}",
+                    record.handle_id,
+                    record.file_inode_id,
+                    record.read_only
+                );
+            }
+            Err(e) => {
+                log::warn!("get buffer failed, handle={}, error={}", handle_id, e);
+            }
         }
 
-        let db = self.db.clone();
-        let handle_id_owned = handle_id.to_string();
-        let record = tokio::task::spawn_blocking(move || db.get_buffer(&handle_id_owned))
-            .await
-            .map_err(|e| NdnError::IoError(format!("get buffer join error: {}", e)))??;
-
-        self.insert_record(record)?;
-        let arc_record = self.get_record(handle_id)?;
-        self.snapshot_record(&arc_record)
+        result
     }
 
     async fn flush(&self, fb: &FileBufferRecord) -> NdnResult<()> {
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&fb.diff_file_path)
-            .await
-        {
-            Ok(file) => file.sync_all().await?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(NdnError::IoError(format!("open diff file failed: {}", e))),
+        log::debug!(
+            "flush buffer start, handle={}, diff_file_path={}",
+            fb.handle_id,
+            fb.diff_file_path.display()
+        );
+        let result: NdnResult<()> = async {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fb.diff_file_path)
+                .await
+            {
+                Ok(file) => file.sync_all().await?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::debug!(
+                        "flush skipped file sync because diff file not found, handle={}, diff_file_path={}",
+                        fb.handle_id,
+                        fb.diff_file_path.display()
+                    );
+                }
+                Err(e) => return Err(NdnError::IoError(format!("open diff file failed: {}", e))),
+            }
+
+            let meta = fb.to_meta();
+            let handle_id = fb.handle_id.clone();
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.set_meta(&handle_id, &meta))
+                .await
+                .map_err(|e| NdnError::IoError(format!("persist meta join error: {}", e)))??;
+
+            Ok(())
+        }
+        .await;
+
+        match &result {
+            Ok(_) => {
+                log::info!("flush buffer succeed, handle={}", fb.handle_id);
+            }
+            Err(e) => {
+                log::warn!("flush buffer failed, handle={}, error={}", fb.handle_id, e);
+            }
         }
 
-        let meta = fb.to_meta();
-        let handle_id = fb.handle_id.clone();
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.set_meta(&handle_id, &meta))
-            .await
-            .map_err(|e| NdnError::IoError(format!("persist meta join error: {}", e)))??;
-
-        Ok(())
+        result
     }
 
     async fn close(&self, fb: &FileBufferRecord) -> NdnResult<()> {
-        self.flush(fb).await
+        log::debug!("close buffer start, handle={}", fb.handle_id);
+        let result = self.flush(fb).await;
+        match &result {
+            Ok(_) => {
+                log::info!("close buffer succeed, handle={}", fb.handle_id);
+            }
+            Err(e) => {
+                log::warn!("close buffer failed, handle={}, error={}", fb.handle_id, e);
+            }
+        }
+        result
     }
 
     async fn append(&self, fb: &FileBufferRecord, data: &[u8]) -> NdnResult<()> {
-        self.ensure_writable(fb)?;
-        if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
-            return Err(NdnError::Unsupported(
-                "append with base chunk list is handled by DiffChunkListWriter".to_string(),
-            ));
+        log::debug!(
+            "append start, handle={}, append_bytes={}",
+            fb.handle_id,
+            data.len()
+        );
+        let result: NdnResult<u64> = async {
+            self.ensure_writable(fb)?;
+            if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
+                return Err(NdnError::Unsupported(
+                    "append with base chunk list is handled by DiffChunkListWriter".to_string(),
+                ));
+            }
+
+            if let Some(parent) = fb.diff_file_path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
+
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&fb.diff_file_path)
+                .await?;
+            file.write_all(data).await?;
+            file.sync_data().await?;
+
+            let meta = fs::metadata(&fb.diff_file_path).await?;
+            let mut state = fb.diff_state.write().map_err(|_| {
+                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+            })?;
+            state.total_size = meta.len();
+            state.position = state.total_size;
+
+            Ok(state.total_size)
         }
+        .await;
 
-        if let Some(parent) = fb.diff_file_path.parent() {
-            fs::create_dir_all(parent).await?;
+        match result {
+            Ok(total_size) => {
+                log::info!(
+                    "append succeed, handle={}, appended_bytes={}, total_size={}",
+                    fb.handle_id,
+                    data.len(),
+                    total_size
+                );
+                Ok(())
+            }
+            Err(e) => {
+                log::warn!(
+                    "append failed, handle={}, appended_bytes={}, error={}",
+                    fb.handle_id,
+                    data.len(),
+                    e
+                );
+                Err(e)
+            }
         }
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&fb.diff_file_path)
-            .await?;
-        file.write_all(data).await?;
-        file.sync_data().await?;
-
-        let meta = fs::metadata(&fb.diff_file_path).await?;
-        let mut state = fb
-            .diff_state
-            .write()
-            .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?;
-        state.total_size = meta.len();
-        state.position = state.total_size;
-
-        Ok(())
     }
 
     async fn cacl_name(&self, fb: &FileBufferRecord) -> NdnResult<bool> {
-        self.close(fb).await?;
+        log::debug!(
+            "cacl_name start, handle={}, inode={}, read_only={}",
+            fb.handle_id,
+            fb.file_inode_id,
+            fb.read_only
+        );
 
-        {
-            let state = fb.diff_state.read().map_err(|_| {
-                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
-            })?;
-            if state.finalized_at.is_some() {
+        let result: NdnResult<bool> = async {
+            self.close(fb).await?;
+
+            {
+                let state = fb.diff_state.read().map_err(|_| {
+                    NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+                })?;
+                if state.finalized_at.is_some() {
+                    log::debug!(
+                        "cacl_name short-circuit because already finalized, handle={}",
+                        fb.handle_id
+                    );
+                    return Ok(true);
+                }
+                if state.linked_obj_id.is_some() {
+                    log::debug!(
+                        "cacl_name short-circuit because already linked, handle={}",
+                        fb.handle_id
+                    );
+                    return Ok(false);
+                }
+            }
+
+            let overlay_context =
+                if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
+                    log::debug!("cacl_name uses overlay mode, handle={}", fb.handle_id);
+                    Some(self.build_overlay_finalize_context(fb, None).await?)
+                } else {
+                    None
+                };
+
+            let finalize_data = if let Some(context) = &overlay_context {
+                context.finalize_data.clone()
+            } else {
+                self.build_finalize_data(fb.file_inode_id, &fb.diff_file_path, None)
+                    .await?
+            };
+            let file_size = finalize_data.file_size;
+            log::debug!(
+                "cacl_name finalize context ready, handle={}, inode={}, file_size={}",
+                fb.handle_id,
+                fb.file_inode_id,
+                file_size
+            );
+
+            if file_size <= DIRECT_FINALIZE_FILE_SIZE {
+                log::debug!(
+                    "cacl_name choose direct finalize path, handle={}, file_size={}",
+                    fb.handle_id,
+                    file_size
+                );
+                let finalized_obj_id = finalize_data.file_obj_id.clone();
+                let finalized_qcid = finalize_data.qcid.clone();
+
+                if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+                    if let Some(context) = &overlay_context {
+                        self.put_overlay_dirty_chunks_to_store(
+                            &named_store_mgr,
+                            &fb.diff_file_path,
+                            &context.dirty_segments,
+                        )
+                        .await?;
+                    } else {
+                        let segments = finalize_data.content_layout.segments();
+                        self.put_chunks_to_store(&named_store_mgr, &fb.diff_file_path, &segments)
+                            .await?;
+                    }
+                    self.put_objects_to_store(
+                        &named_store_mgr,
+                        &finalize_data.content_layout,
+                        &finalize_data.file_obj_id,
+                        &finalize_data.file_obj_str,
+                    )
+                    .await?;
+                } else {
+                    log::warn!(
+                        "cacl_name direct finalize without named_store_mgr configured, handle={}",
+                        fb.handle_id
+                    );
+                }
+                let arc_record = self.get_record(&fb.handle_id)?;
+                self.do_finalize(&arc_record, finalize_data).await?;
+                log::info!(
+                    "cacl_name finalized buffer, handle={}, inode={}, file_obj_id={}, qcid={}, file_size={}",
+                    fb.handle_id,
+                    fb.file_inode_id,
+                    finalized_obj_id,
+                    finalized_qcid.to_string(),
+                    file_size
+                );
                 return Ok(true);
             }
-            if state.linked_obj_id.is_some() {
-                return Ok(false);
+
+            log::debug!(
+                "cacl_name choose linked path, handle={}, file_size={}",
+                fb.handle_id,
+                file_size
+            );
+            if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+                if let Some(context) = &overlay_context {
+                    self.put_overlay_dirty_links_to_store(
+                        &named_store_mgr,
+                        &fb.diff_file_path,
+                        &context.dirty_segments,
+                        &finalize_data.qcid,
+                    )
+                    .await?;
+                } else {
+                    let segments = finalize_data.content_layout.segments();
+                    self.put_links_to_store(
+                        &named_store_mgr,
+                        &fb.diff_file_path,
+                        &segments,
+                        &finalize_data.qcid,
+                    )
+                    .await?;
+                }
+                self.put_objects_to_store(
+                    &named_store_mgr,
+                    &finalize_data.content_layout,
+                    &finalize_data.file_obj_id,
+                    &finalize_data.file_obj_str,
+                )
+                .await?;
+            } else {
+                log::warn!(
+                    "cacl_name linked without named_store_mgr configured, handle={}",
+                    fb.handle_id
+                );
             }
+
+            {
+                let mut state = fb.diff_state.write().map_err(|_| {
+                    NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
+                })?;
+                state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
+                state.linked_qcid = Some(finalize_data.qcid.clone());
+                state.linked_at = Some(finalize_data.linked_at);
+                state.finalized_at = None;
+            }
+            self.persist_meta(fb).await?;
+
+            let linked_obj_id = finalize_data.file_obj_id.clone();
+            let linked_qcid = finalize_data.qcid.clone();
+            self.update_fsmeta_linked_state(
+                fb.file_inode_id,
+                finalize_data.file_obj_id,
+                finalize_data.qcid,
+                fb.handle_id.clone(),
+                finalize_data.linked_at,
+            )
+            .await?;
+            log::info!(
+                "cacl_name linked buffer, handle={}, inode={}, file_obj_id={}, qcid={}, file_size={}",
+                fb.handle_id,
+                fb.file_inode_id,
+                linked_obj_id,
+                linked_qcid.to_string(),
+                file_size
+            );
+
+            Ok(false)
+        }
+        .await;
+
+        if let Err(e) = &result {
+            log::warn!(
+                "cacl_name failed, handle={}, inode={}, error={}",
+                fb.handle_id,
+                fb.file_inode_id,
+                e
+            );
         }
 
-        let overlay_context = if matches!(fb.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
-            Some(self.build_overlay_finalize_context(fb, None).await?)
-        } else {
-            None
-        };
+        result
+    }
 
-        let finalize_data = if let Some(context) = &overlay_context {
-            context.finalize_data.clone()
-        } else {
-            self.build_finalize_data(fb.file_inode_id, &fb.diff_file_path, None)
+    async fn finalize(&self, fb_id: String) -> NdnResult<()> {
+        log::debug!("finalize start, handle={}", fb_id);
+        let result: NdnResult<()> = async {
+            let _ = self.get_buffer(&fb_id).await?;
+            let arc_record = self.get_record(&fb_id)?;
+            let snapshot = self.snapshot_record(&arc_record)?;
+            let state = snapshot
+                .diff_state
+                .read()
+                .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
+                .clone();
+
+            if state.finalized_at.is_some() {
+                log::debug!("finalize skipped because already finalized, handle={}", fb_id);
+                return Ok(());
+            }
+
+            let overlay_context =
+                if matches!(snapshot.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
+                    log::debug!("finalize uses overlay mode, handle={}", fb_id);
+                    Some(
+                        self.build_overlay_finalize_context(&snapshot, state.linked_at)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+
+            let finalize_data = if let Some(context) = &overlay_context {
+                context.finalize_data.clone()
+            } else {
+                self.build_finalize_data(
+                    snapshot.file_inode_id,
+                    &snapshot.diff_file_path,
+                    state.linked_at,
+                )
                 .await?
-        };
-        let file_size = finalize_data.file_size;
+            };
 
-        if file_size <= DIRECT_FINALIZE_FILE_SIZE {
             if let Some(named_store_mgr) = self.get_named_store_mgr()? {
                 if let Some(context) = &overlay_context {
                     self.put_overlay_dirty_chunks_to_store(
                         &named_store_mgr,
-                        &fb.diff_file_path,
+                        &snapshot.diff_file_path,
                         &context.dirty_segments,
                     )
                     .await?;
                 } else {
                     let segments = finalize_data.content_layout.segments();
-                    self.put_chunks_to_store(&named_store_mgr, &fb.diff_file_path, &segments)
+                    self.put_chunks_to_store(&named_store_mgr, &snapshot.diff_file_path, &segments)
                         .await?;
                 }
                 self.put_objects_to_store(
@@ -1168,178 +1493,101 @@ impl FileBufferService for LocalFileBufferService {
                 .await?;
             } else {
                 log::warn!(
-                    "cacl_name direct finalize without named_store_mgr configured, handle={}",
-                    fb.handle_id
+                    "finalize without named_store_mgr configured, handle={}",
+                    fb_id
                 );
             }
-            let arc_record = self.get_record(&fb.handle_id)?;
+
+            if let Some(existing) = state.linked_obj_id {
+                if existing != finalize_data.file_obj_id {
+                    log::warn!(
+                        "finalize recalculated file obj differs from linked state, handle={}, old={}, new={}",
+                        fb_id,
+                        existing,
+                        finalize_data.file_obj_id
+                    );
+                }
+            }
+            if let Some(existing_qcid) = state.linked_qcid {
+                if existing_qcid != finalize_data.qcid {
+                    log::warn!(
+                        "finalize recalculated qcid differs from linked state, handle={}, old={}, new={}",
+                        fb_id,
+                        existing_qcid.to_string(),
+                        finalize_data.qcid.to_string()
+                    );
+                }
+            }
+
+            let finalized_obj_id = finalize_data.file_obj_id.clone();
+            let finalized_qcid = finalize_data.qcid.clone();
+            let finalized_file_size = finalize_data.file_size;
             self.do_finalize(&arc_record, finalize_data).await?;
-            return Ok(true);
-        }
-
-        if let Some(named_store_mgr) = self.get_named_store_mgr()? {
-            if let Some(context) = &overlay_context {
-                self.put_overlay_dirty_links_to_store(
-                    &named_store_mgr,
-                    &fb.diff_file_path,
-                    &context.dirty_segments,
-                    &finalize_data.qcid,
-                )
-                .await?;
-            } else {
-                let segments = finalize_data.content_layout.segments();
-                self.put_links_to_store(
-                    &named_store_mgr,
-                    &fb.diff_file_path,
-                    &segments,
-                    &finalize_data.qcid,
-                )
-                .await?;
-            }
-            self.put_objects_to_store(
-                &named_store_mgr,
-                &finalize_data.content_layout,
-                &finalize_data.file_obj_id,
-                &finalize_data.file_obj_str,
-            )
-            .await?;
-        } else {
-            log::warn!(
-                "cacl_name linked without named_store_mgr configured, handle={}",
-                fb.handle_id
-            );
-        }
-
-        {
-            let mut state = fb.diff_state.write().map_err(|_| {
-                NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
-            })?;
-            state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
-            state.linked_qcid = Some(finalize_data.qcid.clone());
-            state.linked_at = Some(finalize_data.linked_at);
-            state.finalized_at = None;
-        }
-        self.persist_meta(fb).await?;
-
-        self.update_fsmeta_linked_state(
-            fb.file_inode_id,
-            finalize_data.file_obj_id,
-            finalize_data.qcid,
-            fb.handle_id.clone(),
-            finalize_data.linked_at,
-        )
-        .await?;
-
-        Ok(false)
-    }
-
-    async fn finalize(&self, fb_id: String) -> NdnResult<()> {
-        let _ = self.get_buffer(&fb_id).await?;
-        let arc_record = self.get_record(&fb_id)?;
-        let snapshot = self.snapshot_record(&arc_record)?;
-        let state = snapshot
-            .diff_state
-            .read()
-            .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
-            .clone();
-
-        if state.finalized_at.is_some() {
-            return Ok(());
-        }
-
-        let overlay_context =
-            if matches!(snapshot.base_reader, FileBufferBaseReader::BaseChunkList(_)) {
-                Some(
-                    self.build_overlay_finalize_context(&snapshot, state.linked_at)
-                        .await?,
-                )
-            } else {
-                None
-            };
-
-        let finalize_data = if let Some(context) = &overlay_context {
-            context.finalize_data.clone()
-        } else {
-            self.build_finalize_data(
+            log::info!(
+                "finalize buffer succeed, handle={}, inode={}, file_obj_id={}, qcid={}, file_size={}",
+                fb_id,
                 snapshot.file_inode_id,
-                &snapshot.diff_file_path,
-                state.linked_at,
-            )
-            .await?
-        };
-
-        if let Some(named_store_mgr) = self.get_named_store_mgr()? {
-            if let Some(context) = &overlay_context {
-                self.put_overlay_dirty_chunks_to_store(
-                    &named_store_mgr,
-                    &snapshot.diff_file_path,
-                    &context.dirty_segments,
-                )
-                .await?;
-            } else {
-                let segments = finalize_data.content_layout.segments();
-                self.put_chunks_to_store(&named_store_mgr, &snapshot.diff_file_path, &segments)
-                    .await?;
-            }
-            self.put_objects_to_store(
-                &named_store_mgr,
-                &finalize_data.content_layout,
-                &finalize_data.file_obj_id,
-                &finalize_data.file_obj_str,
-            )
-            .await?;
-        } else {
-            log::warn!(
-                "finalize without named_store_mgr configured, handle={}",
-                fb_id
+                finalized_obj_id,
+                finalized_qcid.to_string(),
+                finalized_file_size
             );
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = &result {
+            log::warn!("finalize failed, handle={}, error={}", fb_id, e);
         }
 
-        if let Some(existing) = state.linked_obj_id {
-            if existing != finalize_data.file_obj_id {
-                log::warn!(
-                    "finalize recalculated file obj differs from linked state, handle={}, old={}, new={}",
-                    fb_id,
-                    existing,
-                    finalize_data.file_obj_id
-                );
-            }
-        }
-        if let Some(existing_qcid) = state.linked_qcid {
-            if existing_qcid != finalize_data.qcid {
-                log::warn!(
-                    "finalize recalculated qcid differs from linked state, handle={}, old={}, new={}",
-                    fb_id,
-                    existing_qcid.to_string(),
-                    finalize_data.qcid.to_string()
-                );
-            }
-        }
-
-        self.do_finalize(&arc_record, finalize_data).await
+        result
     }
 
     async fn remove(&self, fb: &FileBufferRecord) -> NdnResult<()> {
-        self.remove_record(&fb.handle_id)?;
+        log::debug!(
+            "remove buffer start, handle={}, diff_file_path={}",
+            fb.handle_id,
+            fb.diff_file_path.display()
+        );
+        let result: NdnResult<()> = async {
+            self.remove_record(&fb.handle_id)?;
 
-        if let Ok(meta) = fs::metadata(&fb.diff_file_path).await {
-            let mut used = self.size_used.write().unwrap();
-            *used = used.saturating_sub(meta.len());
+            if let Ok(meta) = fs::metadata(&fb.diff_file_path).await {
+                let mut used = self.size_used.write().unwrap();
+                *used = used.saturating_sub(meta.len());
+            }
+
+            if let Err(e) = fs::remove_file(&fb.diff_file_path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(NdnError::IoError(format!("remove file failed: {}", e)));
+                }
+                log::debug!(
+                    "remove skipped file deletion because diff file not found, handle={}, diff_file_path={}",
+                    fb.handle_id,
+                    fb.diff_file_path.display()
+                );
+            }
+
+            let handle_id = fb.handle_id.clone();
+            let db = self.db.clone();
+            tokio::task::spawn_blocking(move || db.remove(&handle_id))
+                .await
+                .map_err(|e| NdnError::IoError(format!("remove db entry join error: {}", e)))??;
+
+            Ok(())
         }
+        .await;
 
-        if let Err(e) = fs::remove_file(&fb.diff_file_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(NdnError::IoError(format!("remove file failed: {}", e)));
+        match &result {
+            Ok(_) => {
+                log::info!("remove buffer succeed, handle={}", fb.handle_id);
+            }
+            Err(e) => {
+                log::warn!("remove buffer failed, handle={}, error={}", fb.handle_id, e);
             }
         }
 
-        let handle_id = fb.handle_id.clone();
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || db.remove(&handle_id))
-            .await
-            .map_err(|e| NdnError::IoError(format!("remove db entry join error: {}", e)))??;
-
-        Ok(())
+        result
     }
 }
 

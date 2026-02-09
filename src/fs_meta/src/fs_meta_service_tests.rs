@@ -9,11 +9,20 @@ mod tests {
         NodeRecord, NodeState, OpenWriteFlag,
     };
     use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
-    use std::sync::Arc;
+    use std::sync::{Arc, Once};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
+    use buckyos_kit::init_logging;
+
+    fn ensure_test_logging_once() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            init_logging("test fsmeta", false);
+        });
+    }
 
     fn create_test_service() -> (FSMetaService, TempDir) {
+        ensure_test_logging_once();
         let tmp_dir = TempDir::new().unwrap();
         let db_path = tmp_dir.path().join("test.db");
         let svc = FSMetaService::new(db_path.to_str().unwrap()).unwrap();
@@ -21,6 +30,7 @@ mod tests {
     }
 
     fn create_test_service_with_buffer() -> (FSMetaService, TempDir, TempDir) {
+        ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let fb_tmp_dir = TempDir::new().unwrap();
         let db_path = meta_tmp_dir.path().join("test.db");
@@ -49,6 +59,7 @@ mod tests {
 
     async fn create_test_service_with_store(
     ) -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();
 
@@ -73,6 +84,7 @@ mod tests {
 
     async fn create_test_service_with_store_and_buffer(
     ) -> (FSMetaService, TempDir, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();
         let fb_tmp_dir = TempDir::new().unwrap();

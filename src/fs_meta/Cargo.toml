@@ -12,6 +12,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 krpc = { workspace = true }
 rusqlite = { workspace = true }
+buckyos-kit = {workspace = true}
 ndn-lib = { path = "../ndn-lib" }
 fs-buffer = { path = "../fs_buffer" }
 named_store = { path = "../named_store" }
