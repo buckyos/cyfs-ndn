@@ -9,19 +9,21 @@ Usage:
 1) Build and run:
 
 ```bash
-cargo run -p fs_daemon -- <mountpoint> <data_dir> [mgr_id] [instance_id]
+cargo run -p fs_daemon -- <mountpoint> [--store-config <path>] [--service-config <path>]
 ```
 
 2) Example:
 
 ```bash
-cargo run -p fs_daemon -- /mnt/ndn /var/lib/ndnfs default default
+cargo run -p fs_daemon -- /mnt/ndn \
+  --store-config /opt/buckyos/etc/store_layout.json \
+  --service-config /opt/buckyos/etc/fs_daemon.json
 ```
 
 Mount note (one line):
 
-- macOS: install macFUSE, then `mkdir -p /Volumes/ndn && cargo run -p fs_daemon -- /Volumes/ndn /var/lib/ndnfs`.
-- Linux: install FUSE, then `mkdir -p /mnt/ndn && cargo run -p fs_daemon -- /mnt/ndn /var/lib/ndnfs`.
+- macOS: install macFUSE, then `mkdir -p /Volumes/ndn && cargo run -p fs_daemon -- /Volumes/ndn`.
+- Linux: install FUSE, then `mkdir -p /mnt/ndn && cargo run -p fs_daemon -- /mnt/ndn`.
 
 Notes:
 
@@ -30,4 +32,16 @@ Notes:
 
 Testing:
 
-- Run `cargo test -p fs_daemon` to execute the simulated filesystem logic tests.
+- Run `cargo test -p fs_daemon` to execute the unit tests.
+- Run CLI+FUSE e2e (service stays alive after verification for manual inspection):
+
+```bash
+cd src
+./fs_daemon/tests/fuse_cli_e2e.sh
+```
+
+- The e2e script will:
+  - start `fs_daemon` via command line,
+  - mount to a temp directory,
+  - run `fs_daemon/tests/fuse_ops_verify.sh` to do shell operations against mountpoint,
+  - print PID/mount/log path and keep process running.
