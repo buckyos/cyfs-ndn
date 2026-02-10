@@ -10,6 +10,7 @@ mod hash;
 mod object;
 mod relation_obj;
 mod simple_object_map;
+mod msgobj;
 //mod example;
 
 pub use base_content::*;
@@ -21,6 +22,7 @@ pub use hash::*;
 pub use object::*;
 pub use relation_obj::*;
 pub use simple_object_map::*;
+pub use msgobj::*;
 
 use reqwest::StatusCode;
 use std::future::Future;
@@ -106,6 +108,8 @@ impl From<std::io::Error> for NdnError {
 
 pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
+pub const OBJ_TYPE_MSG: &str = "cymsg";
+pub const OBJ_TYPE_MSG_RECE:&str="cymsgr";
 pub const OBJ_TYPE_PATH: &str = "cypath";
 pub const OBJ_TYPE_INCLUSION_PROOF: &str = "cyinc"; // curator -> creator: content inclusion proof (recommend JWT signed by curator)
 pub const OBJ_TYPE_RELATION: &str = "cyrel";
