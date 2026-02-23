@@ -17,14 +17,18 @@ pub type Uri = String;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MsgObjKind {
-    Info,
-    Event,
-    Accept,
-    Decline,
+    Chat,
+    GroupMsg,
     Deliver,
-    Progress,
-    Error,
-    Cancel,
+    Notify,
+    Event,
+    Operation,
+}
+
+impl Default for MsgObjKind {
+    fn default() -> Self {
+        Self::Chat
+    }
 }
 
 /// Human content format.
@@ -209,7 +213,7 @@ impl Default for MsgObject {
         Self {
             from: DID::undefined(),
             to: Vec::new(),
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread::default(),
             workspace: None,
             created_at_ms: 0,
@@ -358,7 +362,7 @@ mod tests {
         let mut msg = MsgObject {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
                 ..TopicThread::default()
@@ -380,7 +384,7 @@ mod tests {
         print_msg_json("case_1_plain_text", &msg);
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
-        assert_eq!(normalized.kind, MsgObjKind::Info);
+        assert_eq!(normalized.kind, MsgObjKind::default());
         assert_eq!(normalized.content.format, Some(MsgContentFormat::TextPlain));
         assert_eq!(normalized.content.refs.len(), 0);
     }
@@ -472,7 +476,7 @@ mod tests {
         let reply_msg = MsgObject {
             from: did_web("bob.example.com"),
             to: vec![did_web("alice.example.com")],
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
                 reply_to: Some(image_msg_id.clone()),
@@ -508,7 +512,7 @@ mod tests {
         let quoted_text_msg = MsgObject {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
                 ..TopicThread::default()
@@ -576,10 +580,9 @@ mod tests {
         );
 
         let mut msg = MsgObject {
-            from: did_web("workgroup.example.com"),
+            from: did_web("alice.example.com"),
             to: vec![group_did.clone()],
-            source: Some(did_web("alice.example.com")),
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread {
                 topic: Some("grp-release".to_string()),
                 correlation_id: None,
@@ -625,9 +628,8 @@ mod tests {
     fn test_msg_case_6_minimal_all_optional_none() {
         let msg = MsgObject {
             from: did_web("a.example.com"),
-            source: None,
             to: vec![did_web("b.example.com")],
-            kind: MsgObjKind::Info,
+            kind: MsgObjKind::default(),
             thread: TopicThread::default(),
             workspace: None,
             created_at_ms: 0,
@@ -646,7 +648,6 @@ mod tests {
         print_msg_json("case_6_minimal_none", &msg);
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
-        assert_eq!(normalized.source, None);
         assert_eq!(normalized.workspace, None);
         assert_eq!(normalized.expires_at_ms, None);
         assert_eq!(normalized.nonce, None);
@@ -663,7 +664,7 @@ mod tests {
         let raw = json!({
             "from": "did:web:a.example.com",
             "to": ["did:web:b.example.com"],
-            "kind": "info",
+            "kind": "chat",
             "content": {
                 "content": "hello",
                 "format": "text/x-custom"
