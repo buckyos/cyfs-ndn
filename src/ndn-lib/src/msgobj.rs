@@ -77,7 +77,7 @@ impl<'de> Deserialize<'de> for MsgContentFormat {
 
 /// Threading/correlation metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Thread {
+pub struct TopicThread {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub topic: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -170,13 +170,15 @@ pub struct MsgContent {
 /// Immutable message object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgObject {
+    //reply_to
     pub from: DID,
+    // if this msg is a group chat, this is the real msg creator
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub source: Option<DID>,
     pub to: Vec<DID>,
     pub kind: MsgObjKind,
-    #[serde(skip_serializing_if = "Thread::is_empty", default)]
-    pub thread: Thread,
+    #[serde(skip_serializing_if = "TopicThread::is_empty", default)]
+    pub thread: TopicThread,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub workspace: Option<DID>,
     #[serde(skip_serializing_if = "is_zero", default)]
@@ -192,7 +194,7 @@ pub struct MsgObject {
     pub meta: BTreeMap<String, serde_json::Value>,
 }
 
-impl Thread {
+impl TopicThread {
     pub fn is_empty(&self) -> bool {
         self.topic.is_none()
             && self.reply_to.is_none()
@@ -208,7 +210,7 @@ impl Default for MsgObject {
             source: None,
             to: Vec::new(),
             kind: MsgObjKind::Info,
-            thread: Thread::default(),
+            thread: TopicThread::default(),
             workspace: None,
             created_at_ms: 0,
             expires_at_ms: None,
@@ -229,6 +231,14 @@ impl MsgObject {
             content,
             created_at_ms: buckyos_get_unix_timestamp() * 1000,
             ..Self::default()
+        }
+    }
+
+    pub fn get_author(&self) -> &DID {
+        if self.source.is_some() {
+            self.source.as_ref().unwrap()
+        } else {
+            &self.from
         }
     }
 }
@@ -357,9 +367,9 @@ mod tests {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
             kind: MsgObjKind::Info,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
-                ..Thread::default()
+                ..TopicThread::default()
             },
             created_at_ms: 1735689600000,
             content: MsgContent {
@@ -397,9 +407,9 @@ mod tests {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
             kind: MsgObjKind::Deliver,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
-                ..Thread::default()
+                ..TopicThread::default()
             },
             created_at_ms: 1735689615000,
             content: MsgContent {
@@ -443,9 +453,9 @@ mod tests {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
             kind: MsgObjKind::Deliver,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
-                ..Thread::default()
+                ..TopicThread::default()
             },
             created_at_ms: 1735689615000,
             content: MsgContent {
@@ -471,7 +481,7 @@ mod tests {
             from: did_web("bob.example.com"),
             to: vec![did_web("alice.example.com")],
             kind: MsgObjKind::Info,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
                 reply_to: Some(image_msg_id.clone()),
                 correlation_id: Some("reply-image-1".to_string()),
@@ -507,9 +517,9 @@ mod tests {
             from: did_web("alice.example.com"),
             to: vec![did_web("bob.example.com")],
             kind: MsgObjKind::Info,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
-                ..Thread::default()
+                ..TopicThread::default()
             },
             created_at_ms: 1735689600000,
             content: MsgContent {
@@ -528,7 +538,7 @@ mod tests {
             from: did_web("bob.example.com"),
             to: vec![did_web("alice.example.com")],
             kind: MsgObjKind::Event,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("dm-alice-bob".to_string()),
                 reply_to: Some(quoted_msg_id.clone()),
                 correlation_id: Some("quote-1".to_string()),
@@ -578,7 +588,7 @@ mod tests {
             to: vec![group_did.clone()],
             source: Some(did_web("alice.example.com")),
             kind: MsgObjKind::Info,
-            thread: Thread {
+            thread: TopicThread {
                 topic: Some("grp-release".to_string()),
                 correlation_id: None,
                 tunnel_id: Some("im/slack".to_string()),
@@ -626,7 +636,7 @@ mod tests {
             source: None,
             to: vec![did_web("b.example.com")],
             kind: MsgObjKind::Info,
-            thread: Thread::default(),
+            thread: TopicThread::default(),
             workspace: None,
             created_at_ms: 0,
             expires_at_ms: None,
