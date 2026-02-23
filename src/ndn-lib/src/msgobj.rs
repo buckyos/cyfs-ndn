@@ -167,14 +167,15 @@ pub struct MsgContent {
     pub refs: Vec<RefItem>,
 }
 
+// 注意MsgObject的构造:
+//   单聊: from是发起者, to是接受者
+//   群聊: from是发起者, to是群组,
+
+
 /// Immutable message object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgObject {
-    //reply_to
     pub from: DID,
-    // if this msg is a group chat, this is the real msg creator
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub source: Option<DID>,
     pub to: Vec<DID>,
     pub kind: MsgObjKind,
     #[serde(skip_serializing_if = "TopicThread::is_empty", default)]
@@ -207,7 +208,6 @@ impl Default for MsgObject {
     fn default() -> Self {
         Self {
             from: DID::undefined(),
-            source: None,
             to: Vec::new(),
             kind: MsgObjKind::Info,
             thread: TopicThread::default(),
@@ -231,14 +231,6 @@ impl MsgObject {
             content,
             created_at_ms: buckyos_get_unix_timestamp() * 1000,
             ..Self::default()
-        }
-    }
-
-    pub fn get_author(&self) -> &DID {
-        if self.source.is_some() {
-            self.source.as_ref().unwrap()
-        } else {
-            &self.from
         }
     }
 }
