@@ -11,17 +11,88 @@
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
 use crate::{
-    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalStore, ObjectState,
-    SimpleChunkListReader, StoreLayout,
+    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalConfig, NamedLocalStore, ObjectState,
+    SimpleChunkListReader, StoreLayout, StoreTarget,
 };
+use log::warn;
 use ndn_lib::{
     extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkReader,
     ChunkWriter, DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
 };
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct StoreLayoutConfigFile {
+    epoch: u64,
+    #[serde(alias = "targets")]
+    stores: Vec<StoreConfigEntry>,
+    total_capacity: Option<u64>,
+    total_used: Option<u64>,
+}
+
+impl Default for StoreLayoutConfigFile {
+    fn default() -> Self {
+        Self {
+            epoch: 1,
+            stores: Vec::new(),
+            total_capacity: None,
+            total_used: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+struct StoreConfigEntry {
+    store_id: Option<String>,
+    #[serde(alias = "base_dir", alias = "root_path", alias = "store_path")]
+    path: PathBuf,
+    capacity: Option<u64>,
+    used: Option<u64>,
+    readonly: bool,
+    enabled: bool,
+    weight: u32,
+}
+
+impl Default for StoreConfigEntry {
+    fn default() -> Self {
+        Self {
+            store_id: None,
+            path: PathBuf::new(),
+            capacity: None,
+            used: None,
+            readonly: false,
+            enabled: true,
+            weight: 1,
+        }
+    }
+}
+
+fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> NdnResult<T> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| NdnError::IoError(format!("read {} failed: {}", path.display(), e)))?;
+    serde_json::from_str::<T>(&content)
+        .map_err(|e| NdnError::InvalidData(format!("parse {} failed: {}", path.display(), e)))
+}
+
+fn resolve_store_id(entry: &StoreConfigEntry, index: usize) -> String {
+    if let Some(store_id) = entry.store_id.as_ref().filter(|v| !v.is_empty()) {
+        return store_id.clone();
+    }
+    entry
+        .path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| format!("store-{}", index + 1))
+}
 
 const DEFAULT_RESOLVE_NEXT_OBJ_CACHE_MAX_ENTRIES: usize = 10000;
 type ResolveNextObjCacheEntryId = u64;
@@ -131,6 +202,89 @@ pub struct NamedStoreMgr {
 }
 
 impl NamedStoreMgr {
+
+    pub async fn get_store_mgr(store_config_path: &Path) -> NdnResult<Self> {
+        let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
+        if store_config.stores.len() < 1 {
+            return Err(NdnError::InvalidParam(format!(
+                "store config {} must include at least 1 stores",
+                store_config_path.display()
+            )));
+        }
+
+        let store_mgr = Self::new();
+        let mut targets = Vec::with_capacity(store_config.stores.len());
+        let mut total_capacity = 0u64;
+        let mut total_used = 0u64;
+        let mut store_id_set = HashSet::new();
+
+        for (index, entry) in store_config.stores.iter().enumerate() {
+            if entry.path.as_os_str().is_empty() {
+                return Err(NdnError::InvalidParam(format!(
+                    "store config {} has empty path at index {}",
+                    store_config_path.display(),
+                    index
+                )));
+            }
+
+            std::fs::create_dir_all(&entry.path).map_err(|e| {
+                NdnError::IoError(format!(
+                    "create store dir {} failed: {}",
+                    entry.path.display(),
+                    e
+                ))
+            })?;
+
+            let store_id = resolve_store_id(entry, index);
+            let config = NamedLocalConfig {
+                read_only: entry.readonly,
+                ..Default::default()
+            };
+            let store =
+                NamedLocalStore::from_config(Some(store_id.clone()), entry.path.clone(), config)
+                    .await?;
+
+            let actual_store_id = store.store_id().to_string();
+            if actual_store_id != store_id {
+                warn!(
+                    "store id mismatch, configured={}, actual={}, using actual",
+                    store_id, actual_store_id
+                );
+            }
+            if !store_id_set.insert(actual_store_id.clone()) {
+                return Err(NdnError::InvalidParam(format!(
+                    "duplicate store_id '{}' in {}",
+                    actual_store_id,
+                    store_config_path.display()
+                )));
+            }
+
+            let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+            store_mgr.register_store(store_ref).await;
+
+            total_capacity += entry.capacity.unwrap_or(0);
+            total_used += entry.used.unwrap_or(0);
+            targets.push(StoreTarget {
+                store_id: actual_store_id,
+                device_did: None,
+                capacity: entry.capacity,
+                used: entry.used,
+                readonly: entry.readonly,
+                enabled: entry.enabled,
+                weight: entry.weight,
+            });
+        }
+
+        let layout = StoreLayout::new(
+            store_config.epoch.max(1),
+            targets,
+            store_config.total_capacity.unwrap_or(total_capacity),
+            store_config.total_used.unwrap_or(total_used),
+        );
+        store_mgr.add_layout(layout).await;
+        Ok(store_mgr)
+    }
+
     /// Create a new NamedStoreMgr
     pub fn new() -> Self {
         Self {

@@ -239,14 +239,6 @@ impl NamedObject for MsgObject {
     }
 }
 
-/// Inbox/outbox index entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoxEntry {
-    pub msg_id: ObjId,
-    pub added_at_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub source: Option<String>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,7 +253,9 @@ pub enum ReceiptStatus {
 pub struct MsgReceiptObj {
     pub msg_id: ObjId,
     pub iss:DID,
-    pub accepted_at_ms: u64,
+    pub reader:DID,
+    pub group_id:Option<DID>,
+    pub at_ms: u64,
     pub status: ReceiptStatus,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
@@ -707,7 +701,9 @@ mod tests {
         let receipt = MsgReceiptObj {
             msg_id: ObjId::new("cymsg:1234567890abcdef").unwrap(),
             iss: did_web("msg-receipt.example.com"),
-            accepted_at_ms: 1735689700000,
+            reader: did_web("alice.example.com"),
+            group_id: None,
+            at_ms: 1735689700000,
             status: ReceiptStatus::Accepted,
             reason: None,
         };
@@ -716,9 +712,12 @@ mod tests {
         let value = serde_json::to_value(&receipt).unwrap();
         assert!(value.get("reason").is_none());
         assert_eq!(value["iss"], json!("did:web:msg-receipt.example.com"));
+        assert_eq!(value["reader"], json!("did:web:alice.example.com"));
 
         let normalized = assert_receipt_roundtrip_consistency(&receipt);
         assert_eq!(normalized.iss, did_web("msg-receipt.example.com"));
+        assert_eq!(normalized.reader, did_web("alice.example.com"));
+        assert_eq!(normalized.group_id, None);
         assert_eq!(normalized.status, ReceiptStatus::Accepted);
         assert_eq!(normalized.reason, None);
     }
@@ -728,7 +727,9 @@ mod tests {
         let receipt = MsgReceiptObj {
             msg_id: ObjId::new("cymsg:abcdef1234567890").unwrap(),
             iss: did_web("inbox-router.example.com"),
-            accepted_at_ms: 1735689710000,
+            reader: did_web("bob.example.com"),
+            group_id: Some(did_web("dev-team.chat.example.com")),
+            at_ms: 1735689710000,
             status: ReceiptStatus::Rejected,
             reason: Some("policy_denied".to_string()),
         };
@@ -736,6 +737,11 @@ mod tests {
 
         let normalized = assert_receipt_roundtrip_consistency(&receipt);
         assert_eq!(normalized.iss, did_web("inbox-router.example.com"));
+        assert_eq!(normalized.reader, did_web("bob.example.com"));
+        assert_eq!(
+            normalized.group_id,
+            Some(did_web("dev-team.chat.example.com"))
+        );
         assert_eq!(normalized.status, ReceiptStatus::Rejected);
         assert_eq!(normalized.reason, Some("policy_denied".to_string()));
     }
@@ -745,13 +751,21 @@ mod tests {
         let raw = json!({
             "msg_id": "cymsg:00112233445566778899aabbccddeeff",
             "iss": "did:web:inbox.example.com",
-            "accepted_at_ms": 1735689720000u64,
+            "reader": "did:web:carol.example.com",
+            "group_id": "did:web:dev-team.chat.example.com",
+            "at_ms": 1735689720000u64,
             "status": "quarantined",
             "reason": "needs_manual_review"
         });
 
         let receipt: MsgReceiptObj = serde_json::from_value(raw).unwrap();
         assert_eq!(receipt.iss, did_web("inbox.example.com"));
+        assert_eq!(receipt.reader, did_web("carol.example.com"));
+        assert_eq!(
+            receipt.group_id,
+            Some(did_web("dev-team.chat.example.com"))
+        );
+        assert_eq!(receipt.at_ms, 1735689720000u64);
         assert_eq!(receipt.status, ReceiptStatus::Quarantined);
         assert_eq!(receipt.reason, Some("needs_manual_review".to_string()));
         print_receipt_json("receipt_from_json", &receipt);
