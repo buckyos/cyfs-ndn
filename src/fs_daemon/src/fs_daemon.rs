@@ -1272,6 +1272,10 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
     let mut total_used = 0u64;
     let mut store_id_set = HashSet::new();
 
+    let config_dir = store_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
     for (index, entry) in store_config.stores.iter().enumerate() {
         if entry.path.as_os_str().is_empty() {
             return Err(NdnError::InvalidParam(format!(
@@ -1281,10 +1285,16 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
             )));
         }
 
-        std::fs::create_dir_all(&entry.path).map_err(|e| {
+        let store_path = if entry.path.is_absolute() {
+            entry.path.clone()
+        } else {
+            config_dir.join(&entry.path)
+        };
+
+        std::fs::create_dir_all(&store_path).map_err(|e| {
             NdnError::IoError(format!(
                 "create store dir {} failed: {}",
-                entry.path.display(),
+                store_path.display(),
                 e
             ))
         })?;
@@ -1295,7 +1305,7 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
             ..Default::default()
         };
         let store = runtime.block_on(async {
-            NamedLocalStore::from_config(Some(store_id.clone()), entry.path.clone(), store_config)
+            NamedLocalStore::from_config(Some(store_id.clone()), store_path, store_config)
                 .await
         })?;
         let actual_store_id = store.store_id().to_string();

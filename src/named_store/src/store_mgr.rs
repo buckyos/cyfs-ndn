@@ -218,6 +218,10 @@ impl NamedStoreMgr {
         let mut total_used = 0u64;
         let mut store_id_set = HashSet::new();
 
+        let config_dir = store_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+
         for (index, entry) in store_config.stores.iter().enumerate() {
             if entry.path.as_os_str().is_empty() {
                 return Err(NdnError::InvalidParam(format!(
@@ -227,10 +231,16 @@ impl NamedStoreMgr {
                 )));
             }
 
-            std::fs::create_dir_all(&entry.path).map_err(|e| {
+            let store_path = if entry.path.is_absolute() {
+                entry.path.clone()
+            } else {
+                config_dir.join(&entry.path)
+            };
+
+            std::fs::create_dir_all(&store_path).map_err(|e| {
                 NdnError::IoError(format!(
                     "create store dir {} failed: {}",
-                    entry.path.display(),
+                    store_path.display(),
                     e
                 ))
             })?;
@@ -241,7 +251,7 @@ impl NamedStoreMgr {
                 ..Default::default()
             };
             let store =
-                NamedLocalStore::from_config(Some(store_id.clone()), entry.path.clone(), config)
+                NamedLocalStore::from_config(Some(store_id.clone()), store_path, config)
                     .await?;
 
             let actual_store_id = store.store_id().to_string();
