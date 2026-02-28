@@ -31,15 +31,42 @@ impl Default for MsgObjKind {
     }
 }
 
-/// Human content format.
+/// Human content format (MIME-type based).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MsgContentFormat {
+    // Text
     TextPlain,
     TextMarkdown,
     TextHtml,
+    TextCss,
+    TextXml,
+    // Image
     ImagePng,
     ImageJpeg,
+    ImageGif,
+    ImageWebp,
+    ImageSvg,
+    ImageBmp,
+    // Video
+    VideoMp4,
+    VideoWebm,
+    VideoOgg,
+    VideoQuicktime,
+    VideoAvi,
+    // Audio
+    AudioMpeg,
+    AudioWav,
+    AudioOgg,
+    AudioWebm,
+    AudioAac,
+    AudioFlac,
+    // Document / Application
     ApplicationJson,
+    ApplicationXml,
+    ApplicationPdf,
+    ApplicationZip,
+    ApplicationOctetStream,
+    // Fallback for unlisted MIME types
     Unknown(String),
 }
 
@@ -52,9 +79,30 @@ impl Serialize for MsgContentFormat {
             MsgContentFormat::TextPlain => "text/plain",
             MsgContentFormat::TextMarkdown => "text/markdown",
             MsgContentFormat::TextHtml => "text/html",
+            MsgContentFormat::TextCss => "text/css",
+            MsgContentFormat::TextXml => "text/xml",
             MsgContentFormat::ImagePng => "image/png",
             MsgContentFormat::ImageJpeg => "image/jpeg",
+            MsgContentFormat::ImageGif => "image/gif",
+            MsgContentFormat::ImageWebp => "image/webp",
+            MsgContentFormat::ImageSvg => "image/svg+xml",
+            MsgContentFormat::ImageBmp => "image/bmp",
+            MsgContentFormat::VideoMp4 => "video/mp4",
+            MsgContentFormat::VideoWebm => "video/webm",
+            MsgContentFormat::VideoOgg => "video/ogg",
+            MsgContentFormat::VideoQuicktime => "video/quicktime",
+            MsgContentFormat::VideoAvi => "video/x-msvideo",
+            MsgContentFormat::AudioMpeg => "audio/mpeg",
+            MsgContentFormat::AudioWav => "audio/wav",
+            MsgContentFormat::AudioOgg => "audio/ogg",
+            MsgContentFormat::AudioWebm => "audio/webm",
+            MsgContentFormat::AudioAac => "audio/aac",
+            MsgContentFormat::AudioFlac => "audio/flac",
             MsgContentFormat::ApplicationJson => "application/json",
+            MsgContentFormat::ApplicationXml => "application/xml",
+            MsgContentFormat::ApplicationPdf => "application/pdf",
+            MsgContentFormat::ApplicationZip => "application/zip",
+            MsgContentFormat::ApplicationOctetStream => "application/octet-stream",
             MsgContentFormat::Unknown(v) => v.as_str(),
         };
         serializer.serialize_str(s)
@@ -71,9 +119,30 @@ impl<'de> Deserialize<'de> for MsgContentFormat {
             "text/plain" => MsgContentFormat::TextPlain,
             "text/markdown" => MsgContentFormat::TextMarkdown,
             "text/html" => MsgContentFormat::TextHtml,
+            "text/css" => MsgContentFormat::TextCss,
+            "text/xml" => MsgContentFormat::TextXml,
             "image/png" => MsgContentFormat::ImagePng,
-            "image/jpeg" => MsgContentFormat::ImageJpeg,
+            "image/jpeg" | "image/jpg" => MsgContentFormat::ImageJpeg,
+            "image/gif" => MsgContentFormat::ImageGif,
+            "image/webp" => MsgContentFormat::ImageWebp,
+            "image/svg+xml" | "image/svg" => MsgContentFormat::ImageSvg,
+            "image/bmp" => MsgContentFormat::ImageBmp,
+            "video/mp4" => MsgContentFormat::VideoMp4,
+            "video/webm" => MsgContentFormat::VideoWebm,
+            "video/ogg" => MsgContentFormat::VideoOgg,
+            "video/quicktime" => MsgContentFormat::VideoQuicktime,
+            "video/x-msvideo" | "video/avi" => MsgContentFormat::VideoAvi,
+            "audio/mpeg" | "audio/mp3" => MsgContentFormat::AudioMpeg,
+            "audio/wav" | "audio/x-wav" => MsgContentFormat::AudioWav,
+            "audio/ogg" => MsgContentFormat::AudioOgg,
+            "audio/webm" => MsgContentFormat::AudioWebm,
+            "audio/aac" => MsgContentFormat::AudioAac,
+            "audio/flac" => MsgContentFormat::AudioFlac,
             "application/json" => MsgContentFormat::ApplicationJson,
+            "application/xml" => MsgContentFormat::ApplicationXml,
+            "application/pdf" => MsgContentFormat::ApplicationPdf,
+            "application/zip" => MsgContentFormat::ApplicationZip,
+            "application/octet-stream" => MsgContentFormat::ApplicationOctetStream,
             _ => MsgContentFormat::Unknown(s),
         })
     }
@@ -410,7 +479,7 @@ mod tests {
             created_at_ms: 1735689615000,
             content: MsgContent {
                 title: Some("Image".to_string()),
-                format: Some(MsgContentFormat::TextPlain),
+                format: Some(MsgContentFormat::ImagePng),
                 content: "[image]".to_string(),
                 machine: Some(MachineContent {
                     intent: Some("chat_image".to_string()),
@@ -431,6 +500,7 @@ mod tests {
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
         assert_eq!(normalized.kind, MsgObjKind::Deliver);
+        assert_eq!(normalized.content.format, Some(MsgContentFormat::ImagePng));
         assert_eq!(normalized.content.refs.len(), 1);
         assert_eq!(
             normalized
@@ -456,7 +526,7 @@ mod tests {
             created_at_ms: 1735689615000,
             content: MsgContent {
                 title: Some("Image".to_string()),
-                format: Some(MsgContentFormat::TextPlain),
+                format: Some(MsgContentFormat::ImagePng),
                 content: "[image]".to_string(),
                 machine: None,
                 refs: vec![RefItem {
@@ -657,6 +727,169 @@ mod tests {
         assert_eq!(normalized.content.machine, None);
         assert_eq!(normalized.content.refs.len(), 0);
         assert!(normalized.meta.is_empty());
+    }
+
+    #[test]
+    fn test_msg_case_7_voice_message() {
+        let voice_obj_id = ObjId::new("sha256:a1b2c3d4e5f6789012345678abcdef").unwrap();
+
+        let mut machine_data = BTreeMap::new();
+        machine_data.insert("mime".to_string(), CanonValue::String("audio/mpeg".to_string()));
+        machine_data.insert("duration_sec".to_string(), CanonValue::U64(15));
+        machine_data.insert("size".to_string(), CanonValue::U64(245760));
+
+        let msg = MsgObject {
+            from: did_web("alice.example.com"),
+            to: vec![did_web("bob.example.com")],
+            kind: MsgObjKind::Deliver,
+            thread: TopicThread {
+                topic: Some("dm-alice-bob".to_string()),
+                ..TopicThread::default()
+            },
+            created_at_ms: 1735689650000,
+            content: MsgContent {
+                title: Some("Voice Message".to_string()),
+                format: Some(MsgContentFormat::AudioMpeg),
+                content: "[voice]".to_string(),
+                machine: Some(MachineContent {
+                    intent: Some("chat_voice".to_string()),
+                    data: machine_data,
+                }),
+                refs: vec![RefItem {
+                    role: RefRole::Output,
+                    target: RefTarget::DataObj {
+                        obj_id: voice_obj_id.clone(),
+                        uri_hint: Some(format!("cyfs://{}", voice_obj_id.to_string())),
+                    },
+                    label: Some("audio/mpeg".to_string()),
+                }],
+            },
+            ..MsgObject::default()
+        };
+        print_msg_json("case_7_voice", &msg);
+
+        let normalized = assert_msg_roundtrip_consistency(&msg);
+        assert_eq!(normalized.content.format, Some(MsgContentFormat::AudioMpeg));
+        assert_eq!(normalized.content.refs.len(), 1);
+        assert_eq!(
+            normalized
+                .content
+                .machine
+                .as_ref()
+                .and_then(|m| m.intent.as_ref())
+                .map(String::as_str),
+            Some("chat_voice")
+        );
+    }
+
+    #[test]
+    fn test_msg_case_8_downloadable_file() {
+        let file_obj_id = ObjId::new("sha256:f1e2a3b4c5d6789012345678abcdef").unwrap();
+
+        let mut machine_data = BTreeMap::new();
+        machine_data.insert("mime".to_string(), CanonValue::String("application/octet-stream".to_string()));
+        machine_data.insert("filename".to_string(), CanonValue::String("report_2024.xlsx".to_string()));
+        machine_data.insert("size".to_string(), CanonValue::U64(1024000));
+
+        let msg = MsgObject {
+            from: did_web("alice.example.com"),
+            to: vec![did_web("bob.example.com")],
+            kind: MsgObjKind::Deliver,
+            thread: TopicThread {
+                topic: Some("dm-alice-bob".to_string()),
+                ..TopicThread::default()
+            },
+            created_at_ms: 1735689660000,
+            content: MsgContent {
+                title: Some("Report File".to_string()),
+                format: Some(MsgContentFormat::ApplicationOctetStream),
+                content: "[file] report_2024.xlsx".to_string(),
+                machine: Some(MachineContent {
+                    intent: Some("chat_file".to_string()),
+                    data: machine_data,
+                }),
+                refs: vec![RefItem {
+                    role: RefRole::Output,
+                    target: RefTarget::DataObj {
+                        obj_id: file_obj_id.clone(),
+                        uri_hint: Some(format!("cyfs://{}", file_obj_id.to_string())),
+                    },
+                    label: Some("application/octet-stream".to_string()),
+                }],
+            },
+            ..MsgObject::default()
+        };
+        print_msg_json("case_8_downloadable_file", &msg);
+
+        let normalized = assert_msg_roundtrip_consistency(&msg);
+        assert_eq!(normalized.content.format, Some(MsgContentFormat::ApplicationOctetStream));
+        assert_eq!(normalized.content.refs.len(), 1);
+        assert_eq!(
+            normalized
+                .content
+                .machine
+                .as_ref()
+                .and_then(|m| m.data.get("filename"))
+                .and_then(|v| match v {
+                    CanonValue::String(s) => Some(s.as_str()),
+                    _ => None,
+                }),
+            Some("report_2024.xlsx")
+        );
+    }
+
+    #[test]
+    fn test_msg_case_9_pdf_message() {
+        let pdf_obj_id = ObjId::new("sha256:abcdef1234567890abcdef12345678").unwrap();
+
+        let mut machine_data = BTreeMap::new();
+        machine_data.insert("mime".to_string(), CanonValue::String("application/pdf".to_string()));
+        machine_data.insert("filename".to_string(), CanonValue::String("design_spec.pdf".to_string()));
+        machine_data.insert("size".to_string(), CanonValue::U64(524288));
+        machine_data.insert("page_count".to_string(), CanonValue::U64(12));
+
+        let msg = MsgObject {
+            from: did_web("alice.example.com"),
+            to: vec![did_web("bob.example.com")],
+            kind: MsgObjKind::Deliver,
+            thread: TopicThread {
+                topic: Some("dm-alice-bob".to_string()),
+                ..TopicThread::default()
+            },
+            created_at_ms: 1735689670000,
+            content: MsgContent {
+                title: Some("Design Spec".to_string()),
+                format: Some(MsgContentFormat::ApplicationPdf),
+                content: "[pdf] design_spec.pdf".to_string(),
+                machine: Some(MachineContent {
+                    intent: Some("chat_document".to_string()),
+                    data: machine_data,
+                }),
+                refs: vec![RefItem {
+                    role: RefRole::Output,
+                    target: RefTarget::DataObj {
+                        obj_id: pdf_obj_id.clone(),
+                        uri_hint: Some(format!("cyfs://{}", pdf_obj_id.to_string())),
+                    },
+                    label: Some("application/pdf".to_string()),
+                }],
+            },
+            ..MsgObject::default()
+        };
+        print_msg_json("case_9_pdf", &msg);
+
+        let normalized = assert_msg_roundtrip_consistency(&msg);
+        assert_eq!(normalized.content.format, Some(MsgContentFormat::ApplicationPdf));
+        assert_eq!(normalized.content.refs.len(), 1);
+        assert_eq!(
+            normalized
+                .content
+                .machine
+                .as_ref()
+                .and_then(|m| m.intent.as_ref())
+                .map(String::as_str),
+            Some("chat_document")
+        );
     }
 
     #[test]
