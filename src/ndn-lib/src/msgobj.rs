@@ -244,7 +244,6 @@ pub struct MsgContent {
 //   单聊: from是发起者, to是接受者
 //   群聊: from是发起者, to是群组,
 
-
 /// Immutable message object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgObject {
@@ -314,7 +313,6 @@ impl NamedObject for MsgObject {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptStatus {
@@ -327,9 +325,9 @@ pub enum ReceiptStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgReceiptObj {
     pub msg_id: ObjId,
-    pub iss:DID,
-    pub reader:DID,
-    pub group_id:Option<DID>,
+    pub iss: DID,
+    pub reader: DID,
+    pub group_id: Option<DID>,
     pub at_ms: u64,
     pub status: ReceiptStatus,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -371,7 +369,8 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(id2.obj_type, OBJ_TYPE_MSG);
 
-        let (id3, _) = build_named_object_by_json(OBJ_TYPE_MSG, &serde_json::to_value(&d2).unwrap());
+        let (id3, _) =
+            build_named_object_by_json(OBJ_TYPE_MSG, &serde_json::to_value(&d2).unwrap());
         assert_eq!(id2, id3);
 
         d2
@@ -404,10 +403,8 @@ mod tests {
         assert_eq!(id1, id2);
         assert_eq!(id2.obj_type, OBJ_TYPE_MSG_RECE);
 
-        let (id3, _) = build_named_object_by_json(
-            OBJ_TYPE_MSG_RECE,
-            &serde_json::to_value(&d2).unwrap(),
-        );
+        let (id3, _) =
+            build_named_object_by_json(OBJ_TYPE_MSG_RECE, &serde_json::to_value(&d2).unwrap());
         assert_eq!(id2, id3);
 
         d2
@@ -424,7 +421,10 @@ mod tests {
     #[test]
     fn test_msg_case_1_standard_plain_text_message() {
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("mime".to_string(), CanonValue::String("text/plain".to_string()));
+        machine_data.insert(
+            "mime".to_string(),
+            CanonValue::String("text/plain".to_string()),
+        );
         machine_data.insert("lang".to_string(), CanonValue::String("zh-CN".to_string()));
         machine_data.insert("channel".to_string(), CanonValue::String("dm".to_string()));
 
@@ -463,7 +463,10 @@ mod tests {
         let image_obj_id = ObjId::new("sha256:1234567890abcdef").unwrap();
 
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("mime".to_string(), CanonValue::String("image/png".to_string()));
+        machine_data.insert(
+            "mime".to_string(),
+            CanonValue::String("image/png".to_string()),
+        );
         machine_data.insert("width".to_string(), CanonValue::U64(1280));
         machine_data.insert("height".to_string(), CanonValue::U64(720));
         machine_data.insert("size".to_string(), CanonValue::U64(376218));
@@ -639,7 +642,10 @@ mod tests {
         let group_did = did_web("dev-team.chat.example.com");
 
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("chat_type".to_string(), CanonValue::String("group".to_string()));
+        machine_data.insert(
+            "chat_type".to_string(),
+            CanonValue::String("group".to_string()),
+        );
         machine_data.insert("member_count".to_string(), CanonValue::U64(3));
         machine_data.insert(
             "mentions".to_string(),
@@ -677,7 +683,8 @@ mod tests {
             },
             ..MsgObject::default()
         };
-        msg.meta.insert("room".to_string(), json!("release-war-room"));
+        msg.meta
+            .insert("room".to_string(), json!("release-war-room"));
         print_msg_json("case_5_group_chat", &msg);
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
@@ -691,7 +698,10 @@ mod tests {
                 .map(String::as_str),
             Some("group_chat_text")
         );
-        assert_eq!(normalized.meta.get("room"), Some(&json!("release-war-room")));
+        assert_eq!(
+            normalized.meta.get("room"),
+            Some(&json!("release-war-room"))
+        );
     }
 
     #[test]
@@ -734,7 +744,10 @@ mod tests {
         let voice_obj_id = ObjId::new("sha256:a1b2c3d4e5f6789012345678abcdef").unwrap();
 
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("mime".to_string(), CanonValue::String("audio/mpeg".to_string()));
+        machine_data.insert(
+            "mime".to_string(),
+            CanonValue::String("audio/mpeg".to_string()),
+        );
         machine_data.insert("duration_sec".to_string(), CanonValue::U64(15));
         machine_data.insert("size".to_string(), CanonValue::U64(245760));
 
@@ -787,8 +800,14 @@ mod tests {
         let file_obj_id = ObjId::new("sha256:f1e2a3b4c5d6789012345678abcdef").unwrap();
 
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("mime".to_string(), CanonValue::String("application/octet-stream".to_string()));
-        machine_data.insert("filename".to_string(), CanonValue::String("report_2024.xlsx".to_string()));
+        machine_data.insert(
+            "mime".to_string(),
+            CanonValue::String("application/octet-stream".to_string()),
+        );
+        machine_data.insert(
+            "filename".to_string(),
+            CanonValue::String("report_2024.xlsx".to_string()),
+        );
         machine_data.insert("size".to_string(), CanonValue::U64(1024000));
 
         let msg = MsgObject {
@@ -822,7 +841,10 @@ mod tests {
         print_msg_json("case_8_downloadable_file", &msg);
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
-        assert_eq!(normalized.content.format, Some(MsgContentFormat::ApplicationOctetStream));
+        assert_eq!(
+            normalized.content.format,
+            Some(MsgContentFormat::ApplicationOctetStream)
+        );
         assert_eq!(normalized.content.refs.len(), 1);
         assert_eq!(
             normalized
@@ -843,8 +865,14 @@ mod tests {
         let pdf_obj_id = ObjId::new("sha256:abcdef1234567890abcdef12345678").unwrap();
 
         let mut machine_data = BTreeMap::new();
-        machine_data.insert("mime".to_string(), CanonValue::String("application/pdf".to_string()));
-        machine_data.insert("filename".to_string(), CanonValue::String("design_spec.pdf".to_string()));
+        machine_data.insert(
+            "mime".to_string(),
+            CanonValue::String("application/pdf".to_string()),
+        );
+        machine_data.insert(
+            "filename".to_string(),
+            CanonValue::String("design_spec.pdf".to_string()),
+        );
         machine_data.insert("size".to_string(), CanonValue::U64(524288));
         machine_data.insert("page_count".to_string(), CanonValue::U64(12));
 
@@ -879,7 +907,10 @@ mod tests {
         print_msg_json("case_9_pdf", &msg);
 
         let normalized = assert_msg_roundtrip_consistency(&msg);
-        assert_eq!(normalized.content.format, Some(MsgContentFormat::ApplicationPdf));
+        assert_eq!(
+            normalized.content.format,
+            Some(MsgContentFormat::ApplicationPdf)
+        );
         assert_eq!(normalized.content.refs.len(), 1);
         assert_eq!(
             normalized
@@ -997,10 +1028,7 @@ mod tests {
         let receipt: MsgReceiptObj = serde_json::from_value(raw).unwrap();
         assert_eq!(receipt.iss, did_web("inbox.example.com"));
         assert_eq!(receipt.reader, did_web("carol.example.com"));
-        assert_eq!(
-            receipt.group_id,
-            Some(did_web("dev-team.chat.example.com"))
-        );
+        assert_eq!(receipt.group_id, Some(did_web("dev-team.chat.example.com")));
         assert_eq!(receipt.at_ms, 1735689720000u64);
         assert_eq!(receipt.status, ReceiptStatus::Quarantined);
         assert_eq!(receipt.reason, Some("needs_manual_review".to_string()));
@@ -1009,10 +1037,8 @@ mod tests {
         let (obj_id, _) = receipt.gen_obj_id();
         assert_eq!(obj_id.obj_type, OBJ_TYPE_MSG_RECE);
 
-        let (obj_id2, _) = build_named_object_by_json(
-            OBJ_TYPE_MSG_RECE,
-            &serde_json::to_value(&receipt).unwrap(),
-        );
+        let (obj_id2, _) =
+            build_named_object_by_json(OBJ_TYPE_MSG_RECE, &serde_json::to_value(&receipt).unwrap());
         assert_eq!(obj_id, obj_id2);
     }
 }

@@ -202,7 +202,6 @@ pub struct NamedStoreMgr {
 }
 
 impl NamedStoreMgr {
-
     pub async fn get_store_mgr(store_config_path: &Path) -> NdnResult<Self> {
         let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
         if store_config.stores.len() < 1 {
@@ -218,9 +217,7 @@ impl NamedStoreMgr {
         let mut total_used = 0u64;
         let mut store_id_set = HashSet::new();
 
-        let config_dir = store_config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        let config_dir = store_config_path.parent().unwrap_or_else(|| Path::new("."));
 
         for (index, entry) in store_config.stores.iter().enumerate() {
             if entry.path.as_os_str().is_empty() {
@@ -251,8 +248,7 @@ impl NamedStoreMgr {
                 ..Default::default()
             };
             let store =
-                NamedLocalStore::from_config(Some(store_id.clone()), store_path, config)
-                    .await?;
+                NamedLocalStore::from_config(Some(store_id.clone()), store_path, config).await?;
 
             let actual_store_id = store.store_id().to_string();
             if actual_store_id != store_id {

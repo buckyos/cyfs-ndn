@@ -5,8 +5,8 @@ use std::time::UNIX_EPOCH;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use ndm::NamedDataMgr;
 use named_store::ChunkLocalInfo;
+use ndm::NamedDataMgr;
 use ndn_lib::{
     caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkType, DirObject, FileObject, NamedObject,
     NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
@@ -31,7 +31,11 @@ pub enum ContentToStore {
 }
 
 impl ContentToStore {
-    pub fn from_local_file(chunk_id: ChunkId, chunk_size: u64, chunk_local_info: ChunkLocalInfo) -> Self {
+    pub fn from_local_file(
+        chunk_id: ChunkId,
+        chunk_size: u64,
+        chunk_local_info: ChunkLocalInfo,
+    ) -> Self {
         ContentToStore::Chunk(chunk_id, chunk_size, chunk_local_info)
     }
 
@@ -42,14 +46,20 @@ impl ContentToStore {
     pub fn to_obj(self) -> NdnResult<(ObjId, String)> {
         match self {
             ContentToStore::Object(obj_id, obj_str) => Ok((obj_id, obj_str)),
-            _ => Err(NdnError::InvalidParam("Invalid content to store".to_string())),
+            _ => Err(NdnError::InvalidParam(
+                "Invalid content to store".to_string(),
+            )),
         }
     }
 
     pub fn to_local_file(self) -> NdnResult<(ChunkId, u64, ChunkLocalInfo)> {
         match self {
-            ContentToStore::Chunk(chunk_id, chunk_size, local_info) => Ok((chunk_id, chunk_size, local_info)),
-            _ => Err(NdnError::InvalidParam("Invalid content to store".to_string())),
+            ContentToStore::Chunk(chunk_id, chunk_size, local_info) => {
+                Ok((chunk_id, chunk_size, local_info))
+            }
+            _ => Err(NdnError::InvalidParam(
+                "Invalid content to store".to_string(),
+            )),
         }
     }
 }
@@ -128,7 +138,9 @@ pub async fn store_content_to_ndn_mgr(
     store_mode: StoreMode,
 ) -> NdnResult<()> {
     if matches!(store_mode, StoreMode::StoreInNamedMgr)
-        && NamedDataMgr::get_named_data_mgr_by_id(ndn_mgr_id).await.is_none()
+        && NamedDataMgr::get_named_data_mgr_by_id(ndn_mgr_id)
+            .await
+            .is_none()
     {
         warn!("store_content_to_ndn_mgr: named data mgr not found, skip");
     }
@@ -230,8 +242,11 @@ pub async fn cacl_file_object(
                 break;
             }
 
-            let chunk_id =
-                ChunkId::from_mix_hash_result_by_hash_method(chunk_size, &chunk_raw_id, hash_method)?;
+            let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(
+                chunk_size,
+                &chunk_raw_id,
+                hash_method,
+            )?;
             debug!(
                 "cacl_file_object: calc chunk_id success, chunk_id={}, chunk_size={}",
                 chunk_id.to_string(),
@@ -258,9 +273,12 @@ pub async fn cacl_file_object(
             } else {
                 local_file_path.to_string_lossy().to_string()
             };
-            let callback_result =
-                call_ndn_callback(&progress_callback, inner_path, NdnAction::ChunkOK(chunk_id.clone(), chunk_size))
-                    .await?;
+            let callback_result = call_ndn_callback(
+                &progress_callback,
+                inner_path,
+                NdnAction::ChunkOK(chunk_id.clone(), chunk_size),
+            )
+            .await?;
             if !callback_result.is_continue() {
                 return Err(NdnError::InvalidState("break by user".to_string()));
             }
@@ -389,8 +407,9 @@ pub async fn cacl_dir_object(
                 progress_callback.clone(),
             )
             .await?;
-            let file_object_json = serde_json::to_value(&file_object)
-                .map_err(|e| NdnError::InvalidData(format!("serialize FileObject failed: {}", e)))?;
+            let file_object_json = serde_json::to_value(&file_object).map_err(|e| {
+                NdnError::InvalidData(format!("serialize FileObject failed: {}", e))
+            })?;
 
             let callback_result = call_ndn_callback(
                 &progress_callback,

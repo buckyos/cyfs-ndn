@@ -8,11 +8,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use ndm::{NamedDataMgr, ReadOptions};
 use named_store::ChunkStoreState;
+use ndm::{NamedDataMgr, ReadOptions};
 use ndn_lib::{
     copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object_from_str,
-    ChunkHasher, ChunkId, ChunkReader, CYFSHttpRespHeaders, DirObject, FileObject, NdnAction,
+    CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader, DirObject, FileObject, NdnAction,
     NdnError, NdnProgressCallback, NdnResult, ObjId, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE,
     OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
@@ -47,7 +47,11 @@ pub struct NdnClient {
 }
 
 impl NdnClient {
-    pub fn new(default_remote_url: String, session_token: Option<String>, named_mgr_id: Option<String>) -> Self {
+    pub fn new(
+        default_remote_url: String,
+        session_token: Option<String>,
+        named_mgr_id: Option<String>,
+    ) -> Self {
         Self {
             default_ndn_mgr_id: named_mgr_id,
             session_token,
@@ -93,16 +97,12 @@ impl NdnClient {
         let chunk_url = target_url.unwrap_or_else(|| self.gen_chunk_url(chunk_id, None));
         let client = Self::build_http_client()?;
 
-        let head_res = client
-            .head(&chunk_url)
-            .send()
-            .await
-            .map_err(|e| {
-                NdnError::RemoteError(format!(
-                    "query chunk state request by HEAD ({}) failed: {}",
-                    chunk_url, e
-                ))
-            })?;
+        let head_res = client.head(&chunk_url).send().await.map_err(|e| {
+            NdnError::RemoteError(format!(
+                "query chunk state request by HEAD ({}) failed: {}",
+                chunk_url, e
+            ))
+        })?;
 
         let content_length = head_res.content_length().unwrap_or(0);
         match head_res.status() {
@@ -163,7 +163,11 @@ impl NdnClient {
             )));
         }
 
-        info!("PUSH CHUNK {} => {} success", chunk_id.to_string(), chunk_url);
+        info!(
+            "PUSH CHUNK {} => {} success",
+            chunk_id.to_string(),
+            chunk_url
+        );
         Ok(())
     }
 
@@ -231,7 +235,10 @@ impl NdnClient {
 
         if let Some(range) = range {
             if range.end > range.start {
-                req = req.header(header::RANGE, format!("bytes={}-{}", range.start, range.end - 1));
+                req = req.header(
+                    header::RANGE,
+                    format!("bytes={}-{}", range.start, range.end - 1),
+                );
             }
         }
 
@@ -313,7 +320,8 @@ impl NdnClient {
             .await?;
 
         let mut local_writer = pull_mode.open_local_writer().await?;
-        let copied = copy_chunk(chunk_id, &mut remote_reader, &mut local_writer, None, None).await?;
+        let copied =
+            copy_chunk(chunk_id, &mut remote_reader, &mut local_writer, None, None).await?;
         local_writer.flush().await?;
 
         let size = resp_headers.obj_size.unwrap_or(copied);
@@ -339,11 +347,13 @@ impl NdnClient {
             })?;
 
             let chunk_pull_mode = match &pull_mode {
-                StoreMode::LocalFile(local_path, range, need_pull_to_named_mgr) => StoreMode::LocalFile(
-                    local_path.clone(),
-                    range.start + offset..range.start + offset + chunk_size,
-                    *need_pull_to_named_mgr,
-                ),
+                StoreMode::LocalFile(local_path, range, need_pull_to_named_mgr) => {
+                    StoreMode::LocalFile(
+                        local_path.clone(),
+                        range.start + offset..range.start + offset + chunk_size,
+                        *need_pull_to_named_mgr,
+                    )
+                }
                 _ => pull_mode.clone(),
             };
 
@@ -462,8 +472,11 @@ impl NdnClient {
         .await?;
 
         let local_file_obj_path = local_path.with_extension("fileobj");
-        tokio::fs::write(local_file_obj_path, serde_json::to_string(&file_obj_json).unwrap())
-            .await?;
+        tokio::fs::write(
+            local_file_obj_path,
+            serde_json::to_string(&file_obj_json).unwrap(),
+        )
+        .await?;
 
         Ok((obj_id, file_obj))
     }
@@ -491,7 +504,10 @@ impl NdnClient {
             ChunkId::from_mix_hash_result_by_hash_method(file_size, &hash_result, hash_method)?;
 
         let remote_chunk_id = ChunkId::new(file_obj.content.as_str()).map_err(|e| {
-            NdnError::InvalidData(format!("Failed to parse remote file content chunk id: {}", e))
+            NdnError::InvalidData(format!(
+                "Failed to parse remote file content chunk id: {}",
+                e
+            ))
         })?;
 
         Ok(local_chunk_id != remote_chunk_id)

@@ -2000,8 +2000,7 @@ impl FSMetaService {
             return match d.target {
                 DentryTarget::Tombstone => Err(RPCErrors::ReasonError("not found".to_string())),
                 DentryTarget::IndexNodeId(fid) => {
-                    self
-                        .handle_get_inode(fid, None, ctx.clone())
+                    self.handle_get_inode(fid, None, ctx.clone())
                         .await?
                         .ok_or_else(|| RPCErrors::ReasonError("not found".to_string()))?;
                     Ok(MoveSource::Upper {
