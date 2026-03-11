@@ -1,12 +1,11 @@
-use log::{debug, info, warn};
+use log::{debug, info};
+use named_store::{ChunkLocalInfo, NamedStoreMgr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use named_store::ChunkLocalInfo;
-use ndm::NamedDataMgr;
 use ndn_lib::{
     caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkType, DirObject, FileObject, NamedObject,
     NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
@@ -64,72 +63,82 @@ impl ContentToStore {
     }
 }
 
-async fn store_content_compat(content: ContentToStore, store_mode: StoreMode) -> NdnResult<()> {
-    match store_mode {
-        StoreMode::NoStore => Ok(()),
-        StoreMode::StoreInNamedMgr => {
-            warn!(
-                "store_content_to_ndn_mgr: store-in-named-mgr path is not exposed by current NDM API, skip"
-            );
-            Ok(())
-        }
-        StoreMode::LocalFile(local_path, range, _) => {
-            if let Some(parent) = local_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            if !local_path.exists() {
-                tokio::fs::File::create(&local_path).await?;
-            }
+pub type NamedStoreMgrRef = Arc<NamedStoreMgr>;
 
-            match content {
-                ContentToStore::Object(_, obj_str) => {
-                    let mut target = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(local_path)
-                        .await?;
-                    target.seek(std::io::SeekFrom::Start(range.start)).await?;
-                    target.write_all(obj_str.as_bytes()).await?;
-                    target.flush().await?;
-                    Ok(())
-                }
-                ContentToStore::Chunk(_, _, chunk_local_info) => {
-                    let bytes = tokio::fs::read(&chunk_local_info.path).await?;
-                    let slice = if let Some(src_range) = chunk_local_info.range {
-                        let start = src_range.start as usize;
-                        let end = src_range.end as usize;
-                        if end < start || end > bytes.len() {
-                            return Err(NdnError::InvalidParam(format!(
-                                "invalid source range {}..{} for file {}",
-                                src_range.start, src_range.end, chunk_local_info.path
-                            )));
-                        }
-                        &bytes[start..end]
-                    } else {
-                        &bytes
-                    };
+fn named_store_mgr_map() -> &'static Mutex<std::collections::HashMap<String, NamedStoreMgrRef>> {
+    static NAMED_STORE_MGR_MAP: OnceLock<
+        Mutex<std::collections::HashMap<String, NamedStoreMgrRef>>,
+    > = OnceLock::new();
+    NAMED_STORE_MGR_MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
-                    let mut target = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .open(local_path)
-                        .await?;
-                    target.seek(std::io::SeekFrom::Start(range.start)).await?;
-                    target.write_all(slice).await?;
-                    target.flush().await?;
-                    Ok(())
-                }
-            }
+pub async fn get_named_store_mgr_by_id(mgr_id: Option<&str>) -> Option<NamedStoreMgrRef> {
+    let id = mgr_id.unwrap_or("default");
+    let map = named_store_mgr_map().lock().await;
+    map.get(id).cloned()
+}
+
+pub async fn register_named_store_mgr(mgr_id: &str, mgr: NamedStoreMgrRef) -> NamedStoreMgrRef {
+    let mut map = named_store_mgr_map().lock().await;
+    map.insert(mgr_id.to_string(), mgr.clone());
+    mgr
+}
+
+async fn read_chunk_bytes(local_info: &ChunkLocalInfo, chunk_size: u64) -> NdnResult<Vec<u8>> {
+    let bytes = tokio::fs::read(&local_info.path).await?;
+    let slice = if let Some(src_range) = local_info.range.clone() {
+        let start = src_range.start as usize;
+        let end = src_range.end as usize;
+        if end < start || end > bytes.len() {
+            return Err(NdnError::InvalidParam(format!(
+                "invalid source range {}..{} for file {}",
+                src_range.start, src_range.end, local_info.path
+            )));
         }
+        &bytes[start..end]
+    } else {
+        &bytes
+    };
+
+    if slice.len() as u64 != chunk_size {
+        return Err(NdnError::InvalidParam(format!(
+            "chunk size mismatch: expect {} actual {} for {}",
+            chunk_size,
+            slice.len(),
+            local_info.path
+        )));
     }
+
+    Ok(slice.to_vec())
 }
 
 pub async fn store_content_to_ndn_mgr_impl(
-    _ndn_mgr: &NamedDataMgr,
+    store_mgr: &NamedStoreMgr,
     content: ContentToStore,
     store_mode: StoreMode,
 ) -> NdnResult<()> {
-    store_content_compat(content, store_mode).await
+    match store_mode {
+        StoreMode::NoStore => Ok(()),
+        StoreMode::StoreInNamedMgr => match content {
+            ContentToStore::Object(obj_id, obj_str) => {
+                store_mgr.put_object(&obj_id, &obj_str).await
+            }
+            ContentToStore::Chunk(chunk_id, chunk_size, local_info) => {
+                let chunk_bytes = read_chunk_bytes(&local_info, chunk_size).await?;
+                store_mgr.put_chunk(&chunk_id, &chunk_bytes, true).await
+            }
+        },
+        StoreMode::LocalFile(_, _, _) => match content {
+            ContentToStore::Object(obj_id, obj_str) => {
+                store_mgr.put_object(&obj_id, &obj_str).await
+            }
+            ContentToStore::Chunk(chunk_id, chunk_size, local_info) => {
+                store_mgr
+                    .add_chunk_by_link_to_local_file(&chunk_id, chunk_size, &local_info)
+                    .await
+            }
+        },
+    }
 }
 
 pub async fn store_content_to_ndn_mgr(
@@ -137,15 +146,18 @@ pub async fn store_content_to_ndn_mgr(
     content: ContentToStore,
     store_mode: StoreMode,
 ) -> NdnResult<()> {
-    if matches!(store_mode, StoreMode::StoreInNamedMgr)
-        && NamedDataMgr::get_named_data_mgr_by_id(ndn_mgr_id)
-            .await
-            .is_none()
-    {
-        warn!("store_content_to_ndn_mgr: named data mgr not found, skip");
+    if matches!(store_mode, StoreMode::NoStore) {
+        return Ok(());
     }
 
-    store_content_compat(content, store_mode).await
+    let store_mgr = get_named_store_mgr_by_id(ndn_mgr_id).await.ok_or_else(|| {
+        NdnError::NotFound(format!(
+            "named store mgr not found for store mode: {:?}",
+            store_mode
+        ))
+    })?;
+
+    store_content_to_ndn_mgr_impl(store_mgr.as_ref(), content, store_mode).await
 }
 
 async fn call_ndn_callback(
@@ -192,6 +204,9 @@ pub async fn cacl_file_object(
         if let Ok(qcid) = caculate_qcid_from_file(local_file_path).await {
             qcid_string = qcid.to_string();
         }
+    }
+    if qcid_string.is_empty() && matches!(store_mode, StoreMode::LocalFile(_, _, _)) {
+        qcid_string = caculate_qcid_from_file(local_file_path).await?.to_string();
     }
 
     let use_chunk_list_now = use_chunklist && file_size > CHUNK_DEFAULT_SIZE;

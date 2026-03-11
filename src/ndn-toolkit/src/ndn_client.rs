@@ -9,13 +9,14 @@ use tokio::sync::Mutex;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use named_store::ChunkStoreState;
-use ndm::{NamedDataMgr, ReadOptions};
 use ndn_lib::{
     copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object_from_str,
     CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader, DirObject, FileObject, NdnAction,
     NdnError, NdnProgressCallback, NdnResult, ObjId, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE,
     OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
+
+use crate::get_named_store_mgr_by_id;
 
 #[derive(Debug, Clone)]
 pub enum ChunkWorkState {
@@ -37,7 +38,7 @@ pub enum ChunkWriterOpenMode {
 }
 
 pub struct NdnClient {
-    default_ndn_mgr_id: Option<String>,
+    default_store_mgr_id: Option<String>,
     session_token: Option<String>,
     default_remote_url: Option<String>,
     pub enable_remote_pull: bool,
@@ -53,7 +54,7 @@ impl NdnClient {
         named_mgr_id: Option<String>,
     ) -> Self {
         Self {
-            default_ndn_mgr_id: named_mgr_id,
+            default_store_mgr_id: named_mgr_id,
             session_token,
             default_remote_url: Some(default_remote_url),
             enable_remote_pull: false,
@@ -125,18 +126,12 @@ impl NdnClient {
             return Ok(());
         }
 
-        let named_mgr = NamedDataMgr::get_named_data_mgr_by_id(self.default_ndn_mgr_id.as_deref())
+        let store_mgr = get_named_store_mgr_by_id(self.default_store_mgr_id.as_deref())
             .await
-            .ok_or_else(|| NdnError::NotFound("named data mgr not found".to_string()))?;
-        let guard = named_mgr.lock().await;
-        let (chunk_reader, len) = guard
-            .open_chunk_reader(
-                &chunk_id,
-                already_uploaded_size,
-                ReadOptions { auto_pull: false },
-            )
+            .ok_or_else(|| NdnError::NotFound("named store mgr not found".to_string()))?;
+        let (chunk_reader, len) = store_mgr
+            .open_chunk_reader(&chunk_id, already_uploaded_size)
             .await?;
-        drop(guard);
 
         let client = Self::build_http_client()?;
         let stream = ReaderStream::new(chunk_reader);
