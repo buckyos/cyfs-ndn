@@ -1,16 +1,15 @@
-use crate::{cacl_dir_object, cacl_file_object, register_named_store_mgr, CheckMode};
+use crate::{cacl_dir_object, cacl_file_object, CheckMode};
 use named_store::{
     ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
-    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, NamedObject, ObjId, SimpleChunkList,
-    SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, NamedObject, NdnError, ObjId,
+    SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 
@@ -20,14 +19,14 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn create_test_store_mgr(base_dir: &Path) -> Arc<NamedStoreMgr> {
+async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
     let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
         .await
         .unwrap();
     let store_id = store.store_id().to_string();
     let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-    let store_mgr = Arc::new(NamedStoreMgr::new());
+    let store_mgr = NamedStoreMgr::new();
     store_mgr.register_store(store_ref).await;
     store_mgr
         .add_layout(StoreLayout::new(
@@ -49,18 +48,8 @@ async fn create_test_store_mgr(base_dir: &Path) -> Arc<NamedStoreMgr> {
     store_mgr
 }
 
-async fn create_test_named_mgr(base_dir: &Path) -> (String, Arc<NamedStoreMgr>) {
-    let store_mgr = create_test_store_mgr(base_dir).await;
-    let instance_id = format!(
-        "test-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    register_named_store_mgr(&instance_id, store_mgr.clone()).await;
-
-    (instance_id, store_mgr)
+async fn create_test_named_mgr(base_dir: &Path) -> NamedStoreMgr {
+    create_test_store_mgr(base_dir).await
 }
 
 fn clone_chunk_list(chunk_list: &SimpleChunkList) -> SimpleChunkList {
@@ -113,7 +102,7 @@ fn assert_dir_shape(dir_obj: &DirObject) {
 async fn build_chunk_list_from_file(
     file_path: &Path,
     chunk_size: usize,
-    store_mgr: &Arc<NamedStoreMgr>,
+    store_mgr: &NamedStoreMgr,
 ) -> SimpleChunkList {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
     let mut chunk_ids = Vec::new();
@@ -135,13 +124,13 @@ async fn build_chunk_list_from_file(
 
 async fn assert_chunk_list_matches_file(
     file_path: &Path,
-    store_mgr: Arc<NamedStoreMgr>,
+    store_mgr: NamedStoreMgr,
     chunk_list: &SimpleChunkList,
     offset: u64,
 ) {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
     let mut reader = ChunkListReader::new(
-        store_mgr,
+        Arc::new(store_mgr),
         clone_chunk_list(chunk_list),
         SeekFrom::Start(offset),
     )
@@ -154,7 +143,7 @@ async fn assert_chunk_list_matches_file(
     assert_eq!(read_back, file_bytes[offset as usize..].to_vec());
 }
 
-async fn assert_object_stored(store_mgr: &Arc<NamedStoreMgr>, obj_id: &ObjId, expected: &str) {
+async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expected: &str) {
     let stored = store_mgr.get_object(obj_id).await.unwrap();
     match (
         serde_json::from_str::<serde_json::Value>(&stored),
@@ -165,11 +154,7 @@ async fn assert_object_stored(store_mgr: &Arc<NamedStoreMgr>, obj_id: &ObjId, ex
     }
 }
 
-async fn assert_completed_chunk(
-    store_mgr: &Arc<NamedStoreMgr>,
-    chunk_id: &ChunkId,
-    expected: &[u8],
-) {
+async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, expected: &[u8]) {
     let (state, size, _) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(state, ChunkStoreState::Completed);
     assert_eq!(size, expected.len() as u64);
@@ -181,7 +166,7 @@ async fn assert_completed_chunk(
 }
 
 async fn assert_local_link_chunk(
-    store_mgr: &Arc<NamedStoreMgr>,
+    store_mgr: &NamedStoreMgr,
     chunk_id: &ChunkId,
     expected_path: &Path,
     expected_range: Option<std::ops::Range<u64>>,
@@ -209,6 +194,28 @@ async fn assert_local_link_chunk(
     let mut read_back = Vec::new();
     reader.read_to_end(&mut read_back).await.unwrap();
     assert_eq!(read_back, expected);
+}
+
+async fn assert_local_link_reader_fails_after_source_mutation(
+    store_mgr: &NamedStoreMgr,
+    chunk_id: &ChunkId,
+    source_path: &Path,
+) {
+    let mut corrupted = tokio::fs::read(source_path).await.unwrap();
+    assert!(!corrupted.is_empty());
+    corrupted[0] ^= 0xFF;
+    tokio::fs::write(source_path, &corrupted).await.unwrap();
+
+    let err = store_mgr
+        .open_chunk_reader(chunk_id, 0)
+        .await
+        .err()
+        .expect("local-link reader should fail after source mutation");
+    assert!(
+        matches!(err, NdnError::VerifyError(_) | NdnError::InvalidLink(_)),
+        "unexpected error after corrupting local-link source: {:?}",
+        err
+    );
 }
 
 fn embedded_file_object(dir_obj: &DirObject, name: &str) -> (ObjId, FileObject, String) {
@@ -287,10 +294,10 @@ async fn test_cacl_file_object_store_modes() {
 
     let completed_base = temp_dir.path().join("named-mgr-completed");
     tokio::fs::create_dir_all(&completed_base).await.unwrap();
-    let (completed_mgr_id, completed_store_mgr) = create_test_named_mgr(&completed_base).await;
+    let completed_store_mgr = create_test_named_mgr(&completed_base).await;
 
     let (store_mode_obj, store_mode_id, store_mode_str) = cacl_file_object(
-        Some(completed_mgr_id.as_str()),
+        Some(&completed_store_mgr),
         &file_path,
         &file_template,
         true,
@@ -310,11 +317,11 @@ async fn test_cacl_file_object_store_modes() {
 
     let linked_base = temp_dir.path().join("named-mgr-linked");
     tokio::fs::create_dir_all(&linked_base).await.unwrap();
-    let (linked_mgr_id, linked_store_mgr) = create_test_named_mgr(&linked_base).await;
+    let linked_store_mgr = create_test_named_mgr(&linked_base).await;
 
     let placeholder = temp_dir.path().join("ignored-placeholder.bin");
     let (local_obj, local_id, local_str) = cacl_file_object(
-        Some(linked_mgr_id.as_str()),
+        Some(&linked_store_mgr),
         &file_path,
         &file_template,
         true,
@@ -337,6 +344,12 @@ async fn test_cacl_file_object_store_modes() {
         &file_path,
         Some(0..file_bytes.len() as u64),
         &file_bytes,
+    )
+    .await;
+    assert_local_link_reader_fails_after_source_mutation(
+        &linked_store_mgr,
+        &linked_chunk_id,
+        &file_path,
     )
     .await;
 }
@@ -395,10 +408,10 @@ async fn test_cacl_dir_object_store_modes() {
 
     let completed_base = temp_dir.path().join("dir-store-completed");
     tokio::fs::create_dir_all(&completed_base).await.unwrap();
-    let (completed_mgr_id, completed_store_mgr) = create_test_named_mgr(&completed_base).await;
+    let completed_store_mgr = create_test_named_mgr(&completed_base).await;
 
     let (store_mode_dir_obj, store_mode_dir_id, store_mode_dir_str) = cacl_dir_object(
-        Some(completed_mgr_id.as_str()),
+        Some(&completed_store_mgr),
         &source_dir,
         &file_template,
         &CheckMode::ByFullHash,
@@ -429,11 +442,11 @@ async fn test_cacl_dir_object_store_modes() {
 
     let linked_base = temp_dir.path().join("dir-store-linked");
     tokio::fs::create_dir_all(&linked_base).await.unwrap();
-    let (linked_mgr_id, linked_store_mgr) = create_test_named_mgr(&linked_base).await;
+    let linked_store_mgr = create_test_named_mgr(&linked_base).await;
 
     let placeholder = temp_dir.path().join("ignored-dir-placeholder");
     let (local_dir_obj, local_dir_id, local_dir_str) = cacl_dir_object(
-        Some(linked_mgr_id.as_str()),
+        Some(&linked_store_mgr),
         &source_dir,
         &file_template,
         &CheckMode::ByFullHash,
@@ -464,6 +477,12 @@ async fn test_cacl_dir_object_store_modes() {
         &nested_dir.join("child.bin"),
         Some(0..child_bytes.len() as u64),
         &child_bytes,
+    )
+    .await;
+    assert_local_link_reader_fails_after_source_mutation(
+        &linked_store_mgr,
+        &root_chunk_id,
+        &source_dir.join("root.bin"),
     )
     .await;
 }

@@ -8,15 +8,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio_util::io::{ReaderStream, StreamReader};
 
-use named_store::ChunkStoreState;
+use named_store::{ChunkStoreState, NamedStoreMgr};
 use ndn_lib::{
     copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object_from_str,
     CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader, DirObject, FileObject, NdnAction,
     NdnError, NdnProgressCallback, NdnResult, ObjId, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE,
     OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
-
-use crate::get_named_store_mgr_by_id;
 
 #[derive(Debug, Clone)]
 pub enum ChunkWorkState {
@@ -38,7 +36,7 @@ pub enum ChunkWriterOpenMode {
 }
 
 pub struct NdnClient {
-    default_store_mgr_id: Option<String>,
+    default_store_mgr: Option<NamedStoreMgr>,
     session_token: Option<String>,
     default_remote_url: Option<String>,
     pub enable_remote_pull: bool,
@@ -51,10 +49,10 @@ impl NdnClient {
     pub fn new(
         default_remote_url: String,
         session_token: Option<String>,
-        named_mgr_id: Option<String>,
+        store_mgr: Option<NamedStoreMgr>,
     ) -> Self {
         Self {
-            default_store_mgr_id: named_mgr_id,
+            default_store_mgr: store_mgr,
             session_token,
             default_remote_url: Some(default_remote_url),
             enable_remote_pull: false,
@@ -126,9 +124,10 @@ impl NdnClient {
             return Ok(());
         }
 
-        let store_mgr = get_named_store_mgr_by_id(self.default_store_mgr_id.as_deref())
-            .await
-            .ok_or_else(|| NdnError::NotFound("named store mgr not found".to_string()))?;
+        let store_mgr = self
+            .default_store_mgr
+            .as_ref()
+            .ok_or_else(|| NdnError::NotFound("named store mgr not configured".to_string()))?;
         let (chunk_reader, len) = store_mgr
             .open_chunk_reader(&chunk_id, already_uploaded_size)
             .await?;
@@ -398,7 +397,6 @@ impl NdnClient {
 
     pub async fn pull_dir(
         &self,
-        _ndn_mgr_id: Option<&str>,
         dir_obj: DirObject,
         pull_mode: StoreMode,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
@@ -417,13 +415,8 @@ impl NdnClient {
                         NdnError::InvalidData(format!("Failed to parse DirObject: {}", e))
                     })?;
                     let sub_pull_mode = pull_mode.gen_sub_store_mode(sub_name);
-                    Box::pin(self.pull_dir(
-                        None,
-                        sub_dir,
-                        sub_pull_mode,
-                        progress_callback.clone(),
-                    ))
-                    .await?;
+                    Box::pin(self.pull_dir(sub_dir, sub_pull_mode, progress_callback.clone()))
+                        .await?;
                 }
                 OBJ_TYPE_FILE => {
                     let sub_file_obj = sub_item.get_obj().map_err(|_| {

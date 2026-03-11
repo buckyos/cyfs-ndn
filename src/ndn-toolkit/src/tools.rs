@@ -2,7 +2,6 @@ use log::{debug, info};
 use named_store::{ChunkLocalInfo, NamedStoreMgr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 
@@ -63,27 +62,6 @@ impl ContentToStore {
     }
 }
 
-pub type NamedStoreMgrRef = Arc<NamedStoreMgr>;
-
-fn named_store_mgr_map() -> &'static Mutex<std::collections::HashMap<String, NamedStoreMgrRef>> {
-    static NAMED_STORE_MGR_MAP: OnceLock<
-        Mutex<std::collections::HashMap<String, NamedStoreMgrRef>>,
-    > = OnceLock::new();
-    NAMED_STORE_MGR_MAP.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-pub async fn get_named_store_mgr_by_id(mgr_id: Option<&str>) -> Option<NamedStoreMgrRef> {
-    let id = mgr_id.unwrap_or("default");
-    let map = named_store_mgr_map().lock().await;
-    map.get(id).cloned()
-}
-
-pub async fn register_named_store_mgr(mgr_id: &str, mgr: NamedStoreMgrRef) -> NamedStoreMgrRef {
-    let mut map = named_store_mgr_map().lock().await;
-    map.insert(mgr_id.to_string(), mgr.clone());
-    mgr
-}
-
 async fn read_chunk_bytes(local_info: &ChunkLocalInfo, chunk_size: u64) -> NdnResult<Vec<u8>> {
     let bytes = tokio::fs::read(&local_info.path).await?;
     let slice = if let Some(src_range) = local_info.range.clone() {
@@ -142,7 +120,7 @@ pub async fn store_content_to_ndn_mgr_impl(
 }
 
 pub async fn store_content_to_ndn_mgr(
-    ndn_mgr_id: Option<&str>,
+    store_mgr: Option<&NamedStoreMgr>,
     content: ContentToStore,
     store_mode: StoreMode,
 ) -> NdnResult<()> {
@@ -150,14 +128,14 @@ pub async fn store_content_to_ndn_mgr(
         return Ok(());
     }
 
-    let store_mgr = get_named_store_mgr_by_id(ndn_mgr_id).await.ok_or_else(|| {
+    let store_mgr = store_mgr.ok_or_else(|| {
         NdnError::NotFound(format!(
-            "named store mgr not found for store mode: {:?}",
+            "named store mgr is required for store mode: {:?}",
             store_mode
         ))
     })?;
 
-    store_content_to_ndn_mgr_impl(store_mgr.as_ref(), content, store_mode).await
+    store_content_to_ndn_mgr_impl(store_mgr, content, store_mode).await
 }
 
 async fn call_ndn_callback(
@@ -173,7 +151,7 @@ async fn call_ndn_callback(
 }
 
 pub async fn cacl_file_object(
-    ndn_mgr_id: Option<&str>,
+    store_mgr: Option<&NamedStoreMgr>,
     local_file_path: &Path,
     fileobj_template: &FileObject,
     use_chunklist: bool,
@@ -226,7 +204,7 @@ pub async fn cacl_file_object(
             range: Some(0..0),
         };
         let content = ContentToStore::from_local_file(chunk_id.clone(), 0, local_info);
-        store_content_to_ndn_mgr(ndn_mgr_id, content, store_mode.clone()).await?;
+        store_content_to_ndn_mgr(store_mgr, content, store_mode.clone()).await?;
 
         let callback_result = call_ndn_callback(
             &progress_callback,
@@ -276,7 +254,7 @@ pub async fn cacl_file_object(
                 range: range.clone(),
             };
             let content = ContentToStore::from_local_file(chunk_id.clone(), chunk_size, local_info);
-            store_content_to_ndn_mgr(ndn_mgr_id, content, store_mode.clone()).await?;
+            store_content_to_ndn_mgr(store_mgr, content, store_mode.clone()).await?;
 
             let inner_path = if use_chunk_list_now {
                 format!(
@@ -309,20 +287,20 @@ pub async fn cacl_file_object(
         file_obj_result.content = chunk_list_id.to_string();
 
         let content = ContentToStore::from_obj(chunk_list_id, chunk_list_str);
-        store_content_to_ndn_mgr(ndn_mgr_id, content, store_mode.clone()).await?;
+        store_content_to_ndn_mgr(store_mgr, content, store_mode.clone()).await?;
     } else if let Some(chunk_id) = chunk_ids.first() {
         file_obj_result.content = chunk_id.to_string();
     }
 
     let (file_obj_id, file_obj_str) = file_obj_result.gen_obj_id();
     let content = ContentToStore::from_obj(file_obj_id.clone(), file_obj_str.clone());
-    store_content_to_ndn_mgr(ndn_mgr_id, content, store_mode).await?;
+    store_content_to_ndn_mgr(store_mgr, content, store_mode).await?;
 
     Ok((file_obj_result, file_obj_id, file_obj_str))
 }
 
 pub async fn cacl_dir_object(
-    ndn_mgr_id: Option<&str>,
+    store_mgr: Option<&NamedStoreMgr>,
     source_dir: &Path,
     file_obj_template: &FileObject,
     check_mode: &CheckMode,
@@ -368,7 +346,7 @@ pub async fn cacl_dir_object(
             }
 
             let (sub_dir_obj, sub_dir_obj_id, _sub_dir_str) = Box::pin(cacl_dir_object(
-                ndn_mgr_id,
+                store_mgr,
                 &sub_path,
                 file_obj_template,
                 check_mode,
@@ -413,7 +391,7 @@ pub async fn cacl_dir_object(
             }
 
             let (file_object, file_object_id, _file_object_str) = cacl_file_object(
-                ndn_mgr_id,
+                store_mgr,
                 &sub_path,
                 file_obj_template,
                 true,
@@ -454,14 +432,14 @@ pub async fn cacl_dir_object(
     let dir_obj_store_str = serde_json::to_string(&this_dir_obj)
         .map_err(|e| NdnError::InvalidData(format!("serialize DirObject failed: {}", e)))?;
     let content = ContentToStore::from_obj(dir_obj_id.clone(), dir_obj_store_str);
-    store_content_to_ndn_mgr(ndn_mgr_id, content, store_mode).await?;
+    store_content_to_ndn_mgr(store_mgr, content, store_mode).await?;
 
     Ok((this_dir_obj, dir_obj_id, dir_obj_str))
 }
 
 pub async fn restore_file_object(
     _file_object: ObjId,
-    _ndn_mgr_id: Option<&str>,
+    _store_mgr: Option<&NamedStoreMgr>,
     _target_file: &Path,
 ) -> NdnResult<()> {
     Err(NdnError::Unsupported(
@@ -471,7 +449,7 @@ pub async fn restore_file_object(
 
 pub async fn restore_dir_object(
     _dir_object: ObjId,
-    _ndn_mgr_id: Option<&str>,
+    _store_mgr: Option<&NamedStoreMgr>,
     _target_dir: &Path,
 ) -> NdnResult<()> {
     Err(NdnError::Unsupported(
@@ -480,7 +458,7 @@ pub async fn restore_dir_object(
 }
 
 pub async fn put_local_file_as_chunk(
-    _mgr_id: Option<&str>,
+    _store_mgr: Option<&NamedStoreMgr>,
     chunk_type: ChunkType,
     local_file_path: &PathBuf,
     _store_mode: StoreMode,
@@ -506,7 +484,7 @@ pub async fn put_local_file_as_chunk(
 }
 
 pub async fn pub_local_file_as_fileobj(
-    mgr_id: Option<&str>,
+    _store_mgr: Option<&NamedStoreMgr>,
     local_file_path: &PathBuf,
     _ndn_path: &str,
     fileobj_template: &mut FileObject,
@@ -514,7 +492,7 @@ pub async fn pub_local_file_as_fileobj(
     _app_id: &str,
 ) -> NdnResult<(FileObject, ObjId, String)> {
     cacl_file_object(
-        mgr_id,
+        None,
         local_file_path,
         fileobj_template,
         true,
@@ -526,8 +504,8 @@ pub async fn pub_local_file_as_fileobj(
 }
 
 pub async fn copy_file_from_ndn_mgr(
-    _source_ndn_mgr_id: &String,
-    _target_ndn_mgr_id: &String,
+    _source_store_mgr: &NamedStoreMgr,
+    _target_store_mgr: &NamedStoreMgr,
     _file_obj_id: &ObjId,
     _file_object: &FileObject,
     _pull_mode: StoreMode,
@@ -538,8 +516,8 @@ pub async fn copy_file_from_ndn_mgr(
 }
 
 pub async fn copy_dir_from_ndn_mgr(
-    _source_ndn_mgr_id: &String,
-    _target_ndn_mgr_id: &String,
+    _source_store_mgr: &NamedStoreMgr,
+    _target_store_mgr: &NamedStoreMgr,
     _dir_object_id: &ObjId,
     _pull_mode: StoreMode,
 ) -> NdnResult<()> {
