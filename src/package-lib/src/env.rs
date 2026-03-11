@@ -139,6 +139,7 @@ use async_fd_lock::RwLockWriteGuard;
 use async_fd_lock::{LockRead, LockWrite};
 use named_store::NamedStoreMgr;
 use ndn_lib::*;
+use ndn_toolkit::check_file_object_content_ready;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::io::BufReader;
@@ -489,15 +490,86 @@ impl PackageEnv {
         force_install: bool,
     ) -> PkgResult<()> {
         let pkg_id = pkg_meta.get_package_id().to_string();
-
+        let real_meta_obj_id = ObjId::new(meta_obj_id)
+            .map_err(|e| PkgError::ParseError(meta_obj_id.to_owned(), e.to_string()))?;
 
         //新逻辑：
         // 1） pkg_meta现在一定是一个fileobj,所以可以用FileObject来处理
         // 2)  使用ndn-toolkit的辅助函数，将fileobj还原为本地文件，并解压安装到env中
         // 3） 注意，如果通过named_store_config_path配置的named_store_mgr没有这个chunk，则失败。下载是安装的前置逻辑,package-lib本身不管理下载
 
-        
-        unimplemented!();
+        if pkg_meta.content.is_empty() {
+            return Err(PkgError::InstallError(
+                pkg_id,
+                "Package content is empty".to_owned(),
+            ));
+        }
+
+        let store_config_path = self
+            .config
+            .named_store_config_path
+            .as_ref()
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.work_dir.join(path)
+                }
+            })
+            .ok_or_else(|| {
+                PkgError::InstallError(
+                    pkg_id.clone(),
+                    "named_store_config_path is required for package installation".to_owned(),
+                )
+            })?;
+
+        let store_mgr = NamedStoreMgr::get_store_mgr(&store_config_path)
+            .await
+            .map_err(|e| {
+                PkgError::InstallError(
+                    pkg_id.clone(),
+                    format!(
+                        "Failed to open named store config {}: {}",
+                        store_config_path.display(),
+                        e
+                    ),
+                )
+            })?;
+
+        check_file_object_content_ready(&store_mgr, pkg_meta)
+            .await
+            .map_err(|e| {
+                PkgError::InstallError(
+                    pkg_id.clone(),
+                    format!("Package content is not ready in named store: {}", e),
+                )
+            })?;
+
+        let content_obj_id = ObjId::new(pkg_meta.content.as_str()).map_err(|e| {
+            PkgError::InstallError(
+                pkg_id.clone(),
+                format!("Invalid package content obj id {}: {}", pkg_meta.content, e),
+            )
+        })?;
+
+        let (chunk_reader, _) =
+            store_mgr
+                .open_reader(&content_obj_id, None)
+                .await
+                .map_err(|e| {
+                    PkgError::InstallError(
+                        pkg_id.clone(),
+                        format!(
+                            "Failed to open package content {} from named store: {}",
+                            content_obj_id, e
+                        ),
+                    )
+                })?;
+
+        self.do_install_pkg_from_data(pkg_meta, &real_meta_obj_id, chunk_reader, force_install)
+            .await?;
+
         Ok(())
     }
 

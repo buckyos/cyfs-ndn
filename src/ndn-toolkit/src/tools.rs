@@ -299,6 +299,60 @@ pub async fn cacl_file_object(
     Ok((file_obj_result, file_obj_id, file_obj_str))
 }
 
+pub async fn check_file_object_content_ready(
+    store_mgr: &NamedStoreMgr,
+    file_obj: &FileObject,
+) -> NdnResult<()> {
+    if file_obj.content.is_empty() {
+        return Err(NdnError::InvalidParam(format!(
+            "file object {} has empty content",
+            file_obj.name
+        )));
+    }
+
+    let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+    if content_obj_id.is_chunk() {
+        let chunk_id = ChunkId::from_obj_id(&content_obj_id);
+        if store_mgr.have_chunk(&chunk_id).await {
+            return Ok(());
+        }
+
+        return Err(NdnError::NotFound(format!(
+            "file object {} missing chunk {}",
+            file_obj.name,
+            chunk_id.to_string()
+        )));
+    }
+
+    if content_obj_id.is_chunk_list() {
+        let chunklist_json = store_mgr.get_object(&content_obj_id).await?;
+        let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str())?;
+        let mut missing_chunks = Vec::new();
+
+        for chunk_id in chunk_list.body.iter() {
+            if !store_mgr.have_chunk(chunk_id).await {
+                missing_chunks.push(chunk_id.to_string());
+            }
+        }
+
+        if missing_chunks.is_empty() {
+            return Ok(());
+        }
+
+        return Err(NdnError::NotFound(format!(
+            "file object {} missing {} chunk(s): {}",
+            file_obj.name,
+            missing_chunks.len(),
+            missing_chunks.join(",")
+        )));
+    }
+
+    Err(NdnError::InvalidObjType(format!(
+        "file object content {} is not chunk or chunklist",
+        content_obj_id
+    )))
+}
+
 pub async fn cacl_dir_object(
     store_mgr: Option<&NamedStoreMgr>,
     source_dir: &Path,

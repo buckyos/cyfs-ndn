@@ -1,4 +1,4 @@
-use crate::{cacl_dir_object, cacl_file_object, CheckMode};
+use crate::{cacl_dir_object, cacl_file_object, check_file_object_content_ready, CheckMode};
 use named_store::{
     ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
     StoreTarget,
@@ -352,6 +352,49 @@ async fn test_cacl_file_object_store_modes() {
         &file_path,
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_check_file_object_content_ready() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("multi_chunk.bin");
+    let file_size = CHUNK_DEFAULT_SIZE as usize + 257;
+    let file_bytes = deterministic_bytes(file_size);
+    tokio::fs::write(&file_path, &file_bytes).await.unwrap();
+
+    let store_mgr = create_test_named_mgr(temp_dir.path()).await;
+    let file_template = FileObject::default();
+    let (file_obj, _file_obj_id, _file_obj_str) = cacl_file_object(
+        Some(&store_mgr),
+        &file_path,
+        &file_template,
+        true,
+        &CheckMode::ByFullHash,
+        StoreMode::StoreInNamedMgr,
+        None,
+    )
+    .await
+    .unwrap();
+
+    check_file_object_content_ready(&store_mgr, &file_obj)
+        .await
+        .unwrap();
+
+    let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
+    let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
+    let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let removed_chunk = chunk_list.body[0].clone();
+    store_mgr.remove_chunk(&removed_chunk).await.unwrap();
+
+    let err = check_file_object_content_ready(&store_mgr, &file_obj)
+        .await
+        .err()
+        .expect("missing chunk should be detected before open_reader");
+    assert!(
+        matches!(err, NdnError::NotFound(_)),
+        "unexpected error for missing chunk: {:?}",
+        err
+    );
 }
 
 #[tokio::test]
