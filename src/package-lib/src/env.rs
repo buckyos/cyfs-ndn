@@ -156,9 +156,9 @@ pub struct PackageEnvConfig {
     pub enable_link: bool,
     pub enable_strict_mode: bool,
     pub index_db_path: Option<String>,
-    pub parent: Option<PathBuf>,        //parent package env work_dir
-    pub ready_only: bool,               //read only env cann't install any new pkgs
-    pub named_mgr_name: Option<String>, //如果指定了，则使用named_mgr_name作为默认read chunk的named_mgr
+    pub parent: Option<PathBuf>, //parent package env work_dir
+    pub ready_only: bool,        //read only env cann't install any new pkgs
+    pub named_store_config_path: Option<String>, //如果指定了，则使用 named_store 配置文件路径作为默认 read chunk 的来源
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     #[serde(default)]
     pub installed: HashSet<String>, //pkg_id列表，表示已经安装的pkg
@@ -199,7 +199,7 @@ impl Default for PackageEnvConfig {
             index_db_path: None,
             parent: None,
             ready_only: false,
-            named_mgr_name: None,
+            named_store_config_path: None,
             prefix: Some(os_type.to_string()),
             installed: HashSet::new(),
         }
@@ -489,47 +489,15 @@ impl PackageEnv {
         force_install: bool,
     ) -> PkgResult<()> {
         let pkg_id = pkg_meta.get_package_id().to_string();
-        //检查chunk是否存在
-        if !pkg_meta.content.is_empty() {
 
-            //1) ndn_client.pull_file
-            //2) open local file reader
-            //3) install
 
-            // let chunk_id_str = pkg_meta.content.as_str();
-            // let chunk_id = ChunkId::new(chunk_id_str)
-            //     .map_err(|e| PkgError::ParseError(
-            //         pkg_id.clone(),
-            //         format!("Invalid chunk id: {}", e),
-            //     ))?;
-            // if !NamedDataMgr::have_chunk(self.config.named_mgr_name.as_deref(),&chunk_id).await {
-            //     info!("{}'s chunk {} not found, downloading...", pkg_id, chunk_id_str);
-            //     //TODO:ndn client要支持 1个zone内地址(none) ，2个zone外地址（发布者+传播者) 的多源模式
-            //     let zone_ndn_url = "http://127.0.0.1/ndn/";
-            //     let ndn_client = NdnClient::new(zone_ndn_url.to_string(),None,self.config.named_mgr_name.clone());
-            //     let chunk_size = ndn_client.pull_chunk(chunk_id.clone(),StoreMode::StoreInNamedMgr).await
-            //         .map_err(|e| PkgError::DownloadError(
-            //             pkg_id.clone(),
-            //             format!("Failed to download chunk: {}", e),
-            //         ))?;
-            //     info!("chunk {} downloaded, size: {}", chunk_id_str, chunk_size);
-            // }
+        //新逻辑：
+        // 1） pkg_meta现在一定是一个fileobj,所以可以用FileObject来处理
+        // 2)  使用ndn-toolkit的辅助函数，将fileobj还原为本地文件，并解压安装到env中
+        // 3） 注意，如果通过named_store_config_path配置的named_store_mgr没有这个chunk，则失败。下载是安装的前置逻辑,package-lib本身不管理下载
 
-            // let (chunk_reader,chunk_size) = NamedDataMgr::open_chunk_reader(self.config.named_mgr_name.as_deref(),
-            //     &chunk_id,0,false).await
-            //     .map_err(|e| PkgError::LoadError(
-            //         pkg_id.clone(),
-            //         format!("Failed to open chunk reader: {}", e),
-            //     ))?;
-
-            // let meta_obj_id = ObjId::new(meta_obj_id).map_err(|e| PkgError::ParseError(
-            //     pkg_id.clone(),
-            //     format!("Invalid meta obj id: {}", e),
-            // ))?;
-            // self.do_install_pkg_from_data(&pkg_meta,&meta_obj_id,content_reader,force_install).await?;
-            // info!("{} extract chunk to pkg_env OK.", pkg_id);
-        }
-
+        
+        unimplemented!();
         Ok(())
     }
 
