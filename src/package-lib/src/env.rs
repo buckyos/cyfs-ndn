@@ -38,6 +38,10 @@ PackageEnv 当前实现说明
   - 检查其 `content` 指向的 chunk 或 chunklist 是否已经全部存在于 named store
   - 缺失的 chunk 会写入 `miss_chunk_list`
 
+- `check_deps_ready(meta_db, pkg_id, store_mgr, miss_chunk_list)`
+  - 递归检查依赖 pkg 是否 ready
+  - 不检查当前 pkg 自身内容
+
 - `install_pkg(pkg_id, install_deps, force_install)`
   - 获取写锁
   - 读取 `PackageMeta`
@@ -348,17 +352,43 @@ impl PackageEnv {
         pkg_meta: &PackageMeta,
         deps: &mut HashMap<String, PackageMeta>,
     ) -> PkgResult<()> {
+        let mut visiting = HashSet::new();
+        visiting.insert(pkg_meta.get_package_id().to_string());
+        self.cacl_pkg_deps_metas_impl(pkg_meta, deps, &mut visiting)
+            .await
+    }
+
+    async fn cacl_pkg_deps_metas_impl(
+        &self,
+        pkg_meta: &PackageMeta,
+        deps: &mut HashMap<String, PackageMeta>,
+        visiting: &mut HashSet<String>,
+    ) -> PkgResult<()> {
         for (dep_name, dep_version) in pkg_meta.deps.iter() {
             let dep_id = format!("{}#{}", dep_name, dep_version);
             let (meta_obj_id, dep_meta) = self.get_pkg_meta(&dep_id).await?;
-            let next_future = Box::pin(self.cacl_pkg_deps_metas(&dep_meta, deps));
-            let _ = next_future.await?;
+            let dep_pkg_id = dep_meta.get_package_id().to_string();
+            if visiting.contains(&dep_pkg_id) {
+                return Err(PkgError::LoadError(
+                    dep_pkg_id,
+                    "Package dependency cycle detected".to_owned(),
+                ));
+            }
+            if deps.contains_key(&meta_obj_id) {
+                continue;
+            }
+
+            visiting.insert(dep_pkg_id.clone());
+            let next_future = Box::pin(self.cacl_pkg_deps_metas_impl(&dep_meta, deps, visiting));
+            let result = next_future.await;
+            visiting.remove(&dep_pkg_id);
+            result?;
             deps.insert(meta_obj_id, dep_meta);
         }
         Ok(())
     }
 
-    //检查pkg的依赖是否都已经在本机就绪，注意本操作并不会修改env
+    // 只检查当前 pkg 的内容是否在本机就绪，不递归检查依赖
     pub async fn check_pkg_ready(
         meta_index_db: &PathBuf,
         pkg_id: &str,
@@ -390,6 +420,80 @@ impl PackageEnv {
                     miss_chunk_list.push(chunk_id);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    // 递归检查依赖 pkg 是否都已经在本机就绪，不检查 pkg 自身内容
+    pub async fn check_deps_ready(
+        meta_index_db: &PathBuf,
+        pkg_id: &str,
+        store_mgr: &NamedStoreMgr,
+        miss_chunk_list: &mut Vec<ChunkId>,
+    ) -> PkgResult<()> {
+        let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
+        let meta_info = meta_db.get_pkg_meta(pkg_id)?;
+        if meta_info.is_none() {
+            return Err(PkgError::LoadError(
+                pkg_id.to_owned(),
+                "Package metadata not found".to_owned(),
+            ));
+        }
+
+        let (_, pkg_meta) = meta_info.unwrap();
+        let mut visiting = HashSet::new();
+        visiting.insert(pkg_meta.get_package_id().to_string());
+        Self::check_deps_ready_impl(
+            meta_index_db,
+            &pkg_meta,
+            store_mgr,
+            miss_chunk_list,
+            &mut visiting,
+        )
+        .await
+    }
+
+    async fn check_deps_ready_impl(
+        meta_index_db: &PathBuf,
+        pkg_meta: &PackageMeta,
+        store_mgr: &NamedStoreMgr,
+        miss_chunk_list: &mut Vec<ChunkId>,
+        visiting: &mut HashSet<String>,
+    ) -> PkgResult<()> {
+        let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
+
+        for (dep_name, dep_version) in pkg_meta.deps.iter() {
+            let dep_id = format!("{}#{}", dep_name, dep_version);
+            let meta_info = meta_db.get_pkg_meta(&dep_id)?;
+            let Some((_, dep_meta)) = meta_info else {
+                return Err(PkgError::LoadError(
+                    dep_id,
+                    "Package metadata not found".to_owned(),
+                ));
+            };
+
+            let dep_pkg_id = dep_meta.get_package_id().to_string();
+            if visiting.contains(&dep_pkg_id) {
+                return Err(PkgError::LoadError(
+                    dep_pkg_id,
+                    "Package dependency cycle detected".to_owned(),
+                ));
+            }
+
+            Self::check_pkg_ready(meta_index_db, &dep_pkg_id, store_mgr, miss_chunk_list).await?;
+
+            visiting.insert(dep_pkg_id.clone());
+            let result = Box::pin(Self::check_deps_ready_impl(
+                meta_index_db,
+                &dep_meta,
+                store_mgr,
+                miss_chunk_list,
+                visiting,
+            ))
+            .await;
+            visiting.remove(&dep_pkg_id);
+            result?;
         }
 
         Ok(())
@@ -1203,6 +1307,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_check_deps_ready_only_checks_dependencies() {
+        let (env, temp) = setup_test_env().await;
+        let store_mgr = create_test_store_mgr(temp.path()).await;
+        let file_path = temp.path().join("dep.data");
+        let file_bytes = vec![9u8; CHUNK_DEFAULT_SIZE as usize + 23];
+        tokio_fs::write(&file_path, &file_bytes).await.unwrap();
+
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+
+        let mut dep_meta = PackageMeta::new("dep.pkg", "1.0.0", "test", &owner, None);
+        let (dep_file_obj, _, _) = cacl_file_object(
+            Some(&store_mgr),
+            &file_path,
+            &FileObject::default(),
+            true,
+            &CheckMode::ByFullHash,
+            StoreMode::StoreInNamedMgr,
+            None,
+        )
+        .await
+        .unwrap();
+        dep_meta.size = dep_file_obj.size;
+        dep_meta.content = dep_file_obj.content.clone();
+
+        let chunk_list = SimpleChunkList::from_json(
+            store_mgr
+                .get_object(&ObjId::new(&dep_meta.content).unwrap())
+                .await
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap();
+        let missing_chunk = chunk_list.body[0].clone();
+        store_mgr.remove_chunk(&missing_chunk).await.unwrap();
+
+        let dep_meta_obj_id = insert_pkg_meta_to_db(&env, &dep_meta);
+
+        let mut root_meta = PackageMeta::new("root.pkg", "1.0.0", "test", &owner, None);
+        root_meta
+            .deps
+            .insert("dep.pkg".to_string(), "1.0.0".to_string());
+        let _root_meta_obj_id = insert_pkg_meta_to_db(&env, &root_meta);
+
+        let mut pkg_missing_chunks = Vec::new();
+        PackageEnv::check_pkg_ready(
+            &env.get_meta_db_path(),
+            "root.pkg#1.0.0",
+            &store_mgr,
+            &mut pkg_missing_chunks,
+        )
+        .await
+        .unwrap();
+        assert!(pkg_missing_chunks.is_empty());
+
+        let mut dep_missing_chunks = Vec::new();
+        PackageEnv::check_deps_ready(
+            &env.get_meta_db_path(),
+            "root.pkg#1.0.0",
+            &store_mgr,
+            &mut dep_missing_chunks,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dep_missing_chunks, vec![missing_chunk.clone()]);
+
+        let mut dep_self_missing = Vec::new();
+        PackageEnv::check_pkg_ready(
+            &env.get_meta_db_path(),
+            &format!("dep.pkg#1.0.0#{}", dep_meta_obj_id),
+            &store_mgr,
+            &mut dep_self_missing,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dep_self_missing, vec![missing_chunk]);
+    }
+
+    #[tokio::test]
     async fn test_get_pkg_dir_with_objid_uses_filename_once() {
         let (env, _temp) = setup_test_env().await;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
@@ -1219,6 +1401,32 @@ mod tests {
                 .join("test.pkg")
                 .join(meta_obj_id.to_filename())]
         );
+    }
+
+    #[tokio::test]
+    async fn test_cacl_pkg_deps_metas_detects_cycles() {
+        let (env, _temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+
+        let mut pkg_a = PackageMeta::new("cycle.a", "1.0.0", "test", &owner, None);
+        let mut pkg_b = PackageMeta::new("cycle.b", "1.0.0", "test", &owner, None);
+        pkg_a
+            .deps
+            .insert("cycle.b".to_string(), "1.0.0".to_string());
+        pkg_b
+            .deps
+            .insert("cycle.a".to_string(), "1.0.0".to_string());
+
+        insert_pkg_meta_to_db(&env, &pkg_a);
+        insert_pkg_meta_to_db(&env, &pkg_b);
+
+        let mut deps = HashMap::new();
+        let err = env
+            .cacl_pkg_deps_metas(&pkg_a, &mut deps)
+            .await
+            .err()
+            .expect("dependency cycle should be rejected");
+        assert!(matches!(err, PkgError::LoadError(_, _)));
     }
 
     #[tokio::test]

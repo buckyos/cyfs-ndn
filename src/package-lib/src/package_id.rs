@@ -1,5 +1,6 @@
 use crate::error::{PkgError, PkgResult};
 use name_lib::DID;
+use ndn_lib::ObjId;
 use semver::*;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -28,6 +29,10 @@ impl FromStr for VersionExpType {
     type Err = PkgError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Ok(VersionExpType::None);
+        }
+
         let version = Version::parse(s);
         if version.is_ok() {
             return Ok(VersionExpType::Version(version.unwrap()));
@@ -38,7 +43,10 @@ impl FromStr for VersionExpType {
             return Ok(VersionExpType::Req(req.unwrap()));
         }
 
-        return Ok(VersionExpType::None);
+        Err(PkgError::ParseError(
+            s.to_string(),
+            "Invalid version expression".to_string(),
+        ))
     }
 }
 
@@ -393,23 +401,22 @@ impl PackageId {
             2 => {
                 let name = parts[0].to_string();
                 let version_part = parts[1].to_string();
-                if version_part.contains(".")
-                    || version_part.contains(":")
-                    || version_part.contains("*")
-                {
-                    let version_exp = VersionExp::from_str(&version_part)?;
-                    return Ok(PackageId {
-                        name: name,
-                        version_exp: Some(version_exp),
-                        objid: None,
-                    });
-                } else {
+                let is_raw_exact_id = !version_part.is_empty()
+                    && version_part.chars().all(|c| c.is_ascii_alphanumeric());
+                if ObjId::new(&version_part).is_ok() || is_raw_exact_id {
                     return Ok(PackageId {
                         name: name,
                         version_exp: None,
                         objid: Some(version_part),
                     });
                 }
+
+                let version_exp = VersionExp::from_str(&version_part)?;
+                return Ok(PackageId {
+                    name: name,
+                    version_exp: Some(version_exp),
+                    objid: None,
+                });
             }
             3 => {
                 let name = parts[0].to_string();
@@ -493,6 +500,14 @@ mod tests {
         let pkg_id2 = result.to_string();
         assert_eq!(pkg_id, pkg_id2);
 
+        let pkg_id = "a#pkg:0123456789abcdef";
+        let result = PackageId::parse(pkg_id).unwrap();
+        assert_eq!(&result.name, "a");
+        assert_eq!(result.version_exp, None);
+        assert_eq!(result.objid, Some("pkg:0123456789abcdef".to_string()));
+        let pkg_id2 = result.to_string();
+        assert_eq!(pkg_id, pkg_id2);
+
         let pkg_id = "a#>0.1.0";
         let result = PackageId::parse(pkg_id).unwrap();
         assert_eq!(&result.name, "a");
@@ -513,6 +528,12 @@ mod tests {
         );
         let pkg_id2 = result.to_string();
         assert_eq!(pkg_id, pkg_id2);
+
+        assert!(PackageId::parse("a#not-a-version").is_err());
+        assert!(VersionExp::from_str("not-a-version").is_err());
+        let latest = VersionExp::from_str(":latest").unwrap();
+        assert_eq!(latest.version_exp, VersionExpType::None);
+        assert_eq!(latest.tag.as_deref(), Some("latest"));
     }
 
     #[test]

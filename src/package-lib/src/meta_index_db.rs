@@ -32,7 +32,7 @@ use log::*;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use semver::*;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -127,12 +127,37 @@ impl MetaIndexDb {
         pkg_meta: &PackageMeta,
         deps: &mut HashMap<String, PackageMeta>,
     ) -> PkgResult<()> {
+        let mut visiting = HashSet::new();
+        visiting.insert(pkg_meta.get_package_id().to_string());
+        self.cacl_pkg_deps_metas_impl(pkg_meta, deps, &mut visiting)
+    }
+
+    fn cacl_pkg_deps_metas_impl(
+        &self,
+        pkg_meta: &PackageMeta,
+        deps: &mut HashMap<String, PackageMeta>,
+        visiting: &mut HashSet<String>,
+    ) -> PkgResult<()> {
         for (dep_name, dep_version) in pkg_meta.deps.iter() {
             let dep_id = format!("{}#{}", dep_name, dep_version);
             let pkg_result = self.get_pkg_meta(&dep_id)?;
             if pkg_result.is_some() {
                 let (meta_obj_id, dep_meta) = pkg_result.unwrap();
-                self.cacl_pkg_deps_metas(&dep_meta, deps)?;
+                let dep_pkg_id = dep_meta.get_package_id().to_string();
+                if visiting.contains(&dep_pkg_id) {
+                    return Err(PkgError::LoadError(
+                        dep_pkg_id,
+                        "Package dependency cycle detected".to_owned(),
+                    ));
+                }
+                if deps.contains_key(&meta_obj_id) {
+                    continue;
+                }
+
+                visiting.insert(dep_pkg_id.clone());
+                let result = self.cacl_pkg_deps_metas_impl(&dep_meta, deps, visiting);
+                visiting.remove(&dep_pkg_id);
+                result?;
                 deps.insert(meta_obj_id, dep_meta);
             } else {
                 warn!("cacl_pkg_deps_metas:pkg_meta {} not found", dep_id);
