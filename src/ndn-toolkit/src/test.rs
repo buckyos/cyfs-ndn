@@ -1,17 +1,50 @@
-use crate::{cacl_dir_object, cacl_file_object, check_file_object_content_ready, CheckMode};
+use crate::{
+    cacl_dir_object, cacl_file_object, check_file_object_content_ready, CheckMode, CyfsHttpTransport,
+    CyfsNdnClient, CyfsTransportRequest, CyfsTransportResponse, ReqwestCyfsTransport,
+};
 use named_store::{
     ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
-    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, NamedObject, NdnError, ObjId,
-    SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, NamedObject, NdnError,
+    NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, SimpleChunkList,
+    SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Mutex;
+use warp::Filter;
+
+#[derive(Clone)]
+struct TestSchemeTransport {
+    inner: ReqwestCyfsTransport,
+}
+
+impl TestSchemeTransport {
+    fn new() -> Self {
+        Self {
+            inner: ReqwestCyfsTransport::new(reqwest::Client::new()),
+        }
+    }
+}
+
+impl CyfsHttpTransport for TestSchemeTransport {
+    fn send(
+        &self,
+        mut request: CyfsTransportRequest,
+    ) -> Pin<Box<dyn std::future::Future<Output = NdnResult<CyfsTransportResponse>> + Send + '_>>
+    {
+        if let Some(rest) = request.url.strip_prefix("rtcp://") {
+            request.url = format!("http://{}", rest);
+        }
+        self.inner.send(request)
+    }
+}
 
 fn deterministic_bytes(len: usize) -> Vec<u8> {
     (0..len)
@@ -528,4 +561,195 @@ async fn test_cacl_dir_object_store_modes() {
         &source_dir.join("root.bin"),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_cyfs_ndn_client_object_uses_cyfs_head() {
+    let chunk_bytes = deterministic_bytes(1024);
+    let chunk_id = ChunkHasher::new_with_hash_method(HashMethod::Sha256)
+        .unwrap()
+        .calc_mix_chunk_id_from_bytes(&chunk_bytes)
+        .unwrap();
+    let file_obj = FileObject::new(
+        "cyfs-head.bin".to_string(),
+        chunk_bytes.len() as u64,
+        chunk_id.to_string(),
+    );
+    let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
+    let head_str = serde_json::json!({
+        "obj_id": file_obj_id.to_string()
+    })
+    .to_string();
+
+    let body = file_obj_str.clone();
+    let head = head_str.clone();
+    let route = warp::path!("alias" / "fileobj").map(move || {
+        warp::http::Response::builder()
+            .header("cyfs-head", head.clone())
+            .body(body.clone())
+            .unwrap()
+    });
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(warp::serve(route).incoming(listener).run());
+
+    let client = CyfsNdnClient::builder()
+        .transport(TestSchemeTransport::new())
+        .build()
+        .unwrap();
+    let (resolved_obj_id, resolved_json) = client
+        .get(format!("http://127.0.0.1:{}/alias/fileobj", addr.port()))
+        .send()
+        .await
+        .unwrap()
+        .object()
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_obj_id, file_obj_id);
+    let parsed: FileObject = serde_json::from_value(resolved_json).unwrap();
+    assert_eq!(parsed, file_obj);
+}
+
+#[tokio::test]
+async fn test_cyfs_ndn_client_standard_http_get_text() {
+    let route = warp::path!("plain" / "hello").map(|| {
+        warp::http::Response::builder()
+            .body("hello from plain http".to_string())
+            .unwrap()
+    });
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(warp::serve(route).incoming(listener).run());
+
+    let client = CyfsNdnClient::new();
+    let text = client
+        .get(format!("http://127.0.0.1:{}/plain/hello", addr.port()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert_eq!(text, "hello from plain http");
+}
+
+#[tokio::test]
+async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
+    let temp_dir = TempDir::new().unwrap();
+    let store_mgr = create_test_named_mgr(temp_dir.path()).await;
+
+    let file_bytes = deterministic_bytes(4096 + 1500);
+    let mut chunk_ids = Vec::new();
+    let mut chunk_map = std::collections::HashMap::new();
+    for chunk in file_bytes.chunks(1024) {
+        let chunk_id = ChunkHasher::new_with_hash_method(HashMethod::Sha256)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(chunk)
+            .unwrap();
+        chunk_map.insert(chunk_id.to_string(), chunk.to_vec());
+        chunk_ids.push(chunk_id);
+    }
+
+    let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids.clone()).unwrap();
+    let (chunk_list_id, chunk_list_str) = clone_chunk_list(&chunk_list).gen_obj_id();
+    let file_obj = FileObject::new(
+        "largefile.bin".to_string(),
+        file_bytes.len() as u64,
+        chunk_list_id.to_string(),
+    );
+    let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
+
+    let file_bytes_for_route = file_bytes.clone();
+    let chunk_list_id_str = chunk_list_id.to_string();
+    let chunk_list_str_for_route = chunk_list_str.clone();
+    let file_obj_id_str = file_obj_id.to_string();
+    let file_obj_str_for_route = file_obj_str.clone();
+    let route = warp::path!("largefile" / String).map(move |obj_id: String| {
+        if obj_id == file_obj_id_str {
+            return warp::http::Response::builder()
+                .header("cyfs-head", file_obj_str_for_route.clone())
+                .body(file_bytes_for_route.clone())
+                .unwrap();
+        }
+
+        if obj_id == chunk_list_id_str {
+            return warp::http::Response::builder()
+                .body(chunk_list_str_for_route.clone().into_bytes())
+                .unwrap();
+        }
+
+        warp::http::Response::builder()
+            .status(warp::http::StatusCode::NOT_FOUND)
+            .body(Vec::new())
+            .unwrap()
+    });
+
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(warp::serve(route).incoming(listener).run());
+
+    let progress_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let progress_log_for_cb = progress_log.clone();
+    let callback: Arc<Mutex<NdnProgressCallback>> = Arc::new(Mutex::new(Box::new(
+        move |inner_path, action| {
+            let progress_log = progress_log_for_cb.clone();
+            Box::pin(async move {
+                progress_log
+                    .lock()
+                    .await
+                    .push(format!("{}|{}", inner_path, action.to_string()));
+                Ok(ProgressCallbackResult::Continue)
+            })
+        },
+    )));
+
+    let client = CyfsNdnClient::builder()
+        .transport(TestSchemeTransport::new())
+        .build()
+        .unwrap();
+    let result = client
+        .get(format!(
+            "rtcp://127.0.0.1:{}/largefile/{}",
+            addr.port(),
+            file_obj_id.to_string()
+        ))
+        .progress_callback(callback)
+        .pull_to_named_store(&store_mgr)
+        .await
+        .unwrap();
+
+    assert_eq!(result.obj_id, Some(file_obj_id.clone()));
+    assert_eq!(result.total_size, file_bytes.len() as u64);
+    assert_eq!(result.chunk_count, chunk_ids.len());
+
+    assert_object_stored(&store_mgr, &file_obj_id, &file_obj_str).await;
+    assert_object_stored(&store_mgr, &chunk_list_id, &chunk_list_str).await;
+    check_file_object_content_ready(&store_mgr, &file_obj)
+        .await
+        .unwrap();
+
+    for chunk_id in chunk_ids.iter() {
+        assert_completed_chunk(&store_mgr, chunk_id, chunk_map.get(&chunk_id.to_string()).unwrap())
+            .await;
+    }
+
+    let progress_log = progress_log.lock().await;
+    assert_eq!(
+        progress_log
+            .iter()
+            .filter(|line| line.contains("ChunkOK"))
+            .count(),
+        chunk_ids.len()
+    );
+    assert!(progress_log.iter().any(|line| line.contains("FileOK")));
 }
