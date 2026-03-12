@@ -11,6 +11,7 @@ mod msgobj;
 mod object;
 mod relation_obj;
 mod simple_object_map;
+
 //mod example;
 
 pub use base_content::*;
@@ -23,7 +24,7 @@ pub use msgobj::*;
 pub use object::*;
 pub use relation_obj::*;
 pub use simple_object_map::*;
-
+pub use action_obj::*;
 use reqwest::StatusCode;
 use std::future::Future;
 use std::ops::Range;
