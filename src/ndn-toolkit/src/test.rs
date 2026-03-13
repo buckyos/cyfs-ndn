@@ -1,15 +1,17 @@
 use crate::{
-    cacl_dir_object, cacl_file_object, check_file_object_content_ready, CheckMode, CyfsHttpTransport,
-    CyfsNdnClient, CyfsTransportRequest, CyfsTransportResponse, ReqwestCyfsTransport,
+    cacl_dir_object, cacl_file_object, check_file_object_content_ready,
+    get_chunklist_from_known_named_object, CheckMode, CyfsHttpTransport, CyfsNdnClient,
+    CyfsTransportRequest, CyfsTransportResponse, ReqwestCyfsTransport,
 };
+use name_lib::DID;
 use named_store::{
     ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
-    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, NamedObject, NdnError,
-    NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, SimpleChunkList,
-    SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind, MsgObject,
+    NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
+    RefItem, RefRole, RefTarget, SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
@@ -50,6 +52,10 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
     (0..len)
         .map(|idx| ((idx * 31 + idx / 7) % 251) as u8)
         .collect()
+}
+
+fn did_web(host: &str) -> DID {
+    DID::new("web", host)
 }
 
 async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
@@ -428,6 +434,152 @@ async fn test_check_file_object_content_ready() {
         "unexpected error for missing chunk: {:?}",
         err
     );
+}
+
+#[tokio::test]
+async fn test_get_chunklist_from_known_named_object() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("known-object.bin");
+    let file_size = CHUNK_DEFAULT_SIZE as usize + 257;
+    let file_bytes = deterministic_bytes(file_size);
+    tokio::fs::write(&file_path, &file_bytes).await.unwrap();
+
+    let store_mgr = create_test_named_mgr(temp_dir.path()).await;
+    let (file_obj, file_obj_id, _) = cacl_file_object(
+        Some(&store_mgr),
+        &file_path,
+        &FileObject::default(),
+        true,
+        &CheckMode::ByFullHash,
+        StoreMode::StoreInNamedMgr,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
+    let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
+    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+
+    let chunk_ids = get_chunklist_from_known_named_object(
+        &store_mgr,
+        &file_obj_id,
+        &serde_json::to_value(&file_obj).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(chunk_ids, expected_chunk_list.body);
+
+    store_mgr.remove_object(&chunklist_obj_id).await.unwrap();
+    let err = get_chunklist_from_known_named_object(
+        &store_mgr,
+        &file_obj_id,
+        &serde_json::to_value(&file_obj).unwrap(),
+    )
+    .await
+    .err()
+    .expect("missing chunklist object should fail");
+    assert!(
+        matches!(err, NdnError::NotFound(_)),
+        "unexpected error for missing chunklist object: {:?}",
+        err
+    );
+
+    let dir_obj = DirObject::new(Some("root".to_string()));
+    let (dir_obj_id, _) = dir_obj.gen_obj_id().unwrap();
+    let err = get_chunklist_from_known_named_object(
+        &store_mgr,
+        &dir_obj_id,
+        &serde_json::to_value(&dir_obj).unwrap(),
+    )
+    .await
+    .err()
+    .expect("dir object should fail directly");
+    assert!(
+        matches!(err, NdnError::InvalidObjType(_)),
+        "unexpected error for dir object: {:?}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn test_get_chunklist_from_msg_object_output_refs() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("msg-attachment.bin");
+    let file_size = CHUNK_DEFAULT_SIZE as usize + 129;
+    let file_bytes = deterministic_bytes(file_size);
+    tokio::fs::write(&file_path, &file_bytes).await.unwrap();
+
+    let store_mgr = create_test_named_mgr(temp_dir.path()).await;
+    let (_file_obj, file_obj_id, _) = cacl_file_object(
+        Some(&store_mgr),
+        &file_path,
+        &FileObject::default(),
+        true,
+        &CheckMode::ByFullHash,
+        StoreMode::StoreInNamedMgr,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let chunklist_obj_id = ObjId::new(
+        &serde_json::from_str::<FileObject>(&store_mgr.get_object(&file_obj_id).await.unwrap())
+            .unwrap()
+            .content,
+    )
+    .unwrap();
+    let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
+    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+
+    let msg_obj = MsgObject {
+        from: did_web("alice.example.com"),
+        to: vec![did_web("bob.example.com")],
+        kind: MsgObjKind::Deliver,
+        content: MsgContent {
+            content: "[file] msg-attachment.bin".to_string(),
+            refs: vec![RefItem {
+                role: RefRole::Output,
+                target: RefTarget::DataObj {
+                    obj_id: file_obj_id.clone(),
+                    uri_hint: None,
+                },
+                label: Some("attachment".to_string()),
+            }],
+            ..MsgContent::default()
+        },
+        ..MsgObject::default()
+    };
+    let (msg_obj_id, _) = msg_obj.gen_obj_id();
+
+    let chunk_ids = get_chunklist_from_known_named_object(
+        &store_mgr,
+        &msg_obj_id,
+        &serde_json::to_value(&msg_obj).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(chunk_ids, expected_chunk_list.body);
+
+    let text_msg = MsgObject {
+        from: did_web("alice.example.com"),
+        to: vec![did_web("bob.example.com")],
+        kind: MsgObjKind::default(),
+        content: MsgContent {
+            content: "plain text".to_string(),
+            ..MsgContent::default()
+        },
+        ..MsgObject::default()
+    };
+    let (text_msg_id, _) = text_msg.gen_obj_id();
+    let chunk_ids = get_chunklist_from_known_named_object(
+        &store_mgr,
+        &text_msg_id,
+        &serde_json::to_value(&text_msg).unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(chunk_ids.is_empty());
 }
 
 #[tokio::test]

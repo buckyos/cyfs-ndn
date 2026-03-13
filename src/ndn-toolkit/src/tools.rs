@@ -1,14 +1,17 @@
 use log::{debug, info};
 use named_store::{ChunkLocalInfo, NamedStoreMgr};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkType, DirObject, FileObject, NamedObject,
-    NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
-    SimpleChunkList, StoreMode, CHUNK_DEFAULT_SIZE,
+    caculate_qcid_from_file, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkType,
+    DirObject, FileObject, MsgObject, NamedObject, NdnAction, NdnError, NdnProgressCallback,
+    NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, SimpleChunkList, StoreMode,
+    CHUNK_DEFAULT_SIZE,
 };
 
 #[derive(PartialEq)]
@@ -590,4 +593,185 @@ pub async fn copy_dir_from_ndn_mgr(
     Err(NdnError::Unsupported(
         "copy_dir_from_ndn_mgr is unavailable after NDM refactor".to_string(),
     ))
+}
+
+async fn ensure_chunk_list_chunks_ready(
+    store_mgr: &NamedStoreMgr,
+    owner_obj_id: &ObjId,
+    chunk_list: &SimpleChunkList,
+) -> NdnResult<Vec<ChunkId>> {
+    let mut missing_chunks = Vec::new();
+    for chunk_id in chunk_list.body.iter() {
+        if !store_mgr.have_chunk(chunk_id).await {
+            missing_chunks.push(chunk_id.clone());
+        }
+    }
+
+    if !missing_chunks.is_empty() {
+        return Err(NdnError::NotFound(format!(
+            "object {} missing {} chunk(s): {}",
+            owner_obj_id,
+            missing_chunks.len(),
+            missing_chunks
+                .iter()
+                .map(|chunk_id| chunk_id.to_string())
+                .collect::<Vec<String>>()
+                .join(",")
+        )));
+    }
+
+    Ok(chunk_list.body.clone())
+}
+
+async fn load_stored_object(
+    store_mgr: &NamedStoreMgr,
+    obj_id: &ObjId,
+    owner_obj_id: &ObjId,
+) -> NdnResult<String> {
+    store_mgr.get_object(obj_id).await.map_err(|err| match err {
+        NdnError::NotFound(_) => NdnError::NotFound(format!(
+            "object {} referenced by {} not found",
+            obj_id, owner_obj_id
+        )),
+        NdnError::DbError(info) if info.contains("no rows") => NdnError::NotFound(format!(
+            "object {} referenced by {} not found",
+            obj_id, owner_obj_id
+        )),
+        other => other,
+    })
+}
+
+fn parse_known_object_json(obj_str: &str) -> NdnResult<Value> {
+    match serde_json::from_str::<Value>(obj_str) {
+        Ok(value) => Ok(value),
+        Err(_) => load_named_object_from_obj_str(obj_str),
+    }
+}
+
+#[async_recursion::async_recursion]
+async fn get_chunklist_from_known_named_object_impl(
+    store_mgr: &NamedStoreMgr,
+    obj_id: &ObjId,
+    obj_json: &Value,
+    visited_obj_ids: &mut HashSet<ObjId>,
+) -> NdnResult<Vec<ChunkId>> {
+    if !obj_id.is_chunk() && !visited_obj_ids.insert(obj_id.clone()) {
+        return Ok(Vec::new());
+    }
+
+    //dir object直接失败
+    //FileObject解析content,如果chunklist在namedsotremgr中不存在，则失败,成功把chunklist中的所有chunkid返回
+    //其它known object类推
+    if obj_id.is_dir_object() {
+        return Err(NdnError::InvalidObjType(format!(
+            "dir object {} does not have direct chunk list",
+            obj_id
+        )));
+    }
+
+    if obj_id.is_file_object() {
+        let file_obj: FileObject = serde_json::from_value(obj_json.clone()).map_err(|e| {
+            NdnError::InvalidData(format!("parse file object from json failed: {}", e))
+        })?;
+        if file_obj.content.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+        if content_obj_id.is_chunk() {
+            let chunk_id = ChunkId::from_obj_id(&content_obj_id);
+            if !store_mgr.have_chunk(&chunk_id).await {
+                return Err(NdnError::NotFound(format!(
+                    "chunk {} referenced by object {} not found",
+                    chunk_id.to_string(),
+                    obj_id
+                )));
+            }
+            return Ok(vec![chunk_id]);
+        }
+
+        if content_obj_id.is_chunk_list() {
+            let chunklist_json = load_stored_object(store_mgr, &content_obj_id, obj_id).await?;
+            let chunklist_obj_json = parse_known_object_json(chunklist_json.as_str())?;
+            return get_chunklist_from_known_named_object_impl(
+                store_mgr,
+                &content_obj_id,
+                &chunklist_obj_json,
+                visited_obj_ids,
+            )
+            .await;
+        }
+
+        return Err(NdnError::InvalidObjType(format!(
+            "file object content {} is not chunk or chunklist",
+            content_obj_id
+        )));
+    }
+
+    if obj_id.is_chunk_list() {
+        let chunk_list = SimpleChunkList::from_json_value(obj_json.clone())?;
+        return ensure_chunk_list_chunks_ready(store_mgr, obj_id, &chunk_list).await;
+    }
+
+    if obj_id.obj_type == MsgObject::get_obj_type() {
+        let msg_obj: MsgObject = serde_json::from_value(obj_json.clone()).map_err(|e| {
+            NdnError::InvalidData(format!("parse msg object from json failed: {}", e))
+        })?;
+
+        let mut chunk_ids = Vec::new();
+        for ref_item in msg_obj.content.refs.iter() {
+            if ref_item.role != RefRole::Output {
+                continue;
+            }
+
+            let RefTarget::DataObj {
+                obj_id: ref_obj_id, ..
+            } = &ref_item.target
+            else {
+                continue;
+            };
+
+            if ref_obj_id.is_chunk() {
+                let chunk_id = ChunkId::from_obj_id(ref_obj_id);
+                if !store_mgr.have_chunk(&chunk_id).await {
+                    return Err(NdnError::NotFound(format!(
+                        "chunk {} referenced by object {} not found",
+                        chunk_id.to_string(),
+                        obj_id
+                    )));
+                }
+                chunk_ids.push(chunk_id);
+                continue;
+            }
+
+            let ref_obj_str = load_stored_object(store_mgr, ref_obj_id, obj_id).await?;
+            let ref_obj_json = parse_known_object_json(ref_obj_str.as_str())?;
+            chunk_ids.extend(
+                get_chunklist_from_known_named_object_impl(
+                    store_mgr,
+                    ref_obj_id,
+                    &ref_obj_json,
+                    visited_obj_ids,
+                )
+                .await?,
+            );
+        }
+
+        return Ok(chunk_ids);
+    }
+
+    Err(NdnError::InvalidObjType(format!(
+        "object {} is not a supported known named object",
+        obj_id
+    )))
+}
+
+pub async fn get_chunklist_from_known_named_object(
+    store_mgr: &NamedStoreMgr,
+    obj_id: &ObjId,
+    obj_json: &Value,
+) -> NdnResult<Vec<ChunkId>> {
+    let mut visited_obj_ids = HashSet::new();
+    get_chunklist_from_known_named_object_impl(store_mgr, obj_id, obj_json, &mut visited_obj_ids)
+        .await
 }
