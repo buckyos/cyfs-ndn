@@ -531,6 +531,40 @@ impl PackageEnv {
         Ok(())
     }
 
+    //插入一条新的pkg_meta,注意如果meta_db不存在要自动创建
+    pub async fn set_pkg_meta_to_index_db(
+        &self,
+        meta_obj_id: &str,
+        pkg_meta: &PackageMeta,
+    ) -> PkgResult<()> {
+        if self.config.ready_only {
+            return Err(PkgError::InstallError(
+                meta_obj_id.to_owned(),
+                "Cannot update index db in read-only mode".to_owned(),
+            ));
+        }
+
+        let (expected_meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
+        if expected_meta_obj_id.to_string() != meta_obj_id {
+            return Err(PkgError::ParseError(
+                meta_obj_id.to_owned(),
+                format!(
+                    "meta obj id does not match package meta, expected {}",
+                    expected_meta_obj_id
+                ),
+            ));
+        }
+
+        let _filelock = self.acquire_lock().await?;
+        self.write_pkg_meta_to_db(meta_obj_id, &pkg_meta_str, pkg_meta)?;
+
+        info!(
+            "set_pkg_meta_to_index_db: pkg {} indexed successfully",
+            pkg_meta.get_package_id().to_string()
+        );
+        Ok(())
+    }
+
     async fn install_pkg_impl(
         &mut self,
         meta_obj_id: &str,
@@ -659,25 +693,7 @@ impl PackageEnv {
             .await?;
 
         // 将 pkg_meta 写入 meta_index.db
-        let meta_db_path = self.get_meta_db_path();
-        let meta_db = MetaIndexDb::new(meta_db_path, false)?;
-
-        // 添加包元数据
-        meta_db.add_pkg_meta(
-            &meta_obj_id.to_string(),
-            &pkg_meta_str,
-            &pkg_meta.author,
-            None,
-        )?;
-
-        // 设置包版本
-        meta_db.set_pkg_version(
-            &pkg_meta.name,
-            &pkg_meta.author,
-            &pkg_meta.version,
-            &meta_obj_id.to_string(),
-            pkg_meta.version_tag.as_deref(),
-        )?;
+        self.write_pkg_meta_to_db(&meta_obj_id.to_string(), &pkg_meta_str, &pkg_meta)?;
 
         info!(
             "install_pkg_from_local_file: pkg {} installed successfully from {}",
@@ -975,6 +991,24 @@ impl PackageEnv {
         Ok(pkg_dirs)
     }
 
+    fn write_pkg_meta_to_db(
+        &self,
+        meta_obj_id: &str,
+        pkg_meta_str: &str,
+        pkg_meta: &PackageMeta,
+    ) -> PkgResult<()> {
+        let meta_db = MetaIndexDb::new(self.get_meta_db_path(), false)?;
+        meta_db.add_pkg_meta(meta_obj_id, pkg_meta_str, &pkg_meta.author, None)?;
+        meta_db.set_pkg_version(
+            &pkg_meta.name,
+            &pkg_meta.author,
+            &pkg_meta.version,
+            meta_obj_id,
+            pkg_meta.version_tag.as_deref(),
+        )?;
+        Ok(())
+    }
+
     // 添加一个新的私有方法来管理锁文件
     async fn acquire_lock(&self) -> PkgResult<RwLockWriteGuard<File>> {
         let lock_path = self.work_dir.join("pkgs/env.lock");
@@ -1236,6 +1270,105 @@ mod tests {
                 .unwrap(),
             "hello from package"
         );
+    }
+
+    #[tokio::test]
+    async fn test_load_in_non_strict_mode_switches_from_friendly_to_strict_after_indexed() {
+        let (env, _temp) = setup_test_env().await;
+        let friendly_path = env.work_dir.join("test.pkg");
+        tokio_fs::create_dir_all(&friendly_path).await.unwrap();
+        tokio_fs::write(friendly_path.join("hello.txt"), "friendly")
+            .await
+            .unwrap();
+
+        let media_info = env.load("test.pkg").await.unwrap();
+        assert_eq!(media_info.full_path, friendly_path);
+        assert!(matches!(media_info.media_type, MediaType::Dir));
+
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
+        let strict_path = env
+            .get_pkg_strict_dir(&meta_obj_id.to_string(), &pkg_meta)
+            .unwrap();
+        tokio_fs::create_dir_all(&strict_path).await.unwrap();
+        tokio_fs::write(strict_path.join("hello.txt"), "strict")
+            .await
+            .unwrap();
+
+        let media_info = env.load("test.pkg").await.unwrap();
+        assert_eq!(media_info.full_path, strict_path);
+        assert!(matches!(media_info.media_type, MediaType::Dir));
+    }
+
+    #[tokio::test]
+    async fn test_load_by_meta_obj_id_is_exact() {
+        let (env, _temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta_v1 = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        let pkg_meta_v2 = PackageMeta::new("test.pkg", "2.0.0", "test", &owner, None);
+
+        let meta_obj_id_v1 = insert_pkg_meta_to_db(&env, &pkg_meta_v1);
+        let meta_obj_id_v2 = insert_pkg_meta_to_db(&env, &pkg_meta_v2);
+        //println!("meta_obj_id_v1: {}", meta_obj_id_v1.to_string());
+
+        let strict_path_v1 = env
+            .get_pkg_strict_dir(&meta_obj_id_v1.to_string(), &pkg_meta_v1)
+            .unwrap();
+        let strict_path_v2 = env
+            .get_pkg_strict_dir(&meta_obj_id_v2.to_string(), &pkg_meta_v2)
+            .unwrap();
+        tokio_fs::create_dir_all(&strict_path_v1).await.unwrap();
+        tokio_fs::create_dir_all(&strict_path_v2).await.unwrap();
+
+        let media_info = env
+            .load(&format!("test.pkg#{}", meta_obj_id_v1))
+            .await
+            .unwrap();
+        assert_eq!(media_info.full_path, strict_path_v1);
+        assert_ne!(media_info.full_path, strict_path_v2);
+
+        let (meta_obj_id, pkg_meta) = env
+            .get_pkg_meta(&format!("test.pkg#{}", meta_obj_id_v1.to_string()))
+            .await
+            .unwrap();
+        assert_eq!(meta_obj_id, meta_obj_id_v1.to_string());
+        assert_eq!(pkg_meta.version, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_set_pkg_meta_to_index_db_persists_meta() {
+        let (env, _temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta = PackageMeta::new("test.pkg", "1.2.3", "test", &owner, Some("stable"));
+        let (meta_obj_id, _) = pkg_meta.gen_obj_id();
+
+        env.set_pkg_meta_to_index_db(&meta_obj_id.to_string(), &pkg_meta)
+            .await
+            .unwrap();
+
+        let (stored_meta_obj_id, stored_meta) =
+            env.get_pkg_meta("test.pkg#1.2.3:stable").await.unwrap();
+        assert_eq!(stored_meta_obj_id, meta_obj_id.to_string());
+        assert_eq!(stored_meta, pkg_meta);
+    }
+
+    #[tokio::test]
+    async fn test_set_pkg_meta_to_index_db_rejects_read_only_env() {
+        let (mut env, _temp) = setup_test_env().await;
+        env.config.ready_only = true;
+
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta = PackageMeta::new("test.pkg", "1.2.3", "test", &owner, None);
+        let (meta_obj_id, _) = pkg_meta.gen_obj_id();
+
+        let err = env
+            .set_pkg_meta_to_index_db(&meta_obj_id.to_string(), &pkg_meta)
+            .await
+            .err()
+            .expect("read-only env should reject index updates");
+
+        assert!(matches!(err, PkgError::InstallError(_, _)));
     }
 
     #[tokio::test]

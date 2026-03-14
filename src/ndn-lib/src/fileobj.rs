@@ -16,7 +16,7 @@ pub struct FileObject {
     pub size: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     #[serde(default)]
-    pub content: String, //chunkid or chunklistid
+    pub content: String, //chunkid or chunklistid or empty string
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     #[serde(flatten)]

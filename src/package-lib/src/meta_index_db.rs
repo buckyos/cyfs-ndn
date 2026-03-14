@@ -29,6 +29,7 @@ use crate::meta::*;
 use crate::package_id::*;
 use chrono::Utc;
 use log::*;
+use ndn_lib::ObjId;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use semver::*;
 use serde_json::Value;
@@ -173,6 +174,9 @@ impl MetaIndexDb {
     //return metaobjid,pkg_meta
     pub fn get_pkg_meta(&self, pkg_id: &str) -> PkgResult<Option<(String, PackageMeta)>> {
         let package_id = PackageId::parse(pkg_id)?;
+        if let Some(metaobjid) = package_id.objid.as_deref() {
+            return self.get_pkg_meta_by_objid(&package_id, metaobjid);
+        }
         //let conn = Self::create_connection(&self.db_path)?;
         //let author = PackageId::get_author(&package_id.name.as_str());
 
@@ -206,6 +210,83 @@ impl MetaIndexDb {
                     version_exp.tag,
                 );
             }
+        }
+    }
+
+    fn get_pkg_meta_by_objid(
+        &self,
+        package_id: &PackageId,
+        metaobjid: &str,
+    ) -> PkgResult<Option<(String, PackageMeta)>> {
+        let conn = Self::create_connection(&self.db_path)?;
+        for candidate in Self::metaobjid_candidates(metaobjid) {
+            let pkg_meta_str = conn
+                .query_row(
+                    "SELECT pkg_meta FROM pkg_metas WHERE metaobjid = ?",
+                    params![candidate],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| PkgError::SqlError(e.to_string()))?;
+
+            let Some(pkg_meta_str) = pkg_meta_str else {
+                continue;
+            };
+
+            let pkg_meta = PackageMeta::from_str(pkg_meta_str.as_str())?;
+            if !Self::pkg_meta_matches_package_id(package_id, &pkg_meta) {
+                return Ok(None);
+            }
+
+            return Ok(Some((candidate, pkg_meta)));
+        }
+
+        Ok(None)
+    }
+
+    fn metaobjid_candidates(metaobjid: &str) -> Vec<String> {
+        let mut candidates = Vec::new();
+        candidates.push(metaobjid.to_string());
+
+        if let Ok(objid) = ObjId::new(metaobjid) {
+            let hex = objid.to_string();
+            if !candidates.contains(&hex) {
+                candidates.push(hex);
+            }
+
+            let base32 = objid.to_base32();
+            if !candidates.contains(&base32) {
+                candidates.push(base32);
+            }
+        }
+
+        candidates
+    }
+
+    fn pkg_meta_matches_package_id(package_id: &PackageId, pkg_meta: &PackageMeta) -> bool {
+        if pkg_meta.name != package_id.name {
+            return false;
+        }
+
+        let Some(version_exp) = &package_id.version_exp else {
+            return true;
+        };
+
+        if let Some(tag) = version_exp.tag.as_deref() {
+            if pkg_meta.version_tag.as_deref() != Some(tag) {
+                return false;
+            }
+        }
+
+        match &version_exp.version_exp {
+            VersionExpType::None => true,
+            VersionExpType::Version(version) => {
+                VersionExp::compare_versions(&pkg_meta.version, &version.to_string())
+                    == std::cmp::Ordering::Equal
+            }
+            VersionExpType::Req(req) => Version::parse(&pkg_meta.version)
+                .map(|version| req.matches(&version))
+                .unwrap_or(false),
         }
     }
 
@@ -981,6 +1062,21 @@ mod tests {
         assert!(beta_version.is_some());
         let (metaobjid, pkg_meta) = beta_version.unwrap();
         assert_eq!(metaobjid, "meta3");
+
+        let exact_by_objid = meta_db.get_pkg_meta("test-pkg#meta2")?;
+        assert!(exact_by_objid.is_some());
+        let (metaobjid, pkg_meta) = exact_by_objid.unwrap();
+        assert_eq!(metaobjid, "meta2");
+        assert_eq!(pkg_meta.version, "1.1.0");
+
+        let exact_by_version_and_objid = meta_db.get_pkg_meta("test-pkg#1.1.0#meta2")?;
+        assert!(exact_by_version_and_objid.is_some());
+        let (metaobjid, pkg_meta) = exact_by_version_and_objid.unwrap();
+        assert_eq!(metaobjid, "meta2");
+        assert_eq!(pkg_meta.version, "1.1.0");
+
+        let mismatch = meta_db.get_pkg_meta("test-pkg#2.0.0#meta2")?;
+        assert!(mismatch.is_none());
 
         Ok(())
     }
