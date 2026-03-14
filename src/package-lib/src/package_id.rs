@@ -379,36 +379,41 @@ impl PackageId {
         the_pkg_id.get_unique_name()
     }
 
-    pub fn get_pkgid_with_objid(pkg_id: &str, pkg_obj_id: Option<&str>) -> PkgResult<String> {
+    pub fn get_pkgid_with_objid(pkg_id: &str, pkg_obj_id: Option<ObjId>) -> PkgResult<String> {
         let Some(pkg_obj_id) = pkg_obj_id else {
             return Ok(pkg_id.to_string());
         };
+        let normalized_objid = pkg_obj_id.to_string();
 
         let the_pkg_id = PackageId::parse(pkg_id);
         if let Ok(mut the_pkg_id) = the_pkg_id {
             if let Some(existing_objid) = the_pkg_id.objid.as_deref() {
-                if existing_objid != pkg_obj_id {
+                let same_objid = ObjId::new(existing_objid)
+                    .map(|existing| existing == pkg_obj_id)
+                    .unwrap_or_else(|_| existing_objid == normalized_objid);
+                if !same_objid {
                     return Err(PkgError::ParseError(
                         pkg_id.to_string(),
                         format!(
                             "pkg obj id mismatch: existing {} != provided {}",
-                            existing_objid, pkg_obj_id
+                            existing_objid, normalized_objid
                         ),
                     ));
                 }
                 the_pkg_id.version_exp = None;
+                the_pkg_id.objid = Some(normalized_objid);
                 return Ok(the_pkg_id.to_string());
             }
             the_pkg_id.version_exp = None;
-            the_pkg_id.objid = Some(pkg_obj_id.to_string());
+            the_pkg_id.objid = Some(normalized_objid);
             return Ok(the_pkg_id.to_string());
         }
 
         if pkg_id.is_empty() {
-            return Ok(format!("#{}", pkg_obj_id));
+            return Ok(format!("#{}", normalized_objid));
         }
 
-        Ok(format!("{}#{}", pkg_id, pkg_obj_id))
+        Ok(format!("{}#{}", pkg_id, normalized_objid))
     }
 
     pub fn get_unique_name(&self) -> String {
@@ -481,6 +486,14 @@ mod tests {
         "pkg:bcc479e2547e3ce5c6805ec12cffdb460e2f5856dda3ec600e27f0de570e248a";
     const VALID_OBJID_2: &str =
         "pkg:acc479e2547e3ce5c6805ec12cffdb460e2f5856dda3ec600e27f0de570e248a";
+
+    fn objid_1() -> ObjId {
+        ObjId::new(VALID_OBJID_1).unwrap()
+    }
+
+    fn objid_2() -> ObjId {
+        ObjId::new(VALID_OBJID_2).unwrap()
+    }
 
     #[test]
     fn test_parse() {
@@ -577,34 +590,30 @@ mod tests {
     fn test_get_pkgid_with_objid() {
         assert_eq!(PackageId::get_pkgid_with_objid("a", None).unwrap(), "a");
         assert_eq!(
-            PackageId::get_pkgid_with_objid("bb.a#0.5.1", Some(VALID_OBJID_1)).unwrap(),
+            PackageId::get_pkgid_with_objid("bb.a#0.5.1", Some(objid_1())).unwrap(),
             format!("bb.a#{}", VALID_OBJID_1)
         );
         assert_eq!(
-            PackageId::get_pkgid_with_objid("a#1.0.0", Some(VALID_OBJID_1)).unwrap(),
+            PackageId::get_pkgid_with_objid("a#1.0.0", Some(objid_1())).unwrap(),
             format!("a#{}", VALID_OBJID_1)
         );
         assert_eq!(
-            PackageId::get_pkgid_with_objid(&format!("a#{}", VALID_OBJID_1), Some(VALID_OBJID_1))
+            PackageId::get_pkgid_with_objid(&format!("a#{}", VALID_OBJID_1), Some(objid_1()))
                 .unwrap(),
             format!("a#{}", VALID_OBJID_1)
         );
         assert_eq!(
-            PackageId::get_pkgid_with_objid(
-                &format!("a#1.0.0#{}", VALID_OBJID_1),
-                Some(VALID_OBJID_1)
-            )
-            .unwrap(),
+            PackageId::get_pkgid_with_objid(&format!("a#1.0.0#{}", VALID_OBJID_1), Some(objid_1()))
+                .unwrap(),
             format!("a#{}", VALID_OBJID_1)
         );
-        assert!(PackageId::get_pkgid_with_objid(
-            &format!("a#{}", VALID_OBJID_1),
-            Some(VALID_OBJID_2)
-        )
-        .is_err());
+        assert!(
+            PackageId::get_pkgid_with_objid(&format!("a#{}", VALID_OBJID_1), Some(objid_2()))
+                .is_err()
+        );
         assert!(PackageId::get_pkgid_with_objid(
             &format!("a#1.0.0#{}", VALID_OBJID_1),
-            Some(VALID_OBJID_2)
+            Some(objid_2())
         )
         .is_err());
     }
