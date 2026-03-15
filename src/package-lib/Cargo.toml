@@ -17,7 +17,7 @@ futures = { workspace = true }
 regex = "*"
 async-recursion = "*"
 version-compare = "*"
-semver = "*"
+semver = "1"
 toml = "*"
 chrono = { workspace = true }
 serde = { workspace = true }

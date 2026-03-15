@@ -35,3 +35,4 @@ rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", 
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 casbin = { version = "2.9", features = ["logging","explain"] }
 lazy_static = "1.5"
+rand = "0.8.5"
