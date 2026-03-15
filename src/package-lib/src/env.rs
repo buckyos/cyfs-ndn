@@ -1139,6 +1139,55 @@ mod tests {
         archive_path
     }
 
+    async fn create_test_store_config(base_dir: &Path) -> PathBuf {
+        let config_path = base_dir.join("named_store_config.json");
+        let config = serde_json::json!({
+            "epoch": 1,
+            "stores": [
+                {
+                    "path": "named_store",
+                    "readonly": false,
+                    "enabled": true,
+                    "weight": 1
+                }
+            ]
+        });
+        tokio_fs::write(&config_path, serde_json::to_vec(&config).unwrap())
+            .await
+            .unwrap();
+        config_path
+    }
+
+    async fn create_installable_test_pkg(
+        env: &mut PackageEnv,
+        base_dir: &Path,
+        pkg_name: &str,
+        version: &str,
+    ) -> PackageMeta {
+        let store_mgr = create_test_store_mgr(base_dir).await;
+        let store_config_path = create_test_store_config(base_dir).await;
+        env.config.named_store_config_path = Some(store_config_path.to_string_lossy().to_string());
+
+        let archive_path = create_test_pkg_archive(base_dir).await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut pkg_meta = PackageMeta::new(pkg_name, version, "test", &owner, None);
+        let (file_obj, _, _) = cacl_file_object(
+            Some(&store_mgr),
+            &archive_path,
+            &pkg_meta._base,
+            false,
+            &CheckMode::ByFullHash,
+            StoreMode::StoreInNamedMgr,
+            None,
+        )
+        .await
+        .unwrap();
+        pkg_meta.size = file_obj.size;
+        pkg_meta.content = file_obj.content;
+
+        pkg_meta
+    }
+
     fn insert_pkg_meta_to_db(env: &PackageEnv, pkg_meta: &PackageMeta) -> ObjId {
         let meta_db = MetaIndexDb::new(env.get_meta_db_path(), false).unwrap();
         let (meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
@@ -1274,7 +1323,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_in_non_strict_mode_switches_from_friendly_to_strict_after_indexed() {
-        let (env, _temp) = setup_test_env().await;
+        let (mut env, temp) = setup_test_env().await;
         let friendly_path = env.work_dir.join("test.pkg");
         tokio_fs::create_dir_all(&friendly_path).await.unwrap();
         tokio_fs::write(friendly_path.join("hello.txt"), "friendly")
@@ -1285,20 +1334,36 @@ mod tests {
         assert_eq!(media_info.full_path, friendly_path);
         assert!(matches!(media_info.media_type, MediaType::Dir));
 
-        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
-        let pkg_meta = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+
+
+        let pkg_meta =
+            create_installable_test_pkg(&mut env, temp.path(), "test.pkg", "1.0.1").await;
+        let (meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
+        let get_result = env.get_pkg_meta(&format!("test.pkg#{}", meta_obj_id.to_string())).await;
+        assert!(get_result.is_err());
+        println!("get_result: {:?}", get_result);
+
+        
         let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
         let strict_path = env
             .get_pkg_strict_dir(&meta_obj_id.to_string(), &pkg_meta)
             .unwrap();
-        tokio_fs::create_dir_all(&strict_path).await.unwrap();
-        tokio_fs::write(strict_path.join("hello.txt"), "strict")
+
+        let installed_meta_obj_id = env
+            .install_pkg("test.pkg#1.0.1", false, false)
             .await
             .unwrap();
+        assert_eq!(installed_meta_obj_id, meta_obj_id.to_string());
 
         let media_info = env.load("test.pkg").await.unwrap();
         assert_eq!(media_info.full_path, strict_path);
         assert!(matches!(media_info.media_type, MediaType::Dir));
+        assert_eq!(
+            tokio_fs::read_to_string(media_info.full_path.join("bin/hello.txt"))
+                .await
+                .unwrap(),
+            "hello from package"
+        );
     }
 
     #[tokio::test]
