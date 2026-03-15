@@ -1,6 +1,6 @@
 [package]
 name = "named_store"
-version = "0.5.1"
+version.workspace = true
 edition = "2021"
 
 [dependencies]
@@ -19,4 +19,3 @@ buckyos-kit = {workspace = true}
 
 [dev-dependencies]
 tempfile = "3"
-

@@ -13,6 +13,9 @@ members = [
     "./ndn-toolkit"
 ]
 
+[workspace.package]
+version = "0.6.0"
+
 [workspace.dependencies]
 log = "0.4"
 # Pin to 1.x to avoid pulling both thiserror v1 and v2.
