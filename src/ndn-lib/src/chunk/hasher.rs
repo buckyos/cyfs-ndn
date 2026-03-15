@@ -1,4 +1,6 @@
-use super::chunk::{ChunkId,ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SIZE, QCID_HASH_PIECE_SIZE};
+use super::chunk::{
+    ChunkId, ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SIZE, QCID_HASH_PIECE_SIZE,
+};
 use crate::hash::DEFAULT_HASH_METHOD;
 use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult, MIN_QCID_FILE_SIZE};
 use sha2::{Digest, Sha256};
@@ -8,7 +10,16 @@ use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
 
 // 添加类型别名来简化 copy_chunk 的签名
-pub type ChunkProgressCallback = Option<Box<dyn FnMut(ChunkId, u64, &Option<ChunkHasher>) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>> + Send>>;
+pub type ChunkProgressCallback = Option<
+    Box<
+        dyn FnMut(
+                ChunkId,
+                u64,
+                &Option<ChunkHasher>,
+            ) -> Pin<Box<dyn Future<Output = NdnResult<()>> + Send + 'static>>
+            + Send,
+    >,
+>;
 
 pub struct ChunkHasher {
     pub hash_method: HashMethod,
@@ -24,7 +35,7 @@ impl ChunkHasher {
             Some(ht) => HashMethod::from_str(ht)?,
             None => HashMethod::default(),
         };
-        
+
         let hasher = HashHelper::create_hasher(hash_method)?;
 
         Ok(Self {
@@ -120,7 +131,7 @@ impl ChunkHasher {
         mut self,
         reader: &mut T,
         cacl_len: u64,
-    ) -> NdnResult<(Vec<u8>, u64)> {        
+    ) -> NdnResult<(Vec<u8>, u64)> {
         let mut total_read = 0;
         loop {
             let mut buffer_len = cacl_len - total_read;
@@ -184,7 +195,11 @@ impl ChunkHasher {
     pub fn finalize_mix_chunk_id(self) -> NdnResult<ChunkId> {
         let hash_result = self.hasher.finalize();
         let chunk_type = ChunkType::from_hash_type(self.hash_method, true)?;
-        Ok(ChunkId::from_mix_hash_result(self.hash_length, &hash_result, chunk_type))
+        Ok(ChunkId::from_mix_hash_result(
+            self.hash_length,
+            &hash_result,
+            chunk_type,
+        ))
     }
 }
 
@@ -261,9 +276,12 @@ pub async fn calc_quick_hash_by_buffer(
     hasher.update(buffer_end);
     let hash_result = hasher.finalize();
 
-    Ok(ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID))
+    Ok(ChunkId::from_mix_hash_result(
+        length,
+        &hash_result,
+        ChunkType::QCID,
+    ))
 }
-
 
 pub async fn calculate_file_chunk_id(
     file_path: &str,
@@ -278,7 +296,7 @@ pub async fn calculate_file_chunk_id(
         );
         NdnError::IoError(err.to_string())
     })?;
-    
+
     let mut hasher = ChunkHasher::new_with_hash_method(hash_method)?;
     let (hash_result, file_size) = hasher.calc_from_reader(&mut file_reader).await?;
     if chunk_type.is_mix() {
@@ -292,7 +310,10 @@ pub async fn calculate_file_chunk_id(
 
 pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<ChunkId> {
     let mut file_reader = tokio::fs::File::open(file_path).await.map_err(|err| {
-        warn!("caculate_qcid_from_file: open file failed! {}", err.to_string());
+        warn!(
+            "caculate_qcid_from_file: open file failed! {}",
+            err.to_string()
+        );
         NdnError::IoError(err.to_string())
     })?;
     let qcid = calc_quick_hash(&mut file_reader, None).await?;
@@ -350,7 +371,7 @@ where
         } else {
             result_chunk_id = hasher.finalize_chunk_id();
         }
-        
+
         if result_chunk_id != chunk_id {
             return Err(NdnError::VerifyError(format!(
                 "copy chunk hash mismatch:{}",

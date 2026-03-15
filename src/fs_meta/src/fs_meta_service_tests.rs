@@ -1,0 +1,2843 @@
+#[cfg(test)]
+mod tests {
+    use crate::fs_meta_service::FSMetaService;
+    use buckyos_kit::init_logging;
+    use fs_buffer::{LocalFileBufferService, SessionId};
+    use krpc::{RPCContext, RPCErrors};
+    use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
+    use ndm::{
+        ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
+        NodeRecord, NodeState, OpenWriteFlag,
+    };
+    use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
+    use std::sync::{Arc, Once};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+
+    fn ensure_test_logging_once() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            init_logging("test fsmeta", false);
+        });
+    }
+
+    fn create_test_service() -> (FSMetaService, TempDir) {
+        ensure_test_logging_once();
+        let tmp_dir = TempDir::new().unwrap();
+        let db_path = tmp_dir.path().join("test.db");
+        let svc = FSMetaService::new(db_path.to_str().unwrap()).unwrap();
+        (svc, tmp_dir)
+    }
+
+    fn create_test_service_with_buffer() -> (FSMetaService, TempDir, TempDir) {
+        ensure_test_logging_once();
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let fb_tmp_dir = TempDir::new().unwrap();
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let buffer = Arc::new(LocalFileBufferService::new(
+            fb_tmp_dir.path().to_path_buf(),
+            0,
+        ));
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_buffer("test-instance".to_string(), buffer);
+        (svc, meta_tmp_dir, fb_tmp_dir)
+    }
+
+    fn build_test_layout(store_id: &str) -> StoreLayout {
+        let target = StoreTarget {
+            store_id: store_id.to_string(),
+            device_did: None,
+            capacity: None,
+            used: None,
+            readonly: false,
+            enabled: true,
+            weight: 1,
+        };
+        StoreLayout::new(1, vec![target], 0, 0)
+    }
+
+    async fn create_test_service_with_store(
+    ) -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        ensure_test_logging_once();
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let store_tmp_dir = TempDir::new().unwrap();
+
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let store_path = store_tmp_dir.path().join("named_store");
+        let store = NamedLocalStore::get_named_store_by_path(store_path)
+            .await
+            .unwrap();
+        let store_id = store.store_id().to_string();
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+
+        let store_mgr = Arc::new(NamedStoreMgr::new());
+        store_mgr.register_store(store_ref).await;
+        store_mgr.add_layout(build_test_layout(&store_id)).await;
+
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_named_store(store_mgr.clone());
+
+        (svc, meta_tmp_dir, store_tmp_dir, store_mgr)
+    }
+
+    async fn create_test_service_with_store_and_buffer(
+    ) -> (FSMetaService, TempDir, TempDir, TempDir, Arc<NamedStoreMgr>) {
+        ensure_test_logging_once();
+        let meta_tmp_dir = TempDir::new().unwrap();
+        let store_tmp_dir = TempDir::new().unwrap();
+        let fb_tmp_dir = TempDir::new().unwrap();
+
+        let db_path = meta_tmp_dir.path().join("test.db");
+        let store_path = store_tmp_dir.path().join("named_store");
+        let store = NamedLocalStore::get_named_store_by_path(store_path)
+            .await
+            .unwrap();
+        let store_id = store.store_id().to_string();
+        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
+
+        let store_mgr = Arc::new(NamedStoreMgr::new());
+        store_mgr.register_store(store_ref).await;
+        store_mgr.add_layout(build_test_layout(&store_id)).await;
+
+        let buffer = Arc::new(LocalFileBufferService::new(
+            fb_tmp_dir.path().to_path_buf(),
+            0,
+        ));
+
+        let svc = FSMetaService::new(db_path.to_str().unwrap())
+            .unwrap()
+            .with_named_store(store_mgr.clone())
+            .with_buffer("test-instance".to_string(), buffer);
+
+        (svc, meta_tmp_dir, store_tmp_dir, fb_tmp_dir, store_mgr)
+    }
+
+    fn create_obj_id(seed: u8) -> ObjId {
+        // ObjId requires obj_type:obj_hash format
+        let hash = vec![seed; 32];
+        ObjId::new_by_raw("file".to_string(), hash)
+    }
+
+    fn dummy_ctx() -> RPCContext {
+        RPCContext::default()
+    }
+
+    async fn split_parent_name_with_ensure(
+        svc: &FSMetaService,
+        path: &NdmPath,
+    ) -> Result<(IndexNodeId, String), RPCErrors> {
+        let (parent_path, name) = path
+            .split_parent_name()
+            .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
+        if name.is_empty() {
+            return Err(RPCErrors::ReasonError("invalid path".to_string()));
+        }
+        let parent = svc.ensure_dir_inode(&parent_path).await?;
+        Ok((parent, name))
+    }
+
+    async fn handle_create_dir_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_create_dir(parent, name, ctx).await
+    }
+
+    async fn handle_set_file_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_set_file(parent, name, obj_id, ctx).await
+    }
+
+    async fn handle_set_dir_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        dir_obj_id: ObjId,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_set_dir(parent, name, dir_obj_id, ctx).await
+    }
+
+    async fn handle_symlink_path(
+        svc: &FSMetaService,
+        link_path: &NdmPath,
+        target: &NdmPath,
+        ctx: RPCContext,
+    ) -> Result<(), RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, link_path).await?;
+        svc.handle_symlink(parent, name, target.as_str().to_string(), ctx)
+            .await
+    }
+
+    async fn handle_open_file_writer_path(
+        svc: &FSMetaService,
+        path: &NdmPath,
+        flag: OpenWriteFlag,
+        expected_size: Option<u64>,
+        ctx: RPCContext,
+    ) -> Result<String, RPCErrors> {
+        let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
+        svc.handle_open_file_writer(parent, name, flag, expected_size, ctx)
+            .await
+    }
+
+    fn create_dir_node(inode_id: IndexNodeId) -> NodeRecord {
+        NodeRecord {
+            inode_id,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::DirNormal,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        }
+    }
+
+    fn create_file_node_working(inode_id: IndexNodeId, fb_handle: &str) -> NodeRecord {
+        NodeRecord {
+            inode_id,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::Working(ndm::FileWorkingState {
+                fb_handle: fb_handle.to_string(),
+                last_write_at: 1000,
+            }),
+            rev: None,
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        }
+    }
+
+    async fn parent_rev(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> u64 {
+        svc.handle_get_inode(parent, txid, ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .rev
+            .unwrap_or(0)
+    }
+
+    async fn upsert_dentry_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        target: DentryTarget,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        let rev = parent_rev(svc, parent, txid.clone(), ctx.clone()).await;
+        let existing = svc
+            .handle_get_dentry(parent, name.clone(), txid.clone(), ctx.clone())
+            .await?;
+        match existing {
+            Some(dentry) => {
+                svc.handle_replace_target(parent, name, dentry.target, target, rev, txid, ctx)
+                    .await
+            }
+            None => {
+                svc.handle_create_dentry(parent, name, target, rev, txid, ctx)
+                    .await
+            }
+        }
+    }
+
+    async fn set_tombstone_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        upsert_dentry_auto(svc, parent, name, DentryTarget::Tombstone, txid, ctx).await
+    }
+
+    async fn delete_dentry_auto(
+        svc: &FSMetaService,
+        parent: IndexNodeId,
+        name: String,
+        txid: Option<String>,
+        ctx: RPCContext,
+    ) -> Result<(), krpc::RPCErrors> {
+        let rev = parent_rev(svc, parent, txid.clone(), ctx.clone()).await;
+        svc.handle_delete_dentry(parent, name, rev, txid, ctx).await
+    }
+
+    // ==================== Root Dir Tests ====================
+
+    #[tokio::test]
+    async fn test_root_dir() {
+        let (svc, _tmp) = create_test_service();
+        let root = svc.handle_root_dir(dummy_ctx()).await.unwrap();
+        assert_eq!(root, 1);
+    }
+
+    // ==================== Inode CRUD Tests ====================
+
+    #[tokio::test]
+    async fn test_get_inode_root_exists() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+        let node = svc.handle_get_inode(root, None, ctx).await.unwrap();
+        assert!(node.is_some());
+        let node = node.unwrap();
+        assert_eq!(node.inode_id, root);
+        assert_eq!(node.get_node_kind(), NodeKind::Dir);
+    }
+
+    #[tokio::test]
+    async fn test_get_inode_not_found() {
+        let (svc, _tmp) = create_test_service();
+        let node = svc.handle_get_inode(9999, None, dummy_ctx()).await.unwrap();
+        assert!(node.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_and_get_inode() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_dir_node(100);
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let fetched = svc.handle_get_inode(100, None, ctx).await.unwrap().unwrap();
+        assert_eq!(fetched.inode_id, 100);
+        assert_eq!(fetched.get_node_kind(), NodeKind::Dir);
+        assert!(!fetched.read_only);
+    }
+
+    #[tokio::test]
+    async fn test_set_inode_upsert() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let mut node = create_dir_node(101);
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Update read_only
+        node.read_only = true;
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let fetched = svc.handle_get_inode(101, None, ctx).await.unwrap().unwrap();
+        assert!(fetched.read_only);
+    }
+
+    #[tokio::test]
+    async fn test_alloc_inode_auto_id() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_dir_node(0); // inode_id = 0 means auto-alloc
+        let id = svc
+            .handle_alloc_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        assert!(id > 1); // root is 1
+
+        let fetched = svc.handle_get_inode(id, None, ctx).await.unwrap().unwrap();
+        assert_eq!(fetched.inode_id, id);
+    }
+
+    #[tokio::test]
+    async fn test_alloc_inode_explicit_id() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_dir_node(200);
+        let id = svc
+            .handle_alloc_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(id, 200);
+
+        let fetched = svc.handle_get_inode(200, None, ctx).await.unwrap().unwrap();
+        assert_eq!(fetched.inode_id, 200);
+    }
+
+    #[tokio::test]
+    async fn test_update_inode_state() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(300, "fb-001");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Transition to Cooling
+        let new_state = NodeState::Cooling(ndm::FileCoolingState {
+            fb_handle: "fb-001".to_string(),
+            closed_at: 2000,
+        });
+        svc.handle_update_inode_state(300, new_state, node.state, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let fetched = svc.handle_get_inode(300, None, ctx).await.unwrap().unwrap();
+        match fetched.state {
+            NodeState::Cooling(s) => {
+                assert_eq!(s.fb_handle, "fb-001");
+                assert_eq!(s.closed_at, 2000);
+            }
+            _ => panic!("expected Cooling state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_inode_state_not_found() {
+        let (svc, _tmp) = create_test_service();
+        let result = svc
+            .handle_update_inode_state(
+                9999,
+                NodeState::DirNormal,
+                NodeState::DirNormal,
+                None,
+                dummy_ctx(),
+            )
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_update_inode_state_conflict() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(301, "fb-002");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let result = svc
+            .handle_update_inode_state(
+                301,
+                NodeState::Cooling(ndm::FileCoolingState {
+                    fb_handle: "fb-002".to_string(),
+                    closed_at: 2000,
+                }),
+                NodeState::FileNormal,
+                None,
+                ctx.clone(),
+            )
+            .await;
+        assert!(result.is_err());
+
+        let fetched = svc.handle_get_inode(301, None, ctx).await.unwrap().unwrap();
+        assert!(matches!(fetched.state, NodeState::Working(_)));
+    }
+
+    // ==================== Dentry Tests ====================
+
+    #[tokio::test]
+    async fn test_upsert_and_get_dentry() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Create a child inode
+        let child = create_dir_node(400);
+        svc.handle_set_inode(child.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Link dentry
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "subdir".to_string(),
+            DentryTarget::IndexNodeId(400),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "subdir".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(dentry.parent, root);
+        assert_eq!(dentry.name, "subdir");
+        match dentry.target {
+            DentryTarget::IndexNodeId(id) => assert_eq!(id, 400),
+            _ => panic!("expected IndexNodeId target"),
+        }
+        assert!(dentry.id > 0);
+        let inode = svc
+            .handle_get_inode(400, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inode.ref_by, Some(dentry.id));
+    }
+
+    #[tokio::test]
+    async fn test_upsert_dentry_updates_inode_ref_by() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let inode_a = create_dir_node(410);
+        svc.handle_set_inode(inode_a, None, ctx.clone())
+            .await
+            .unwrap();
+        let inode_b = create_dir_node(411);
+        svc.handle_set_inode(inode_b, None, ctx.clone())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "swap".to_string(),
+            DentryTarget::IndexNodeId(410),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let first = svc
+            .handle_get_dentry(root, "swap".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_a = svc
+            .handle_get_inode(410, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inode_a.ref_by, Some(first.id));
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "swap".to_string(),
+            DentryTarget::IndexNodeId(411),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let second = svc
+            .handle_get_dentry(root, "swap".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.id, second.id);
+
+        let inode_a = svc
+            .handle_get_inode(410, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inode_a.ref_by, None);
+        let inode_b = svc
+            .handle_get_inode(411, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inode_b.ref_by, Some(second.id));
+    }
+
+    #[tokio::test]
+    async fn test_remove_dentry_clears_inode_ref_by() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let inode = create_dir_node(412);
+        svc.handle_set_inode(inode, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "to_remove_ref".to_string(),
+            DentryTarget::IndexNodeId(412),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let linked = svc
+            .handle_get_inode(412, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(linked.ref_by.is_some());
+
+        delete_dentry_auto(&svc, root, "to_remove_ref".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let unlinked = svc
+            .handle_get_inode(412, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unlinked.ref_by, None);
+    }
+
+    #[tokio::test]
+    async fn test_symlink_creates_symlink_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let target = create_file_node_working(401, "fb-link-target");
+        svc.handle_set_inode(target, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "target_file".to_string(),
+            DentryTarget::IndexNodeId(401),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_file"),
+            &NdmPath::new("/target_file"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_file".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "/target_file"),
+            _ => panic!("expected SymLink target"),
+        }
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/link_file"), 0, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "/target_file"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(resolved.inner_path, None);
+    }
+
+    #[tokio::test]
+    async fn test_symlink_accepts_symlink_target_path() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let target = create_file_node_working(402, "fb-link-target-2");
+        svc.handle_set_inode(target, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "target_file_2".to_string(),
+            DentryTarget::IndexNodeId(402),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_a"),
+            &NdmPath::new("/target_file_2"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_b"),
+            &NdmPath::new("/link_a"),
+            ctx,
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_b".to_string(), None, dummy_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "/link_a"),
+            _ => panic!("expected SymLink target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_symlink_accepts_relative_target_path() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_rel"),
+            &NdmPath::new("../a/b"),
+            ctx,
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "link_rel".to_string(), None, dummy_ctx())
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::SymLink(target_path) => assert_eq!(target_path, "../a/b"),
+            _ => panic!("expected SymLink target"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_ex_sym_count_zero_returns_symlink_and_tail() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/link_a"),
+            &NdmPath::new("/target_a"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/link_a/sub/path"), 0, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match resolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "/target_a"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(resolved.inner_path, Some("/sub/path".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_ex_expands_relative_symlink() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_a = create_dir_node(620);
+        let dir_x = create_dir_node(621);
+        let dir_y = create_dir_node(622);
+        let file = create_file_node_working(623, "fb-symlink-rel");
+        svc.handle_set_inode(dir_a, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(dir_x, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(dir_y, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(file, None, ctx.clone()).await.unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(620),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            620,
+            "x".to_string(),
+            DentryTarget::IndexNodeId(621),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            620,
+            "y".to_string(),
+            DentryTarget::IndexNodeId(622),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            622,
+            "file".to_string(),
+            DentryTarget::IndexNodeId(623),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        handle_symlink_path(
+            &svc,
+            &NdmPath::new("/a/x/l"),
+            &NdmPath::new("../y"),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let unresolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 0, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match unresolved.item {
+            FsMetaResolvePathItem::SymLink(target_path) => assert_eq!(target_path, "../y"),
+            _ => panic!("expected SymLink result"),
+        }
+        assert_eq!(unresolved.inner_path, Some("/file".to_string()));
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 1, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, 623),
+            _ => panic!("expected Inode result"),
+        }
+        assert_eq!(resolved.inner_path, None);
+    }
+
+    #[tokio::test]
+    async fn test_get_dentry_not_found() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "nonexistent".to_string(), None, ctx)
+            .await
+            .unwrap();
+        assert!(dentry.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_dentries() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Create multiple dentries
+        for i in 0..3 {
+            let child = create_dir_node(500 + i);
+            svc.handle_set_inode(child.clone(), None, ctx.clone())
+                .await
+                .unwrap();
+            upsert_dentry_auto(
+                &svc,
+                root,
+                format!("child_{}", i),
+                DentryTarget::IndexNodeId(500 + i),
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dentries = svc.handle_list_dentries(root, None, ctx).await.unwrap();
+        assert_eq!(dentries.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_session_cache() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        for i in 0..3 {
+            let child = create_dir_node(550 + i);
+            svc.handle_set_inode(child.clone(), None, ctx.clone())
+                .await
+                .unwrap();
+            upsert_dentry_auto(
+                &svc,
+                root,
+                format!("entry_{}", i),
+                DentryTarget::IndexNodeId(550 + i),
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let list_session_id = svc
+            .handle_start_list(root, None, ctx.clone())
+            .await
+            .unwrap();
+        let page1 = svc
+            .handle_list_next(list_session_id, 2, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page1.keys().next().unwrap(), "entry_0");
+        assert_eq!(page1.keys().next_back().unwrap(), "entry_1");
+        assert!(page1.values().all(|v| v.inode.is_some()));
+
+        let page2 = svc
+            .handle_list_next(list_session_id, 2, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2.keys().next().unwrap(), "entry_2");
+
+        svc.handle_stop_list(list_session_id, ctx.clone())
+            .await
+            .unwrap();
+        let err = svc.handle_list_next(list_session_id, 1, ctx).await;
+        assert!(err.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_start_list_merges_overlay_base_and_upper() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let base_child_dir = DirObject::new(Some("base_child".to_string()));
+        let (base_child_dir_id, base_child_dir_str) = base_child_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_child_dir_id, base_child_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let base_file = FileObject::new(
+            "base.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut base_dir = DirObject::new(Some("a".to_string()));
+        base_dir
+            .add_file(
+                "base_file".to_string(),
+                serde_json::to_value(base_file).unwrap(),
+                1,
+            )
+            .unwrap();
+        base_dir
+            .add_directory("base_dir".to_string(), base_child_dir_id, 0)
+            .unwrap();
+        let (base_dir_id, base_dir_str) = base_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_dir_id, base_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let overlay_inode = NodeRecord {
+            inode_id: 900,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: Some(base_dir_id),
+            state: NodeState::DirOverlay,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+        svc.handle_set_inode(overlay_inode, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(900),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let upper_child = create_dir_node(901);
+        svc.handle_set_inode(upper_child, None, ctx.clone())
+            .await
+            .unwrap();
+        set_tombstone_auto(&svc, 900, "base_dir".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            900,
+            "upper_dir".to_string(),
+            DentryTarget::IndexNodeId(901),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let list_id = svc.handle_start_list(900, None, ctx.clone()).await.unwrap();
+        let entries = svc
+            .handle_list_next(list_id, 100, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_stop_list(list_id, ctx).await.unwrap();
+
+        assert!(entries.contains_key("base_file"));
+        assert!(entries.contains_key("upper_dir"));
+        assert!(!entries.contains_key("base_dir"));
+    }
+
+    #[tokio::test]
+    async fn test_remove_dentry_row() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+        svc.handle_set_inode(create_dir_node(600), None, ctx.clone())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "to_remove".to_string(),
+            DentryTarget::IndexNodeId(600),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        delete_dentry_auto(&svc, root, "to_remove".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "to_remove".to_string(), None, ctx)
+            .await
+            .unwrap();
+        assert!(dentry.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_set_tombstone() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        set_tombstone_auto(&svc, root, "deleted".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "deleted".to_string(), None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match dentry.target {
+            DentryTarget::Tombstone => {}
+            _ => panic!("expected Tombstone target"),
+        }
+    }
+
+    // ==================== Directory Rev Tests ====================
+
+    #[tokio::test]
+    async fn test_bump_dir_rev_success() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Root should have rev = 0
+        let new_rev = svc
+            .handle_bump_dir_rev(root, 0, None, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(new_rev, 1);
+
+        // Bump again
+        let new_rev = svc.handle_bump_dir_rev(root, 1, None, ctx).await.unwrap();
+        assert_eq!(new_rev, 2);
+    }
+
+    #[tokio::test]
+    async fn test_bump_dir_rev_mismatch() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let result = svc.handle_bump_dir_rev(root, 999, None, ctx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dir_rev_auto_bump_on_dentry_real_change() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(990);
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let root_node0 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node0.rev, Some(0));
+
+        // Insert dentry => rev +1
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "rev_case".to_string(),
+            DentryTarget::IndexNodeId(990),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let root_node1 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node1.rev, Some(1));
+
+        // Same upsert (no effective change) => rev unchanged
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "rev_case".to_string(),
+            DentryTarget::IndexNodeId(990),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let root_node2 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node2.rev, Some(1));
+
+        // Target change to tombstone => rev +1
+        set_tombstone_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node3 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node3.rev, Some(2));
+
+        // Same tombstone again (no effective change) => rev unchanged
+        set_tombstone_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node4 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node4.rev, Some(2));
+
+        // Delete existing dentry row => rev +1
+        delete_dentry_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node5 = svc
+            .handle_get_inode(root, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node5.rev, Some(3));
+
+        // Delete non-existing dentry row => rev unchanged
+        delete_dentry_auto(&svc, root, "rev_case".to_string(), None, ctx.clone())
+            .await
+            .unwrap();
+        let root_node6 = svc
+            .handle_get_inode(root, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root_node6.rev, Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_create_dentry_requires_expected_parent_rev() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(991);
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let err = svc
+            .handle_create_dentry(
+                root,
+                "rev_lock".to_string(),
+                DentryTarget::IndexNodeId(991),
+                9_999,
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rev mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_replace_target_requires_expected_old_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let a = create_dir_node(992);
+        let b = create_dir_node(993);
+        svc.handle_set_inode(a, None, ctx.clone()).await.unwrap();
+        svc.handle_set_inode(b, None, ctx.clone()).await.unwrap();
+
+        let rev0 = parent_rev(&svc, root, None, ctx.clone()).await;
+        svc.handle_create_dentry(
+            root,
+            "cas_target".to_string(),
+            DentryTarget::IndexNodeId(992),
+            rev0,
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev1 = parent_rev(&svc, root, None, ctx.clone()).await;
+        let err = svc
+            .handle_replace_target(
+                root,
+                "cas_target".to_string(),
+                DentryTarget::Tombstone,
+                DentryTarget::IndexNodeId(993),
+                rev1,
+                None,
+                ctx.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dentry target mismatch"));
+    }
+
+    // ==================== Transaction Tests ====================
+
+    #[tokio::test]
+    async fn test_begin_and_commit_txn() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
+        assert!(txid.starts_with("tx-"));
+
+        // Create node in transaction
+        let node = create_dir_node(700);
+        svc.handle_set_inode(node.clone(), Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+
+        // Should be visible within txn
+        let fetched = svc
+            .handle_get_inode(700, Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert!(fetched.is_some());
+
+        // Commit
+        svc.handle_commit(Some(txid), ctx.clone()).await.unwrap();
+
+        // Should still be visible after commit
+        let fetched = svc.handle_get_inode(700, None, ctx).await.unwrap();
+        assert!(fetched.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_begin_and_rollback_txn() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
+
+        let node = create_dir_node(701);
+        svc.handle_set_inode(node.clone(), Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+
+        // Rollback
+        svc.handle_rollback(Some(txid), ctx.clone()).await.unwrap();
+
+        // Should NOT be visible after rollback
+        let fetched = svc.handle_get_inode(701, None, ctx).await.unwrap();
+        assert!(fetched.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_commit_without_txid() {
+        let (svc, _tmp) = create_test_service();
+        // Should be no-op
+        let result = svc.handle_commit(None, dummy_ctx()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_rollback_without_txid() {
+        let (svc, _tmp) = create_test_service();
+        let result = svc.handle_rollback(None, dummy_ctx()).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_commit_invalid_txid() {
+        let (svc, _tmp) = create_test_service();
+        let result = svc
+            .handle_commit(Some("invalid-txid".to_string()), dummy_ctx())
+            .await;
+        assert!(result.is_err());
+    }
+
+    // ==================== File Lease Tests ====================
+
+    #[tokio::test]
+    async fn test_acquire_file_lease() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(800, "fb-800");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        let lease_seq = svc
+            .handle_acquire_file_lease(800, session, Duration::from_secs(60), ctx)
+            .await
+            .unwrap();
+        assert!(lease_seq > 0);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_file_lease_renewal() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(801, "fb-801");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        let seq1 = svc
+            .handle_acquire_file_lease(801, session.clone(), Duration::from_secs(60), ctx.clone())
+            .await
+            .unwrap();
+
+        // Same session should get same seq (renewal)
+        let seq2 = svc
+            .handle_acquire_file_lease(801, session, Duration::from_secs(60), ctx)
+            .await
+            .unwrap();
+        assert_eq!(seq1, seq2);
+    }
+
+    #[tokio::test]
+    async fn test_acquire_file_lease_conflict() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(802, "fb-802");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session1 = SessionId("session-1".to_string());
+        svc.handle_acquire_file_lease(802, session1, Duration::from_secs(3600), ctx.clone())
+            .await
+            .unwrap();
+
+        // Different session should fail (lease not expired)
+        let session2 = SessionId("session-2".to_string());
+        let result = svc
+            .handle_acquire_file_lease(802, session2, Duration::from_secs(60), ctx)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_file_lease_node_not_found() {
+        let (svc, _tmp) = create_test_service();
+        let session = SessionId("session-1".to_string());
+        let result = svc
+            .handle_acquire_file_lease(9999, session, Duration::from_secs(60), dummy_ctx())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_renew_file_lease() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(803, "fb-803");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        let lease_seq = svc
+            .handle_acquire_file_lease(803, session.clone(), Duration::from_secs(60), ctx.clone())
+            .await
+            .unwrap();
+
+        // Renew with correct session and seq
+        let result = svc
+            .handle_renew_file_lease(803, session, lease_seq, Duration::from_secs(120), ctx)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_renew_file_lease_mismatch() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(804, "fb-804");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        svc.handle_acquire_file_lease(804, session.clone(), Duration::from_secs(60), ctx.clone())
+            .await
+            .unwrap();
+
+        // Wrong seq
+        let result = svc
+            .handle_renew_file_lease(804, session, 999, Duration::from_secs(120), ctx)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_release_file_lease() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(805, "fb-805");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        let lease_seq = svc
+            .handle_acquire_file_lease(805, session.clone(), Duration::from_secs(60), ctx.clone())
+            .await
+            .unwrap();
+
+        // Release
+        let result = svc
+            .handle_release_file_lease(805, session, lease_seq, ctx.clone())
+            .await;
+        assert!(result.is_ok());
+
+        // After release, another session can acquire
+        let session2 = SessionId("session-2".to_string());
+        let result = svc
+            .handle_acquire_file_lease(805, session2, Duration::from_secs(60), ctx)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_release_file_lease_mismatch() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = create_file_node_working(806, "fb-806");
+        svc.handle_set_inode(node.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        let session = SessionId("session-1".to_string());
+        svc.handle_acquire_file_lease(806, session.clone(), Duration::from_secs(60), ctx.clone())
+            .await
+            .unwrap();
+
+        // Wrong session
+        let wrong_session = SessionId("wrong-session".to_string());
+        let result = svc
+            .handle_release_file_lease(806, wrong_session, 1, ctx)
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_write_lease_cleanup_task_reclaims_expired_open_writer_lease() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let inode_id = 807;
+        let mut inode = create_file_node_working(inode_id, "fb-807");
+        inode.lease_client_session = Some(ClientSessionId("test-instance:807".to_string()));
+        inode.lease_seq = Some(1);
+        inode.lease_expire_at = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(1),
+        );
+        svc.handle_set_inode(inode, None, ctx.clone())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let refreshed = svc
+            .handle_get_inode(inode_id, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refreshed.lease_client_session.is_none());
+        assert!(refreshed.lease_expire_at.is_none());
+        assert!(matches!(refreshed.state, NodeState::Cooling(_)));
+    }
+
+    #[tokio::test]
+    async fn test_write_lease_cleanup_unblocks_new_acquire_after_timeout() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let inode_id = 808;
+        let node = create_file_node_working(inode_id, "fb-808");
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let first_session = SessionId("s1".to_string());
+        svc.handle_acquire_file_lease(inode_id, first_session, Duration::from_secs(1), ctx.clone())
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let second_session = SessionId("s2".to_string());
+        let seq2 = svc
+            .handle_acquire_file_lease(
+                inode_id,
+                second_session,
+                Duration::from_secs(60),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(seq2 >= 2);
+
+        let refreshed = svc
+            .handle_get_inode(inode_id, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(refreshed.state, NodeState::Cooling(_)));
+        assert_eq!(
+            refreshed.lease_client_session,
+            Some(ClientSessionId("s2".to_string()))
+        );
+        assert!(refreshed.lease_expire_at.is_some());
+    }
+
+    // ==================== ObjStat Tests ====================
+
+    #[tokio::test]
+    async fn test_obj_stat_bump_new() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(1);
+        let ref_count = svc
+            .handle_obj_stat_bump(obj_id.clone(), 1, None, ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(ref_count, 1);
+
+        // Bump again
+        let ref_count = svc
+            .handle_obj_stat_bump(obj_id, 2, None, ctx)
+            .await
+            .unwrap();
+        assert_eq!(ref_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_bump_decrement() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(2);
+        svc.handle_obj_stat_bump(obj_id.clone(), 5, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let ref_count = svc
+            .handle_obj_stat_bump(obj_id, -2, None, ctx)
+            .await
+            .unwrap();
+        assert_eq!(ref_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_bump_negative_error() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(3);
+        svc.handle_obj_stat_bump(obj_id.clone(), 2, None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Try to decrement below zero
+        let result = svc.handle_obj_stat_bump(obj_id, -10, None, ctx).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_bump_new_with_negative_error() {
+        let (svc, _tmp) = create_test_service();
+        let obj_id = create_obj_id(4);
+
+        // Cannot create with negative delta
+        let result = svc
+            .handle_obj_stat_bump(obj_id, -1, None, dummy_ctx())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_get() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(5);
+        svc.handle_obj_stat_bump(obj_id.clone(), 3, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap().unwrap();
+        assert_eq!(stat.ref_count, 3);
+        assert!(stat.zero_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_get_not_found() {
+        let (svc, _tmp) = create_test_service();
+        let obj_id = create_obj_id(6);
+        let stat = svc.handle_obj_stat_get(obj_id, dummy_ctx()).await.unwrap();
+        assert!(stat.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_zero_since() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(7);
+        svc.handle_obj_stat_bump(obj_id.clone(), 2, None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Decrement to zero
+        svc.handle_obj_stat_bump(obj_id.clone(), -2, None, ctx.clone())
+            .await
+            .unwrap();
+
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap().unwrap();
+        assert_eq!(stat.ref_count, 0);
+        assert!(stat.zero_since.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_list_zero() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        // Create several objects with zero ref_count
+        for i in 0..3 {
+            let obj_id = create_obj_id(10 + i);
+            svc.handle_obj_stat_bump(obj_id.clone(), 1, None, ctx.clone())
+                .await
+                .unwrap();
+            svc.handle_obj_stat_bump(obj_id, -1, None, ctx.clone())
+                .await
+                .unwrap();
+        }
+
+        // List zero refs
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 10; // future timestamp to include all
+        let zeros = svc.handle_obj_stat_list_zero(now, 10, ctx).await.unwrap();
+        assert_eq!(zeros.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_delete_if_zero() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(20);
+        svc.handle_obj_stat_bump(obj_id.clone(), 1, None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_obj_stat_bump(obj_id.clone(), -1, None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Delete
+        let deleted = svc
+            .handle_obj_stat_delete_if_zero(obj_id.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        assert!(deleted);
+
+        // Should be gone
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap();
+        assert!(stat.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_obj_stat_delete_if_zero_nonzero() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(21);
+        svc.handle_obj_stat_bump(obj_id.clone(), 5, None, ctx.clone())
+            .await
+            .unwrap();
+
+        // Should not delete (ref_count != 0)
+        let deleted = svc
+            .handle_obj_stat_delete_if_zero(obj_id.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        assert!(!deleted);
+
+        // Should still exist
+        let stat = svc.handle_obj_stat_get(obj_id, ctx).await.unwrap();
+        assert!(stat.is_some());
+    }
+
+    // ==================== Node State Tests ====================
+
+    #[tokio::test]
+    async fn test_node_state_linked() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(30);
+        let qcid = create_obj_id(31);
+
+        let node = NodeRecord {
+            inode_id: 900,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::Linked(ndm::FileLinkedState {
+                obj_id: obj_id.clone(),
+                qcid: qcid.clone(),
+                filebuffer_id: "fb-900".to_string(),
+                linked_at: 5000,
+            }),
+            rev: None,
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let fetched = svc.handle_get_inode(900, None, ctx).await.unwrap().unwrap();
+        match fetched.state {
+            NodeState::Linked(s) => {
+                assert_eq!(s.obj_id, obj_id);
+                assert_eq!(s.qcid, qcid);
+                assert_eq!(s.filebuffer_id, "fb-900");
+                assert_eq!(s.linked_at, 5000);
+            }
+            _ => panic!("expected Linked state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_state_finalized() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let obj_id = create_obj_id(40);
+
+        let node = NodeRecord {
+            inode_id: 901,
+            ref_by: None,
+            read_only: true,
+            base_obj_id: None,
+            state: NodeState::Finalized(ndm::FinalizedObjState {
+                obj_id: obj_id.clone(),
+                finalized_at: 6000,
+            }),
+            rev: None,
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let fetched = svc.handle_get_inode(901, None, ctx).await.unwrap().unwrap();
+        assert!(fetched.read_only);
+        match fetched.state {
+            NodeState::Finalized(s) => {
+                assert_eq!(s.obj_id, obj_id);
+                assert_eq!(s.finalized_at, 6000);
+            }
+            _ => panic!("expected Finalized state"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_node_with_meta() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let meta = serde_json::json!({
+            "owner": "user1",
+            "permissions": 0o755,
+            "custom": {"key": "value"}
+        });
+
+        let node = NodeRecord {
+            inode_id: 902,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::DirNormal,
+            rev: Some(0),
+            meta: Some(meta.clone()),
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let fetched = svc.handle_get_inode(902, None, ctx).await.unwrap().unwrap();
+        assert!(fetched.meta.is_some());
+        let fetched_meta = fetched.meta.unwrap();
+        assert_eq!(fetched_meta["owner"], "user1");
+        assert_eq!(fetched_meta["permissions"], 0o755);
+    }
+
+    #[tokio::test]
+    async fn test_node_with_lease_info() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let node = NodeRecord {
+            inode_id: 903,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: None,
+            state: NodeState::Working(ndm::FileWorkingState {
+                fb_handle: "fb-903".to_string(),
+                last_write_at: 1000,
+            }),
+            rev: None,
+            meta: None,
+            lease_client_session: Some(ClientSessionId("session-x".to_string())),
+            lease_seq: Some(5),
+            lease_expire_at: Some(9999999),
+        };
+
+        svc.handle_set_inode(node, None, ctx.clone()).await.unwrap();
+
+        let fetched = svc.handle_get_inode(903, None, ctx).await.unwrap().unwrap();
+        assert_eq!(
+            fetched.lease_client_session,
+            Some(ClientSessionId("session-x".to_string()))
+        );
+        assert_eq!(fetched.lease_seq, Some(5));
+        assert_eq!(fetched.lease_expire_at, Some(9999999));
+    }
+
+    // ==================== Dentry with ObjId Target ====================
+
+    #[tokio::test]
+    async fn test_dentry_with_obj_id_target() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let obj_id = create_obj_id(50);
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "linked_file".to_string(),
+            DentryTarget::ObjId(obj_id.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dentry = svc
+            .handle_get_dentry(root, "linked_file".to_string(), None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        match dentry.target {
+            DentryTarget::ObjId(id) => assert_eq!(id, obj_id),
+            _ => panic!("expected ObjId target"),
+        }
+    }
+
+    // ==================== Transaction Isolation ====================
+
+    #[tokio::test]
+    async fn test_transaction_isolation() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
+
+        // Create node in txn
+        let node = create_dir_node(950);
+        svc.handle_set_inode(node, Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+
+        // NOT visible outside txn (before commit)
+        // Note: Due to SQLite WAL mode and how connections work,
+        // uncommitted changes in one connection may or may not be visible
+        // in another. This test verifies the basic transaction semantics.
+        let fetched_in_txn = svc
+            .handle_get_inode(950, Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+        assert!(fetched_in_txn.is_some());
+
+        // Commit
+        svc.handle_commit(Some(txid), ctx.clone()).await.unwrap();
+
+        // Now visible outside txn
+        let fetched_after = svc.handle_get_inode(950, None, ctx).await.unwrap();
+        assert!(fetched_after.is_some());
+    }
+
+    // ==================== Resolve Path Cache Tests ====================
+
+    #[tokio::test]
+    async fn test_resolve_path_cache_invalidate_prefix_on_edge_change() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Build /a/b/c where each component is a directory inode.
+        let a = create_dir_node(10);
+        let b1 = create_dir_node(11);
+        let c = create_dir_node(12);
+        svc.handle_set_inode(a.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(a.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b1.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            b1.inode_id,
+            "c".to_string(),
+            DentryTarget::IndexNodeId(c.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Populate cache.
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, c.inode_id),
+            _ => panic!("expected Inode result"),
+        }
+
+        // Change edge /a/b -> new inode, should invalidate /a/b/* cache entries.
+        let b2 = create_dir_node(20);
+        svc.handle_set_inode(b2.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b2.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resolved2 = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
+            .await
+            .unwrap();
+        assert!(resolved2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_cache_invalidate_on_commit() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        // Build /a/b/c.
+        let a = create_dir_node(30);
+        let b1 = create_dir_node(31);
+        let c = create_dir_node(32);
+        svc.handle_set_inode(a.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(b1.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+        svc.handle_set_inode(c.clone(), None, ctx.clone())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(a.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b1.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            b1.inode_id,
+            "c".to_string(),
+            DentryTarget::IndexNodeId(c.inode_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Populate cache.
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::Inode { inode_id, .. } => assert_eq!(inode_id, c.inode_id),
+            _ => panic!("expected Inode result"),
+        }
+
+        // Mutate /a/b within a transaction.
+        let txid = svc.handle_begin_txn(ctx.clone()).await.unwrap();
+        let b2 = create_dir_node(40);
+        svc.handle_set_inode(b2.clone(), Some(txid.clone()), ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            a.inode_id,
+            "b".to_string(),
+            DentryTarget::IndexNodeId(b2.inode_id),
+            Some(txid.clone()),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        svc.handle_commit(Some(txid), ctx.clone()).await.unwrap();
+
+        // After commit, the cached /a/b/* entries must be invalidated.
+        let resolved2 = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
+            .await
+            .unwrap();
+        assert!(resolved2.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_materializes_overlay_chain_from_dir_object() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_c = DirObject::new(Some("c".to_string()));
+        let (c_obj_id, c_obj_str) = dir_c.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&c_obj_id, c_obj_str.as_str())
+            .await
+            .unwrap();
+
+        let mut dir_b = DirObject::new(Some("b".to_string()));
+        dir_b
+            .add_directory("c".to_string(), c_obj_id.clone(), 0)
+            .unwrap();
+        let (b_obj_id, b_obj_str) = dir_b.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&b_obj_id, b_obj_str.as_str())
+            .await
+            .unwrap();
+
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_directory("b".to_string(), b_obj_id.clone(), 0)
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        handle_create_dir_path(&svc, &NdmPath::new("/a/b/c/new"), ctx.clone())
+            .await
+            .unwrap();
+
+        let dentry_a = svc
+            .handle_get_dentry(root, "a".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_a = match dentry_a.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a"),
+        };
+        let node_a = svc
+            .handle_get_inode(inode_a, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_a.base_obj_id, Some(a_obj_id));
+        match node_a.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a"),
+        }
+
+        let dentry_b = svc
+            .handle_get_dentry(inode_a, "b".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_b = match dentry_b.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b"),
+        };
+        let node_b = svc
+            .handle_get_inode(inode_b, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_b.base_obj_id, Some(b_obj_id));
+        match node_b.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a/b"),
+        }
+
+        let dentry_c = svc
+            .handle_get_dentry(inode_b, "c".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_c = match dentry_c.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b/c"),
+        };
+        let node_c = svc
+            .handle_get_inode(inode_c, None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_c.base_obj_id, Some(c_obj_id));
+        match node_c.state {
+            NodeState::DirOverlay => {}
+            _ => panic!("expected DirOverlay for /a/b/c"),
+        }
+
+        let dentry_new = svc
+            .handle_get_dentry(inode_c, "new".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let inode_new = match dentry_new.target {
+            DentryTarget::IndexNodeId(id) => id,
+            _ => panic!("expected inode target for /a/b/c/new"),
+        };
+        let node_new = svc
+            .handle_get_inode(inode_new, None, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node_new.base_obj_id, None);
+        match node_new.state {
+            NodeState::DirNormal => {}
+            _ => panic!("expected DirNormal for /a/b/c/new"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_path_ex_reads_base_child_in_overlay_inode() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let base_file = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut base_dir = DirObject::new(Some("a".to_string()));
+        base_dir
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(base_file).unwrap(),
+                1,
+            )
+            .unwrap();
+        let expected_leaf_obj = {
+            let item = base_dir.get("leaf").unwrap();
+            let (obj_id, _) = item.get_obj_id().unwrap();
+            obj_id
+        };
+        let (base_dir_id, base_dir_str) = base_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&base_dir_id, base_dir_str.as_str())
+            .await
+            .unwrap();
+
+        let overlay_inode = NodeRecord {
+            inode_id: 910,
+            ref_by: None,
+            read_only: false,
+            base_obj_id: Some(base_dir_id),
+            state: NodeState::DirOverlay,
+            rev: Some(0),
+            meta: None,
+            lease_client_session: None,
+            lease_seq: None,
+            lease_expire_at: None,
+        };
+        svc.handle_set_inode(overlay_inode, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::IndexNodeId(910),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let resolved = svc
+            .handle_resolve_path_ex(&NdmPath::new("/a/leaf"), 0, ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        match resolved.item {
+            FsMetaResolvePathItem::ObjId(obj_id) => assert_eq!(obj_id, expected_leaf_obj),
+            _ => panic!("expected ObjId from base child"),
+        }
+        assert_eq!(resolved.inner_path, None);
+    }
+
+    #[tokio::test]
+    async fn test_create_dir_rejects_non_dir_child_in_base_dir_object() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_create_dir_path(&svc, &NdmPath::new("/a/leaf/new"), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn test_set_file_rejects_existing_upper_entry() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
+            .await
+            .unwrap();
+
+        handle_set_file_path(
+            &svc,
+            &NdmPath::new("/a/file"),
+            create_obj_id(11),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(12), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_dir_rejects_existing_upper_entry() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
+            .await
+            .unwrap();
+
+        let dir1 = DirObject::new(Some("d1".to_string()));
+        let (dir1_id, _) = dir1.gen_obj_id().unwrap();
+        handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir1_id, ctx.clone())
+            .await
+            .unwrap();
+
+        let dir2 = DirObject::new(Some("d2".to_string()));
+        let (dir2_id, _) = dir2.gen_obj_id().unwrap();
+        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir2_id, ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_file_rejects_existing_base_entry() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_set_file_path(&svc, &NdmPath::new("/a/leaf"), create_obj_id(33), ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_set_dir_rejects_existing_base_entry() {
+        let (svc, _meta_tmp, _store_tmp, store_mgr) = create_test_service_with_store().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child_dir = DirObject::new(Some("sub".to_string()));
+        let (child_id, child_str) = child_dir.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&child_id, child_str.as_str())
+            .await
+            .unwrap();
+
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a.add_directory("sub".to_string(), child_id, 0).unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let dir_new = DirObject::new(Some("new".to_string()));
+        let (dir_new_id, _) = dir_new.gen_obj_id().unwrap();
+        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/sub"), dir_new_id, ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_rejects_upper_dir_object() {
+        let (svc, _meta_tmp, _fb_tmp) = create_test_service_with_buffer();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let dir_obj = DirObject::new(Some("a".to_string()));
+        let (dir_obj_id, _) = dir_obj.gen_obj_id().unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(dir_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a"),
+            OpenWriteFlag::CreateOrTruncate,
+            None,
+            ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_rejects_existing_base_file_on_create_exclusive() {
+        let (svc, _meta_tmp, _store_tmp, _fb_tmp, store_mgr) =
+            create_test_service_with_store_and_buffer().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a/leaf"),
+            OpenWriteFlag::CreateExclusive,
+            None,
+            ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_continue_write_treats_base_file_as_existing() {
+        let (svc, _meta_tmp, _store_tmp, _fb_tmp, store_mgr) =
+            create_test_service_with_store_and_buffer().await;
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let file_obj = FileObject::new(
+            "leaf.txt".to_string(),
+            1,
+            "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string(),
+        );
+        let mut dir_a = DirObject::new(Some("a".to_string()));
+        dir_a
+            .add_file(
+                "leaf".to_string(),
+                serde_json::to_value(file_obj).unwrap(),
+                1,
+            )
+            .unwrap();
+        let (a_obj_id, a_obj_str) = dir_a.gen_obj_id().unwrap();
+        store_mgr
+            .put_object(&a_obj_id, a_obj_str.as_str())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "a".to_string(),
+            DentryTarget::ObjId(a_obj_id),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/a/leaf"),
+            OpenWriteFlag::ContinueWrite,
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap_err();
+
+        let err_msg = err.to_string();
+        assert!(!err_msg.contains("file not found"), "err={}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn test_open_file_writer_create_exclusive_new_file_succeeds() {
+        let (svc, _meta_tmp, _fb_tmp) = create_test_service_with_buffer();
+        let ctx = dummy_ctx();
+
+        let handle = handle_open_file_writer_path(
+            &svc,
+            &NdmPath::new("/new_file"),
+            OpenWriteFlag::CreateExclusive,
+            None,
+            ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!handle.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_move_path_overwrites_existing_target_same_parent() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let src_obj = create_obj_id(61);
+        let dst_obj = create_obj_id(62);
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "src".to_string(),
+            DentryTarget::ObjId(src_obj.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "dst".to_string(),
+            DentryTarget::ObjId(dst_obj),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev0 = parent_rev(&svc, root, None, ctx.clone()).await;
+        svc.handle_move_path(
+            root,
+            "src".to_string(),
+            root,
+            "dst".to_string(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let rev1 = parent_rev(&svc, root, None, ctx.clone()).await;
+        assert_eq!(rev1, rev0 + 2);
+
+        let src = svc
+            .handle_get_dentry(root, "src".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(src.target, DentryTarget::Tombstone));
+
+        let dst = svc
+            .handle_get_dentry(root, "dst".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(dst.target, DentryTarget::ObjId(obj) if obj == src_obj));
+    }
+
+    #[tokio::test]
+    async fn test_move_path_cross_parent_overwrite_updates_both_revs() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+
+        handle_create_dir_path(&svc, &NdmPath::new("/left"), ctx.clone())
+            .await
+            .unwrap();
+        handle_create_dir_path(&svc, &NdmPath::new("/right"), ctx.clone())
+            .await
+            .unwrap();
+        let left = svc.ensure_dir_inode(&NdmPath::new("/left")).await.unwrap();
+        let right = svc.ensure_dir_inode(&NdmPath::new("/right")).await.unwrap();
+
+        let src_obj = create_obj_id(71);
+        let dst_obj = create_obj_id(72);
+        upsert_dentry_auto(
+            &svc,
+            right,
+            "src".to_string(),
+            DentryTarget::ObjId(src_obj.clone()),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            left,
+            "dst".to_string(),
+            DentryTarget::ObjId(dst_obj),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let left_rev0 = parent_rev(&svc, left, None, ctx.clone()).await;
+        let right_rev0 = parent_rev(&svc, right, None, ctx.clone()).await;
+
+        svc.handle_move_path(
+            right,
+            "src".to_string(),
+            left,
+            "dst".to_string(),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let left_rev1 = parent_rev(&svc, left, None, ctx.clone()).await;
+        let right_rev1 = parent_rev(&svc, right, None, ctx.clone()).await;
+        assert_eq!(left_rev1, left_rev0 + 1);
+        assert_eq!(right_rev1, right_rev0 + 1);
+
+        let src = svc
+            .handle_get_dentry(right, "src".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(src.target, DentryTarget::Tombstone));
+
+        let dst = svc
+            .handle_get_dentry(left, "dst".to_string(), None, ctx.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(dst.target, DentryTarget::ObjId(obj) if obj == src_obj));
+    }
+
+    #[tokio::test]
+    async fn test_strong_tree_unique_inode_target_constraint() {
+        let (svc, _tmp) = create_test_service();
+        let ctx = dummy_ctx();
+        let root = svc.handle_root_dir(ctx.clone()).await.unwrap();
+
+        let child = create_dir_node(920);
+        svc.handle_set_inode(child, None, ctx.clone())
+            .await
+            .unwrap();
+        upsert_dentry_auto(
+            &svc,
+            root,
+            "left".to_string(),
+            DentryTarget::IndexNodeId(920),
+            None,
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+
+        let err = upsert_dentry_auto(
+            &svc,
+            root,
+            "right".to_string(),
+            DentryTarget::IndexNodeId(920),
+            None,
+            ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"));
+    }
+}

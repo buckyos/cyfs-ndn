@@ -1,12 +1,12 @@
 use crate::{NdnError, NdnResult};
 use blake2::{digest::Update as Blake2Update, Blake2s256, Digest as Blake2Digest};
+use crypto_common::hazmat::{SerializableState, SerializedState};
+use hex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256, Sha512};
 use sha3::Keccak256;
 use std::str::FromStr;
-use hex;
-use serde_json::{json, Value};
-use crypto_common::hazmat::{SerializedState, SerializableState};
 
 pub trait Hasher {
     fn support_state(&self) -> bool;
@@ -17,10 +17,9 @@ pub trait Hasher {
     fn finalize(self: Box<Self>) -> Vec<u8>;
 }
 
-
 pub const DEFAULT_HASH_METHOD: &str = "sha256";
 
-#[derive(Debug, Clone,Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum HashMethod {
     Sha256,
     Sha512,
@@ -40,7 +39,7 @@ impl HashMethod {
         match self {
             Self::Sha256 => "sha256",
             Self::Sha512 => "sha512",
-            Self::QCID => "qcid",   // QCID is a special case, not a hash method, use sha256 for hash
+            Self::QCID => "qcid", // QCID is a special case, not a hash method, use sha256 for hash
             Self::Blake2s256 => "blake2s256",
             Self::Keccak256 => "keccak256",
         }
@@ -115,7 +114,7 @@ pub struct Sha256Hasher {
 
 impl Sha256Hasher {
     pub fn new() -> Self {
-        Self { 
+        Self {
             hasher: Sha256::new(),
             pos: 0,
         }
@@ -123,18 +122,28 @@ impl Sha256Hasher {
 }
 
 impl Hasher for Sha256Hasher {
-    fn support_state(&self) -> bool { true }
-    fn get_pos(&self) -> u64 { self.pos }
+    fn support_state(&self) -> bool {
+        true
+    }
+    fn get_pos(&self) -> u64 {
+        self.pos
+    }
 
     fn restore_from_state(&mut self, state_json: serde_json::Value) -> NdnResult<()> {
         let pos = state_json["pos"].as_u64().unwrap_or(0);
         let serialized_state = hex::decode(
-            state_json["state"].as_str().ok_or(NdnError::Internal("invalid hasher state json".to_string()))?)
-            .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?;
+            state_json["state"]
+                .as_str()
+                .ok_or(NdnError::Internal("invalid hasher state json".to_string()))?,
+        )
+        .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}", e.to_string())))?;
 
         self.hasher = Sha256::deserialize(
-            &SerializedState::<Sha256>::try_from(&serialized_state[..]).map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?)
-            .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?;
+            &SerializedState::<Sha256>::try_from(&serialized_state[..]).map_err(|e| {
+                NdnError::Internal(format!("invalid hasher state json:{}", e.to_string()))
+            })?,
+        )
+        .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}", e.to_string())))?;
         self.pos = pos;
         Ok(())
     }
@@ -166,7 +175,7 @@ pub struct Sha512Hasher {
 
 impl Sha512Hasher {
     pub fn new() -> Self {
-        Self { 
+        Self {
             hasher: Sha512::new(),
             pos: 0,
         }
@@ -174,17 +183,27 @@ impl Sha512Hasher {
 }
 
 impl Hasher for Sha512Hasher {
-    fn support_state(&self) -> bool { true }
-    fn get_pos(&self) -> u64 { self.pos }
+    fn support_state(&self) -> bool {
+        true
+    }
+    fn get_pos(&self) -> u64 {
+        self.pos
+    }
     fn restore_from_state(&mut self, state_json: serde_json::Value) -> NdnResult<()> {
         let pos = state_json["pos"].as_u64().unwrap_or(0);
         let serialized_state = hex::decode(
-            state_json["state"].as_str().ok_or(NdnError::Internal("invalid hasher state json".to_string()))?)
-            .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?;
+            state_json["state"]
+                .as_str()
+                .ok_or(NdnError::Internal("invalid hasher state json".to_string()))?,
+        )
+        .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}", e.to_string())))?;
 
         self.hasher = Sha512::deserialize(
-            &SerializedState::<Sha512>::try_from(&serialized_state[..]).map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?)
-            .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}",e.to_string())))?;
+            &SerializedState::<Sha512>::try_from(&serialized_state[..]).map_err(|e| {
+                NdnError::Internal(format!("invalid hasher state json:{}", e.to_string()))
+            })?,
+        )
+        .map_err(|e| NdnError::Internal(format!("invalid hasher state json:{}", e.to_string())))?;
         self.pos = pos;
         Ok(())
     }
@@ -216,7 +235,10 @@ impl HashHelper {
         match hash_method {
             HashMethod::Sha256 => Ok(Box::new(Sha256Hasher::new())),
             HashMethod::Sha512 => Ok(Box::new(Sha512Hasher::new())),
-            _ => Err(NdnError::InvalidParam(format!("Unsupported hash method: {:?}", hash_method))),
+            _ => Err(NdnError::InvalidParam(format!(
+                "Unsupported hash method: {:?}",
+                hash_method
+            ))),
         }
     }
 
@@ -255,7 +277,7 @@ impl HashHelper {
                 for item in data {
                     hasher.update(item);
                 }
-        
+
                 hasher.finalize().to_vec()
             }
             HashMethod::Sha512 => {
@@ -263,7 +285,7 @@ impl HashHelper {
                 for item in data {
                     hasher.update(item);
                 }
-        
+
                 hasher.finalize().to_vec()
             }
             HashMethod::Blake2s256 => {
@@ -271,15 +293,15 @@ impl HashHelper {
                 for item in data {
                     blake2::Digest::update(&mut hasher, item);
                 }
-        
+
                 hasher.finalize().to_vec()
             }
-            HashMethod::Keccak256 =>  {
+            HashMethod::Keccak256 => {
                 let mut hasher = Keccak256::new();
                 for item in data {
                     sha3::Digest::update(&mut hasher, item);
                 }
-        
+
                 hasher.finalize().to_vec()
             }
             HashMethod::QCID => {
@@ -359,5 +381,4 @@ mod tests {
     fn test_sha512_hasher_state_save_restore() {
         test_hasher_state_save_restore(HashMethod::Sha512);
     }
-
 }

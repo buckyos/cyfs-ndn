@@ -1,0 +1,26 @@
+{
+  "epoch": 1,
+  "stores": [
+    {
+      "store_id": "store-a",
+      "path": "/opt/stores/store-a",
+      "weight": 1,
+      "enabled": true,
+      "readonly": false
+    },
+    {
+      "store_id": "store-b",
+      "path": "/opt/stores/store-b",
+      "weight": 1,
+      "enabled": true,
+      "readonly": false
+    },
+    {
+      "store_id": "store-c",
+      "path": "/opt/stores/store-c",
+      "weight": 1,
+      "enabled": true,
+      "readonly": false
+    }
+  ]
+}

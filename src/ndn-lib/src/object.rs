@@ -5,9 +5,10 @@ use crate::{
     OBJ_TYPE_LIST_SIMPLE, OBJ_TYPE_OBJMAP, OBJ_TYPE_OBJMAP_SIMPLE, OBJ_TYPE_PACK, OBJ_TYPE_PKG,
     OBJ_TYPE_TRIE_SIMPLE,
 };
-use jsonwebtoken::{encode, EncodingKey};
+use buckyos_kit::get_by_json_path;
+use jsonwebtoken::{encode, DecodingKeyKind, EncodingKey};
 use name_lib::EncodedDocument;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
 use std::str::FromStr;
@@ -17,10 +18,29 @@ use std::{
 };
 
 //objid link to a did::EncodedDocument
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ObjId {
     pub obj_type: String,
     pub obj_hash: Vec<u8>, //hash result
+}
+
+impl Serialize for ObjId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        ObjId::new(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 impl ObjId {
@@ -78,7 +98,7 @@ impl ObjId {
     pub fn is_chunk_list(&self) -> bool {
         self.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE
     }
-    
+
     pub fn is_json(&self) -> bool {
         if self.is_chunk() || self.is_container() {
             return false;
@@ -88,6 +108,14 @@ impl ObjId {
             OBJ_TYPE_PACK => false,
             _ => true,
         }
+    }
+
+    pub fn is_dir_object(&self) -> bool {
+        self.obj_type == OBJ_TYPE_DIR
+    }
+
+    pub fn is_file_object(&self) -> bool {
+        self.obj_type == OBJ_TYPE_FILE
     }
 
     pub fn is_container(&self) -> bool {
@@ -120,10 +148,10 @@ impl ObjId {
         let hex_str = hex::encode(self.obj_hash.clone());
         format!("{}:{}", self.obj_type, hex_str)
     }
-   
-    pub fn to_filename(&self)->String {
+
+    pub fn to_filename(&self) -> String {
         let hex_str = hex::encode(self.obj_hash.clone());
-        format!("{}.{}",hex_str,self.obj_type)
+        format!("{}.{}", hex_str, self.obj_type)
     }
 
     pub fn to_base32(&self) -> String {
@@ -142,6 +170,13 @@ impl ObjId {
     pub fn from_bytes(objid_bytes: &[u8]) -> NdnResult<Self> {
         let (obj_type, obj_hash) = ObjIdBytesCodec::from_bytes(objid_bytes)?;
         Ok(Self { obj_type, obj_hash })
+    }
+
+    pub fn from_value(v: &serde_json::Value) -> NdnResult<Self> {
+        if let Some(obj_id_str) = v.as_str() {
+            return Self::new(obj_id_str);
+        }
+        return Err(NdnError::InvalidData("ObjId MUST be string".to_string()));
     }
 
     pub fn from_hostname(hostname: &str) -> NdnResult<Self> {
@@ -256,6 +291,62 @@ impl TryFrom<&str> for ObjId {
     }
 }
 
+pub trait NamedObject: Serialize {
+    fn get_obj_type() -> &'static str;
+
+    fn gen_obj_id(&self) -> (ObjId, String) {
+        let json_value = serde_json::to_value(self).expect("failed to serialize named object");
+        build_named_object_by_json(Self::get_obj_type(), &json_value)
+    }
+}
+
+//obj_data_str 可以是jwt或json_string
+pub fn load_named_obj<T: DeserializeOwned>(obj_data_str: &str) -> NdnResult<T> {
+    let obj_json = load_named_object_from_obj_str(obj_data_str)?;
+    serde_json::from_value(obj_json).map_err(|e| {
+        NdnError::DecodeError(format!(
+            "deserialize object from obj_data_str failed: {}",
+            e
+        ))
+    })
+}
+
+//只验证objid,不会验证jwt.jwt通常需要读取特定对象的字段后才能决定怎么验证，无法自动化验证
+pub fn load_named_obj_and_verify<T: DeserializeOwned>(
+    obj_id: &ObjId,
+    obj_data_str: &str,
+) -> NdnResult<T> {
+    let obj_json = load_named_object_from_obj_str(obj_data_str)?;
+    if !verify_named_object(obj_id, &obj_json) {
+        return Err(NdnError::InvalidId(format!(
+            "verify named object failed for obj_id:{}",
+            obj_id
+        )));
+    }
+
+    serde_json::from_value(obj_json).map_err(|e| {
+        NdnError::DecodeError(format!(
+            "deserialize object from obj_data_str failed: {}",
+            e
+        ))
+    })
+}
+
+pub fn extract_objid_by_path(obj_json: &serde_json::Value, path: &str) -> NdnResult<ObjId> {
+    let target = get_by_json_path(obj_json, path)
+        .ok_or_else(|| NdnError::InvalidParam(format!("objid path not found: {}", path)))?;
+    //尝试将target转换成ObjId
+    ObjId::from_value(&target)
+        .map_err(|e| NdnError::InvalidData(format!("invalid objid at path {}: {}", path, e)))
+}
+/*
+usage:
+let obj_data_str = load_obj_data_from_file("test_fileobj")
+let fileobj:FileObject = load_obj_from_str(obj_data_str)?;
+let (fileobj_id,obj_body_str2) = fileobj.gen_obj_id()
+*/
+
+//-------------------------------------------------------------------
 pub fn build_obj_id(obj_type: &str, obj_json_str: &str) -> ObjId {
     let hash_value: Vec<u8> = Sha256::digest(obj_json_str.as_bytes()).to_vec();
     ObjId::new_by_raw(obj_type.to_string(), hash_value)
@@ -290,16 +381,12 @@ pub fn build_named_object_by_json(
     (obj_id, json_str)
 }
 
-pub fn build_named_object_by_jwt(
-    obj_type: &str,
-    jwt_str: &str
-) -> NdnResult<(ObjId, String)> {
+pub fn build_named_object_by_jwt(obj_type: &str, jwt_str: &str) -> NdnResult<(ObjId, String)> {
     let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
         .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
     let (obj_id, json_str) = build_named_object_by_json(obj_type, &claims);
     Ok((obj_id, json_str))
 }
-
 
 pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bool {
     let (obj_id2, json_str) = build_named_object_by_json(obj_id.obj_type.as_str(), json_value);
@@ -311,9 +398,12 @@ pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bo
 
 pub fn verify_named_object_from_str(obj_id: &ObjId, obj_str: &str) -> NdnResult<serde_json::Value> {
     let obj_json = serde_json::from_str(obj_str)
-        .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
-    if !verify_named_object(obj_id, &obj_json)  {
-        return Err(NdnError::InvalidId(format!("verify named object failed:{}",obj_str)));
+        .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string())))?;
+    if !verify_named_object(obj_id, &obj_json) {
+        return Err(NdnError::InvalidId(format!(
+            "verify named object failed:{}",
+            obj_str
+        )));
     }
     Ok(obj_json)
 }
@@ -329,11 +419,11 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
     return Ok(true);
 }
 
-
 pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
     if obj_str.find("{").is_some() {
-        let obj_json = serde_json::from_str(obj_str)
-            .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}",e.to_string())))?;
+        let obj_json = serde_json::from_str(obj_str).map_err(|e| {
+            NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string()))
+        })?;
         return Ok(obj_json);
     } else {
         let claims = name_lib::decode_jwt_claim_without_verify(obj_str)
@@ -341,7 +431,6 @@ pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Va
         return Ok(claims);
     }
 }
-
 
 pub fn named_obj_str_to_jwt(
     obj_json_str: &String,
@@ -377,6 +466,7 @@ pub fn named_obj_to_jwt(
 mod tests {
     use super::*;
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
+    use serde::{Deserialize, Serialize};
     use serde_json::json;
 
     #[test]
@@ -424,6 +514,115 @@ mod tests {
     }
 
     #[test]
+    fn test_obj_id_from_value() {
+        let str_value = json!("sha256:0203040506");
+        let obj_id = ObjId::from_value(&str_value).unwrap();
+        assert_eq!(obj_id.to_string(), "sha256:0203040506");
+
+        let obj_value = json!({
+            "obj_type": "sha256",
+            "obj_hash": [2, 3, 4, 5, 6]
+        });
+        let err = ObjId::from_value(&obj_value).err().unwrap();
+        assert!(matches!(err, NdnError::InvalidData(_)));
+    }
+
+    #[test]
+    fn test_obj_id_serde_as_string() {
+        let obj_id = ObjId::new("sha256:0203040506").unwrap();
+
+        let v = serde_json::to_value(&obj_id).unwrap();
+        assert_eq!(v, json!("sha256:0203040506"));
+
+        let parsed: ObjId = serde_json::from_value(json!("sha256:0203040506")).unwrap();
+        assert_eq!(parsed, obj_id);
+
+        let parse_obj: Result<ObjId, _> = serde_json::from_value(json!({
+            "obj_type": "sha256",
+            "obj_hash": [2, 3, 4, 5, 6]
+        }));
+        assert!(parse_obj.is_err());
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct TestObjWithObjId {
+        inode: u64,
+        target: ObjId,
+    }
+
+    #[test]
+    fn test_custom_object_with_obj_id_serde() {
+        let obj = TestObjWithObjId {
+            inode: 42,
+            target: ObjId::new("sha256:0203040506").unwrap(),
+        };
+
+        let value = serde_json::to_value(&obj).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "inode": 42,
+                "target": "sha256:0203040506"
+            })
+        );
+
+        let parsed: TestObjWithObjId = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, obj);
+
+        let old_style: Result<TestObjWithObjId, _> = serde_json::from_value(json!({
+            "inode": 42,
+            "target": {
+                "obj_type": "sha256",
+                "obj_hash": [2, 3, 4, 5, 6]
+            }
+        }));
+        assert!(old_style.is_err());
+    }
+
+    #[test]
+    fn test_extract_objid_by_path_ok() {
+        let obj_json = json!({
+            "target": "sha256:0203040506",
+            "body": {
+                "items": [
+                    {
+                        "id": "sha256:010203"
+                    }
+                ]
+            }
+        });
+
+        let obj_id = extract_objid_by_path(&obj_json, "/target").unwrap();
+        assert_eq!(obj_id.to_string(), "sha256:0203040506");
+
+        let nested_obj_id = extract_objid_by_path(&obj_json, "/body/items/0/id").unwrap();
+        assert_eq!(nested_obj_id.to_string(), "sha256:010203");
+    }
+
+    #[test]
+    fn test_extract_objid_by_path_not_found() {
+        let obj_json = json!({
+            "target": "sha256:0203040506"
+        });
+
+        let err = extract_objid_by_path(&obj_json, "/body/missing").unwrap_err();
+        assert!(matches!(err, NdnError::InvalidParam(_)));
+    }
+
+    #[test]
+    fn test_extract_objid_by_path_invalid_objid() {
+        let obj_json = json!({
+            "target": {
+                "obj_type": "sha256",
+                "obj_hash": [2, 3, 4, 5, 6]
+            }
+        });
+
+        let err = extract_objid_by_path(&obj_json, "/target").unwrap_err();
+        assert!(matches!(err, NdnError::InvalidData(_)));
+    }
+
+    #[test]
     fn test_build_obj_id() {
         let json_value = json!({"age":18,"name":"test"});
         let (obj_id, json_str) = build_named_object_by_json("jobj", &json_value);
@@ -442,5 +641,62 @@ mod tests {
         println!("obj_id2#string : {}", obj_id2.to_string());
 
         assert_eq!(verify_named_object(&obj_id, &json_value2), true);
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestNamedObject {
+        name: String,
+        age: u32,
+    }
+
+    impl NamedObject for TestNamedObject {
+        fn get_obj_type() -> &'static str {
+            "jobj"
+        }
+    }
+
+    #[test]
+    fn test_named_object_trait() {
+        let obj = TestNamedObject {
+            name: "test".to_string(),
+            age: 18,
+        };
+
+        let (obj_id, obj_str) = obj.gen_obj_id();
+        let obj_json = serde_json::to_value(&obj).unwrap();
+        let (obj_id2, obj_str2) = build_named_object_by_json("jobj", &obj_json);
+
+        assert_eq!(obj_id, obj_id2);
+        assert_eq!(obj_str, obj_str2);
+    }
+
+    #[test]
+    fn test_load_obj_from_str() {
+        let obj = TestNamedObject {
+            name: "test".to_string(),
+            age: 18,
+        };
+        let obj_str = serde_json::to_string(&obj).unwrap();
+
+        let obj2: TestNamedObject = load_named_obj(&obj_str).unwrap();
+        assert_eq!(obj2.name, "test");
+        assert_eq!(obj2.age, 18);
+    }
+
+    #[test]
+    fn test_load_named_obj_and_verify() {
+        let obj = TestNamedObject {
+            name: "test".to_string(),
+            age: 18,
+        };
+
+        let (obj_id, obj_str) = obj.gen_obj_id();
+        let obj2: TestNamedObject = load_named_obj_and_verify(&obj_id, &obj_str).unwrap();
+        assert_eq!(obj2.name, "test");
+        assert_eq!(obj2.age, 18);
+
+        let bad_obj_id = ObjId::new("jobj:123456").unwrap();
+        let err = load_named_obj_and_verify::<TestNamedObject>(&bad_obj_id, &obj_str).unwrap_err();
+        assert!(matches!(err, NdnError::InvalidId(_)));
     }
 }
