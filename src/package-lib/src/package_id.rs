@@ -380,12 +380,16 @@ impl PackageId {
     }
 
     pub fn get_pkgid_with_objid(pkg_id: &str, pkg_obj_id: Option<ObjId>) -> PkgResult<String> {
+        let the_pkg_id = PackageId::parse(pkg_id);
         let Some(pkg_obj_id) = pkg_obj_id else {
+            if let Ok(mut the_pkg_id) = the_pkg_id {
+                the_pkg_id.version_exp = None;
+                return Ok(the_pkg_id.to_string());
+            }
             return Ok(pkg_id.to_string());
         };
         let normalized_objid = pkg_obj_id.to_string();
 
-        let the_pkg_id = PackageId::parse(pkg_id);
         if let Ok(mut the_pkg_id) = the_pkg_id {
             if let Some(existing_objid) = the_pkg_id.objid.as_deref() {
                 let same_objid = ObjId::new(existing_objid)
@@ -589,6 +593,7 @@ mod tests {
     #[test]
     fn test_get_pkgid_with_objid() {
         assert_eq!(PackageId::get_pkgid_with_objid("a", None).unwrap(), "a");
+        assert_eq!(PackageId::get_pkgid_with_objid("a#0.5.1", None).unwrap(), "a");
         assert_eq!(
             PackageId::get_pkgid_with_objid("bb.a#0.5.1", Some(objid_1())).unwrap(),
             format!("bb.a#{}", VALID_OBJID_1)
