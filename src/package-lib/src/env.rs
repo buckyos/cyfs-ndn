@@ -1367,6 +1367,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_in_non_strict_mode_ignores_older_indexed_version_with_objid() {
+        let (mut env, temp) = setup_test_env().await;
+        let friendly_path = env.work_dir.join("test.pkg");
+        tokio_fs::create_dir_all(&friendly_path).await.unwrap();
+        tokio_fs::write(friendly_path.join("hello.txt"), "friendly")
+            .await
+            .unwrap();
+
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta_v1 = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        assert!(pkg_meta_v1.content.is_empty());
+        let meta_obj_id_v1 = insert_pkg_meta_to_db(&env, &pkg_meta_v1);
+
+        let (resolved_meta_obj_id, resolved_meta) = env.get_pkg_meta("test.pkg").await.unwrap();
+        assert_eq!(resolved_meta_obj_id, meta_obj_id_v1.to_string());
+        assert_eq!(resolved_meta.version, "1.0.0");
+        assert!(resolved_meta.content.is_empty());
+
+        let media_info = env.load("test.pkg").await.unwrap();
+        assert_eq!(media_info.full_path, friendly_path);
+        assert!(matches!(media_info.media_type, MediaType::Dir));
+        assert_eq!(
+            tokio_fs::read_to_string(media_info.full_path.join("hello.txt"))
+                .await
+                .unwrap(),
+            "friendly"
+        );
+
+        let old_pkg_base_dir = temp.path().join("pkg-0.9.0");
+        tokio_fs::create_dir_all(&old_pkg_base_dir).await.unwrap();
+        let old_pkg_meta =
+            create_installable_test_pkg(&mut env, &old_pkg_base_dir, "test.pkg", "0.9.0").await;
+        assert!(!old_pkg_meta.content.is_empty());
+        let old_meta_obj_id = insert_pkg_meta_to_db(&env, &old_pkg_meta);
+        assert_ne!(old_meta_obj_id, meta_obj_id_v1);
+
+        let (resolved_meta_obj_id, resolved_meta) = env.get_pkg_meta("test.pkg").await.unwrap();
+        assert_eq!(resolved_meta_obj_id, meta_obj_id_v1.to_string());
+        assert_eq!(resolved_meta.version, "1.0.0");
+        assert!(resolved_meta.content.is_empty());
+
+        let media_info = env.load("test.pkg").await.unwrap();
+        assert_eq!(media_info.full_path, friendly_path);
+        assert!(matches!(media_info.media_type, MediaType::Dir));
+        assert_eq!(
+            tokio_fs::read_to_string(media_info.full_path.join("hello.txt"))
+                .await
+                .unwrap(),
+            "friendly"
+        );
+
+        let new_pkg_base_dir = temp.path().join("pkg-1.0.1");
+        tokio_fs::create_dir_all(&new_pkg_base_dir).await.unwrap();
+        let new_pkg_meta =
+            create_installable_test_pkg(&mut env, &new_pkg_base_dir, "test.pkg", "1.0.1").await;
+        assert!(!new_pkg_meta.content.is_empty());
+        let new_meta_obj_id = insert_pkg_meta_to_db(&env, &new_pkg_meta);
+        let strict_path = env
+            .get_pkg_strict_dir(&new_meta_obj_id.to_string(), &new_pkg_meta)
+            .unwrap();
+
+        let installed_meta_obj_id = env
+            .install_pkg("test.pkg#1.0.1", false, false)
+            .await
+            .unwrap();
+        assert_eq!(installed_meta_obj_id, new_meta_obj_id.to_string());
+
+        let (resolved_meta_obj_id, resolved_meta) = env.get_pkg_meta("test.pkg").await.unwrap();
+        assert_eq!(resolved_meta_obj_id, new_meta_obj_id.to_string());
+        assert_eq!(resolved_meta.version, "1.0.1");
+        assert_eq!(resolved_meta.content, new_pkg_meta.content);
+
+        let media_info = env.load("test.pkg").await.unwrap();
+        assert_eq!(media_info.full_path, strict_path);
+        assert!(matches!(media_info.media_type, MediaType::Dir));
+        assert_eq!(
+            tokio_fs::read_to_string(media_info.full_path.join("bin/hello.txt"))
+                .await
+                .unwrap(),
+            "hello from package"
+        );
+    }
+
+    #[tokio::test]
     async fn test_load_by_meta_obj_id_is_exact() {
         let (env, _temp) = setup_test_env().await;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
