@@ -121,3 +121,73 @@ BuckyOS 的经济模型围绕 `Name` 展开。
 
 
 > “在 BuckyOS 里，你不是在给服务器下指令，你是在给**结果**下定义。调度器就像一个自动化的 DevOps 团队，它根据你定义的亲和性，在全网帮你寻找最便宜、最快、离数据最近的显卡。如果中间有人拔了电源，调度器会自动换一台机器，并从上一个层级（Seekable Layer）帮你接上。”
+
+--- 实现流程
+
+```python
+
+def open_reader(thunk_id,range)
+    obj_id = get_realtion("SameAs",thunk_id)
+    if obj_id.is_chunk() or obj_id.is_chunk_list():
+        return open_reader(obj_id,range)
+    
+    thunk_obj = get_object(thunk_id)
+    if not thunk_obj.result_type.is_stream():
+        return Err("Not support")
+    # 发起计算请求
+    cacl_thunk(thunk_obj,range)
+    return open_reader(thunk_id,range)
+
+def run_workflow_expr(workflow_expr):
+    # 会在流程里
+    pass
+
+
+def schedule_thunk(thunk_obj_id,range):
+    thunk_obj = get(thunk_obj_id)
+    is_ready = False
+    if thunk_obj.param_type == "check_by_runner"
+        is_ready = True
+    if thunk_obj.param_type == "fixed":
+        is_ready = True
+    if thunk_obj.param_type == "normal":
+        is_ready = check_param_in_named_store(thunk_obj.params)
+    
+    if is_ready:
+        executor_node_id = find_best_node(thunk_obj)
+        dispatch_thunk(executor_node_id,thunk_obj_id)
+# 实际计算
+def do_cacl_thunk(thunk_obj,range):
+    func_obj = get_object(thunk_obj.func_obj_id)
+    real_params = {}
+    result = func_obj.execute(thunk_obj.params,range)
+    save(result)
+    set_realtion("thunk_obj",result,thunk_obj)
+    return
+
+# type bash
+def func_bash.execute(self,params,range)
+    if range:
+        Error("Not Support")
+    node_state = get_node_state()
+    if node_state_version != params.node_state_version:
+        Error("Node State Expiered")
+    
+    ret_code,output = run_bash(self.content,params)
+    new_state = get_node_state()
+    return (ret_code,new_state,new_state)
+
+# type service
+def func_llm.execute(self,params,range)
+    if range:
+        Error("Not Support")
+    
+    llm_request = open(params["req"])
+    llm_resp = run_llm(self.llm_model_name,llm_request)
+    return llm_resp
+
+# type pkg(2进制，可执行脚本都在里面)
+def func_run_pkg.execute(self,params,range)
+    pkg = load_pkg(self.pkgid)
+    pkg.run(params,range)
+```
