@@ -593,7 +593,10 @@ mod tests {
     #[test]
     fn test_get_pkgid_with_objid() {
         assert_eq!(PackageId::get_pkgid_with_objid("a", None).unwrap(), "a");
-        assert_eq!(PackageId::get_pkgid_with_objid("a#0.5.1", None).unwrap(), "a");
+        assert_eq!(
+            PackageId::get_pkgid_with_objid("a#0.5.1", None).unwrap(),
+            "a"
+        );
         assert_eq!(
             PackageId::get_pkgid_with_objid("bb.a#0.5.1", Some(objid_1())).unwrap(),
             format!("bb.a#{}", VALID_OBJID_1)

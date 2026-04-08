@@ -23,9 +23,8 @@ use tokio_util::io::StreamReader;
 use ndn_lib::{
     caculate_qcid_from_file, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers,
     verify_named_object_from_str, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader,
-    DirObject, FileObject, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult,
-    ObjId, ProgressCallbackResult, SimpleChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE,
-    OBJ_TYPE_FILE,
+    DirObject, FileObject, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId,
+    ProgressCallbackResult, SimpleChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_FILE,
 };
 
 #[derive(Clone)]
@@ -349,10 +348,9 @@ where
                 .get(header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok());
-            let stream = response
-                .into_body()
-                .into_data_stream()
-                .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+            let stream = response.into_body().into_data_stream().map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            });
 
             Ok(CyfsTransportResponse {
                 status,
@@ -410,7 +408,11 @@ impl CyfsNdnClient {
                 })?;
             Ok(with_host.to_string())
         } else {
-            Ok(format!("{}/{}", base.trim_end_matches('/'), obj_id.to_string()))
+            Ok(format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                obj_id.to_string()
+            ))
         }
     }
 
@@ -461,7 +463,10 @@ impl CyfsNdnClient {
                     pull_mode,
                     target_store_mgr,
                     vec![file_obj_store.clone()],
-                    Some(NdnAction::FileOK(file_obj_store.obj_id.clone(), file_obj.size)),
+                    Some(NdnAction::FileOK(
+                        file_obj_store.obj_id.clone(),
+                        file_obj.size,
+                    )),
                 )
                 .await;
         }
@@ -473,7 +478,9 @@ impl CyfsNdnClient {
             )));
         }
 
-        let chunk_list_obj = self.get_verified_object_by_id(base, &content_obj_id).await?;
+        let chunk_list_obj = self
+            .get_verified_object_by_id(base, &content_obj_id)
+            .await?;
         let chunk_list = SimpleChunkList::from_json_value(chunk_list_obj.obj_json)?;
         let chunklist_store = KnownObjectToStore {
             obj_id: chunk_list_obj.obj_id.clone(),
@@ -549,17 +556,21 @@ impl CyfsNdnClient {
                 .progress_callback_opt(progress_callback.clone())
                 .send()
                 .await?;
-            let chunk_bytes = chunk_resp.into_verified_chunk_bytes(chunk_id.clone()).await?;
+            let chunk_bytes = chunk_resp
+                .into_verified_chunk_bytes(chunk_id.clone())
+                .await?;
 
             if let Some(writer) = local_writer.as_mut() {
                 writer.write_all(chunk_bytes.as_slice()).await?;
             }
 
             if matches!(pull_mode, StoreMode::StoreInNamedMgr) {
-                let store_mgr = target_store_mgr.as_ref().ok_or_else(|| {
-                    NdnError::NotFound("named store mgr is required".to_string())
-                })?;
-                store_mgr.put_chunk(chunk_id, chunk_bytes.as_slice(), true).await?;
+                let store_mgr = target_store_mgr
+                    .as_ref()
+                    .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
+                store_mgr
+                    .put_chunk(chunk_id, chunk_bytes.as_slice(), true)
+                    .await?;
             } else if pull_mode.need_store_to_named_mgr() {
                 pending_links.push(LocalChunkLink {
                     chunk_id: chunk_id.clone(),
@@ -637,10 +648,7 @@ impl CyfsNdnRequestBuilder {
         self
     }
 
-    fn progress_callback_opt(
-        mut self,
-        callback: Option<Arc<Mutex<NdnProgressCallback>>>,
-    ) -> Self {
+    fn progress_callback_opt(mut self, callback: Option<Arc<Mutex<NdnProgressCallback>>>) -> Self {
         self.progress_callback = callback;
         self
     }
@@ -710,7 +718,10 @@ impl CyfsNdnRequestBuilder {
         })
     }
 
-    pub async fn pull_to_local_file(self, local_path: impl Into<PathBuf>) -> NdnResult<CyfsPullResult> {
+    pub async fn pull_to_local_file(
+        self,
+        local_path: impl Into<PathBuf>,
+    ) -> NdnResult<CyfsPullResult> {
         self.send()
             .await?
             .pull(StoreMode::LocalFile(local_path.into(), 0..0, false), None)
@@ -858,9 +869,8 @@ impl CyfsNdnResponse {
                     real_obj_id.to_string()
                 )));
             }
-            serde_json::from_str::<Value>(obj_str.as_str()).map_err(|e| {
-                NdnError::InvalidData(format!("parse chunklist json failed: {}", e))
-            })?
+            serde_json::from_str::<Value>(obj_str.as_str())
+                .map_err(|e| NdnError::InvalidData(format!("parse chunklist json failed: {}", e)))?
         } else {
             verify_named_object_from_str(&effective_obj_id, obj_str.as_str())?
         };
@@ -879,7 +889,10 @@ impl CyfsNdnResponse {
         Ok(bytes)
     }
 
-    pub async fn pull_to_local_file(self, local_path: impl Into<PathBuf>) -> NdnResult<CyfsPullResult> {
+    pub async fn pull_to_local_file(
+        self,
+        local_path: impl Into<PathBuf>,
+    ) -> NdnResult<CyfsPullResult> {
         self.pull(StoreMode::LocalFile(local_path.into(), 0..0, false), None)
             .await
     }
@@ -906,11 +919,8 @@ impl CyfsNdnResponse {
         pull_mode: StoreMode,
         store_mgr: Option<NamedStoreMgr>,
     ) -> NdnResult<CyfsPullResult> {
-        let target_store_mgr = resolve_target_store_mgr(
-            &pull_mode,
-            store_mgr,
-            self.client.default_store_mgr.clone(),
-        )?;
+        let target_store_mgr =
+            resolve_target_store_mgr(&pull_mode, store_mgr, self.client.default_store_mgr.clone())?;
         if let Some(descriptor) = self.describe_raw_pull().await? {
             return match descriptor {
                 PullDescriptor::Chunk {
@@ -953,16 +963,18 @@ impl CyfsNdnResponse {
         }
 
         let effective_obj_id = self.meta.effective_obj_id().ok_or_else(|| {
-            NdnError::InvalidId(format!("cannot infer obj id for {}", self.meta.transport_url))
+            NdnError::InvalidId(format!(
+                "cannot infer obj id for {}",
+                self.meta.transport_url
+            ))
         })?;
 
         if effective_obj_id.obj_type == OBJ_TYPE_FILE {
             let request = self.request.clone();
             let client = self.client.clone();
             let verified_obj = self.into_verified_object().await?;
-            let file_obj: FileObject = serde_json::from_value(verified_obj.obj_json).map_err(|e| {
-                NdnError::InvalidData(format!("parse file object failed: {}", e))
-            })?;
+            let file_obj: FileObject = serde_json::from_value(verified_obj.obj_json)
+                .map_err(|e| NdnError::InvalidData(format!("parse file object failed: {}", e)))?;
             return client
                 .pull_file_object(
                     &request.resolved_url,
@@ -1072,7 +1084,10 @@ impl CyfsNdnResponse {
         }
 
         let effective_obj_id = self.meta.effective_obj_id().ok_or_else(|| {
-            NdnError::InvalidId(format!("cannot infer obj id for {}", self.meta.transport_url))
+            NdnError::InvalidId(format!(
+                "cannot infer obj id for {}",
+                self.meta.transport_url
+            ))
         })?;
 
         if effective_obj_id.is_chunk() {
@@ -1113,14 +1128,17 @@ impl CyfsNdnResponse {
 
         match &pull_mode {
             StoreMode::StoreInNamedMgr => {
-                let store_mgr = target_store_mgr.as_ref().ok_or_else(|| {
-                    NdnError::NotFound("named store mgr is required".to_string())
-                })?;
-                let mut writer = store_mgr.open_new_chunk_writer(&chunk_id, chunk_size).await?;
+                let store_mgr = target_store_mgr
+                    .as_ref()
+                    .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
+                let mut writer = store_mgr
+                    .open_new_chunk_writer(&chunk_id, chunk_size)
+                    .await?;
                 let hasher = Some(ChunkHasher::new_with_hash_method(
                     chunk_id.chunk_type.to_hash_method()?,
                 )?);
-                let total_size = copy_chunk(chunk_id.clone(), &mut reader, &mut writer, hasher, None).await?;
+                let total_size =
+                    copy_chunk(chunk_id.clone(), &mut reader, &mut writer, hasher, None).await?;
                 writer.flush().await?;
 
                 call_progress_callback(
@@ -1131,12 +1149,8 @@ impl CyfsNdnResponse {
                 .await?;
 
                 if let Some(file_action) = file_action {
-                    call_progress_callback(
-                        &progress_callback,
-                        original_url.clone(),
-                        file_action,
-                    )
-                    .await?;
+                    call_progress_callback(&progress_callback, original_url.clone(), file_action)
+                        .await?;
                 }
 
                 return Ok(CyfsPullResult {
@@ -1152,7 +1166,8 @@ impl CyfsNdnResponse {
                 let hasher = Some(ChunkHasher::new_with_hash_method(
                     chunk_id.chunk_type.to_hash_method()?,
                 )?);
-                let total_size = copy_chunk(chunk_id.clone(), &mut reader, &mut writer, hasher, None).await?;
+                let total_size =
+                    copy_chunk(chunk_id.clone(), &mut reader, &mut writer, hasher, None).await?;
                 writer.flush().await?;
 
                 if pull_mode.need_store_to_named_mgr() {
@@ -1183,12 +1198,8 @@ impl CyfsNdnResponse {
                 .await?;
 
                 if let Some(file_action) = file_action {
-                    call_progress_callback(
-                        &progress_callback,
-                        original_url.clone(),
-                        file_action,
-                    )
-                    .await?;
+                    call_progress_callback(&progress_callback, original_url.clone(), file_action)
+                        .await?;
                 }
 
                 return Ok(CyfsPullResult {
@@ -1203,7 +1214,8 @@ impl CyfsNdnResponse {
                 let hasher = Some(ChunkHasher::new_with_hash_method(
                     chunk_id.chunk_type.to_hash_method()?,
                 )?);
-                let total_size = copy_chunk(chunk_id.clone(), &mut reader, &mut sink, hasher, None).await?;
+                let total_size =
+                    copy_chunk(chunk_id.clone(), &mut reader, &mut sink, hasher, None).await?;
                 call_progress_callback(
                     &progress_callback,
                     format!("chunk:{}", chunk_id.to_string()),
@@ -1261,10 +1273,12 @@ impl CyfsNdnResponse {
             }
 
             if matches!(pull_mode, StoreMode::StoreInNamedMgr) {
-                let store_mgr = target_store_mgr.as_ref().ok_or_else(|| {
-                    NdnError::NotFound("named store mgr is required".to_string())
-                })?;
-                store_mgr.put_chunk(chunk_id, chunk_bytes.as_slice(), true).await?;
+                let store_mgr = target_store_mgr
+                    .as_ref()
+                    .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
+                store_mgr
+                    .put_chunk(chunk_id, chunk_bytes.as_slice(), true)
+                    .await?;
             } else if pull_mode.need_store_to_named_mgr() {
                 pending_links.push(LocalChunkLink {
                     chunk_id: chunk_id.clone(),
@@ -1294,12 +1308,7 @@ impl CyfsNdnResponse {
         .await?;
 
         if let Some(file_action) = file_action {
-            call_progress_callback(
-                &progress_callback,
-                original_url,
-                file_action,
-            )
-            .await?;
+            call_progress_callback(&progress_callback, original_url, file_action).await?;
         }
 
         Ok(CyfsPullResult {
@@ -1324,14 +1333,12 @@ impl ResolvedUrl {
             {
                 Some(ObjLocator::HostFirstLabel)
             } else {
-                parsed_original
-                    .path_segments()
-                    .and_then(|segments| {
-                        segments
-                            .enumerate()
-                            .find(|(_, segment)| ObjId::new(segment).ok().as_ref() == Some(&obj_id))
-                            .map(|(index, _)| ObjLocator::PathSegment(index))
-                    })
+                parsed_original.path_segments().and_then(|segments| {
+                    segments
+                        .enumerate()
+                        .find(|(_, segment)| ObjId::new(segment).ok().as_ref() == Some(&obj_id))
+                        .map(|(index, _)| ObjLocator::PathSegment(index))
+                })
             };
 
             return Ok(Self {
@@ -1443,7 +1450,9 @@ async fn ensure_local_file_exists(path: &Path) -> NdnResult<()> {
     Ok(())
 }
 
-async fn open_local_writer_if_needed(pull_mode: &StoreMode) -> NdnResult<Option<ndn_lib::ChunkWriter>> {
+async fn open_local_writer_if_needed(
+    pull_mode: &StoreMode,
+) -> NdnResult<Option<ndn_lib::ChunkWriter>> {
     if let StoreMode::LocalFile(path, _, _) = pull_mode {
         ensure_local_file_exists(path).await?;
         return Ok(Some(pull_mode.open_local_writer().await?));
@@ -1512,7 +1521,10 @@ async fn call_progress_callback(
     if let Some(callback) = progress_callback {
         let mut callback = callback.lock().await;
         let result = callback(inner_path, action).await?;
-        if !matches!(result, ProgressCallbackResult::Continue | ProgressCallbackResult::Skip) {
+        if !matches!(
+            result,
+            ProgressCallbackResult::Continue | ProgressCallbackResult::Skip
+        ) {
             return Err(NdnError::InvalidState("break by user".to_string()));
         }
     }
@@ -1564,9 +1576,9 @@ fn parse_cyfs_head(headers: &HeaderMap) -> NdnResult<Option<CyfsHead>> {
     let Some(raw) = headers.get("cyfs-head") else {
         return Ok(None);
     };
-    let raw = raw.to_str().map_err(|e| {
-        NdnError::DecodeError(format!("decode cyfs-head header failed: {}", e))
-    })?;
+    let raw = raw
+        .to_str()
+        .map_err(|e| NdnError::DecodeError(format!("decode cyfs-head header failed: {}", e)))?;
     Ok(Some(parse_cyfs_head_value(raw)?))
 }
 
@@ -1628,11 +1640,7 @@ fn parse_cyfs_head_value(raw: &str) -> NdnResult<CyfsHead> {
 
 impl CyfsHeadEnvelope {
     fn into_headers(self) -> NdnResult<CYFSHttpRespHeaders> {
-        let obj_id = self
-            .obj_id
-            .as_ref()
-            .map(|v| ObjId::new(v))
-            .transpose()?;
+        let obj_id = self.obj_id.as_ref().map(|v| ObjId::new(v)).transpose()?;
         let root_obj_id = self
             .root_obj_id
             .as_ref()

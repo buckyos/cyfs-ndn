@@ -10,8 +10,8 @@ use named_store::{
 };
 use ndn_lib::{
     ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind, MsgObject,
-    NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
-    RefItem, RefRole, RefTarget, SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, RefItem,
+    RefRole, RefTarget, SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
@@ -852,8 +852,8 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
 
     let progress_log = Arc::new(Mutex::new(Vec::<String>::new()));
     let progress_log_for_cb = progress_log.clone();
-    let callback: Arc<Mutex<NdnProgressCallback>> = Arc::new(Mutex::new(Box::new(
-        move |inner_path, action| {
+    let callback: Arc<Mutex<NdnProgressCallback>> =
+        Arc::new(Mutex::new(Box::new(move |inner_path, action| {
             let progress_log = progress_log_for_cb.clone();
             Box::pin(async move {
                 progress_log
@@ -862,8 +862,7 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
                     .push(format!("{}|{}", inner_path, action.to_string()));
                 Ok(ProgressCallbackResult::Continue)
             })
-        },
-    )));
+        })));
 
     let client = CyfsNdnClient::builder()
         .transport(TestSchemeTransport::new())
@@ -891,8 +890,12 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
         .unwrap();
 
     for chunk_id in chunk_ids.iter() {
-        assert_completed_chunk(&store_mgr, chunk_id, chunk_map.get(&chunk_id.to_string()).unwrap())
-            .await;
+        assert_completed_chunk(
+            &store_mgr,
+            chunk_id,
+            chunk_map.get(&chunk_id.to_string()).unwrap(),
+        )
+        .await;
     }
 
     let progress_log = progress_log.lock().await;

@@ -1334,16 +1334,15 @@ mod tests {
         assert_eq!(media_info.full_path, friendly_path);
         assert!(matches!(media_info.media_type, MediaType::Dir));
 
-
-
         let pkg_meta =
             create_installable_test_pkg(&mut env, temp.path(), "test.pkg", "1.0.1").await;
         let (meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
-        let get_result = env.get_pkg_meta(&format!("test.pkg#{}", meta_obj_id.to_string())).await;
+        let get_result = env
+            .get_pkg_meta(&format!("test.pkg#{}", meta_obj_id.to_string()))
+            .await;
         assert!(get_result.is_err());
         println!("get_result: {:?}", get_result);
 
-        
         let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
         let strict_path = env
             .get_pkg_strict_dir(&meta_obj_id.to_string(), &pkg_meta)

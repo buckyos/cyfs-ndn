@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::str::FromStr;
 use std::{future::Future, io::SeekFrom, ops::Range, path::PathBuf, pin::Pin};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite};
+
 //关键参数! 系统里的chunk的默认大小为32
 pub const CHUNK_DEFAULT_SIZE: u64 = 1024 * 1024 * 32;
 pub const CALC_HASH_PIECE_SIZE: u64 = 1024 * 1024 * 4;
@@ -460,7 +461,7 @@ mod tests {
     #[test]
     fn test_var_length() {
         let mut buffer = vec![0u8; 2048];
-        let mut rng = rand::rng();
+        let mut rng = rand::thread_rng();
         rng.fill(&mut buffer[..]);
 
         let mut length_buf = unsigned_varint::encode::u64_buffer();

@@ -1,3 +1,4 @@
+mod backend;
 mod chunk_list_reader;
 mod diff_chunk_list;
 mod limit_reader;
@@ -6,6 +7,10 @@ mod store_db;
 mod store_layout;
 mod store_mgr;
 
+pub use backend::{
+    ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
+    NamedDataStoreBackendExt,
+};
 pub use chunk_list_reader::*;
 #[allow(unused_imports)]
 pub use diff_chunk_list::*;

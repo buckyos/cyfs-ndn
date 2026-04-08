@@ -110,6 +110,9 @@ pub struct PackageMetaNode {
 
 mod tests {
     use super::*;
+    use ndn_lib::load_named_obj_and_verify_from_file;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
     struct MyPackageMeta {
@@ -229,5 +232,39 @@ mod tests {
         assert_eq!(my_meta4_meta, meta4);
 
         //assert_eq!(file_obj_str, json_str);
+    }
+
+    #[test]
+    fn test_package_meta_file_roundtrip() {
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut meta = PackageMeta::new("demo.pkg", "1.2.3", "alice", &owner, Some("stable"));
+        meta._base.size = 4_096;
+        meta._base.content =
+            "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+                .to_string();
+        meta._base.create_time = 1_700_000_000;
+        meta._base.last_update_time = 1_700_000_100;
+        meta._base.exp = 1_700_086_400;
+        meta._base
+            .meta
+            .insert("channel".to_string(), json!("nightly"));
+        meta.deps
+            .insert("demo.dep".to_string(), ">=0.9.0".to_string());
+
+        let (obj_id, obj_str) = meta.gen_obj_id();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("package-meta.json");
+        fs::write(&file_path, &obj_str).unwrap();
+
+        let decoded: PackageMeta =
+            load_named_obj_and_verify_from_file(&obj_id, &file_path).unwrap();
+        let objjson = serde_json::from_str::<Value>(&obj_str).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), objjson);
+
+        let report = json!({
+            "objid": obj_id.to_string(),
+            "objjson": serde_json::from_str::<Value>(&obj_str).unwrap(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
     }
 }

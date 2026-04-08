@@ -14,6 +14,7 @@ mod simple_object_map;
 
 //mod example;
 
+pub use action_obj::*;
 pub use base_content::*;
 pub use chunk::*;
 pub use cyfs_http::*;
@@ -23,9 +24,8 @@ pub use hash::*;
 pub use msgobj::*;
 pub use object::*;
 pub use relation_obj::*;
-pub use simple_object_map::*;
-pub use action_obj::*;
 use reqwest::StatusCode;
+pub use simple_object_map::*;
 use std::future::Future;
 use std::ops::Range;
 use std::path::PathBuf;

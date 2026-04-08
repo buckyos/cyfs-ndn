@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Range,
+    path::Path,
 };
 
 //objid link to a did::EncodedDocument
@@ -311,6 +312,19 @@ pub fn load_named_obj<T: DeserializeOwned>(obj_data_str: &str) -> NdnResult<T> {
     })
 }
 
+pub fn load_named_obj_from_file<T: DeserializeOwned, P: AsRef<Path>>(
+    obj_file_path: P,
+) -> NdnResult<T> {
+    let obj_data_str = std::fs::read_to_string(obj_file_path.as_ref()).map_err(|e| {
+        NdnError::IoError(format!(
+            "read named object file failed ({}): {}",
+            obj_file_path.as_ref().display(),
+            e
+        ))
+    })?;
+    load_named_obj(&obj_data_str)
+}
+
 //只验证objid,不会验证jwt.jwt通常需要读取特定对象的字段后才能决定怎么验证，无法自动化验证
 pub fn load_named_obj_and_verify<T: DeserializeOwned>(
     obj_id: &ObjId,
@@ -330,6 +344,20 @@ pub fn load_named_obj_and_verify<T: DeserializeOwned>(
             e
         ))
     })
+}
+
+pub fn load_named_obj_and_verify_from_file<T: DeserializeOwned, P: AsRef<Path>>(
+    obj_id: &ObjId,
+    obj_file_path: P,
+) -> NdnResult<T> {
+    let obj_data_str = std::fs::read_to_string(obj_file_path.as_ref()).map_err(|e| {
+        NdnError::IoError(format!(
+            "read named object file failed ({}): {}",
+            obj_file_path.as_ref().display(),
+            e
+        ))
+    })?;
+    load_named_obj_and_verify(obj_id, &obj_data_str)
 }
 
 pub fn extract_objid_by_path(obj_json: &serde_json::Value, path: &str) -> NdnResult<ObjId> {
@@ -466,8 +494,17 @@ pub fn named_obj_to_jwt(
 mod tests {
     use super::*;
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
+    use crate::{
+        ActionObject, CanonValue, InclusionProof, MachineContent, MsgContent, MsgContentFormat,
+        MsgObjKind, MsgObject, MsgReceiptObj, PathObject, ReceiptStatus, RefItem, RefRole,
+        RefTarget, RelationObject, TopicThread, ACTION_TYPE_VIEWED,
+    };
+    use name_lib::DID;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use std::collections::{BTreeMap, HashMap};
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_obj_id() {
@@ -698,5 +735,172 @@ mod tests {
         let bad_obj_id = ObjId::new("jobj:123456").unwrap();
         let err = load_named_obj_and_verify::<TestNamedObject>(&bad_obj_id, &obj_str).unwrap_err();
         assert!(matches!(err, NdnError::InvalidId(_)));
+    }
+
+    fn did_web(host: &str) -> DID {
+        DID::new("web", host)
+    }
+
+    fn assert_named_object_file_roundtrip<T>(case_name: &str, obj: &T) -> serde_json::Value
+    where
+        T: NamedObject + DeserializeOwned,
+    {
+        let (obj_id, obj_str) = obj.gen_obj_id();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join(format!("{}.json", case_name));
+        fs::write(&file_path, &obj_str).unwrap();
+
+        let decoded: T = load_named_obj_and_verify_from_file(&obj_id, &file_path).unwrap();
+        let decoded_json = serde_json::to_value(&decoded).unwrap();
+        let encoded_json: serde_json::Value = serde_json::from_str(&obj_str).unwrap();
+        assert_eq!(decoded_json, encoded_json);
+
+        json!({
+            "objid": obj_id.to_string(),
+            "objjson": encoded_json,
+        })
+    }
+
+    #[test]
+    fn test_non_chunk_named_object_file_roundtrip() {
+        let mut file_object = crate::FileObject::new(
+            "hello.txt".to_string(),
+            12,
+            "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+                .to_string(),
+        );
+        file_object.content_obj.create_time = 1_700_000_000;
+        file_object.content_obj.last_update_time = 1_700_000_120;
+        file_object.author = "alice".to_string();
+        file_object
+            .meta
+            .insert("mime".to_string(), json!("text/plain"));
+
+        let path_object = PathObject {
+            path: "/repo/apps/demo".to_string(),
+            uptime: 1_700_000_200,
+            target: ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            exp: 1_700_086_600,
+        };
+
+        let inclusion_content = json!({
+            "name": "hello.txt",
+            "size": 12,
+            "content": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+        });
+        let mut inclusion_proof = InclusionProof::new(
+            ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            inclusion_content,
+            did_web("curator.example.com"),
+            88,
+            vec!["docs".to_string(), "featured".to_string()],
+        );
+        inclusion_proof.editor = vec!["did:web:editor.example.com".to_string()];
+        inclusion_proof.review_url =
+            Some("https://curator.example.com/review/hello.txt".to_string());
+        inclusion_proof.meta = Some(json!({"score": 9.6, "comment": "stable"}));
+        inclusion_proof.iat = 1_700_000_300;
+        inclusion_proof.exp = 1_703_110_300;
+
+        let mut relation_object = RelationObject::create_by_link_data(
+            ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            crate::ObjectLinkData::PartOf(ObjId::new("sha256:1122334455667788").unwrap(), 0..12),
+        );
+        relation_object.iat = Some(1_700_000_400);
+        relation_object.exp = Some(1_700_086_800);
+        relation_object
+            .body
+            .insert("note".to_string(), json!("excerpt"));
+
+        let action_object = ActionObject {
+            subject: ObjId::new("cyfile:aaaaaaaaaaaaaaaa").unwrap(),
+            action: ACTION_TYPE_VIEWED.to_string(),
+            target: ObjId::new("cymsg:bbbbbbbbbbbbbbbb").unwrap(),
+            base_on: Some(ObjId::new("cyact:cccccccccccccccc").unwrap()),
+            details: Some(json!({"device": "desktop", "source": "unit-test"})),
+            iat: 1_700_000_500,
+            exp: 1_700_086_900,
+        };
+
+        let mut machine_data = BTreeMap::new();
+        machine_data.insert("level".to_string(), CanonValue::U64(3));
+        machine_data.insert("urgent".to_string(), CanonValue::Bool(true));
+        let msg_object = MsgObject {
+            from: did_web("alice.example.com"),
+            to: vec![did_web("bob.example.com"), did_web("carol.example.com")],
+            kind: MsgObjKind::Chat,
+            thread: TopicThread {
+                topic: Some("release".to_string()),
+                reply_to: Some(ObjId::new("cymsg:010203040506").unwrap()),
+                correlation_id: Some("corr-001".to_string()),
+                tunnel_id: Some("tnl-001".to_string()),
+            },
+            workspace: Some(did_web("workspace.example.com")),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: Some(1_700_086_400_000),
+            nonce: Some(7),
+            content: MsgContent {
+                title: Some("Hello".to_string()),
+                format: Some(MsgContentFormat::ApplicationJson),
+                content: "{\"status\":\"ok\"}".to_string(),
+                machine: Some(MachineContent {
+                    intent: Some("sync".to_string()),
+                    data: machine_data,
+                }),
+                refs: vec![RefItem {
+                    role: RefRole::Input,
+                    target: RefTarget::DataObj {
+                        obj_id: ObjId::new("cyfile:1234567890abcdef").unwrap(),
+                        uri_hint: Some("cyfs://hello.txt".to_string()),
+                    },
+                    label: Some("attachment".to_string()),
+                }],
+            },
+            proof: Some("proof-001".to_string()),
+            meta: BTreeMap::from([
+                ("priority".to_string(), json!(1)),
+                ("lang".to_string(), json!("zh-CN")),
+            ]),
+        };
+
+        let msg_receipt = MsgReceiptObj {
+            msg_id: ObjId::new("cymsg:010203040506").unwrap(),
+            iss: did_web("inbox.example.com"),
+            reader: did_web("bob.example.com"),
+            group_id: Some(did_web("group.example.com")),
+            at_ms: 1_700_000_100_000,
+            status: ReceiptStatus::Accepted,
+            reason: Some("delivered".to_string()),
+        };
+
+        let reports = vec![
+            assert_named_object_file_roundtrip("file_object", &file_object),
+            assert_named_object_file_roundtrip("path_object", &path_object),
+            assert_named_object_file_roundtrip("inclusion_proof", &inclusion_proof),
+            assert_named_object_file_roundtrip("relation_object", &relation_object),
+            assert_named_object_file_roundtrip("action_object", &action_object),
+            assert_named_object_file_roundtrip("msg_object", &msg_object),
+            assert_named_object_file_roundtrip("msg_receipt", &msg_receipt),
+        ];
+
+        assert_eq!(reports.len(), 7);
+        assert!(reports.iter().all(|report| report.get("objid").is_some()));
+        assert!(reports.iter().all(|report| report.get("objjson").is_some()));
+        println!("{}", serde_json::to_string_pretty(&reports).unwrap());
+    }
+
+    #[test]
+    fn test_load_named_obj_from_file() {
+        let obj = TestNamedObject {
+            name: "file-test".to_string(),
+            age: 20,
+        };
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_named_object.json");
+        fs::write(&file_path, serde_json::to_string(&obj).unwrap()).unwrap();
+
+        let decoded: TestNamedObject = load_named_obj_from_file(&file_path).unwrap();
+        assert_eq!(decoded.name, "file-test");
+        assert_eq!(decoded.age, 20);
     }
 }
