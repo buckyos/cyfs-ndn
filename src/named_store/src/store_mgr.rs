@@ -20,7 +20,6 @@ use ndn_lib::{
     ChunkWriter, DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
 };
 use serde::Deserialize;
-use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1114,31 +1113,6 @@ impl NamedStoreMgr {
         }
 
         None
-    }
-
-    //TODO:ndn-lib里有通用函数？
-    fn value_to_obj_id(value: &Value) -> NdnResult<ObjId> {
-        match value {
-            Value::String(v) => ObjId::new(v),
-            Value::Object(map) => {
-                if let Some(Value::String(v)) = map.get("obj_id") {
-                    return ObjId::new(v);
-                }
-
-                if let Ok(obj_id) = serde_json::from_value::<ObjId>(value.clone()) {
-                    return Ok(obj_id);
-                }
-
-                Err(NdnError::InvalidParam(format!(
-                    "cannot convert object value to ObjId: {}",
-                    value
-                )))
-            }
-            _ => Err(NdnError::InvalidParam(format!(
-                "cannot convert value to ObjId: {}",
-                value
-            ))),
-        }
     }
 
     fn normalize_inner_path(inner_path: Option<String>) -> Option<String> {

@@ -1,17 +1,13 @@
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
-use buckyos_kit::get_by_json_path;
 use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, extract_objid_by_path, ChunkHasher, ChunkId, ChunkReader, ChunkWriter,
-    FileObject, NdnError, NdnResult, ObjId, OBJ_TYPE_FILE,
+    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult,
+    ObjId,
 };
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -20,8 +16,6 @@ const CONFIG_FILE_NAME: &str = "named_store.json";
 const DEFAULT_DB_FILE: &str = "named_store.db";
 const CHUNK_DIR_NAME: &str = "chunks";
 const CHUNK_TMP_EXT: &str = "tmp";
-static STORE_REGISTRY: Lazy<Mutex<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedLocalConfig {
@@ -102,21 +96,6 @@ impl NamedLocalStore {
         Self::from_config(Some(mgr_id), root_path, mgr_config).await
     }
 
-    pub async fn is_named_store_exist(named_store_id: Option<&str>) -> bool {
-        let registry = STORE_REGISTRY.lock().unwrap();
-        match named_store_id {
-            Some(id) => registry.contains_key(id),
-            None => !registry.is_empty(),
-        }
-    }
-
-    pub async fn get_named_store_by_id(
-        named_store_id: Option<&str>,
-    ) -> Option<Arc<tokio::sync::Mutex<Self>>> {
-        let registry = STORE_REGISTRY.lock().unwrap();
-        named_store_id.and_then(|id| registry.get(id).cloned())
-    }
-
     pub async fn from_config(
         store_id: Option<String>,
         root_path: PathBuf,
@@ -154,15 +133,10 @@ impl NamedLocalStore {
         let store = NamedLocalStore {
             base_dir: root_path,
             read_only,
-            store_id: store_id.clone(),
+            store_id,
             db,
             chunk_dir,
         };
-
-        let mut registry = STORE_REGISTRY.lock().unwrap();
-        registry
-            .entry(store_id)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(store.clone())));
 
         Ok(store)
     }
@@ -244,15 +218,6 @@ impl NamedLocalStore {
             Ok((ChunkStoreState::NotExist, 0, String::new()))
         }
     }
-    // 这里不能实现open_reader(间接寻址)
-    // 因为obj_id inner_obj_path指向的对象，可能不在当前store
-    // pub async fn open_reader(
-    //     &self,
-    //     obj_id: &ObjId,
-    //     inner_obj_path: Option<String>,
-    // ) -> NdnResult<(ChunkReader, u64)> {
-    // }
-
     pub async fn open_chunk_reader(
         &self,
         chunk_id: &ChunkId,
@@ -657,30 +622,6 @@ impl NamedLocalStore {
         }
     }
 
-    fn value_to_obj_id(value: &Value) -> NdnResult<ObjId> {
-        match value {
-            Value::String(v) => ObjId::new(v),
-            Value::Object(map) => {
-                if let Some(Value::String(v)) = map.get("obj_id") {
-                    return ObjId::new(v);
-                }
-
-                if let Ok(obj_id) = serde_json::from_value::<ObjId>(value.clone()) {
-                    return Ok(obj_id);
-                }
-
-                Err(NdnError::InvalidParam(format!(
-                    "cannot convert object value to ObjId: {}",
-                    value
-                )))
-            }
-            _ => Err(NdnError::InvalidParam(format!(
-                "cannot convert value to ObjId: {}",
-                value
-            ))),
-        }
-    }
-
     async fn verify_local_link(&self, chunk_id: &ChunkId, info: &ChunkLocalInfo) -> NdnResult<()> {
         if info.qcid.is_empty() {
             return Err(NdnError::InvalidLink(format!(
@@ -743,7 +684,7 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{build_named_object_by_json, ChunkHasher, SimpleChunkList, MIN_QCID_FILE_SIZE};
+    use ndn_lib::{ChunkHasher, MIN_QCID_FILE_SIZE};
     use serde_json::json;
     use tempfile::TempDir;
 
