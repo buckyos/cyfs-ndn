@@ -1581,3 +1581,7 @@ impl NamedLocalStoreDB {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "test_gc.rs"]
+mod test_gc;
