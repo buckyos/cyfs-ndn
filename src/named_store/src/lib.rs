@@ -2,6 +2,7 @@ mod backend;
 mod chunk_list_reader;
 mod diff_chunk_list;
 mod gc_types;
+pub mod http_backend;
 mod limit_reader;
 pub mod local_fs_backend;
 mod lru_hot_table;
@@ -11,11 +12,14 @@ mod store_db;
 mod store_layout;
 mod store_mgr;
 mod store_http_gateway;
+#[cfg(test)]
+mod test_http_roundtrip;
 
 pub use backend::{
     ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
     NamedDataStoreBackendExt,
 };
+pub use http_backend::{HttpBackend, HttpBackendConfig};
 pub use local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 pub use chunk_list_reader::*;
 #[allow(unused_imports)]

@@ -18,7 +18,10 @@ cyfs-gateway-lib = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
-
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "http1"] }
+tokio = { workspace = true }

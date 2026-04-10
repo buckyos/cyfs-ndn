@@ -203,10 +203,13 @@ impl NamedStore {
         }
 
         let (_obj_type, obj_str) = self.db.get_object(obj_id).map_err(|e| {
-            if e.is_not_found() {
-                NdnError::NotFound(obj_id.to_string())
-            } else {
-                e
+            match &e {
+                NdnError::NotFound(_) => e,
+                // rusqlite's QueryReturnedNoRows arrives as DbError — treat as NotFound.
+                NdnError::DbError(msg) if msg.contains("no rows") => {
+                    NdnError::NotFound(obj_id.to_string())
+                }
+                _ => e,
             }
         })?;
 
