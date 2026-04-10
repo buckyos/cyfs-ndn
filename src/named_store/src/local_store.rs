@@ -1,3 +1,5 @@
+use crate::gc_types::*;
+use crate::lru_hot_table::LruHotTable;
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
 use fs2::FileExt;
 use log::{debug, warn};
@@ -8,7 +10,7 @@ use ndn_lib::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
@@ -40,6 +42,9 @@ pub enum ObjectState {
     Object(String),
 }
 
+/// Default relatime threshold: 60 seconds between DB flushes for the same key.
+const LRU_RELATIME_THRESHOLD_SECS: u64 = 60;
+
 #[derive(Clone)]
 pub struct NamedLocalStore {
     base_dir: PathBuf,
@@ -47,6 +52,7 @@ pub struct NamedLocalStore {
     store_id: String,
     db: Arc<NamedLocalStoreDB>,
     chunk_dir: PathBuf,
+    lru_hot: Arc<LruHotTable>,
 }
 
 impl NamedLocalStore {
@@ -136,6 +142,7 @@ impl NamedLocalStore {
             store_id,
             db,
             chunk_dir,
+            lru_hot: Arc::new(LruHotTable::new(LRU_RELATIME_THRESHOLD_SECS)),
         };
 
         Ok(store)
@@ -609,6 +616,218 @@ impl NamedLocalStore {
         })?;
         self.complete_chunk_writer(chunk_id).await?;
 
+        Ok(())
+    }
+
+    // ================================================================
+    // GC Public API
+    // ================================================================
+
+    /// Pin an object with a given scope and optional TTL.
+    pub async fn pin(
+        &self,
+        obj_id: &ObjId,
+        owner: &str,
+        scope: PinScope,
+        ttl: Option<Duration>,
+    ) -> NdnResult<()> {
+        self.db.pin(obj_id, owner, scope, ttl)
+    }
+
+    /// Unpin an object for a specific owner.
+    pub async fn unpin(&self, obj_id: &ObjId, owner: &str) -> NdnResult<()> {
+        self.db.unpin(obj_id, owner)
+    }
+
+    /// Remove all pins for the given owner. Returns number of affected objects.
+    pub async fn unpin_owner(&self, owner: &str) -> NdnResult<usize> {
+        self.db.unpin_owner(owner)
+    }
+
+    /// Acquire an fs_anchor for the given object (used by fs_meta layer).
+    pub async fn fs_acquire(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<()> {
+        self.db.fs_acquire(obj_id, inode_id, field_tag)
+    }
+
+    /// Release an fs_anchor.
+    pub async fn fs_release(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<()> {
+        self.db.fs_release(obj_id, inode_id, field_tag)
+    }
+
+    /// Release all fs_anchors for a given inode. Returns number of affected objects.
+    pub async fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
+        self.db.fs_release_inode(inode_id)
+    }
+
+    /// Apply an incoming edge message (from outbox sender of another bucket).
+    pub async fn apply_edge(&self, msg: EdgeMsg) -> NdnResult<()> {
+        self.db.apply_edge(&msg)
+    }
+
+    /// Touch an object's access time (LRU tracking, in-memory only until flush).
+    pub fn touch(&self, obj_id: &ObjId) {
+        self.lru_hot.touch(&obj_id.to_string());
+    }
+
+    /// Flush the LRU hot table dirty entries to DB.
+    pub async fn flush_lru(&self) -> NdnResult<()> {
+        let batch = self.lru_hot.collect_dirty_batch();
+        if !batch.is_empty() {
+            self.db.batch_touch_last_access_with_max(&batch)?;
+        }
+        Ok(())
+    }
+
+    /// Run one round of background GC: expire pins, then evict class-0 LRU items.
+    /// `target_bytes` is the amount of owned_bytes to free.
+    pub async fn run_background_gc(&self) -> NdnResult<GcReport> {
+        // Step 1: Flush LRU
+        self.flush_lru().await?;
+
+        // Step 2: Expire pins
+        let expired = self.db.expire_pins().unwrap_or(0);
+        if expired > 0 {
+            debug!("GC: expired {} pins", expired);
+        }
+
+        // Step 3: Not target-based; just do a small cleanup round
+        self.gc_round(0).await
+    }
+
+    /// Target-based GC round. Evict class-0 items until `target_bytes` are freed.
+    pub async fn gc_round(&self, target_bytes: u64) -> NdnResult<GcReport> {
+        let mut report = GcReport::default();
+        let batch_size = 100;
+
+        loop {
+            let candidates = self.db.list_gc_candidates(batch_size)?;
+            if candidates.is_empty() {
+                break;
+            }
+
+            for (obj_id_str, _owned_bytes) in &candidates {
+                let freed = self.db.try_evict_object(obj_id_str)?;
+                if freed > 0 {
+                    // Delete the actual blob file
+                    if let Ok(obj_id) = ObjId::new(obj_id_str) {
+                        if obj_id.is_chunk() {
+                            let chunk_id = ChunkId::from_obj_id(&obj_id);
+                            let _ = self.delete_chunk_files(&chunk_id).await;
+                            report.evicted_chunks += 1;
+                        } else {
+                            report.evicted_objects += 1;
+                        }
+                    }
+                    report.freed_bytes += freed;
+                } else {
+                    report.skipped_protected += 1;
+                }
+
+                if target_bytes > 0 && report.freed_bytes >= target_bytes {
+                    return Ok(report);
+                }
+            }
+
+            if target_bytes == 0 {
+                break; // non-targeted: one batch only
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Forced GC: try to free at least `target_bytes`. Returns ENOSPC if impossible.
+    pub async fn forced_gc_until(&self, target_bytes: u64) -> NdnResult<u64> {
+        let report = self.gc_round(target_bytes).await?;
+        if report.freed_bytes >= target_bytes {
+            Ok(report.freed_bytes)
+        } else {
+            Err(NdnError::IoError(format!(
+                "ENOSPC: freed {} bytes but needed {}; no class-0 owned bytes left to evict",
+                report.freed_bytes, target_bytes
+            )))
+        }
+    }
+
+    /// Wait until the edge outbox is empty (all cascade effects have been delivered).
+    pub async fn await_cascade_idle(&self) -> NdnResult<()> {
+        loop {
+            let count = self.db.outbox_count()?;
+            if count == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Debug: dump the expand state of an object.
+    pub async fn debug_dump_expand_state(&self, obj_id: &ObjId) -> NdnResult<ExpandDebug> {
+        self.db.debug_dump_expand_state(obj_id)
+    }
+
+    /// Query the cascade state of a pin (P0: Pending | Materializing).
+    pub async fn anchor_state(
+        &self,
+        obj_id: &ObjId,
+        owner: &str,
+    ) -> NdnResult<CascadeStateP0> {
+        self.db.anchor_state(obj_id, owner)
+    }
+
+    /// Query the cascade state of an fs_anchor (P0: Pending | Materializing).
+    pub async fn fs_anchor_state(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<CascadeStateP0> {
+        self.db.fs_anchor_state(obj_id, inode_id, field_tag)
+    }
+
+    /// Fetch ready outbox entries for the outbox sender to process.
+    pub async fn fetch_outbox_ready(&self, limit: usize) -> NdnResult<Vec<OutboxEntry>> {
+        self.db.fetch_outbox_ready(limit)
+    }
+
+    /// Mark an outbox entry as completed (delivered).
+    pub async fn complete_outbox_entry(&self, seq: i64) -> NdnResult<()> {
+        self.db.complete_outbox_entry(seq)
+    }
+
+    /// Mark an outbox entry for retry with backoff.
+    pub async fn retry_outbox_entry(&self, seq: i64) -> NdnResult<()> {
+        self.db.retry_outbox_entry(seq)
+    }
+
+    /// Count pending outbox entries.
+    pub async fn outbox_count(&self) -> NdnResult<u64> {
+        self.db.outbox_count()
+    }
+
+    /// Helper: delete chunk files (final + tmp) from disk.
+    async fn delete_chunk_files(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+        let final_path = self.get_chunk_final_path(chunk_id);
+        if let Err(err) = fs::remove_file(&final_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!("delete_chunk_files: remove final failed: {}", err);
+            }
+        }
+        let tmp_path = self.get_chunk_tmp_path(chunk_id);
+        if let Err(err) = fs::remove_file(&tmp_path).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!("delete_chunk_files: remove tmp failed: {}", err);
+            }
+        }
         Ok(())
     }
 
