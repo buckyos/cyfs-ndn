@@ -60,6 +60,50 @@ impl EdgeRouter for LoopbackRouter {
     }
 }
 
+/// HTTP-based edge router: delivers edges to a remote gateway via `HttpGcClient`.
+pub struct HttpEdgeRouter {
+    client: crate::http_gc_client::HttpGcClient,
+}
+
+impl HttpEdgeRouter {
+    pub fn new(client: crate::http_gc_client::HttpGcClient) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait::async_trait]
+impl EdgeRouter for HttpEdgeRouter {
+    async fn deliver(&self, entry: &OutboxEntry) -> Result<(), String> {
+        self.client
+            .apply_edge(&entry.msg)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Edge router that uses `NamedStoreMgr` to route edges.
+/// For multi-bucket same-machine deployments: routes via Maglev
+/// to the correct local store and calls `apply_edge` directly.
+pub struct MgrEdgeRouter {
+    store_mgr: std::sync::Arc<crate::store_mgr::NamedStoreMgr>,
+}
+
+impl MgrEdgeRouter {
+    pub fn new(store_mgr: std::sync::Arc<crate::store_mgr::NamedStoreMgr>) -> Self {
+        Self { store_mgr }
+    }
+}
+
+#[async_trait::async_trait]
+impl EdgeRouter for MgrEdgeRouter {
+    async fn deliver(&self, entry: &OutboxEntry) -> Result<(), String> {
+        self.store_mgr
+            .apply_edge(entry.msg.clone())
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The outbox sender background task handle.
 pub struct OutboxSender {
     cancel: Arc<Notify>,

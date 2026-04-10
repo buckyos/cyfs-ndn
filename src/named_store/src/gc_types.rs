@@ -1,9 +1,11 @@
 use ndn_lib::ObjId;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::Duration;
 
 /// Pin scope: how a pin protects the target and its children.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PinScope {
     /// Lock self + expand children recursively.
     Recursive,
@@ -39,7 +41,7 @@ impl fmt::Display for PinScope {
 }
 
 /// Minimal per-anchor completeness for P0 (root-level only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CascadeStateP0 {
     /// Anchor registered but root object is still shadow / not arrived.
     Pending,
@@ -71,7 +73,8 @@ impl fmt::Display for CascadeStateP0 {
 }
 
 /// Edge operation in outbox / apply_edge messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgeOp {
     Add,
     Remove,
@@ -95,7 +98,7 @@ impl EdgeOp {
 }
 
 /// A cross-bucket edge message (used by outbox sender and apply_edge).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeMsg {
     pub op: EdgeOp,
     /// The child being referenced.
@@ -117,7 +120,8 @@ pub struct OutboxEntry {
 }
 
 /// Object state in the GC model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ItemState {
     Present,
     Shadow,
@@ -154,16 +158,24 @@ impl fmt::Display for ItemState {
 }
 
 /// Pin request parameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinRequest {
     pub obj_id: ObjId,
     pub owner: String,
     pub scope: PinScope,
-    pub ttl: Option<Duration>,
+    /// TTL in seconds. `None` means no expiration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+impl PinRequest {
+    pub fn ttl(&self) -> Option<Duration> {
+        self.ttl_secs.map(Duration::from_secs)
+    }
 }
 
 /// Debug info for expand state inspection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpandDebug {
     pub obj_id: ObjId,
     pub state: ItemState,
@@ -180,7 +192,7 @@ pub struct ExpandDebug {
 }
 
 /// GC report after a gc_round.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcReport {
     pub freed_bytes: u64,
     pub evicted_objects: u64,

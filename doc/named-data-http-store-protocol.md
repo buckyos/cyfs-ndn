@@ -320,3 +320,192 @@ DELETE /{obj_id}
 - **批量 HEAD**（一次查询多个 chunk 状态）：可加 `POST /_state` + JSON 数组。本期不做。
 - **签名 / 鉴权**：留空。生产部署应在前面套 reverse proxy 或在 Header 加 `Authorization`。
 - **压缩**：协议层不强制；如果客户端/服务端协商 `Content-Encoding`，必须在校验 hash **之前**做解码。
+
+---
+
+## 10. GC 控制面协议（`/_gc/` 端点）
+
+数据面（§3-§6）只覆盖 object/chunk 的 CRUD。跨 bucket 的 GC 引用边传播、pin/unpin 等操作属于**控制面**，统一挂在 `/_gc/` 路径前缀下。
+
+所有 GC 端点的请求和响应 body 均为 `application/json`。
+
+### 10.1 URL 命名空间
+
+```
+{base}/_gc/{operation}
+```
+
+例如 `https://store.example/ndn/_gc/edge`。
+
+### 10.2 GC 操作映射总表
+
+| 操作 | HTTP 方法 | URL | 请求 Body | 响应 |
+|---|---|---|---|---|
+| `apply_edge` | `POST /_gc/edge` | `EdgeMsg` JSON | `204 No Content` |
+| `pin` | `POST /_gc/pin` | `PinRequest` JSON | `204 No Content` |
+| `unpin` | `POST /_gc/unpin` | `{"obj_id":"...","owner":"..."}` | `204 No Content` |
+| `unpin_owner` | `POST /_gc/unpin_owner` | `{"owner":"..."}` | `{"count": N}` |
+| `fs_acquire` | `POST /_gc/fs_acquire` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` |
+| `fs_release` | `POST /_gc/fs_release` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` |
+| `outbox_count` | `GET /_gc/outbox_count` | (无) | `{"count": N}` |
+| `expand_state` | `GET /_gc/expand_state/{obj_id}` | (无) | `ExpandDebug` JSON |
+| `anchor_state` | `GET /_gc/anchor_state/{obj_id}?owner=...` | (无) | `{"state":"..."}` |
+
+### 10.3 `apply_edge` — 跨 bucket 边消息投递
+
+```
+POST /_gc/edge
+Content-Type: application/json
+
+{
+  "op": "add",            // "add" | "remove"
+  "referee": "sha256:...",  // 被引用的 child obj_id
+  "referrer": "cydir:...",  // 发起引用的 parent obj_id
+  "target_epoch": 1         // 声明 bucket 的 epoch
+}
+```
+
+**响应**：`204 No Content`。
+
+这是 outbox sender 的投递目标。bucket A 的 outbox sender 把本地 `edge_outbox` 中到期的条目通过此端点发到 bucket B（referee 的 home bucket）。服务端收到后执行 `apply_edge` 事务（见 `named_store_gc.md` §5.4）：
+
+1. `upsert_shadow_if_absent(referee)`;
+2. 插入/删除 `incoming_refs`;
+3. `recompute_eviction_class` + `reconcile_expand_state`。
+
+**幂等**：重复投递同一条边消息是安全的。
+
+### 10.4 `pin` — 远程 pin 对象
+
+```
+POST /_gc/pin
+Content-Type: application/json
+
+{
+  "obj_id": "sha256:...",
+  "owner": "my-app",
+  "scope": "recursive",     // "recursive" | "skeleton" | "lease"
+  "ttl_secs": 3600           // 可选，null 表示永不过期
+}
+```
+
+**响应**：`204 No Content`。
+
+服务端根据 `obj_id` 路由到对应 bucket 并调用 `pin(obj_id, owner, scope, ttl)`。
+
+### 10.5 `unpin` — 远程 unpin 对象
+
+```
+POST /_gc/unpin
+Content-Type: application/json
+
+{
+  "obj_id": "sha256:...",
+  "owner": "my-app"
+}
+```
+
+**响应**：`204 No Content`。
+
+### 10.6 `unpin_owner` — 按 owner 批量 unpin
+
+```
+POST /_gc/unpin_owner
+Content-Type: application/json
+
+{
+  "owner": "my-app"
+}
+```
+
+**响应**：
+
+```json
+{"count": 5}
+```
+
+服务端遍历所有 bucket，删除该 owner 的全部 pin。返回被删除的总数。
+
+### 10.7 `fs_acquire` / `fs_release` — 文件系统 anchor
+
+```
+POST /_gc/fs_acquire
+Content-Type: application/json
+
+{
+  "obj_id": "sha256:...",
+  "inode_id": 12345,
+  "field_tag": 0
+}
+```
+
+```
+POST /_gc/fs_release
+Content-Type: application/json
+
+{
+  "obj_id": "sha256:...",
+  "inode_id": 12345,
+  "field_tag": 0
+}
+```
+
+**响应**：均为 `204 No Content`。
+
+### 10.8 观测端点
+
+**`GET /_gc/outbox_count`**
+
+返回所有 bucket 的 outbox 条目总数。
+
+```json
+{"count": 42}
+```
+
+**`GET /_gc/expand_state/{obj_id}`**
+
+返回对象在 GC 模型中的完整状态（调试用）。
+
+```json
+{
+  "obj_id": "sha256:...",
+  "state": "present",
+  "eviction_class": 2,
+  "children_expanded": true,
+  "fs_anchor_count": 1,
+  "incoming_refs_count": 0,
+  "has_recursive_pin": true,
+  "has_skeleton_pin": false,
+  "has_lease_pin": false,
+  "owned_bytes": 1024,
+  "logical_size": 1024,
+  "last_access_time": 1712700000
+}
+```
+
+**`GET /_gc/anchor_state/{obj_id}?owner=my-app`**
+
+返回特定 (obj_id, owner) 对的 cascade state。
+
+```json
+{"state": "Materializing"}
+```
+
+### 10.9 错误格式
+
+GC 端点复用 §5 的通用错误格式：
+
+```json
+{
+  "error": "not_found",
+  "message": "no store for referee sha256:..."
+}
+```
+
+错误码与数据面一致（`not_found`, `invalid_param`, `invalid_data`, `permission_denied` 等）。
+
+### 10.10 客户端实现
+
+- **`HttpGcClient`**（`http_gc_client.rs`）：封装所有 `/_gc/` 端点的 reqwest 客户端。
+- **`HttpEdgeRouter`**（`outbox_sender.rs`）：实现 `EdgeRouter` trait，把 outbox 条目通过 `HttpGcClient::apply_edge()` 投递到远端。
+- **`MgrEdgeRouter`**（`outbox_sender.rs`）：实现 `EdgeRouter` trait，通过 `NamedStoreMgr::apply_edge()` 在同机多 bucket 间路由。

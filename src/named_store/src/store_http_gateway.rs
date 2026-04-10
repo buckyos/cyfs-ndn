@@ -15,6 +15,7 @@ use log::{info, warn};
 use ndn_lib::{ChunkId, NdnError, ObjId};
 use std::sync::Arc;
 
+use crate::gc_types::{EdgeMsg, PinRequest};
 use crate::store_mgr::NamedStoreMgr;
 
 // Custom headers
@@ -97,6 +98,12 @@ impl NamedStoreMgrHttpGateway {
             .unwrap_or("/")
             .to_string();
 
+        // ---- GC control-plane ----
+        if let Some(gc_sub) = Self::strip_gc_prefix(&path) {
+            return self.route_gc_request(gc_sub, req).await;
+        }
+
+        // ---- Data-plane ----
         let obj_id = Self::parse_obj_id_from_path(&path)?;
         let is_chunk = obj_id.is_chunk();
         let method = req.method().clone();
@@ -308,6 +315,215 @@ impl NamedStoreMgrHttpGateway {
             .body(empty_body())
             .map_err(|e| NdnError::Internal(format!("build response: {e}")))
     }
+
+    // ======================== GC control-plane ========================
+
+    /// Strip the `/_gc/` prefix from a path. Returns the sub-path after `/_gc/`
+    /// (e.g. `"edge"`, `"pin"`, `"outbox_count"`), or `None` if not a GC path.
+    fn strip_gc_prefix(path: &str) -> Option<String> {
+        // Normalize: find "/_gc/" in the path (may have a prefix like "/ndn/_gc/")
+        let idx = path.find("/_gc/")?;
+        let sub = &path[idx + 5..]; // skip "/_gc/"
+        if sub.is_empty() {
+            None
+        } else {
+            Some(sub.to_string())
+        }
+    }
+
+    async fn route_gc_request(
+        &self,
+        sub_path: String,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let method = req.method().clone();
+
+        match (method, sub_path.as_str()) {
+            (Method::POST, "edge") => self.handle_gc_apply_edge(req).await,
+            (Method::POST, "pin") => self.handle_gc_pin(req).await,
+            (Method::POST, "unpin") => self.handle_gc_unpin(req).await,
+            (Method::POST, "unpin_owner") => self.handle_gc_unpin_owner(req).await,
+            (Method::POST, "fs_acquire") => self.handle_gc_fs_acquire(req).await,
+            (Method::POST, "fs_release") => self.handle_gc_fs_release(req).await,
+            (Method::GET, "outbox_count") => self.handle_gc_outbox_count().await,
+            (m, sub) => {
+                // GET /_gc/expand_state/{obj_id}
+                if m == Method::GET && sub.starts_with("expand_state/") {
+                    let obj_id_str = &sub["expand_state/".len()..];
+                    let obj_id = ObjId::new(obj_id_str)?;
+                    return self.handle_gc_expand_state(&obj_id).await;
+                }
+                // GET /_gc/anchor_state/{obj_id}?owner=...
+                if m == Method::GET && sub.starts_with("anchor_state/") {
+                    return self.handle_gc_anchor_state(sub, &req).await;
+                }
+                Err(NdnError::Unsupported(format!(
+                    "{} /_gc/{}",
+                    m, sub
+                )))
+            }
+        }
+    }
+
+    async fn handle_gc_apply_edge(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let msg: EdgeMsg = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid EdgeMsg JSON: {e}")))?;
+        self.store_mgr.apply_edge(msg).await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_pin(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let pin_req: PinRequest = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid PinRequest JSON: {e}")))?;
+        self.store_mgr
+            .pin(&pin_req.obj_id, &pin_req.owner, pin_req.scope, pin_req.ttl())
+            .await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_unpin(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let obj_id_str = v["obj_id"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidParam("missing obj_id".to_string()))?;
+        let owner = v["owner"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidParam("missing owner".to_string()))?;
+        let obj_id = ObjId::new(obj_id_str)?;
+        self.store_mgr.unpin(&obj_id, owner).await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_unpin_owner(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let owner = v["owner"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidParam("missing owner".to_string()))?;
+        let count = self.store_mgr.unpin_owner(owner).await?;
+        json_response(&serde_json::json!({ "count": count }))
+    }
+
+    async fn handle_gc_fs_acquire(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let obj_id = ObjId::new(
+            v["obj_id"]
+                .as_str()
+                .ok_or_else(|| NdnError::InvalidParam("missing obj_id".to_string()))?,
+        )?;
+        let inode_id = v["inode_id"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing inode_id".to_string()))?;
+        let field_tag = v["field_tag"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing field_tag".to_string()))?
+            as u32;
+        self.store_mgr
+            .fs_acquire(&obj_id, inode_id, field_tag)
+            .await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_fs_release(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let obj_id = ObjId::new(
+            v["obj_id"]
+                .as_str()
+                .ok_or_else(|| NdnError::InvalidParam("missing obj_id".to_string()))?,
+        )?;
+        let inode_id = v["inode_id"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing inode_id".to_string()))?;
+        let field_tag = v["field_tag"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing field_tag".to_string()))?
+            as u32;
+        self.store_mgr
+            .fs_release(&obj_id, inode_id, field_tag)
+            .await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_outbox_count(
+        &self,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let count = self.store_mgr.outbox_count().await?;
+        json_response(&serde_json::json!({ "count": count }))
+    }
+
+    async fn handle_gc_expand_state(
+        &self,
+        obj_id: &ObjId,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let state = self.store_mgr.debug_dump_expand_state(obj_id).await?;
+        let body_str = serde_json::to_string(&state)
+            .map_err(|e| NdnError::Internal(format!("serialize ExpandDebug: {e}")))?;
+        ok_response_builder()
+            .header("content-type", "application/json; charset=utf-8")
+            .body(full_body(Bytes::from(body_str)))
+            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+    }
+
+    async fn handle_gc_anchor_state(
+        &self,
+        sub_path: &str,
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        // sub_path = "anchor_state/{obj_id}" or "anchor_state/{obj_id}?owner=..."
+        let after_prefix = &sub_path["anchor_state/".len()..];
+        let (obj_id_str, query_str) = match after_prefix.find('?') {
+            Some(i) => (&after_prefix[..i], &after_prefix[i + 1..]),
+            None => {
+                // Check URI query string
+                let q = req
+                    .uri()
+                    .query()
+                    .unwrap_or("");
+                (after_prefix, q)
+            }
+        };
+        let obj_id = ObjId::new(obj_id_str)?;
+        let owner = query_str
+            .split('&')
+            .find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == "owner" {
+                    parts.next()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| NdnError::InvalidParam("missing owner query param".to_string()))?;
+        let state = self.store_mgr.anchor_state(&obj_id, owner).await?;
+        json_response(&serde_json::json!({ "state": state }))
+    }
 }
 
 // ======================== Streaming helpers ========================
@@ -440,6 +656,24 @@ fn ndn_error_to_status(e: &NdnError) -> (StatusCode, String) {
             "internal_error".to_string(),
         ),
     }
+}
+
+fn no_content_response() -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(empty_body())
+        .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+}
+
+fn json_response(
+    value: &serde_json::Value,
+) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+    let body_str = serde_json::to_string(value)
+        .map_err(|e| NdnError::Internal(format!("serialize JSON: {e}")))?;
+    ok_response_builder()
+        .header("content-type", "application/json; charset=utf-8")
+        .body(full_body(Bytes::from(body_str)))
+        .map_err(|e| NdnError::Internal(format!("build response: {e}")))
 }
 
 fn build_error_response(

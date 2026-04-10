@@ -10,6 +10,7 @@
 /// 1. Try current layout first
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
+use crate::gc_types::{CascadeStateP0, EdgeMsg, ExpandDebug, PinScope};
 use crate::{
     ChunkLocalInfo, ChunkStoreState, ChunkWriteOutcome, LayoutVersion, NamedLocalConfig,
     NamedStore, ObjectState, SimpleChunkListReader, StoreLayout, StoreTarget,
@@ -23,6 +24,7 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1026,6 +1028,124 @@ impl NamedStoreMgr {
             .add_chunk_by_link_to_local_file(chunk_id, chunk_size, chunk_local_info)
             .await
     }
+
+    // ==================== GC / Edge Operations ====================
+
+    /// Route an edge message to the bucket owning `msg.referee`.
+    pub async fn apply_edge(&self, msg: EdgeMsg) -> NdnResult<()> {
+        let store = self
+            .select_store_for_write(&msg.referee)
+            .await
+            .ok_or_else(|| {
+                NdnError::NotFound(format!("no store for referee {}", msg.referee))
+            })?;
+        let store_guard = store.lock().await;
+        store_guard.apply_edge(msg).await
+    }
+
+    /// Pin an object in the bucket owning `obj_id`.
+    pub async fn pin(
+        &self,
+        obj_id: &ObjId,
+        owner: &str,
+        scope: PinScope,
+        ttl: Option<Duration>,
+    ) -> NdnResult<()> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for pin".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.pin(obj_id, owner, scope, ttl).await
+    }
+
+    /// Unpin an object in the bucket owning `obj_id`.
+    pub async fn unpin(&self, obj_id: &ObjId, owner: &str) -> NdnResult<()> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for unpin".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.unpin(obj_id, owner).await
+    }
+
+    /// Unpin all objects owned by `owner` across all stores.
+    pub async fn unpin_owner(&self, owner: &str) -> NdnResult<usize> {
+        let stores = self.stores.read().await;
+        let mut total = 0usize;
+        for store in stores.values() {
+            let store_guard = store.lock().await;
+            total += store_guard.unpin_owner(owner).await?;
+        }
+        Ok(total)
+    }
+
+    /// Acquire an fs anchor in the bucket owning `obj_id`.
+    pub async fn fs_acquire(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<()> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for fs_acquire".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.fs_acquire(obj_id, inode_id, field_tag).await
+    }
+
+    /// Release an fs anchor in the bucket owning `obj_id`.
+    pub async fn fs_release(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<()> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for fs_release".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.fs_release(obj_id, inode_id, field_tag).await
+    }
+
+    /// Sum of outbox counts across all stores.
+    pub async fn outbox_count(&self) -> NdnResult<u64> {
+        let stores = self.stores.read().await;
+        let mut total = 0u64;
+        for store in stores.values() {
+            let store_guard = store.lock().await;
+            total += store_guard.outbox_count().await?;
+        }
+        Ok(total)
+    }
+
+    /// Debug: dump expand state for an object (routes to owning bucket).
+    pub async fn debug_dump_expand_state(&self, obj_id: &ObjId) -> NdnResult<ExpandDebug> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for expand_state".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.debug_dump_expand_state(obj_id).await
+    }
+
+    /// Query anchor state for (obj_id, owner) — routes to owning bucket.
+    pub async fn anchor_state(
+        &self,
+        obj_id: &ObjId,
+        owner: &str,
+    ) -> NdnResult<CascadeStateP0> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for anchor_state".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.anchor_state(obj_id, owner).await
+    }
+
+    // ==================== Store Access ====================
 
     /// Get store by store_id
     pub async fn get_store(

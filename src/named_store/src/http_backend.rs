@@ -303,6 +303,11 @@ impl NamedDataStoreBackend for HttpBackend {
 }
 
 /// Map HTTP error status to NdnError by trying to parse JSON body first.
+/// Public so that `HttpGcClient` can reuse it.
+pub(crate) fn map_http_error_public(status: StatusCode, body: &str) -> NdnError {
+    map_http_error(status, body)
+}
+
 fn map_http_error(status: StatusCode, body: &str) -> NdnError {
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         let error_code = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
