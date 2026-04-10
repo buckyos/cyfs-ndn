@@ -87,15 +87,11 @@ pub struct ChunkStateInfo {
 | `get_object` | `GET {url}` | Resp: `Content-Type: application/cyfs-object`，body 为 `obj_str` | 仅用于非 chunk |
 | `put_object` | `PUT {url}` | Req: `Content-Type: application/cyfs-object`，body 为 `obj_str`；`X-CYFS-Obj-Id: {obj_id}` | 幂等 |
 | `get_chunk_state` | `HEAD {url}` | Resp: `X-CYFS-Chunk-State`, `Content-Length`（chunk 大小） | 不返回 body |
-| `open_chunk_reader` | `GET {url}` | Req: `Range: bytes={offset}-`；Resp: `206`/`200`，`Content-Length` 为剩余字节 | 与 RFC7233 一致 |
+| `open_chunk_reader` | `GET {url}` | Req: `Range: bytes={offset}-`；Resp: `206`/`200`，`Content-Length` 为剩余字节 | 与 RFC7233 一致，流式传输 |
 | `open_chunk_writer` | `PUT {url}` | Req: `Content-Type: application/octet-stream`，`Content-Length: {chunk_size}`，`X-CYFS-Chunk-Size: {chunk_size}` | 一次性，无续传 |
 | 删除 chunk/object（可选，本地实现使用） | `DELETE {url}` | — | 不在最小集合中，但保留 |
 
-为了保证 chunk 与 object 路由可区分（对部分代理/网关有意义），约定：
-- chunk 资源在 PUT/GET 时必须带 `X-CYFS-Resource-Kind: chunk`
-- object 资源在 PUT/GET 时必须带 `X-CYFS-Resource-Kind: object`
-
-服务端可以用此 header 校验请求路径与对象类型是否匹配（防止把 chunk PUT 到 object 上反之亦然）。
+资源类型由 `obj_id` 自身决定（`obj_id.is_chunk()`），**不需要额外 header**。服务端解析 URL 中的 `obj_id` 后即可判定是 chunk 还是 object，无歧义。
 
 ---
 
@@ -105,7 +101,6 @@ pub struct ChunkStateInfo {
 
 ```
 GET /{obj_id}
-X-CYFS-Resource-Kind: object
 Accept: application/cyfs-object
 ```
 
@@ -122,7 +117,6 @@ X-CYFS-Obj-Id: {obj_id}
 
 错误：
 - `404 Not Found` → `NdnError::NotFound`
-- `400 Bad Request` → `obj_id` 是 chunk id（拒绝在 object 接口上读 chunk），映射为 `NdnError::InvalidObjType`
 - `403 Forbidden` → `NdnError::PermissionDenied`
 
 **body 形态**：对应 `local_store.get_object` 返回的 `String`，对 JWT 友好，因此这里不强求 JSON 解析，仅保证字节级一致。
@@ -131,7 +125,6 @@ X-CYFS-Obj-Id: {obj_id}
 
 ```
 PUT /{obj_id}
-X-CYFS-Resource-Kind: object
 X-CYFS-Obj-Id: {obj_id}
 Content-Type: application/cyfs-object
 Content-Length: {N}
@@ -148,7 +141,6 @@ Content-Length: {N}
 或 `200 OK` 携带空 body。`put_object` **必须**幂等：同一 `obj_id` 重复 PUT 完全相同的内容应返回成功。若 `obj_id` 与 body 内容不自洽（例如服务端能验证 hash 时），返回 `409 Conflict` → `NdnError::VerifyError`。
 
 错误：
-- `400 Bad Request` → `obj_id` 是 chunk id
 - `403 Forbidden` → 后端只读
 - `409 Conflict` → 内容与 obj_id 校验失败
 
@@ -156,7 +148,6 @@ Content-Length: {N}
 
 ```
 HEAD /{obj_id}
-X-CYFS-Resource-Kind: chunk
 ```
 
 **响应（存在）**
@@ -182,7 +173,6 @@ X-CYFS-Chunk-State: not_exist
 
 ```
 GET /{obj_id}
-X-CYFS-Resource-Kind: chunk
 Range: bytes={offset}-
 ```
 
@@ -217,11 +207,12 @@ X-CYFS-Chunk-Size: {chunk_size}
 
 注意：客户端拿到 `(reader, total_size)` 与 trait 签名一致 —— `total_size` 即 `X-CYFS-Chunk-Size`（不是 `Content-Length`，因为带 offset 时 `Content-Length` 是剩余长度）。
 
+**流式传输**：服务端 **必须** 以流式方式发送 chunk body（边读边发），不得将整个 chunk 缓冲到内存后再发送。客户端同样应以流式方式消费响应 body。这对大 chunk（最大 32MB）的内存占用至关重要。
+
 ### 4.5 `open_chunk_writer`（一次性写入，无续传）
 
 ```
 PUT /{obj_id}
-X-CYFS-Resource-Kind: chunk
 X-CYFS-Chunk-Size: {chunk_size}
 Content-Type: application/octet-stream
 Content-Length: {chunk_size}
@@ -275,7 +266,6 @@ X-CYFS-Chunk-Size: {chunk_size}
 
 ```
 DELETE /{obj_id}
-X-CYFS-Resource-Kind: chunk|object
 ```
 
 `200 OK` 或 `204 No Content`，幂等；不存在也返回 `204`。`NamedLocalStore::remove_chunk` / `remove_object` 走这个接口。

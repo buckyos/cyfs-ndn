@@ -2,22 +2,22 @@
 //!
 //! 一个机器上只有一个实例，通过 `NamedStoreMgr` 管理多个 store 桶。
 //! 协议详情见 `doc/named-data-http-store-protocol.md`。
+//!
+//! 资源类型由 `obj_id.is_chunk()` 自动判定，不需要额外 header。
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use cyfs_gateway_lib::{HttpServer, ServerError, ServerResult, StreamInfo};
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, StreamBody};
 use log::{info, warn};
 use ndn_lib::{ChunkId, NdnError, ObjId};
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
 
 use crate::store_mgr::NamedStoreMgr;
 
 // Custom headers
-const H_RESOURCE_KIND: &str = "x-cyfs-resource-kind";
 const H_CHUNK_STATE: &str = "x-cyfs-chunk-state";
 const H_CHUNK_SIZE: &str = "x-cyfs-chunk-size";
 const H_OBJ_ID: &str = "x-cyfs-obj-id";
@@ -25,6 +25,9 @@ const H_CHUNK_ALREADY: &str = "x-cyfs-chunk-already";
 
 const CONTENT_TYPE_OBJECT: &str = "application/cyfs-object";
 const CONTENT_TYPE_OCTET: &str = "application/octet-stream";
+
+/// 从 ChunkReader (AsyncRead) 逐块产出 Frame 的流适配器。
+const STREAM_BUF_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct NamedStoreMgrHttpGateway {
@@ -72,42 +75,15 @@ impl HttpServer for NamedStoreMgrHttpGateway {
 }
 
 impl NamedStoreMgrHttpGateway {
-    /// Parse obj_id from the request URI path (strip the gateway prefix).
-    /// Expects path like `/{prefix}/{obj_id}` — we take the last non-empty segment(s)
-    /// that form a valid obj_id string like `sha256:abcd...` or `mix256:abcd...`.
+    /// Parse obj_id from the request URI path.
+    /// Takes the last non-empty path segment as obj_id (format: `type:hex`).
     fn parse_obj_id_from_path(path: &str) -> Result<ObjId, NdnError> {
-        // Find the obj_id portion: everything after the last `/` that contains a `:`
-        // or use the full remaining path after stripping leading segments.
         let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             return Err(NdnError::InvalidParam("empty path".to_string()));
         }
-        // The obj_id is the last segment (could be `type:hex`)
-        // But obj_id format is `type:hex` which doesn't contain `/`, so last segment works.
-        // However the path prefix may vary. Try from last segment backwards.
         let last = segments.last().unwrap();
         ObjId::new(last)
-    }
-
-    fn get_resource_kind(
-        req: &http::Request<BoxBody<Bytes, ServerError>>,
-        obj_id: &ObjId,
-    ) -> ResourceKind {
-        if let Some(val) = req.headers().get(H_RESOURCE_KIND) {
-            if let Ok(s) = val.to_str() {
-                match s.to_lowercase().as_str() {
-                    "chunk" => return ResourceKind::Chunk,
-                    "object" => return ResourceKind::Object,
-                    _ => {}
-                }
-            }
-        }
-        // Fallback: infer from obj_id type
-        if obj_id.is_chunk() {
-            ResourceKind::Chunk
-        } else {
-            ResourceKind::Object
-        }
     }
 
     async fn route_request(
@@ -122,32 +98,24 @@ impl NamedStoreMgrHttpGateway {
             .to_string();
 
         let obj_id = Self::parse_obj_id_from_path(&path)?;
-        let kind = Self::get_resource_kind(&req, &obj_id);
+        let is_chunk = obj_id.is_chunk();
         let method = req.method().clone();
 
-        match (&method, kind) {
-            (&Method::GET, ResourceKind::Object) => self.handle_get_object(&obj_id).await,
-            (&Method::PUT, ResourceKind::Object) => self.handle_put_object(&obj_id, req).await,
-            (&Method::DELETE, ResourceKind::Object) => self.handle_delete_object(&obj_id).await,
-            (&Method::HEAD, ResourceKind::Chunk) => self.handle_head_chunk(&obj_id).await,
-            (&Method::GET, ResourceKind::Chunk) => self.handle_get_chunk(&obj_id, &req).await,
-            (&Method::PUT, ResourceKind::Chunk) => self.handle_put_chunk(&obj_id, req).await,
-            (&Method::DELETE, ResourceKind::Chunk) => self.handle_delete_chunk(&obj_id).await,
-            (&Method::HEAD, ResourceKind::Object) => {
-                // HEAD on object: check existence
-                let obj_str = self.store_mgr.get_object(&obj_id).await?;
-                let body_bytes = obj_str.into_bytes();
-                ok_response_builder()
-                    .header("content-type", CONTENT_TYPE_OBJECT)
-                    .header("content-length", body_bytes.len())
-                    .header(H_OBJ_ID, obj_id.to_string())
-                    .body(empty_body())
-                    .map_err(|e| NdnError::Internal(format!("build response: {e}")))
-            }
+        match (&method, is_chunk) {
+            // ---- Object ----
+            (&Method::GET, false) => self.handle_get_object(&obj_id).await,
+            (&Method::HEAD, false) => self.handle_head_object(&obj_id).await,
+            (&Method::PUT, false) => self.handle_put_object(&obj_id, req).await,
+            (&Method::DELETE, false) => self.handle_delete_object(&obj_id).await,
+            // ---- Chunk ----
+            (&Method::HEAD, true) => self.handle_head_chunk(&obj_id).await,
+            (&Method::GET, true) => self.handle_get_chunk(&obj_id, &req).await,
+            (&Method::PUT, true) => self.handle_put_chunk(&obj_id, req).await,
+            (&Method::DELETE, true) => self.handle_delete_chunk(&obj_id).await,
             _ => Err(NdnError::Unsupported(format!(
-                "{} on {:?}",
+                "{} on {}",
                 method,
-                kind
+                if is_chunk { "chunk" } else { "object" }
             ))),
         }
     }
@@ -158,11 +126,6 @@ impl NamedStoreMgrHttpGateway {
         &self,
         obj_id: &ObjId,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
-        if obj_id.is_chunk() {
-            return Err(NdnError::InvalidObjType(
-                "use chunk endpoint for chunk ids".to_string(),
-            ));
-        }
         let obj_str = self.store_mgr.get_object(obj_id).await?;
         let body_bytes = Bytes::from(obj_str);
         let len = body_bytes.len();
@@ -174,16 +137,24 @@ impl NamedStoreMgrHttpGateway {
             .map_err(|e| NdnError::Internal(format!("build response: {e}")))
     }
 
+    async fn handle_head_object(
+        &self,
+        obj_id: &ObjId,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let obj_str = self.store_mgr.get_object(obj_id).await?;
+        ok_response_builder()
+            .header("content-type", CONTENT_TYPE_OBJECT)
+            .header("content-length", obj_str.len())
+            .header(H_OBJ_ID, obj_id.to_string())
+            .body(empty_body())
+            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+    }
+
     async fn handle_put_object(
         &self,
         obj_id: &ObjId,
         req: http::Request<BoxBody<Bytes, ServerError>>,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
-        if obj_id.is_chunk() {
-            return Err(NdnError::InvalidObjType(
-                "use chunk endpoint for chunk ids".to_string(),
-            ));
-        }
         let body = collect_body(req).await?;
         let obj_str =
             String::from_utf8(body).map_err(|e| NdnError::InvalidData(format!("invalid utf8: {e}")))?;
@@ -240,21 +211,18 @@ impl NamedStoreMgrHttpGateway {
         let chunk_id = ChunkId::from_obj_id(obj_id);
         let offset = parse_range_offset(req);
 
-        let (mut reader, total_size) =
+        let (reader, total_size) =
             self.store_mgr.open_chunk_reader(&chunk_id, offset).await?;
 
-        // Read the chunk data into memory for response.
-        // For large chunks a streaming approach would be better, but the current
-        // NamedStoreMgr API returns a ChunkReader (Pin<Box<dyn AsyncRead>>), which
-        // we consume here. The protocol limits chunks to DEFAULT_CHUNK_SIZE anyway.
         let remaining = total_size - offset;
-        let mut buf = Vec::with_capacity(remaining as usize);
-        reader
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| NdnError::IoError(format!("read chunk: {e}")))?;
 
-        let body_bytes = Bytes::from(buf);
+        // 流式响应：把 ChunkReader (AsyncRead) 转为 http body stream，
+        // 逐块读取，不全量缓冲。
+        let stream = tokio_stream::wrappers::ReceiverStream::new(
+            chunk_reader_to_channel(reader, remaining),
+        );
+        let stream_body = StreamBody::new(stream);
+        let boxed_body: BoxBody<Bytes, ServerError> = BodyExt::boxed(stream_body);
 
         if offset == 0 {
             ok_response_builder()
@@ -262,7 +230,7 @@ impl NamedStoreMgrHttpGateway {
                 .header("content-length", remaining)
                 .header(H_CHUNK_SIZE, total_size)
                 .header("accept-ranges", "bytes")
-                .body(full_body(body_bytes))
+                .body(boxed_body)
                 .map_err(|e| NdnError::Internal(format!("build response: {e}")))
         } else {
             Response::builder()
@@ -274,7 +242,7 @@ impl NamedStoreMgrHttpGateway {
                 )
                 .header("content-length", remaining)
                 .header(H_CHUNK_SIZE, total_size)
-                .body(full_body(body_bytes))
+                .body(boxed_body)
                 .map_err(|e| NdnError::Internal(format!("build response: {e}")))
         }
     }
@@ -293,22 +261,8 @@ impl NamedStoreMgrHttpGateway {
             ));
         }
 
-        // Parse chunk size from header or content-length
-        let chunk_size = if let Some(val) = req.headers().get(H_CHUNK_SIZE) {
-            val.to_str()
-                .map_err(|_| NdnError::InvalidParam("invalid X-CYFS-Chunk-Size".to_string()))?
-                .parse::<u64>()
-                .map_err(|_| NdnError::InvalidParam("invalid X-CYFS-Chunk-Size".to_string()))?
-        } else if let Some(val) = req.headers().get("content-length") {
-            val.to_str()
-                .map_err(|_| NdnError::InvalidParam("missing chunk size".to_string()))?
-                .parse::<u64>()
-                .map_err(|_| NdnError::InvalidParam("invalid content-length".to_string()))?
-        } else {
-            return Err(NdnError::InvalidParam(
-                "missing X-CYFS-Chunk-Size and Content-Length".to_string(),
-            ));
-        };
+        // Parse chunk size from X-CYFS-Chunk-Size or Content-Length
+        let chunk_size = parse_chunk_size(&req)?;
 
         let body_data = collect_body(req).await?;
         if body_data.len() as u64 != chunk_size {
@@ -319,17 +273,8 @@ impl NamedStoreMgrHttpGateway {
             )));
         }
 
-        // Check if chunk already exists (idempotent PUT)
-        let already_exists = self.store_mgr.have_chunk(&chunk_id).await;
-        if already_exists {
-            return ok_response_builder()
-                .header(H_CHUNK_ALREADY, "1")
-                .header(H_CHUNK_SIZE, chunk_size)
-                .body(empty_body())
-                .map_err(|e| NdnError::Internal(format!("build response: {e}")));
-        }
-
-        self.store_mgr
+        let outcome = self
+            .store_mgr
             .put_chunk_by_reader(
                 &chunk_id,
                 chunk_size,
@@ -337,12 +282,19 @@ impl NamedStoreMgrHttpGateway {
             )
             .await?;
 
-        Response::builder()
-            .status(StatusCode::CREATED)
-            .header(H_CHUNK_SIZE, chunk_size)
-            .header(H_OBJ_ID, obj_id.to_string())
-            .body(empty_body())
-            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+        match outcome {
+            crate::ChunkWriteOutcome::Written => Response::builder()
+                .status(StatusCode::CREATED)
+                .header(H_CHUNK_SIZE, chunk_size)
+                .header(H_OBJ_ID, obj_id.to_string())
+                .body(empty_body())
+                .map_err(|e| NdnError::Internal(format!("build response: {e}"))),
+            crate::ChunkWriteOutcome::AlreadyExists => ok_response_builder()
+                .header(H_CHUNK_ALREADY, "1")
+                .header(H_CHUNK_SIZE, chunk_size)
+                .body(empty_body())
+                .map_err(|e| NdnError::Internal(format!("build response: {e}"))),
+        }
     }
 
     async fn handle_delete_chunk(
@@ -358,13 +310,47 @@ impl NamedStoreMgrHttpGateway {
     }
 }
 
-// ======================== Helpers ========================
+// ======================== Streaming helpers ========================
 
-#[derive(Debug, Clone, Copy)]
-enum ResourceKind {
-    Object,
-    Chunk,
+/// 把 ChunkReader (AsyncRead) 转成一个 tokio mpsc channel，
+/// 后台 task 逐块读取并发送 Frame<Bytes>，HTTP body 消费端零拷贝流式输出。
+fn chunk_reader_to_channel(
+    mut reader: ndn_lib::ChunkReader,
+    total: u64,
+) -> tokio::sync::mpsc::Receiver<Result<http_body::Frame<Bytes>, ServerError>> {
+    use http_body::Frame;
+    use tokio::io::AsyncReadExt;
+
+    // channel buffer 2 帧，保证读和发之间有一点并行度但不堆积太多内存。
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, ServerError>>(2);
+
+    tokio::spawn(async move {
+        let mut sent: u64 = 0;
+        loop {
+            let to_read = std::cmp::min(STREAM_BUF_SIZE as u64, total - sent) as usize;
+            if to_read == 0 {
+                break;
+            }
+            let mut buf = vec![0u8; to_read];
+            match reader.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    sent += n as u64;
+                    if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
+                        break; // receiver dropped
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // tx drops here → stream ends
+    });
+
+    rx
 }
+
+// ======================== Helpers ========================
 
 fn ok_response_builder() -> http::response::Builder {
     Response::builder().status(StatusCode::OK)
@@ -393,6 +379,28 @@ async fn collect_body(
     Ok(collected.to_bytes().to_vec())
 }
 
+fn parse_chunk_size(
+    req: &http::Request<BoxBody<Bytes, ServerError>>,
+) -> Result<u64, NdnError> {
+    if let Some(val) = req.headers().get(H_CHUNK_SIZE) {
+        return val
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| NdnError::InvalidParam("invalid X-CYFS-Chunk-Size".to_string()));
+    }
+    if let Some(val) = req.headers().get("content-length") {
+        return val
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| NdnError::InvalidParam("invalid content-length".to_string()));
+    }
+    Err(NdnError::InvalidParam(
+        "missing X-CYFS-Chunk-Size and Content-Length".to_string(),
+    ))
+}
+
 /// Parse `Range: bytes=N-` header to extract offset. Returns 0 if absent.
 fn parse_range_offset(req: &http::Request<BoxBody<Bytes, ServerError>>) -> u64 {
     let Some(val) = req.headers().get("range") else {
@@ -401,7 +409,6 @@ fn parse_range_offset(req: &http::Request<BoxBody<Bytes, ServerError>>) -> u64 {
     let Ok(s) = val.to_str() else {
         return 0;
     };
-    // Expecting "bytes=N-" or "bytes=N-M"
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("bytes=") {
         if let Some(start_str) = rest.split('-').next() {

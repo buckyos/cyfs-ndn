@@ -11,8 +11,8 @@
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
 use crate::{
-    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalConfig, NamedStore, ObjectState,
-    SimpleChunkListReader, StoreLayout, StoreTarget,
+    ChunkLocalInfo, ChunkStoreState, ChunkWriteOutcome, LayoutVersion, NamedLocalConfig,
+    NamedStore, ObjectState, SimpleChunkListReader, StoreLayout, StoreTarget,
 };
 use log::warn;
 use ndn_lib::{
@@ -978,7 +978,7 @@ impl NamedStoreMgr {
         chunk_id: &ChunkId,
         chunk_size: u64,
         reader: ChunkReader,
-    ) -> NdnResult<()> {
+    ) -> NdnResult<ChunkWriteOutcome> {
         let obj_id = chunk_id.to_obj_id();
         let store = self
             .select_store_for_write(&obj_id)

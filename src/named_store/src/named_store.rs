@@ -401,7 +401,7 @@ impl NamedStore {
         chunk_id: &ChunkId,
         chunk_size: u64,
         reader: ChunkReader,
-    ) -> NdnResult<()> {
+    ) -> NdnResult<ChunkWriteOutcome> {
         self.ensure_writable()?;
         if chunk_size > CHUNK_DEFAULT_SIZE {
             return Err(NdnError::InvalidParam(format!(
@@ -422,7 +422,7 @@ impl NamedStore {
             self.db.set_chunk_item(&chunk_item)?;
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// 原子写入 chunk 字节数据，backend 自动进行 hash 校验。
@@ -431,7 +431,8 @@ impl NamedStore {
     pub async fn put_chunk(&self, chunk_id: &ChunkId, chunk_data: &[u8]) -> NdnResult<()> {
         let chunk_size = chunk_data.len() as u64;
         let reader: ChunkReader = Box::pin(std::io::Cursor::new(chunk_data.to_vec()));
-        self.put_chunk_by_reader(chunk_id, chunk_size, reader).await
+        self.put_chunk_by_reader(chunk_id, chunk_size, reader).await?;
+        Ok(())
     }
 
     // ================================================================

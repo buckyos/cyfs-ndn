@@ -2,6 +2,8 @@
 //!
 //! 通过 HTTP 协议访问远端（或本机）的 `NamedStoreMgrHttpGateway`。
 //! 协议详情见 `doc/named-data-http-store-protocol.md`。
+//!
+//! 资源类型由 URL 中的 obj_id 自动判定（`obj_id.is_chunk()`），不需要额外 header。
 
 use async_trait::async_trait;
 use log::debug;
@@ -11,8 +13,6 @@ use tokio::io::AsyncReadExt;
 
 use crate::backend::{ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend};
 
-// Custom headers — must match store_http_gateway.rs
-const H_RESOURCE_KIND: &str = "x-cyfs-resource-kind";
 const H_CHUNK_SIZE: &str = "x-cyfs-chunk-size";
 const H_OBJ_ID: &str = "x-cyfs-obj-id";
 const H_CHUNK_ALREADY: &str = "x-cyfs-chunk-already";
@@ -65,7 +65,6 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .get(&url)
-            .header(H_RESOURCE_KIND, "object")
             .send()
             .await
             .map_err(|e| NdnError::RemoteError(format!("GET {url}: {e}")))?;
@@ -95,7 +94,6 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .put(&url)
-            .header(H_RESOURCE_KIND, "object")
             .header(H_OBJ_ID, obj_id.to_string())
             .header("content-type", CONTENT_TYPE_OBJECT)
             .body(obj_str.to_owned())
@@ -122,7 +120,6 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .head(&url)
-            .header(H_RESOURCE_KIND, "chunk")
             .send()
             .await
             .map_err(|e| NdnError::RemoteError(format!("HEAD {url}: {e}")))?;
@@ -132,11 +129,9 @@ impl NamedDataStoreBackend for HttpBackend {
             return Ok(ChunkStateInfo::not_exist());
         }
         if !status.is_success() {
-            let body_text = String::new(); // HEAD has no body
-            return Err(map_http_error(status, &body_text));
+            return Err(map_http_error(status, ""));
         }
 
-        // Parse chunk_size from X-CYFS-Chunk-Size or Content-Length
         let chunk_size = resp
             .headers()
             .get(H_CHUNK_SIZE)
@@ -157,11 +152,7 @@ impl NamedDataStoreBackend for HttpBackend {
         let url = self.url_for(&obj_id);
         debug!("HttpBackend::open_chunk_reader GET {} offset={}", url, offset);
 
-        let mut req = self
-            .client
-            .get(&url)
-            .header(H_RESOURCE_KIND, "chunk");
-
+        let mut req = self.client.get(&url);
         if offset > 0 {
             req = req.header("range", format!("bytes={}-", offset));
         }
@@ -183,34 +174,34 @@ impl NamedDataStoreBackend for HttpBackend {
             return Err(map_http_error(status, &body));
         }
 
-        // total_size from X-CYFS-Chunk-Size
+        // total_size from X-CYFS-Chunk-Size (preferred) or Content-Length / Content-Range
         let total_size = resp
             .headers()
             .get(H_CHUNK_SIZE)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or_else(|| {
-                // Fallback: for offset=0, content-length == total_size
-                // For offset>0, need to parse content-range
                 if offset == 0 {
                     resp.content_length().unwrap_or(0)
                 } else {
-                    // Parse Content-Range: bytes N-M/total
+                    // Content-Range: bytes N-M/total
                     resp.headers()
                         .get("content-range")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|s| s.rsplit('/').next())
-                        .and_then(|total_str| total_str.parse::<u64>().ok())
+                        .and_then(|t| t.parse::<u64>().ok())
                         .unwrap_or(0)
                 }
             });
 
-        // Read full body into memory (chunks are bounded by DEFAULT_CHUNK_SIZE)
-        let data = resp
-            .bytes()
-            .await
-            .map_err(|e| NdnError::IoError(format!("read chunk body: {e}")))?;
-        let reader: ChunkReader = Box::pin(std::io::Cursor::new(data.to_vec()));
+        // 流式：把 reqwest 的 byte stream 转成 AsyncRead，不全量缓冲
+        let byte_stream = resp.bytes_stream();
+        use futures_util::StreamExt;
+        let mapped = byte_stream.map(|result| {
+            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        });
+        let stream_reader = tokio_util::io::StreamReader::new(mapped);
+        let reader: ChunkReader = Box::pin(stream_reader);
 
         Ok((reader, total_size))
     }
@@ -221,7 +212,7 @@ impl NamedDataStoreBackend for HttpBackend {
         chunk_size: u64,
         mut source: ChunkReader,
     ) -> NdnResult<ChunkWriteOutcome> {
-        // Read all data from source first
+        // 必须先读完 source 再发 HTTP 请求（reqwest 的 body 需要完整数据或 Stream）
         let mut buf = Vec::with_capacity(chunk_size as usize);
         let n = source
             .read_to_end(&mut buf)
@@ -241,27 +232,21 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .put(&url)
-            .header(H_RESOURCE_KIND, "chunk")
             .header(H_CHUNK_SIZE, chunk_size)
             .header("content-type", CONTENT_TYPE_OCTET)
-            .header("content-length", chunk_size)
             .body(buf)
             .send()
             .await
             .map_err(|e| NdnError::RemoteError(format!("PUT {url}: {e}")))?;
 
         let status = resp.status();
-
-        // Check for "already exists" response
         if status.is_success() {
             let already = resp
                 .headers()
                 .get(H_CHUNK_ALREADY)
                 .and_then(|v| v.to_str().ok())
-                .map(|v| v == "1")
-                .unwrap_or(false);
-
-            if already || status == StatusCode::OK {
+                == Some("1");
+            if already {
                 return Ok(ChunkWriteOutcome::AlreadyExists);
             }
             return Ok(ChunkWriteOutcome::Written);
@@ -280,7 +265,6 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .delete(&url)
-            .header(H_RESOURCE_KIND, "object")
             .send()
             .await
             .map_err(|e| NdnError::RemoteError(format!("DELETE {url}: {e}")))?;
@@ -303,7 +287,6 @@ impl NamedDataStoreBackend for HttpBackend {
         let resp = self
             .client
             .delete(&url)
-            .header(H_RESOURCE_KIND, "chunk")
             .send()
             .await
             .map_err(|e| NdnError::RemoteError(format!("DELETE {url}: {e}")))?;
@@ -321,16 +304,9 @@ impl NamedDataStoreBackend for HttpBackend {
 
 /// Map HTTP error status to NdnError by trying to parse JSON body first.
 fn map_http_error(status: StatusCode, body: &str) -> NdnError {
-    // Try to extract error code from JSON body
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-        let error_code = json
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let message = json
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or(body);
+        let error_code = json.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        let message = json.get("message").and_then(|v| v.as_str()).unwrap_or(body);
 
         return match error_code {
             "not_found" => NdnError::NotFound(message.to_string()),
@@ -346,7 +322,6 @@ fn map_http_error(status: StatusCode, body: &str) -> NdnError {
         };
     }
 
-    // Fallback: map by status code
     match status {
         StatusCode::NOT_FOUND => NdnError::NotFound(body.to_string()),
         StatusCode::BAD_REQUEST => NdnError::InvalidParam(body.to_string()),
@@ -381,7 +356,6 @@ mod tests {
         let backend = HttpBackend::new(config);
         let obj_id = ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789").unwrap();
         let url = backend.url_for(&obj_id);
-        // Should not have double slash
         assert!(!url.contains("//ndn//"));
     }
 

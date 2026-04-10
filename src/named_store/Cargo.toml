@@ -17,8 +17,12 @@ buckyos-kit = {workspace = true}
 cyfs-gateway-lib = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
+http-body = "1"
 http-body-util = { workspace = true }
 reqwest = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = "0.1"
+futures-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
