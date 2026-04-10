@@ -11,7 +11,7 @@
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
 use crate::{
-    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalConfig, NamedLocalStore, ObjectState,
+    ChunkLocalInfo, ChunkStoreState, LayoutVersion, NamedLocalConfig, NamedStore, ObjectState,
     SimpleChunkListReader, StoreLayout, StoreTarget,
 };
 use log::warn;
@@ -191,7 +191,7 @@ pub struct NamedStoreMgr {
     versions: Arc<RwLock<Vec<LayoutVersion>>>,
 
     /// Store instances keyed by store_id
-    stores: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedLocalStore>>>>>,
+    stores: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<NamedStore>>>>>,
 
     /// Maximum number of layout versions to keep
     max_versions: usize,
@@ -247,7 +247,7 @@ impl NamedStoreMgr {
                 ..Default::default()
             };
             let store =
-                NamedLocalStore::from_config(Some(store_id.clone()), store_path, config).await?;
+                NamedStore::from_config(Some(store_id.clone()), store_path, config).await?;
 
             let actual_store_id = store.store_id().to_string();
             if actual_store_id != store_id {
@@ -315,7 +315,7 @@ impl NamedStoreMgr {
     }
 
     /// Register a store instance
-    pub async fn register_store(&self, store: Arc<tokio::sync::Mutex<NamedLocalStore>>) {
+    pub async fn register_store(&self, store: Arc<tokio::sync::Mutex<NamedStore>>) {
         let store_id = {
             let guard = store.lock().await;
             guard.store_id().to_string()
@@ -524,7 +524,7 @@ impl NamedStoreMgr {
     pub async fn select_store_for_write(
         &self,
         obj_id: &ObjId,
-    ) -> Option<Arc<tokio::sync::Mutex<NamedLocalStore>>> {
+    ) -> Option<Arc<tokio::sync::Mutex<NamedStore>>> {
         let versions = self.versions.read().await;
         let stores = self.stores.read().await;
 
@@ -1069,7 +1069,7 @@ impl NamedStoreMgr {
     pub async fn get_store(
         &self,
         store_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<NamedLocalStore>>> {
+    ) -> Option<Arc<tokio::sync::Mutex<NamedStore>>> {
         let stores = self.stores.read().await;
         stores.get(store_id).cloned()
     }
@@ -1085,7 +1085,7 @@ impl NamedStoreMgr {
     pub async fn select_store_for_read(
         &self,
         obj_id: &ObjId,
-    ) -> Option<Arc<tokio::sync::Mutex<NamedLocalStore>>> {
+    ) -> Option<Arc<tokio::sync::Mutex<NamedStore>>> {
         let versions = self.versions.read().await;
         let stores = self.stores.read().await;
 

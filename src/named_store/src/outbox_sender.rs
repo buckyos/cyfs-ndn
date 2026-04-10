@@ -2,11 +2,11 @@
 //! to the target bucket's `apply_edge` endpoint.
 //!
 //! In a single-bucket P0 deployment, the sender loops back to the same
-//! `NamedLocalStore` instance. For multi-bucket setups, it would route via
+//! `NamedStore` instance. For multi-bucket setups, it would route via
 //! the `NamedStoreMgr` routing layer.
 
 use crate::gc_types::OutboxEntry;
-use crate::local_store::NamedLocalStore;
+use crate::named_store::NamedStore;
 use log::{debug, warn};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,11 +41,11 @@ pub trait EdgeRouter: Send + Sync {
 
 /// Loopback router: delivers edges to the same store.
 pub struct LoopbackRouter {
-    store: NamedLocalStore,
+    store: NamedStore,
 }
 
 impl LoopbackRouter {
-    pub fn new(store: NamedLocalStore) -> Self {
+    pub fn new(store: NamedStore) -> Self {
         Self { store }
     }
 }
@@ -68,7 +68,7 @@ pub struct OutboxSender {
 impl OutboxSender {
     /// Spawn the sender as a background tokio task. Returns a handle that can stop it.
     pub fn spawn(
-        store: NamedLocalStore,
+        store: NamedStore,
         router: Arc<dyn EdgeRouter>,
         config: OutboxSenderConfig,
     ) -> Self {
@@ -88,7 +88,7 @@ impl OutboxSender {
     }
 
     async fn run_loop(
-        store: NamedLocalStore,
+        store: NamedStore,
         router: Arc<dyn EdgeRouter>,
         config: OutboxSenderConfig,
         cancel: Arc<Notify>,

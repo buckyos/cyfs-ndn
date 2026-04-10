@@ -14,7 +14,7 @@
 //!    退化为实现细节：写入过程中本地后端可以用 tmp 文件，但外部观察者看不到中间态。
 
 use async_trait::async_trait;
-use ndn_lib::{ChunkId, ChunkReader, NdnResult, ObjId};
+use ndn_lib::{ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult, ObjId};
 
 /// 对外可见的 chunk 状态。协议语义下只有两态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +128,38 @@ pub trait NamedDataStoreBackend: Send + Sync {
         chunk_size: u64,
         source: ChunkReader,
     ) -> NdnResult<ChunkWriteOutcome>;
+
+    // ---------- 流式写入（可选） ----------
+
+    /// 创建一个流式 chunk writer，用于分步写入。
+    ///
+    /// 与 `open_chunk_writer`（一次性写完）不同，此方法返回一个 `ChunkWriter`，
+    /// 调用方可以分多次写入数据，写完后调用 `commit_chunk_writer` 提交。
+    ///
+    /// - `offset == 0`：创建新的写入（截断已有的 tmp 文件）。
+    /// - `offset > 0`：续传——跳到已有 tmp 文件的 `offset` 位置继续写。
+    ///
+    /// 同一 `chunk_id` 同一时刻只能有一个活跃的 streaming writer。
+    /// chunk 在调用 `commit_chunk_writer` 之前对外不可见。
+    async fn create_chunk_writer(
+        &self,
+        _chunk_id: &ChunkId,
+        _chunk_size: u64,
+        _offset: u64,
+    ) -> NdnResult<ChunkWriter> {
+        Err(NdnError::PermissionDenied(
+            "streaming writes not supported by this backend".to_string(),
+        ))
+    }
+
+    /// 提交由 `create_chunk_writer` 开始的流式写入。
+    ///
+    /// 实现应原子地让 chunk 对外可见（例如 rename tmp → final）。
+    async fn commit_chunk_writer(&self, _chunk_id: &ChunkId) -> NdnResult<()> {
+        Err(NdnError::PermissionDenied(
+            "streaming writes not supported by this backend".to_string(),
+        ))
+    }
 
     // ---------- 可选但实用 ----------
 

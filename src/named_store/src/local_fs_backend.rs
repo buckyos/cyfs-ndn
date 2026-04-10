@@ -33,8 +33,9 @@ use crate::backend::{
     ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
 };
 use async_trait::async_trait;
+use fs2::FileExt;
 use log::warn;
-use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId};
+use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult, ObjId};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,9 +45,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const CHUNK_DIR: &str = "chunks";
 const OBJECT_DIR: &str = "objects";
-const CHUNK_EXT: &str = "chunk";
-const OBJECT_EXT: &str = "obj";
 const CHUNK_TMP_TAG: &str = "tmp";
+const STREAMING_TMP_EXT: &str = "tmp";
 const COPY_BUF_SIZE: usize = 64 * 1024;
 
 /// 全局 tmp 文件名计数器，避免同进程内 ns 冲突。
@@ -106,9 +106,7 @@ impl LocalFsBackend {
     fn chunk_final_path(&self, chunk_id: &ChunkId) -> PathBuf {
         let file_name = chunk_id.to_obj_id().to_filename();
         let prefix = &file_name[0..2.min(file_name.len())];
-        self.chunk_dir
-            .join(prefix)
-            .join(format!("{}.{}", file_name, CHUNK_EXT))
+        self.chunk_dir.join(prefix).join(file_name)
     }
 
     /// 为每次写入生成一个全局唯一的 tmp 路径。即便进程内有大量并发 writer
@@ -128,12 +126,19 @@ impl LocalFsBackend {
         ))
     }
 
+    /// 流式写入使用的确定性 tmp 路径。同一个 chunk_id 只有一个 streaming tmp。
+    fn chunk_streaming_tmp_path(&self, chunk_id: &ChunkId) -> PathBuf {
+        let file_name = chunk_id.to_obj_id().to_filename();
+        let prefix = &file_name[0..2.min(file_name.len())];
+        self.chunk_dir
+            .join(prefix)
+            .join(format!("{}.{}", file_name, STREAMING_TMP_EXT))
+    }
+
     fn object_path(&self, obj_id: &ObjId) -> PathBuf {
         let file_name = obj_id.to_filename();
         let prefix = &file_name[0..2.min(file_name.len())];
-        self.object_dir
-            .join(prefix)
-            .join(format!("{}.{}", file_name, OBJECT_EXT))
+        self.object_dir.join(prefix).join(file_name)
     }
 
     async fn ensure_parent(path: &Path) -> NdnResult<()> {
@@ -260,8 +265,7 @@ impl NamedDataStoreBackend for LocalFsBackend {
 
         // 和 chunk 一样用 tmp+rename 保证原子：其它 reader 绝不会看到半写的 object 文件。
         let tmp_path = final_path.with_extension(format!(
-            "{}.tmp.{}.{}",
-            OBJECT_EXT,
+            "tmp.{}.{}",
             process::id(),
             TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -429,18 +433,111 @@ impl NamedDataStoreBackend for LocalFsBackend {
         Ok(ChunkWriteOutcome::Written)
     }
 
+    async fn create_chunk_writer(
+        &self,
+        chunk_id: &ChunkId,
+        _chunk_size: u64,
+        offset: u64,
+    ) -> NdnResult<ChunkWriter> {
+        self.ensure_writable()?;
+
+        let tmp_path = self.chunk_streaming_tmp_path(chunk_id);
+        Self::ensure_parent(&tmp_path).await?;
+
+        if offset == 0 {
+            // 新建写入
+            let file = File::create(&tmp_path).await.map_err(|e| {
+                NdnError::IoError(format!("create streaming tmp failed: {}", e))
+            })?;
+            let std_file = file.into_std().await;
+            std_file.try_lock_exclusive().map_err(|e| {
+                NdnError::IoError(format!("lock streaming tmp failed: {}", e))
+            })?;
+            Ok(Box::pin(tokio::fs::File::from_std(std_file)))
+        } else {
+            // 续传：打开已有 tmp 并 seek
+            let meta = fs::metadata(&tmp_path).await.map_err(|e| {
+                NdnError::IoError(format!("stat streaming tmp failed: {}", e))
+            })?;
+            if offset > meta.len() {
+                return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
+            }
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&tmp_path)
+                .await
+                .map_err(|e| {
+                    NdnError::IoError(format!("open streaming tmp failed: {}", e))
+                })?;
+
+            if offset != 0 {
+                file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+                    NdnError::IoError(format!("seek streaming tmp failed: {}", e))
+                })?;
+            } else {
+                file.seek(SeekFrom::End(0)).await.map_err(|e| {
+                    NdnError::IoError(format!("seek streaming tmp failed: {}", e))
+                })?;
+            }
+            Ok(Box::pin(file))
+        }
+    }
+
+    async fn commit_chunk_writer(&self, chunk_id: &ChunkId) -> NdnResult<()> {
+        self.ensure_writable()?;
+
+        let tmp_path = self.chunk_streaming_tmp_path(chunk_id);
+        let final_path = self.chunk_final_path(chunk_id);
+
+        if !tmp_path.exists() {
+            return Err(NdnError::NotFound(format!(
+                "chunk tmp file not found: {}",
+                tmp_path.display()
+            )));
+        }
+
+        if final_path.exists() {
+            return Err(NdnError::AlreadyExists(format!(
+                "chunk final already exists: {}",
+                final_path.display()
+            )));
+        }
+
+        Self::ensure_parent(&final_path).await?;
+
+        fs::rename(&tmp_path, &final_path).await.map_err(|e| {
+            NdnError::IoError(format!("rename streaming tmp to final failed: {}", e))
+        })?;
+
+        Ok(())
+    }
+
     async fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         self.ensure_writable()?;
+        // 删除 final 文件
         let final_path = self.chunk_final_path(chunk_id);
-        match fs::remove_file(&final_path).await {
-            Ok(_) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(NdnError::IoError(format!(
-                "remove chunk {} failed: {}",
-                chunk_id.to_string(),
-                e
-            ))),
+        if let Err(e) = fs::remove_file(&final_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(NdnError::IoError(format!(
+                    "remove chunk {} failed: {}",
+                    chunk_id.to_string(),
+                    e
+                )));
+            }
         }
+        // 同时清理 streaming tmp（如果存在）
+        let tmp_path = self.chunk_streaming_tmp_path(chunk_id);
+        if let Err(e) = fs::remove_file(&tmp_path).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "LocalFsBackend: remove streaming tmp failed: {} ({})",
+                    tmp_path.display(),
+                    e
+                );
+            }
+        }
+        Ok(())
     }
 
     fn is_read_only(&self) -> bool {

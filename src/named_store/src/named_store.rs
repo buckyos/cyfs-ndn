@@ -1,7 +1,8 @@
+use crate::backend::NamedDataStoreBackend;
 use crate::gc_types::*;
+use crate::local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 use crate::lru_hot_table::LruHotTable;
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
-use fs2::FileExt;
 use log::{debug, warn};
 use ndn_lib::{
     caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult,
@@ -11,13 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::fs::{self, File, OpenOptions};
+use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 const CONFIG_FILE_NAME: &str = "named_store.json";
 const DEFAULT_DB_FILE: &str = "named_store.db";
 const CHUNK_DIR_NAME: &str = "chunks";
-const CHUNK_TMP_EXT: &str = "tmp";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamedLocalConfig {
@@ -45,25 +45,34 @@ pub enum ObjectState {
 /// Default relatime threshold: 60 seconds between DB flushes for the same key.
 const LRU_RELATIME_THRESHOLD_SECS: u64 = 60;
 
+/// 通用 Named Store：使用 `NamedDataStoreBackend` 进行 chunk I/O，
+/// 使用 `NamedLocalStoreDB` 管理元数据（chunk 状态、GC、pin、outbox 等）。
+///
+/// 对象存储在 DB 中（兼容已有行为），chunk 数据委托给 backend。
 #[derive(Clone)]
-pub struct NamedLocalStore {
+pub struct NamedStore {
     base_dir: PathBuf,
     read_only: bool,
     store_id: String,
     db: Arc<NamedLocalStoreDB>,
-    chunk_dir: PathBuf,
+    backend: Arc<dyn NamedDataStoreBackend>,
     lru_hot: Arc<LruHotTable>,
 }
 
-impl NamedLocalStore {
+impl NamedStore {
     pub fn store_id(&self) -> &str {
         &self.store_id
     }
 
-    pub async fn get_named_store_by_path(root_path: PathBuf) -> NdnResult<NamedLocalStore> {
+    pub fn backend(&self) -> &Arc<dyn NamedDataStoreBackend> {
+        &self.backend
+    }
+
+    /// 从路径创建 NamedStore，自动使用 LocalFsBackend。
+    pub async fn get_named_store_by_path(root_path: PathBuf) -> NdnResult<NamedStore> {
         if !root_path.exists() {
             debug!(
-                "NamedLocalStore: create base dir:{}",
+                "NamedStore: create base dir:{}",
                 root_path.to_string_lossy()
             );
             fs::create_dir_all(root_path.clone())
@@ -81,7 +90,7 @@ impl NamedLocalStore {
             let config = NamedLocalConfig::default();
             let mgr_json_str =
                 serde_json::to_string(&config).map_err(|e| NdnError::Internal(e.to_string()))?;
-            let mut file = File::create(mgr_json_file.clone())
+            let mut file = tokio::fs::File::create(mgr_json_file.clone())
                 .await
                 .map_err(|e| NdnError::IoError(format!("create config failed: {}", e)))?;
             file.write_all(mgr_json_str.as_bytes())
@@ -90,11 +99,11 @@ impl NamedLocalStore {
             config
         } else {
             let mgr_json_str = fs::read_to_string(&mgr_json_file).await.map_err(|e| {
-                warn!("NamedLocalStore: read mgr config failed! {}", e);
+                warn!("NamedStore: read mgr config failed! {}", e);
                 NdnError::NotFound("named store config not found".to_string())
             })?;
             serde_json::from_str::<NamedLocalConfig>(&mgr_json_str).map_err(|e| {
-                warn!("NamedLocalStore: parse mgr config failed! {}", e);
+                warn!("NamedStore: parse mgr config failed! {}", e);
                 NdnError::InvalidData("named store config invalid".to_string())
             })?
         };
@@ -102,26 +111,46 @@ impl NamedLocalStore {
         Self::from_config(Some(mgr_id), root_path, mgr_config).await
     }
 
+    /// 从配置创建 NamedStore，自动使用 LocalFsBackend。
     pub async fn from_config(
         store_id: Option<String>,
         root_path: PathBuf,
         config: NamedLocalConfig,
     ) -> NdnResult<Self> {
         let read_only = config.read_only;
-        let db_path = config
-            .db_path
-            .clone()
-            .unwrap_or_else(|| root_path.join(DEFAULT_DB_FILE));
         let chunk_dir = config
             .chunk_dir
             .clone()
             .unwrap_or_else(|| root_path.join(CHUNK_DIR_NAME));
 
-        if !read_only {
-            fs::create_dir_all(&chunk_dir)
-                .await
-                .map_err(|e| NdnError::IoError(format!("create chunk dir failed: {}", e)))?;
-        }
+        // 创建 LocalFsBackend，root 设为 chunk_dir 的父目录
+        let backend_root = chunk_dir
+            .parent()
+            .unwrap_or(&root_path)
+            .to_path_buf();
+        let backend = Arc::new(
+            LocalFsBackend::new(LocalFsBackendConfig {
+                root: backend_root,
+                read_only,
+            })
+            .await?,
+        ) as Arc<dyn NamedDataStoreBackend>;
+
+        Self::from_config_with_backend(store_id, root_path, config, backend).await
+    }
+
+    /// 使用自定义 backend 创建 NamedStore。
+    pub async fn from_config_with_backend(
+        store_id: Option<String>,
+        root_path: PathBuf,
+        config: NamedLocalConfig,
+        backend: Arc<dyn NamedDataStoreBackend>,
+    ) -> NdnResult<Self> {
+        let read_only = config.read_only;
+        let db_path = config
+            .db_path
+            .clone()
+            .unwrap_or_else(|| root_path.join(DEFAULT_DB_FILE));
 
         let db = Arc::new(NamedLocalStoreDB::new(
             db_path.to_string_lossy().to_string(),
@@ -136,12 +165,12 @@ impl NamedLocalStore {
             })
             .unwrap_or_else(|| "default".to_string());
 
-        let store = NamedLocalStore {
+        let store = NamedStore {
             base_dir: root_path,
             read_only,
             store_id,
             db,
-            chunk_dir,
+            backend,
             lru_hot: Arc::new(LruHotTable::new(LRU_RELATIME_THRESHOLD_SECS)),
         };
 
@@ -151,6 +180,10 @@ impl NamedLocalStore {
     pub fn get_base_dir(&self) -> PathBuf {
         self.base_dir.clone()
     }
+
+    // ================================================================
+    // Object Operations (via DB)
+    // ================================================================
 
     pub async fn is_object_exist(&self, obj_id: &ObjId) -> NdnResult<bool> {
         let obj_state = self.query_object_by_id(obj_id).await?;
@@ -164,7 +197,6 @@ impl NamedLocalStore {
         Ok(ObjectState::NotExist)
     }
 
-    // 直接寻址得到对象内容，返回String是为了兼容JWT
     pub async fn get_object(&self, obj_id: &ObjId) -> NdnResult<String> {
         if obj_id.is_chunk() {
             return Err(NdnError::InvalidObjType(obj_id.to_string()));
@@ -178,7 +210,7 @@ impl NamedLocalStore {
             }
         })?;
 
-        return Ok(obj_str);
+        Ok(obj_str)
     }
 
     pub async fn put_object(&self, obj_id: &ObjId, obj_data: &str) -> NdnResult<()> {
@@ -196,6 +228,10 @@ impl NamedLocalStore {
             self.db.remove_object(obj_id)
         }
     }
+
+    // ================================================================
+    // Chunk Operations (via Backend + DB metadata)
+    // ================================================================
 
     async fn get_chunk_item(&self, chunk_id: &ChunkId) -> NdnResult<ChunkItem> {
         self.db.get_chunk_item(chunk_id)
@@ -225,6 +261,7 @@ impl NamedLocalStore {
             Ok((ChunkStoreState::NotExist, 0, String::new()))
         }
     }
+
     pub async fn open_chunk_reader(
         &self,
         chunk_id: &ChunkId,
@@ -233,66 +270,13 @@ impl NamedLocalStore {
         let chunk_item = self.get_chunk_item(chunk_id).await?;
         match chunk_item.chunk_state {
             ChunkStoreState::Completed => {
-                let chunk_real_path = self.get_chunk_final_path(&chunk_item.chunk_id);
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .open(&chunk_real_path)
-                    .await
-                    .map_err(|e| {
-                        warn!("open_chunk_reader: open file failed! {}", e.to_string());
-                        NdnError::IoError(e.to_string())
-                    })?;
-                if offset > 0 {
-                    if offset > chunk_item.chunk_size {
-                        return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
-                    }
-                    file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                        warn!(
-                            "open_chunk_reader: seek chunk file failed! {}",
-                            e.to_string()
-                        );
-                        NdnError::IoError(e.to_string())
-                    })?;
-                }
-                let limited = file.take(chunk_item.chunk_size - offset);
-                Ok((Box::pin(limited), chunk_item.chunk_size))
+                // 委托给 backend
+                self.backend.open_chunk_reader(chunk_id, offset).await
             }
-            ChunkStoreState::LocalLink(local_info) => {
-                self.verify_local_link(chunk_id, &local_info).await?;
-
-                let chunk_real_path = PathBuf::from(local_info.path);
-                let mut real_offset = 0u64;
-                let mut limit_len = chunk_item.chunk_size;
-
-                if let Some(range) = local_info.range.clone() {
-                    let range_len = range.end.saturating_sub(range.start);
-                    if range_len != chunk_item.chunk_size {
-                        return Err(NdnError::InvalidLink(format!(
-                            "link range mismatch: expected {} got {}",
-                            chunk_item.chunk_size, range_len
-                        )));
-                    }
-                    real_offset = range.start;
-                    limit_len = range_len;
-                }
-
-                if offset > limit_len {
-                    return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
-                }
-
-                real_offset += offset;
-                let mut file = File::open(&chunk_real_path).await.map_err(|e| {
-                    warn!("open_chunk_reader: open file failed! {}", e.to_string());
-                    NdnError::IoError(e.to_string())
-                })?;
-                if real_offset > 0 {
-                    file.seek(SeekFrom::Start(real_offset)).await.map_err(|e| {
-                        warn!("open_chunk_reader: seek file failed! {}", e.to_string());
-                        NdnError::IoError(e.to_string())
-                    })?;
-                }
-                let limited = file.take(limit_len - offset);
-                Ok((Box::pin(limited), chunk_item.chunk_size))
+            ChunkStoreState::LocalLink(ref local_info) => {
+                // LocalLink: 直接读取外部文件
+                self.open_local_link_reader(chunk_id, &chunk_item, local_info, offset)
+                    .await
             }
             _ => Err(NdnError::Internal(format!(
                 "chunk {} state not support open reader! state:{}",
@@ -302,6 +286,57 @@ impl NamedLocalStore {
         }
     }
 
+    /// 打开 LocalLink 引用的外部文件读取器。
+    async fn open_local_link_reader(
+        &self,
+        chunk_id: &ChunkId,
+        chunk_item: &ChunkItem,
+        local_info: &ChunkLocalInfo,
+        offset: u64,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        self.verify_local_link(chunk_id, local_info).await?;
+
+        let chunk_real_path = PathBuf::from(&local_info.path);
+        let mut real_offset = 0u64;
+        let mut limit_len = chunk_item.chunk_size;
+
+        if let Some(range) = local_info.range.clone() {
+            let range_len = range.end.saturating_sub(range.start);
+            if range_len != chunk_item.chunk_size {
+                return Err(NdnError::InvalidLink(format!(
+                    "link range mismatch: expected {} got {}",
+                    chunk_item.chunk_size, range_len
+                )));
+            }
+            real_offset = range.start;
+            limit_len = range_len;
+        }
+
+        if offset > limit_len {
+            return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
+        }
+
+        real_offset += offset;
+        let mut file = tokio::fs::File::open(&chunk_real_path).await.map_err(|e| {
+            warn!("open_local_link_reader: open file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        if real_offset > 0 {
+            file.seek(SeekFrom::Start(real_offset))
+                .await
+                .map_err(|e| {
+                    warn!(
+                        "open_local_link_reader: seek file failed! {}",
+                        e.to_string()
+                    );
+                    NdnError::IoError(e.to_string())
+                })?;
+        }
+        let limited = file.take(limit_len - offset);
+        Ok((Box::pin(limited), chunk_item.chunk_size))
+    }
+
+    /// 打开流式 chunk writer，委托给 backend 的 create_chunk_writer。
     pub async fn open_chunk_writer(
         &self,
         chunk_id: &ChunkId,
@@ -311,11 +346,10 @@ impl NamedLocalStore {
         self.ensure_writable()?;
 
         let chunk_item = self.db.get_chunk_item(chunk_id);
-        let mut chunk_state = ChunkStoreState::NotExist;
 
         if let Ok(item) = chunk_item {
-            chunk_state = item.chunk_state.clone();
-            if chunk_state == ChunkStoreState::Completed {
+            let chunk_state = &item.chunk_state;
+            if *chunk_state == ChunkStoreState::Completed {
                 return Err(NdnError::AlreadyExists(format!(
                     "chunk {} already completed",
                     chunk_id.to_string()
@@ -330,67 +364,11 @@ impl NamedLocalStore {
             }
         }
 
-        let chunk_tmp_path = self.get_chunk_tmp_path(chunk_id);
-        if let Some(parent) = chunk_tmp_path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                warn!("open_chunk_writer: create dir failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
-            })?;
-        }
-
-        let file = if chunk_state == ChunkStoreState::Incompleted {
-            let file_meta = fs::metadata(&chunk_tmp_path).await.map_err(|e| {
-                warn!("open_chunk_writer: get metadata failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
-            })?;
-
-            if offset > file_meta.len() {
-                warn!(
-                    "open_chunk_writer: offset too large! {}",
-                    chunk_id.to_string()
-                );
-                return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
-            }
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .open(&chunk_tmp_path)
-                .await
-                .map_err(|e| {
-                    warn!("open_chunk_writer: open file failed! {}", e.to_string());
-                    NdnError::IoError(e.to_string())
-                })?;
-
-            if offset != 0 {
-                file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                    warn!("open_chunk_writer: seek file failed! {}", e.to_string());
-                    NdnError::IoError(e.to_string())
-                })?;
-            } else {
-                file.seek(SeekFrom::End(0)).await.map_err(|e| {
-                    warn!("open_chunk_writer: seek file failed! {}", e.to_string());
-                    NdnError::IoError(e.to_string())
-                })?;
-            }
-            file
-        } else {
-            if offset != 0 {
-                warn!("open_chunk_writer: offset not 0! {}", chunk_id.to_string());
-                return Err(NdnError::InvalidParam("offset not 0".to_string()));
-            }
-
-            let file = File::create(&chunk_tmp_path).await.map_err(|e| {
-                warn!("open_chunk_writer: create file failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
-            })?;
-
-            let std_file = file.into_std().await;
-            std_file.try_lock_exclusive().map_err(|e| {
-                warn!("open_chunk_writer: lock file failed! {}", e.to_string());
-                NdnError::IoError(e.to_string())
-            })?;
-            tokio::fs::File::from_std(std_file)
-        };
+        // 委托给 backend
+        let writer = self
+            .backend
+            .create_chunk_writer(chunk_id, chunk_size, offset)
+            .await?;
 
         let mut chunk_item = match self.db.get_chunk_item(chunk_id) {
             Ok(item) => item,
@@ -401,7 +379,7 @@ impl NamedLocalStore {
             chunk_item.progress = serde_json::json!({ "pos": offset }).to_string();
         }
         self.db.set_chunk_item(&chunk_item)?;
-        Ok((Box::pin(file), chunk_item.progress.clone()))
+        Ok((writer, chunk_item.progress.clone()))
     }
 
     pub async fn open_new_chunk_writer(
@@ -418,39 +396,17 @@ impl NamedLocalStore {
             )));
         }
 
-        let chunk_tmp_path = self.get_chunk_tmp_path(chunk_id);
-        if let Some(parent) = chunk_tmp_path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                warn!(
-                    "open_new_chunk_writer: create dir failed! {}",
-                    e.to_string()
-                );
-                NdnError::IoError(e.to_string())
-            })?;
-        }
-
-        let file = File::create(&chunk_tmp_path).await.map_err(|e| {
-            warn!(
-                "open_new_chunk_writer: create file failed! {}",
-                e.to_string()
-            );
-            NdnError::IoError(e.to_string())
-        })?;
-
-        let std_file = file.into_std().await;
-        std_file.try_lock_exclusive().map_err(|e| {
-            warn!("open_new_chunk_writer: lock file failed! {}", e.to_string());
-            NdnError::IoError(e.to_string())
-        })?;
-        let file = tokio::fs::File::from_std(std_file);
+        // 委托给 backend，offset=0 表示新建
+        let writer = self
+            .backend
+            .create_chunk_writer(chunk_id, chunk_size, 0)
+            .await?;
 
         let chunk_item = ChunkItem::new_incompleted(chunk_id, chunk_size);
         self.db.set_chunk_item(&chunk_item)?;
-        Ok(Box::pin(file))
+        Ok(writer)
     }
 
-    //系统并不鼓励保存大Chunk,这通常是为了兼容一些已有文件的
-    //日常不要使用这个接口
     pub async fn update_chunk_progress(
         &self,
         chunk_id: &ChunkId,
@@ -463,27 +419,9 @@ impl NamedLocalStore {
         self.ensure_writable()?;
 
         let mut chunk_item = self.db.get_chunk_item(chunk_id)?;
-        let tmp_path = self.get_chunk_tmp_path(chunk_id);
-        let final_path = self.get_chunk_final_path(chunk_id);
 
-        if !tmp_path.exists() {
-            return Err(NdnError::NotFound(format!(
-                "chunk tmp file not found: {}",
-                tmp_path.to_string_lossy()
-            )));
-        }
-
-        if final_path.exists() {
-            return Err(NdnError::AlreadyExists(format!(
-                "chunk final already exists: {}",
-                final_path.to_string_lossy()
-            )));
-        }
-
-        fs::rename(&tmp_path, &final_path).await.map_err(|e| {
-            warn!("complete_chunk_writer: rename failed! {}", e.to_string());
-            NdnError::IoError(e.to_string())
-        })?;
+        // 委托给 backend 完成提交（rename tmp → final）
+        self.backend.commit_chunk_writer(chunk_id).await?;
 
         chunk_item.chunk_state = ChunkStoreState::Completed;
         chunk_item.progress = String::new();
@@ -495,20 +433,10 @@ impl NamedLocalStore {
     pub async fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         self.ensure_writable()?;
 
-        let final_path = self.get_chunk_final_path(chunk_id);
-        if let Err(err) = fs::remove_file(&final_path).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(NdnError::IoError(err.to_string()));
-            }
-        }
+        // 委托给 backend 删除文件（final + tmp）
+        self.backend.remove_chunk(chunk_id).await?;
 
-        let tmp_path = self.get_chunk_tmp_path(chunk_id);
-        if let Err(err) = fs::remove_file(&tmp_path).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                return Err(NdnError::IoError(err.to_string()));
-            }
-        }
-
+        // 清理 DB 元数据
         self.db.remove_chunk(chunk_id)
     }
 
@@ -623,7 +551,6 @@ impl NamedLocalStore {
     // GC Public API
     // ================================================================
 
-    /// Pin an object with a given scope and optional TTL.
     pub async fn pin(
         &self,
         obj_id: &ObjId,
@@ -634,17 +561,14 @@ impl NamedLocalStore {
         self.db.pin(obj_id, owner, scope, ttl)
     }
 
-    /// Unpin an object for a specific owner.
     pub async fn unpin(&self, obj_id: &ObjId, owner: &str) -> NdnResult<()> {
         self.db.unpin(obj_id, owner)
     }
 
-    /// Remove all pins for the given owner. Returns number of affected objects.
     pub async fn unpin_owner(&self, owner: &str) -> NdnResult<usize> {
         self.db.unpin_owner(owner)
     }
 
-    /// Acquire an fs_anchor for the given object (used by fs_meta layer).
     pub async fn fs_acquire(
         &self,
         obj_id: &ObjId,
@@ -654,7 +578,6 @@ impl NamedLocalStore {
         self.db.fs_acquire(obj_id, inode_id, field_tag)
     }
 
-    /// Release an fs_anchor.
     pub async fn fs_release(
         &self,
         obj_id: &ObjId,
@@ -664,22 +587,18 @@ impl NamedLocalStore {
         self.db.fs_release(obj_id, inode_id, field_tag)
     }
 
-    /// Release all fs_anchors for a given inode. Returns number of affected objects.
     pub async fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
         self.db.fs_release_inode(inode_id)
     }
 
-    /// Apply an incoming edge message (from outbox sender of another bucket).
     pub async fn apply_edge(&self, msg: EdgeMsg) -> NdnResult<()> {
         self.db.apply_edge(&msg)
     }
 
-    /// Touch an object's access time (LRU tracking, in-memory only until flush).
     pub fn touch(&self, obj_id: &ObjId) {
         self.lru_hot.touch(&obj_id.to_string());
     }
 
-    /// Flush the LRU hot table dirty entries to DB.
     pub async fn flush_lru(&self) -> NdnResult<()> {
         let batch = self.lru_hot.collect_dirty_batch();
         if !batch.is_empty() {
@@ -688,23 +607,15 @@ impl NamedLocalStore {
         Ok(())
     }
 
-    /// Run one round of background GC: expire pins, then evict class-0 LRU items.
-    /// `target_bytes` is the amount of owned_bytes to free.
     pub async fn run_background_gc(&self) -> NdnResult<GcReport> {
-        // Step 1: Flush LRU
         self.flush_lru().await?;
-
-        // Step 2: Expire pins
         let expired = self.db.expire_pins().unwrap_or(0);
         if expired > 0 {
             debug!("GC: expired {} pins", expired);
         }
-
-        // Step 3: Not target-based; just do a small cleanup round
         self.gc_round(0).await
     }
 
-    /// Target-based GC round. Evict class-0 items until `target_bytes` are freed.
     pub async fn gc_round(&self, target_bytes: u64) -> NdnResult<GcReport> {
         let mut report = GcReport::default();
         let batch_size = 100;
@@ -718,11 +629,10 @@ impl NamedLocalStore {
             for (obj_id_str, _owned_bytes) in &candidates {
                 let freed = self.db.try_evict_object(obj_id_str)?;
                 if freed > 0 {
-                    // Delete the actual blob file
                     if let Ok(obj_id) = ObjId::new(obj_id_str) {
                         if obj_id.is_chunk() {
                             let chunk_id = ChunkId::from_obj_id(&obj_id);
-                            let _ = self.delete_chunk_files(&chunk_id).await;
+                            let _ = self.backend.remove_chunk(&chunk_id).await;
                             report.evicted_chunks += 1;
                         } else {
                             report.evicted_objects += 1;
@@ -739,14 +649,13 @@ impl NamedLocalStore {
             }
 
             if target_bytes == 0 {
-                break; // non-targeted: one batch only
+                break;
             }
         }
 
         Ok(report)
     }
 
-    /// Forced GC: try to free at least `target_bytes`. Returns ENOSPC if impossible.
     pub async fn forced_gc_until(&self, target_bytes: u64) -> NdnResult<u64> {
         let report = self.gc_round(target_bytes).await?;
         if report.freed_bytes >= target_bytes {
@@ -759,7 +668,6 @@ impl NamedLocalStore {
         }
     }
 
-    /// Wait until the edge outbox is empty (all cascade effects have been delivered).
     pub async fn await_cascade_idle(&self) -> NdnResult<()> {
         loop {
             let count = self.db.outbox_count()?;
@@ -770,12 +678,10 @@ impl NamedLocalStore {
         }
     }
 
-    /// Debug: dump the expand state of an object.
     pub async fn debug_dump_expand_state(&self, obj_id: &ObjId) -> NdnResult<ExpandDebug> {
         self.db.debug_dump_expand_state(obj_id)
     }
 
-    /// Query the cascade state of a pin (P0: Pending | Materializing).
     pub async fn anchor_state(
         &self,
         obj_id: &ObjId,
@@ -784,7 +690,6 @@ impl NamedLocalStore {
         self.db.anchor_state(obj_id, owner)
     }
 
-    /// Query the cascade state of an fs_anchor (P0: Pending | Materializing).
     pub async fn fs_anchor_state(
         &self,
         obj_id: &ObjId,
@@ -794,42 +699,25 @@ impl NamedLocalStore {
         self.db.fs_anchor_state(obj_id, inode_id, field_tag)
     }
 
-    /// Fetch ready outbox entries for the outbox sender to process.
     pub async fn fetch_outbox_ready(&self, limit: usize) -> NdnResult<Vec<OutboxEntry>> {
         self.db.fetch_outbox_ready(limit)
     }
 
-    /// Mark an outbox entry as completed (delivered).
     pub async fn complete_outbox_entry(&self, seq: i64) -> NdnResult<()> {
         self.db.complete_outbox_entry(seq)
     }
 
-    /// Mark an outbox entry for retry with backoff.
     pub async fn retry_outbox_entry(&self, seq: i64) -> NdnResult<()> {
         self.db.retry_outbox_entry(seq)
     }
 
-    /// Count pending outbox entries.
     pub async fn outbox_count(&self) -> NdnResult<u64> {
         self.db.outbox_count()
     }
 
-    /// Helper: delete chunk files (final + tmp) from disk.
-    async fn delete_chunk_files(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        let final_path = self.get_chunk_final_path(chunk_id);
-        if let Err(err) = fs::remove_file(&final_path).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!("delete_chunk_files: remove final failed: {}", err);
-            }
-        }
-        let tmp_path = self.get_chunk_tmp_path(chunk_id);
-        if let Err(err) = fs::remove_file(&tmp_path).await {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                warn!("delete_chunk_files: remove tmp failed: {}", err);
-            }
-        }
-        Ok(())
-    }
+    // ================================================================
+    // Internal Helpers
+    // ================================================================
 
     fn ensure_writable(&self) -> NdnResult<()> {
         if self.read_only {
@@ -875,23 +763,10 @@ impl NamedLocalStore {
 
         Ok(())
     }
-
-    fn chunk_file_name(&self, chunk_id: &ChunkId) -> String {
-        chunk_id.to_obj_id().to_filename()
-    }
-
-    fn get_chunk_final_path(&self, chunk_id: &ChunkId) -> PathBuf {
-        let file_name = self.chunk_file_name(chunk_id);
-        let prefix = &file_name[0..2.min(file_name.len())];
-        self.chunk_dir.join(prefix).join(file_name)
-    }
-
-    fn get_chunk_tmp_path(&self, chunk_id: &ChunkId) -> PathBuf {
-        let file_name = format!("{}.{}", self.chunk_file_name(chunk_id), CHUNK_TMP_EXT);
-        let prefix = &file_name[0..2.min(file_name.len())];
-        self.chunk_dir.join(prefix).join(file_name)
-    }
 }
+
+/// 向后兼容的类型别名。
+pub type NamedLocalStore = NamedStore;
 
 fn current_unix_ts() -> u64 {
     SystemTime::now()
@@ -917,7 +792,7 @@ mod tests {
     #[tokio::test]
     async fn test_put_and_read_chunk() {
         let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -936,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn test_local_link_qcid_ok() {
         let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -976,7 +851,7 @@ mod tests {
     #[tokio::test]
     async fn test_local_link_qcid_mismatch() {
         let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -987,7 +862,6 @@ mod tests {
         let chunk_id = calc_chunk_id(&data);
         let qcid = caculate_qcid_from_file(&file_path).await.unwrap();
 
-        // Modify file after qcid is recorded
         let new_data = vec![0xBBu8; data.len()];
         fs::write(&file_path, &new_data).await.unwrap();
 
@@ -1017,7 +891,7 @@ mod tests {
     #[tokio::test]
     async fn test_local_link_missing_qcid() {
         let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
@@ -1052,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_large_chunk_stream() {
         let temp_dir = TempDir::new().unwrap();
-        let store = NamedLocalStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
