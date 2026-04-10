@@ -22,6 +22,10 @@ log = "0.4"
 thiserror = "*"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-native-roots"] }
+url = "2.5.8"
+http = "1.4.0"
+http-body-util = "0.1.3"
+bytes = "1.11.0"
 futures = "0.3"
 futures-util = "0.3"
 chrono = "0.4"
@@ -35,6 +39,9 @@ name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "nam
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "main"}
 krpc = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC", branch = "main" }
 rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", branch = "main" }
+cyfs-gateway-lib = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs-gateway-lib", branch = "main" }
+
+
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 casbin = { version = "2.9", features = ["logging","explain"] }
 lazy_static = "1.5"

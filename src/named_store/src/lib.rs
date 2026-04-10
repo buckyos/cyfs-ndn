@@ -10,6 +10,7 @@ mod outbox_sender;
 mod store_db;
 mod store_layout;
 mod store_mgr;
+mod store_http_gateway;
 
 pub use backend::{
     ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
@@ -24,5 +25,6 @@ pub use limit_reader::*;
 pub use local_store::{NamedLocalConfig, NamedLocalStore, ObjectState};
 pub use outbox_sender::{EdgeRouter, LoopbackRouter, OutboxSender, OutboxSenderConfig};
 pub use store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
+pub use store_http_gateway::NamedStoreMgrHttpGateway;
 pub use store_layout::*;
 pub use store_mgr::*;
