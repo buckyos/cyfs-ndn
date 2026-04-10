@@ -74,7 +74,9 @@ pub struct ChunkStateInfo {
 
 资源类型由 `obj_id.is_chunk()` 决定：
 - 非 chunk → object 资源（小数据，文本或 JSON/JWT 字符串）
-- chunk → chunk 资源（不限大小的二进制流）
+- chunk → **标准 chunk** 资源（单 blob 二进制流，大小上限 32MB）
+
+大于 32MB 的"逻辑大 chunk"不通过 §3-§6 的二进制 PUT 直接写入；它必须由上层先产出 `ChunkList`，再通过 §10 的 GC/控制面把该逻辑 chunk 物化为 `SameAs(big_chunk -> chunk_list)`。原因不是上传策略，而是 GC 元数据语义不同：`SameAs` 需要把 big chunk 记为 `owned_bytes=0`，并让 `parse_obj_refs(big_chunk)` 返回 `[chunk_list_id]`。
 
 如有"集合"操作（HEAD 状态查询、列表、删除等），统一使用同一个 URL，由 HTTP method / Header 区分语义，不在路径里加 `?op=...` 或 `/state` 之类的子路径。这与 RESTful 风格一致，也方便部署在 CDN/反代后。
 
@@ -232,6 +234,7 @@ Expect: 100-continue   ; 可选，但推荐
 5. **原子可见性**：成功写入的最后一步必须是原子操作（本地实现：`rename(tmp, final)`；对象存储后端：multipart commit 或 server-side copy）。在该步骤完成之前，并发的 `open_chunk_reader`/`get_chunk_state` 必须看到 `not_exist`；之后必须看到 `completed`。
 6. **失败即清理**：传输中断、客户端断开、校验失败、磁盘错误等任何分支，服务端都必须保证 chunk 最终状态为 `not_exist`（清理临时文件、不更新元数据）。
 7. **`Expect: 100-continue` 推荐**：客户端先发头，服务端检查 `chunk_id` 是否已存在或 `chunk_size` 是否合法，再用 `100 Continue` 放行 body。已存在的 chunk 服务端可直接回 `200 OK` + `X-CYFS-Chunk-Already: 1` 跳过 body（`PUT` 幂等）。
+8. **标准 chunk 大小上限为 32MB**。超过上限时返回 `413 Payload Too Large`；调用方应改走 `ChunkList + SameAs`，见 §10.6。
 
 **响应**
 
@@ -323,13 +326,36 @@ DELETE /{obj_id}
 
 ---
 
-## 10. GC 控制面协议（`/_gc/` 端点）
+## 10. GC / Cascade 控制面协议（`/_gc/` 端点）
 
-数据面（§3-§6）只覆盖 object/chunk 的 CRUD。跨 bucket 的 GC 引用边传播、pin/unpin 等操作属于**控制面**，统一挂在 `/_gc/` 路径前缀下。
+数据面（§3-§6）只覆盖 object/标准 chunk 的 CRUD。凡是会影响 `named_store_gc.md` 中 reachability、anchor、`children_expanded`、`owned_bytes`、`SameAs` 等 GC 本地事实的操作，统一归入 `/_gc/` 控制面。
+
+把这些端点集中在一起有两个目的：
+
+1. 在大型部署里，GC 常常整体关闭；此时只需要关闭 `/_gc/` 前缀，数据面仍可独立提供 CRUD。
+2. 在声称"支持 `named_store_gc.md` P0"的部署里，必须成组实现这些端点，避免出现"pin 有了，但 `fs_anchor_state` / `SameAs` / inode 级 release 缺失"的半套协议。
 
 所有 GC 端点的请求和响应 body 均为 `application/json`。
 
-### 10.1 URL 命名空间
+### 10.1 部署模式与边界
+
+GC 控制面是一个**可选能力集**，不是数据面的强依赖。部署可分成两档：
+
+| 模式 | 是否暴露 `/_gc/*` | 适用场景 | 能力边界 |
+|---|---|---|---|
+| **Data-only** | 否，或统一返回 `404/501` | 大型系统关闭 GC，只把 store 当对象/chunk 缓存或只读副本 | **不**承诺支持 `named_store_gc.md` / `ndm_gc.md` 的 pin、fs_anchor、reachability 语义 |
+| **GC-enabled P0** | 是 | 需要 `named_store_gc.md` P0 能力的部署 | 必须实现 §10.3 中标记为 `P0 必选` 的全部端点 |
+
+推荐当 GC 被关闭时返回统一错误：
+
+```json
+{
+  "error": "gc_disabled",
+  "message": "gc control-plane is disabled on this deployment"
+}
+```
+
+### 10.2 URL 命名空间
 
 ```
 {base}/_gc/{operation}
@@ -337,28 +363,38 @@ DELETE /{obj_id}
 
 例如 `https://store.example/ndn/_gc/edge`。
 
-### 10.2 GC 操作映射总表
+### 10.3 GC 操作映射总表
 
-| 操作 | HTTP 方法 | URL | 请求 Body | 响应 |
-|---|---|---|---|---|
-| `apply_edge` | `POST /_gc/edge` | `EdgeMsg` JSON | `204 No Content` |
-| `pin` | `POST /_gc/pin` | `PinRequest` JSON | `204 No Content` |
-| `unpin` | `POST /_gc/unpin` | `{"obj_id":"...","owner":"..."}` | `204 No Content` |
-| `unpin_owner` | `POST /_gc/unpin_owner` | `{"owner":"..."}` | `{"count": N}` |
-| `fs_acquire` | `POST /_gc/fs_acquire` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` |
-| `fs_release` | `POST /_gc/fs_release` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` |
-| `outbox_count` | `GET /_gc/outbox_count` | (无) | `{"count": N}` |
-| `expand_state` | `GET /_gc/expand_state/{obj_id}` | (无) | `ExpandDebug` JSON |
-| `anchor_state` | `GET /_gc/anchor_state/{obj_id}?owner=...` | (无) | `{"state":"..."}` |
+| 类别 | 操作 | HTTP 方法 | URL | 请求 Body | 响应 | P0 |
+|---|---|---|---|---|---|---|
+| Reachability | `apply_edge` | `POST` | `/_gc/edge` | `EdgeMsg` JSON | `204 No Content` | 必选 |
+| Anchor | `pin` | `POST` | `/_gc/pin` | `PinRequest` JSON | `204 No Content` | 必选 |
+| Anchor | `unpin` | `POST` | `/_gc/unpin` | `{"obj_id":"...","owner":"..."}` | `204 No Content` | 必选 |
+| Anchor | `unpin_owner` | `POST` | `/_gc/unpin_owner` | `{"owner":"..."}` | `{"count": N}` | 必选 |
+| FS anchor | `fs_acquire` | `POST` | `/_gc/fs_acquire` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` | 必选 |
+| FS anchor | `fs_release` | `POST` | `/_gc/fs_release` | `{"obj_id":"...","inode_id":N,"field_tag":N}` | `204 No Content` | 必选 |
+| FS anchor | `fs_release_inode` | `POST` | `/_gc/fs_release_inode` | `{"inode_id":N}` | `{"count": N}` | 必选 |
+| GC-significant materialization | `same_as` | `POST` | `/_gc/same_as` | `{"big_chunk_id":"...","chunk_list_id":"..."}` | `204 No Content` | 必选 |
+| Observation | `outbox_count` | `GET` | `/_gc/outbox_count` | 无 | `{"count": N}` | 必选 |
+| Observation | `expand_state` | `GET` | `/_gc/expand_state/{obj_id}` | 无 | `ExpandDebug` JSON | 必选 |
+| Observation | `anchor_state` | `GET` | `/_gc/anchor_state/{obj_id}?owner=...` | 无 | `{"state":"..."}` | 必选 |
+| Observation | `fs_anchor_state` | `GET` | `/_gc/fs_anchor_state/{obj_id}?inode_id=N&field_tag=N` | 无 | `{"state":"..."}` | 必选 |
+| Admin | `forced_gc` | `POST` | `/_gc/forced_gc` | `{"target_bytes": N}` | `{"freed_bytes": N}` | 可选 |
 
-### 10.3 `apply_edge` — 跨 bucket 边消息投递
+说明：
+
+- `forced_gc` 属于运维/管理接口，不是 reachability 正确性的前提；大型系统可不暴露。
+- `await_cascade_idle()` 的远程等价形式在 P0 不单独定义阻塞端点；客户端通过轮询 `GET /_gc/outbox_count` 直到 `count == 0` 即可实现。
+- `same_as` 被放在 GC 控制面，不是因为它是"GC 算法"，而是因为它写入的是 **GC 依赖的 store 元数据语义**：`owned_bytes=0`、`logical_size=big_chunk_size`、以及 `big_chunk -> chunk_list` 的引用边。
+
+### 10.4 `apply_edge` — 跨 bucket 边消息投递
 
 ```
 POST /_gc/edge
 Content-Type: application/json
 
 {
-  "op": "add",            // "add" | "remove"
+  "op": "add",              // "add" | "remove"
   "referee": "sha256:...",  // 被引用的 child obj_id
   "referrer": "cydir:...",  // 发起引用的 parent obj_id
   "target_epoch": 1         // 声明 bucket 的 epoch
@@ -375,30 +411,30 @@ Content-Type: application/json
 
 **幂等**：重复投递同一条边消息是安全的。
 
-### 10.4 `pin` — 远程 pin 对象
+`target_epoch` 在 P0 只作为透传/审计字段保存；P0 不承诺跨 epoch 乱序过滤。迁移边界仍以 `named_store_gc.md` §5.8 为准。
 
-```
-POST /_gc/pin
-Content-Type: application/json
+### 10.5 `pin` / `unpin` / `unpin_owner`
 
+**`POST /_gc/pin`**
+
+```json
 {
   "obj_id": "sha256:...",
   "owner": "my-app",
-  "scope": "recursive",     // "recursive" | "skeleton" | "lease"
-  "ttl_secs": 3600           // 可选，null 表示永不过期
+  "scope": "recursive",
+  "ttl_secs": 3600
 }
 ```
+
+`scope` 取值：`recursive` | `skeleton` | `lease`。
 
 **响应**：`204 No Content`。
 
 服务端根据 `obj_id` 路由到对应 bucket 并调用 `pin(obj_id, owner, scope, ttl)`。
 
-### 10.5 `unpin` — 远程 unpin 对象
+**`POST /_gc/unpin`**
 
-```
-POST /_gc/unpin
-Content-Type: application/json
-
+```json
 {
   "obj_id": "sha256:...",
   "owner": "my-app"
@@ -407,18 +443,15 @@ Content-Type: application/json
 
 **响应**：`204 No Content`。
 
-### 10.6 `unpin_owner` — 按 owner 批量 unpin
+**`POST /_gc/unpin_owner`**
 
-```
-POST /_gc/unpin_owner
-Content-Type: application/json
-
+```json
 {
   "owner": "my-app"
 }
 ```
 
-**响应**：
+**响应**
 
 ```json
 {"count": 5}
@@ -426,12 +459,41 @@ Content-Type: application/json
 
 服务端遍历所有 bucket，删除该 owner 的全部 pin。返回被删除的总数。
 
-### 10.7 `fs_acquire` / `fs_release` — 文件系统 anchor
+### 10.6 `same_as` — 物化大 chunk 的 GC 语义
 
 ```
-POST /_gc/fs_acquire
+POST /_gc/same_as
 Content-Type: application/json
 
+{
+  "big_chunk_id": "sha256:...",
+  "chunk_list_id": "chunklist:..."
+}
+```
+
+**响应**：`204 No Content`。
+
+这对应 `NamedLocalStore::add_chunk_by_same_as(big_chunk_id, chunk_list_id)`。虽然"何时把大 chunk 转成 `ChunkList + SameAs`"可以由上层决定，但**一旦做出这个决策，最终必须由 store 自己写入对应元数据**，否则远端 GC 看不到正确的本地事实。
+
+服务端行为：
+
+1. 校验 `chunk_list_id` 已存在；
+2. 校验 sub-chunks 完整；
+3. 流式 hash 校验拼接内容的 ChunkId 等于 `big_chunk_id`；
+4. 写入一行 `state='present'`、`logical_size=big_chunk_size`、`owned_bytes=0`、`ChunkStoreState::SameAs(chunk_list_id)`；
+5. 令 `parse_obj_refs(big_chunk)` 在后续 GC 解析中返回 `[chunk_list_id]`。
+
+错误：
+
+- `404 Not Found`：`chunk_list_id` 或其 sub-chunks 不存在；
+- `409 Conflict`：拼接 hash 与 `big_chunk_id` 不一致；
+- `413 Payload Too Large`：如果调用方错误地试图用 §4.5 的二进制 PUT 写入同一个大 chunk，应被拒绝并改走此端点。
+
+### 10.7 `fs_acquire` / `fs_release` / `fs_release_inode`
+
+**`POST /_gc/fs_acquire`**
+
+```json
 {
   "obj_id": "sha256:...",
   "inode_id": 12345,
@@ -439,10 +501,9 @@ Content-Type: application/json
 }
 ```
 
-```
-POST /_gc/fs_release
-Content-Type: application/json
+**`POST /_gc/fs_release`**
 
+```json
 {
   "obj_id": "sha256:...",
   "inode_id": 12345,
@@ -451,6 +512,24 @@ Content-Type: application/json
 ```
 
 **响应**：均为 `204 No Content`。
+
+**`POST /_gc/fs_release_inode`**
+
+```json
+{
+  "inode_id": 12345
+}
+```
+
+**响应**
+
+```json
+{"count": 3}
+```
+
+返回该 inode 下被释放的 anchor 总数。这对应 `named_store_gc.md` / `ndm_gc.md` 中 inode 销毁或 orphan 清理的标准入口。
+
+> 重要边界：HTTP 控制面只表达 `named_store` 侧的 anchor 变化；它**不**自动提供 `fs_meta` 与 `named_store` 的跨进程同事务能力。若上层像 `ndm_gc.md` 那样要求"字段改动与 `fs_acquire`/`fs_release` 同事务提交"，该原子性仍需要由同机共享事务、上层 2PC，或其它外部协调机制保证，不能靠 `/_gc/` HTTP 自身隐含获得。
 
 ### 10.8 观测端点
 
@@ -461,6 +540,8 @@ Content-Type: application/json
 ```json
 {"count": 42}
 ```
+
+客户端对远端 `await_cascade_idle()` 的 P0 实现就是轮询这个接口直到 `count == 0`。
 
 **`GET /_gc/expand_state/{obj_id}`**
 
@@ -485,13 +566,44 @@ Content-Type: application/json
 
 **`GET /_gc/anchor_state/{obj_id}?owner=my-app`**
 
-返回特定 (obj_id, owner) 对的 cascade state。
+返回特定 `(obj_id, owner)` 对的 `cascade_state`：
 
 ```json
 {"state": "Materializing"}
 ```
 
-### 10.9 错误格式
+**`GET /_gc/fs_anchor_state/{obj_id}?inode_id=12345&field_tag=0`**
+
+返回特定 `(obj_id, inode_id, field_tag)` 对的 `cascade_state`：
+
+```json
+{"state": "Pending"}
+```
+
+这两个接口都只回答 P0 的 root 级状态：`Pending` / `Materializing`。
+
+### 10.9 `forced_gc`（可选管理端点）
+
+```
+POST /_gc/forced_gc
+Content-Type: application/json
+
+{
+  "target_bytes": 104857600
+}
+```
+
+**响应**
+
+```json
+{"freed_bytes": 104857600}
+```
+
+语义等价于本地 `forced_gc_until(target_bytes)`。若 class 0 清空后仍然不够，应返回容量不足错误而不是继续动 class 1 / class 2。
+
+这是运维接口，不要求所有 GC-enabled 部署暴露；大型系统可以关闭它。
+
+### 10.10 错误格式
 
 GC 端点复用 §5 的通用错误格式：
 
@@ -502,10 +614,14 @@ GC 端点复用 §5 的通用错误格式：
 }
 ```
 
-错误码与数据面一致（`not_found`, `invalid_param`, `invalid_data`, `permission_denied` 等）。
+错误码与数据面一致（`not_found`, `invalid_param`, `invalid_data`, `permission_denied` 等）。额外约定两个 GC 控制面的错误码：
 
-### 10.10 客户端实现
+- `gc_disabled`：部署未启用 GC 控制面；
+- `out_of_space`：`forced_gc` 清空 class 0 后仍无法满足目标字节数。
+
+### 10.11 客户端实现
 
 - **`HttpGcClient`**（`http_gc_client.rs`）：封装所有 `/_gc/` 端点的 reqwest 客户端。
 - **`HttpEdgeRouter`**（`outbox_sender.rs`）：实现 `EdgeRouter` trait，把 outbox 条目通过 `HttpGcClient::apply_edge()` 投递到远端。
 - **`MgrEdgeRouter`**（`outbox_sender.rs`）：实现 `EdgeRouter` trait，通过 `NamedStoreMgr::apply_edge()` 在同机多 bucket 间路由。
+- `await_cascade_idle()` 的远端 helper 直接循环调用 `HttpGcClient::outbox_count()` 直到为 0。
