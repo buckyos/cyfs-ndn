@@ -435,6 +435,29 @@ impl NamedStore {
         Ok(())
     }
 
+    /// 物化大 chunk 的 SameAs 关系：big_chunk_id 的内容等价于 chunk_list_id 指向的 ChunkList 拼接。
+    ///
+    /// 写入 state='present', owned_bytes=0, logical_size=big_chunk_size, SameAs(chunk_list_id)。
+    /// 后续 GC 的 parse_obj_refs(big_chunk) 会返回 [chunk_list_id]。
+    pub async fn add_chunk_by_same_as(
+        &self,
+        big_chunk_id: &ChunkId,
+        big_chunk_size: u64,
+        chunk_list_id: &ObjId,
+    ) -> NdnResult<()> {
+        self.ensure_writable()?;
+
+        let chunk_item = ChunkItem {
+            chunk_id: big_chunk_id.clone(),
+            chunk_size: big_chunk_size,
+            chunk_state: ChunkStoreState::SameAs(chunk_list_id.clone()),
+            create_time: current_unix_ts(),
+            update_time: current_unix_ts(),
+        };
+        self.db.set_chunk_item(&chunk_item)?;
+        Ok(())
+    }
+
     // ================================================================
     // GC Public API
     // ================================================================

@@ -732,7 +732,7 @@ impl NamedLocalStoreDB {
 
     /// Parse children references from an object's stored content.
     fn parse_obj_refs_tx(tx: &Transaction, obj_id: &ObjId) -> NdnResult<Vec<ObjId>> {
-        // Read obj_type and obj_data
+        // Read obj_type and obj_data from objects table
         let result: Option<(String, String)> = tx
             .query_row(
                 "SELECT obj_type, obj_data FROM objects WHERE obj_id = ?1 AND state = 'present'",
@@ -741,26 +741,39 @@ impl NamedLocalStoreDB {
             )
             .ok();
 
-        let (obj_type, obj_data) = match result {
-            Some(v) => v,
-            None => return Ok(Vec::new()),
-        };
-
-        if obj_type.is_empty() || obj_data.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Use KnownStandardObject to extract children
-        match KnownStandardObject::from_obj_data(obj_id, &obj_data) {
-            Ok(known) => {
-                let children = known.get_child_objs().unwrap_or_default();
-                Ok(children.into_iter().map(|(id, _)| id).collect())
-            }
-            Err(_) => {
-                // Not a known container type; no children
-                Ok(Vec::new())
+        if let Some((obj_type, obj_data)) = result {
+            if !obj_type.is_empty() && !obj_data.is_empty() {
+                // Use KnownStandardObject to extract children
+                match KnownStandardObject::from_obj_data(obj_id, &obj_data) {
+                    Ok(known) => {
+                        let children = known.get_child_objs().unwrap_or_default();
+                        return Ok(children.into_iter().map(|(id, _)| id).collect());
+                    }
+                    Err(_) => {
+                        // Not a known container type; fall through
+                    }
+                }
             }
         }
+
+        // For chunks: if it's a SameAs chunk, return the chunk_list_id as the single child ref.
+        if obj_id.is_chunk() {
+            let same_as_target: Option<String> = tx
+                .query_row(
+                    "SELECT local_info FROM chunk_items
+                     WHERE chunk_id = ?1 AND chunk_state = 'same_as' AND state = 'present'",
+                    params![obj_id.to_string()],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let Some(target_str) = same_as_target {
+                if let Ok(target_id) = ObjId::new(&target_str) {
+                    return Ok(vec![target_id]);
+                }
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// The central reconcile: compare should_expand vs children_expanded,

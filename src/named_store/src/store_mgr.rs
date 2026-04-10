@@ -1110,6 +1110,80 @@ impl NamedStoreMgr {
         store_guard.fs_release(obj_id, inode_id, field_tag).await
     }
 
+    /// Release all fs anchors for a given inode across all stores.
+    pub async fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
+        let stores = self.stores.read().await;
+        let mut total = 0usize;
+        for store in stores.values() {
+            let store_guard = store.lock().await;
+            total += store_guard.fs_release_inode(inode_id).await?;
+        }
+        Ok(total)
+    }
+
+    /// Query fs anchor state for (obj_id, inode_id, field_tag) — routes to owning bucket.
+    pub async fn fs_anchor_state(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<CascadeStateP0> {
+        let store = self
+            .select_store_for_write(obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for fs_anchor_state".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard.fs_anchor_state(obj_id, inode_id, field_tag).await
+    }
+
+    /// Run forced GC across all stores until target_bytes freed.
+    pub async fn forced_gc_until(&self, target_bytes: u64) -> NdnResult<u64> {
+        let stores = self.stores.read().await;
+        let mut total_freed = 0u64;
+        for store in stores.values() {
+            if total_freed >= target_bytes {
+                break;
+            }
+            let store_guard = store.lock().await;
+            let remaining = target_bytes - total_freed;
+            match store_guard.forced_gc_until(remaining).await {
+                Ok(freed) => total_freed += freed,
+                Err(_) => {
+                    // This store couldn't free enough, try next
+                    if let Ok(report) = store_guard.gc_round(remaining).await {
+                        total_freed += report.freed_bytes;
+                    }
+                }
+            }
+        }
+        if total_freed >= target_bytes {
+            Ok(total_freed)
+        } else {
+            Err(NdnError::IoError(format!(
+                "ENOSPC: freed {} bytes but needed {}; no class-0 owned bytes left to evict",
+                total_freed, target_bytes
+            )))
+        }
+    }
+
+    /// Register a SameAs relationship: big_chunk_id content equals chunk_list_id.
+    pub async fn add_chunk_by_same_as(
+        &self,
+        big_chunk_id: &ChunkId,
+        big_chunk_size: u64,
+        chunk_list_id: &ObjId,
+    ) -> NdnResult<()> {
+        let obj_id = big_chunk_id.to_obj_id();
+        let store = self
+            .select_store_for_write(&obj_id)
+            .await
+            .ok_or_else(|| NdnError::NotFound("no store for same_as".to_string()))?;
+        let store_guard = store.lock().await;
+        store_guard
+            .add_chunk_by_same_as(big_chunk_id, big_chunk_size, chunk_list_id)
+            .await
+    }
+
     /// Sum of outbox counts across all stores.
     pub async fn outbox_count(&self) -> NdnResult<u64> {
         let stores = self.stores.read().await;

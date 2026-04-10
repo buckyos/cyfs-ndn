@@ -163,6 +163,75 @@ impl HttpGcClient {
         check_no_content(resp, &url).await
     }
 
+    /// Release all fs anchors for a given inode. Returns count of released anchors.
+    pub async fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
+        let url = self.gc_url("fs_release_inode");
+        let body = serde_json::json!({ "inode_id": inode_id });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("POST {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_gc_error(resp).await);
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| NdnError::IoError(format!("parse response: {e}")))?;
+        Ok(v["count"].as_u64().unwrap_or(0) as usize)
+    }
+
+    // ======================== same_as ========================
+
+    /// Register a SameAs relationship for a big chunk.
+    pub async fn same_as(
+        &self,
+        big_chunk_id: &ObjId,
+        chunk_list_id: &ObjId,
+    ) -> NdnResult<()> {
+        let url = self.gc_url("same_as");
+        let body = serde_json::json!({
+            "big_chunk_id": big_chunk_id.to_string(),
+            "chunk_list_id": chunk_list_id.to_string(),
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("POST {url}: {e}")))?;
+        check_no_content(resp, &url).await
+    }
+
+    // ======================== forced_gc ========================
+
+    /// Trigger forced GC to free at least target_bytes. Returns freed bytes.
+    pub async fn forced_gc(&self, target_bytes: u64) -> NdnResult<u64> {
+        let url = self.gc_url("forced_gc");
+        let body = serde_json::json!({ "target_bytes": target_bytes });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("POST {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_gc_error(resp).await);
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| NdnError::IoError(format!("parse response: {e}")))?;
+        Ok(v["freed_bytes"].as_u64().unwrap_or(0))
+    }
+
     // ======================== Observation ========================
 
     /// Query total outbox count on the remote node.
@@ -201,6 +270,40 @@ impl HttpGcClient {
         resp.json::<ExpandDebug>()
             .await
             .map_err(|e| NdnError::IoError(format!("parse ExpandDebug: {e}")))
+    }
+
+    /// Query fs anchor state for (obj_id, inode_id, field_tag).
+    pub async fn fs_anchor_state(
+        &self,
+        obj_id: &ObjId,
+        inode_id: u64,
+        field_tag: u32,
+    ) -> NdnResult<CascadeStateP0> {
+        let url = format!(
+            "{}?inode_id={}&field_tag={}",
+            self.gc_url(&format!("fs_anchor_state/{}", obj_id)),
+            inode_id,
+            field_tag
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("GET {url}: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(map_gc_error(resp).await);
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| NdnError::IoError(format!("parse response: {e}")))?;
+        let state_str = v["state"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidData("missing state field".to_string()))?;
+        CascadeStateP0::from_str(state_str)
+            .ok_or_else(|| NdnError::InvalidData(format!("unknown cascade state: {state_str}")))
     }
 
     /// Query anchor state for (obj_id, owner).

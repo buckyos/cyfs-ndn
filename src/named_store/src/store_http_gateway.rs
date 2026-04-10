@@ -33,11 +33,29 @@ const STREAM_BUF_SIZE: usize = 64 * 1024;
 #[derive(Clone)]
 pub struct NamedStoreMgrHttpGateway {
     store_mgr: Arc<NamedStoreMgr>,
+    /// When `false`, all `/_gc/*` endpoints return `gc_disabled` error.
+    /// Large-scale deployments can set this to `false` to run in Data-only mode.
+    gc_enabled: bool,
 }
 
 impl NamedStoreMgrHttpGateway {
     pub fn new(store_mgr: Arc<NamedStoreMgr>) -> Self {
-        Self { store_mgr }
+        Self {
+            store_mgr,
+            gc_enabled: true,
+        }
+    }
+
+    pub fn new_data_only(store_mgr: Arc<NamedStoreMgr>) -> Self {
+        Self {
+            store_mgr,
+            gc_enabled: false,
+        }
+    }
+
+    pub fn with_gc_enabled(mut self, enabled: bool) -> Self {
+        self.gc_enabled = enabled;
+        self
     }
 }
 
@@ -336,6 +354,12 @@ impl NamedStoreMgrHttpGateway {
         sub_path: String,
         req: http::Request<BoxBody<Bytes, ServerError>>,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        if !self.gc_enabled {
+            return Err(NdnError::Unsupported(
+                "gc control-plane is disabled on this deployment".to_string(),
+            ));
+        }
+
         let method = req.method().clone();
 
         match (method, sub_path.as_str()) {
@@ -345,6 +369,9 @@ impl NamedStoreMgrHttpGateway {
             (Method::POST, "unpin_owner") => self.handle_gc_unpin_owner(req).await,
             (Method::POST, "fs_acquire") => self.handle_gc_fs_acquire(req).await,
             (Method::POST, "fs_release") => self.handle_gc_fs_release(req).await,
+            (Method::POST, "fs_release_inode") => self.handle_gc_fs_release_inode(req).await,
+            (Method::POST, "same_as") => self.handle_gc_same_as(req).await,
+            (Method::POST, "forced_gc") => self.handle_gc_forced_gc(req).await,
             (Method::GET, "outbox_count") => self.handle_gc_outbox_count().await,
             (m, sub) => {
                 // GET /_gc/expand_state/{obj_id}
@@ -356,6 +383,10 @@ impl NamedStoreMgrHttpGateway {
                 // GET /_gc/anchor_state/{obj_id}?owner=...
                 if m == Method::GET && sub.starts_with("anchor_state/") {
                     return self.handle_gc_anchor_state(sub, &req).await;
+                }
+                // GET /_gc/fs_anchor_state/{obj_id}?inode_id=N&field_tag=N
+                if m == Method::GET && sub.starts_with("fs_anchor_state/") {
+                    return self.handle_gc_fs_anchor_state(sub, &req).await;
                 }
                 Err(NdnError::Unsupported(format!(
                     "{} /_gc/{}",
@@ -523,6 +554,104 @@ impl NamedStoreMgrHttpGateway {
             .ok_or_else(|| NdnError::InvalidParam("missing owner query param".to_string()))?;
         let state = self.store_mgr.anchor_state(&obj_id, owner).await?;
         json_response(&serde_json::json!({ "state": state }))
+    }
+
+    async fn handle_gc_fs_anchor_state(
+        &self,
+        sub_path: &str,
+        req: &http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        // sub_path = "fs_anchor_state/{obj_id}" or "fs_anchor_state/{obj_id}?inode_id=N&field_tag=N"
+        let after_prefix = &sub_path["fs_anchor_state/".len()..];
+        let (obj_id_str, query_str) = match after_prefix.find('?') {
+            Some(i) => (&after_prefix[..i], &after_prefix[i + 1..]),
+            None => (after_prefix, req.uri().query().unwrap_or("")),
+        };
+        let obj_id = ObjId::new(obj_id_str)?;
+
+        let parse_query_param = |key: &str| -> Option<u64> {
+            query_str.split('&').find_map(|kv| {
+                let mut parts = kv.splitn(2, '=');
+                if parts.next()? == key {
+                    parts.next()?.parse().ok()
+                } else {
+                    None
+                }
+            })
+        };
+
+        let inode_id = parse_query_param("inode_id")
+            .ok_or_else(|| NdnError::InvalidParam("missing inode_id query param".to_string()))?;
+        let field_tag = parse_query_param("field_tag")
+            .ok_or_else(|| NdnError::InvalidParam("missing field_tag query param".to_string()))?
+            as u32;
+
+        let state = self
+            .store_mgr
+            .fs_anchor_state(&obj_id, inode_id, field_tag)
+            .await?;
+        json_response(&serde_json::json!({ "state": state }))
+    }
+
+    async fn handle_gc_fs_release_inode(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let inode_id = v["inode_id"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing inode_id".to_string()))?;
+        let count = self.store_mgr.fs_release_inode(inode_id).await?;
+        json_response(&serde_json::json!({ "count": count }))
+    }
+
+    async fn handle_gc_same_as(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let big_chunk_id_str = v["big_chunk_id"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidParam("missing big_chunk_id".to_string()))?;
+        let chunk_list_id_str = v["chunk_list_id"]
+            .as_str()
+            .ok_or_else(|| NdnError::InvalidParam("missing chunk_list_id".to_string()))?;
+
+        let big_chunk_obj_id = ObjId::new(big_chunk_id_str)?;
+        let big_chunk_id = ChunkId::from_obj_id(&big_chunk_obj_id);
+        let chunk_list_id = ObjId::new(chunk_list_id_str)?;
+
+        // Validate chunk_list_id exists as an object in the store
+        let chunk_list_str = self.store_mgr.get_object(&chunk_list_id).await?;
+
+        // Parse chunk list to compute big_chunk_size
+        let obj_json = ndn_lib::load_named_object_from_obj_str(&chunk_list_str)?;
+        let chunk_list = ndn_lib::SimpleChunkList::from_json_value(obj_json)
+            .map_err(|e| NdnError::InvalidData(format!("invalid chunk list: {e}")))?;
+        let big_chunk_size = chunk_list.total_size;
+
+        self.store_mgr
+            .add_chunk_by_same_as(&big_chunk_id, big_chunk_size, &chunk_list_id)
+            .await?;
+        no_content_response()
+    }
+
+    async fn handle_gc_forced_gc(
+        &self,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        let body = collect_body(req).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+        let target_bytes = v["target_bytes"]
+            .as_u64()
+            .ok_or_else(|| NdnError::InvalidParam("missing target_bytes".to_string()))?;
+        let freed_bytes = self.store_mgr.forced_gc_until(target_bytes).await?;
+        json_response(&serde_json::json!({ "freed_bytes": freed_bytes }))
     }
 }
 
