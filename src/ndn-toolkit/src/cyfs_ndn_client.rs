@@ -569,7 +569,7 @@ impl CyfsNdnClient {
                     .as_ref()
                     .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
                 store_mgr
-                    .put_chunk(chunk_id, chunk_bytes.as_slice(), true)
+                    .put_chunk(chunk_id, chunk_bytes.as_slice())
                     .await?;
             } else if pull_mode.need_store_to_named_mgr() {
                 pending_links.push(LocalChunkLink {
@@ -1131,20 +1131,14 @@ impl CyfsNdnResponse {
                 let store_mgr = target_store_mgr
                     .as_ref()
                     .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
-                let mut writer = store_mgr
-                    .open_new_chunk_writer(&chunk_id, chunk_size)
+                store_mgr
+                    .put_chunk_by_reader(&chunk_id, chunk_size, reader)
                     .await?;
-                let hasher = Some(ChunkHasher::new_with_hash_method(
-                    chunk_id.chunk_type.to_hash_method()?,
-                )?);
-                let total_size =
-                    copy_chunk(chunk_id.clone(), &mut reader, &mut writer, hasher, None).await?;
-                writer.flush().await?;
 
                 call_progress_callback(
                     &progress_callback,
                     format!("chunk:{}", chunk_id.to_string()),
-                    NdnAction::ChunkOK(chunk_id.clone(), total_size),
+                    NdnAction::ChunkOK(chunk_id.clone(), chunk_size),
                 )
                 .await?;
 
@@ -1155,7 +1149,7 @@ impl CyfsNdnResponse {
 
                 return Ok(CyfsPullResult {
                     obj_id: effective_obj_id,
-                    total_size,
+                    total_size: chunk_size,
                     chunk_count: 1,
                     stored_objects,
                 });
@@ -1277,7 +1271,7 @@ impl CyfsNdnResponse {
                     .as_ref()
                     .ok_or_else(|| NdnError::NotFound("named store mgr is required".to_string()))?;
                 store_mgr
-                    .put_chunk(chunk_id, chunk_bytes.as_slice(), true)
+                    .put_chunk(chunk_id, chunk_bytes.as_slice())
                     .await?;
             } else if pull_mode.need_store_to_named_mgr() {
                 pending_links.push(LocalChunkLink {

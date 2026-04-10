@@ -10,7 +10,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 rusqlite = { workspace = true }
 name-lib = { workspace = true }
-fs2 = "*"
 once_cell = "*"
 ndn-lib = { path = "../ndn-lib" }
 async-trait = {workspace = true}

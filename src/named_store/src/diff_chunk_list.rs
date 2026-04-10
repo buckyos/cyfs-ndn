@@ -306,7 +306,7 @@ impl DiffChunkListReader {
 
                     if store_to_named_store_mgr {
                         self.named_store_mgr
-                            .put_chunk(&chunk_id, &diff_bytes, false)
+                            .put_chunk(&chunk_id, &diff_bytes)
                             .await?;
                     }
 
@@ -1172,7 +1172,7 @@ impl DiffChunkListWriter {
                 .calc_mix_chunk_id_from_bytes(chunk_data)?;
             if named_mode {
                 self.named_store_mgr
-                    .put_chunk(&chunk_id, chunk_data, false)
+                    .put_chunk(&chunk_id, chunk_data)
                     .await?;
                 diff_chunk_ids.push(chunk_id.clone());
             }
@@ -1644,7 +1644,7 @@ async fn ensure_chunks_available_in_local(
 ) -> NdnResult<Vec<u64>> {
     let mut chunk_sizes = Vec::with_capacity(chunk_list.body.len());
     for (index, chunk_id) in chunk_list.body.iter().enumerate() {
-        let (state, chunk_size, _) = named_store_mgr.query_chunk_state(chunk_id).await?;
+        let (state, chunk_size) = named_store_mgr.query_chunk_state(chunk_id).await?;
         if !state.can_open_reader() {
             return Err(NdnError::NotFound(format!(
                 "chunk {} missing in NamedStoreMgr local mode, state={}",
@@ -1737,7 +1737,7 @@ mod tests {
         {
             let store = store.lock().await;
             for (chunk_id, data) in chunk_ids.iter().zip(chunks.iter()) {
-                store.put_chunk(chunk_id, data, true).await.unwrap();
+                store.put_chunk(chunk_id, data).await.unwrap();
             }
         }
 

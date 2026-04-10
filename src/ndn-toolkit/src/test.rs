@@ -152,7 +152,7 @@ async fn build_chunk_list_from_file(
             .calc_mix_chunk_id_from_bytes(chunk_data)
             .unwrap();
         store_mgr
-            .put_chunk(&chunk_id, chunk_data, true)
+            .put_chunk(&chunk_id, chunk_data)
             .await
             .unwrap();
         chunk_ids.push(chunk_id);
@@ -194,7 +194,7 @@ async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expecte
 }
 
 async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, expected: &[u8]) {
-    let (state, size, _) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
+    let (state, size) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(state, ChunkStoreState::Completed);
     assert_eq!(size, expected.len() as u64);
 
@@ -211,7 +211,7 @@ async fn assert_local_link_chunk(
     expected_range: Option<std::ops::Range<u64>>,
     expected: &[u8],
 ) {
-    let (state, size, _) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
+    let (state, size) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(size, expected.len() as u64);
 
     match state {

@@ -1,11 +1,11 @@
-use crate::backend::NamedDataStoreBackend;
+use crate::backend::{ChunkWriteOutcome, NamedDataStoreBackend};
 use crate::gc_types::*;
 use crate::local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 use crate::lru_hot_table::LruHotTable;
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkHasher, ChunkId, ChunkReader, ChunkWriter, NdnError, NdnResult,
+    caculate_qcid_from_file, ChunkId, ChunkReader, CHUNK_DEFAULT_SIZE, NdnError, NdnResult,
     ObjId,
 };
 use serde::{Deserialize, Serialize};
@@ -239,7 +239,7 @@ impl NamedStore {
 
     pub async fn have_chunk(&self, chunk_id: &ChunkId) -> bool {
         let query_result = self.query_chunk_state(chunk_id).await;
-        if let Ok((chunk_state, _chunk_size, _progress)) = query_result {
+        if let Ok((chunk_state, _chunk_size)) = query_result {
             chunk_state.can_open_reader()
         } else {
             false
@@ -249,16 +249,12 @@ impl NamedStore {
     pub async fn query_chunk_state(
         &self,
         chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkStoreState, u64, String)> {
+    ) -> NdnResult<(ChunkStoreState, u64)> {
         let chunk_item = self.get_chunk_item(chunk_id).await;
         if let Ok(chunk_item) = chunk_item {
-            Ok((
-                chunk_item.chunk_state,
-                chunk_item.chunk_size,
-                chunk_item.progress,
-            ))
+            Ok((chunk_item.chunk_state, chunk_item.chunk_size))
         } else {
-            Ok((ChunkStoreState::NotExist, 0, String::new()))
+            Ok((ChunkStoreState::NotExist, 0))
         }
     }
 
@@ -336,104 +332,10 @@ impl NamedStore {
         Ok((Box::pin(limited), chunk_item.chunk_size))
     }
 
-    /// 打开流式 chunk writer，委托给 backend 的 create_chunk_writer。
-    pub async fn open_chunk_writer(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_size: u64,
-        offset: u64,
-    ) -> NdnResult<(ChunkWriter, String)> {
-        self.ensure_writable()?;
-
-        let chunk_item = self.db.get_chunk_item(chunk_id);
-
-        if let Ok(item) = chunk_item {
-            let chunk_state = &item.chunk_state;
-            if *chunk_state == ChunkStoreState::Completed {
-                return Err(NdnError::AlreadyExists(format!(
-                    "chunk {} already completed",
-                    chunk_id.to_string()
-                )));
-            }
-            if !chunk_state.can_open_writer() {
-                return Err(NdnError::InvalidState(format!(
-                    "chunk {} state not support open writer! {}",
-                    chunk_id.to_string(),
-                    chunk_state.to_str()
-                )));
-            }
-        }
-
-        // 委托给 backend
-        let writer = self
-            .backend
-            .create_chunk_writer(chunk_id, chunk_size, offset)
-            .await?;
-
-        let mut chunk_item = match self.db.get_chunk_item(chunk_id) {
-            Ok(item) => item,
-            Err(_) => ChunkItem::new_incompleted(chunk_id, chunk_size),
-        };
-        chunk_item.chunk_state = ChunkStoreState::Incompleted;
-        if chunk_item.progress.is_empty() {
-            chunk_item.progress = serde_json::json!({ "pos": offset }).to_string();
-        }
-        self.db.set_chunk_item(&chunk_item)?;
-        Ok((writer, chunk_item.progress.clone()))
-    }
-
-    pub async fn open_new_chunk_writer(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_size: u64,
-    ) -> NdnResult<ChunkWriter> {
-        self.ensure_writable()?;
-
-        if self.db.get_chunk_item(chunk_id).is_ok() {
-            return Err(NdnError::AlreadyExists(format!(
-                "chunk {} already exists",
-                chunk_id.to_string()
-            )));
-        }
-
-        // 委托给 backend，offset=0 表示新建
-        let writer = self
-            .backend
-            .create_chunk_writer(chunk_id, chunk_size, 0)
-            .await?;
-
-        let chunk_item = ChunkItem::new_incompleted(chunk_id, chunk_size);
-        self.db.set_chunk_item(&chunk_item)?;
-        Ok(writer)
-    }
-
-    pub async fn update_chunk_progress(
-        &self,
-        chunk_id: &ChunkId,
-        progress: String,
-    ) -> NdnResult<()> {
-        self.db.update_chunk_progress(chunk_id, progress)
-    }
-
-    pub async fn complete_chunk_writer(&self, chunk_id: &ChunkId) -> NdnResult<()> {
-        self.ensure_writable()?;
-
-        let mut chunk_item = self.db.get_chunk_item(chunk_id)?;
-
-        // 委托给 backend 完成提交（rename tmp → final）
-        self.backend.commit_chunk_writer(chunk_id).await?;
-
-        chunk_item.chunk_state = ChunkStoreState::Completed;
-        chunk_item.progress = String::new();
-        chunk_item.update_time = current_unix_ts();
-        self.db.set_chunk_item(&chunk_item)?;
-        Ok(())
-    }
-
     pub async fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         self.ensure_writable()?;
 
-        // 委托给 backend 删除文件（final + tmp）
+        // 委托给 backend 删除文件
         self.backend.remove_chunk(chunk_id).await?;
 
         // 清理 DB 元数据
@@ -488,63 +390,45 @@ impl NamedStore {
         Ok(buffer)
     }
 
+    /// 原子写入 chunk：一次性从 reader 读取全部数据，backend 负责 hash 校验和原子提交。
+    ///
+    /// chunk_size 不能超过 CHUNK_DEFAULT_SIZE（32MB），大文件必须使用 SameAs ChunkList 模式。
     pub async fn put_chunk_by_reader(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
-        reader: &mut ChunkReader,
+        reader: ChunkReader,
     ) -> NdnResult<()> {
-        let mut chunk_writer = self.open_new_chunk_writer(chunk_id, chunk_size).await?;
-        let mut limited = reader.take(chunk_size);
-        let copy_bytes = tokio::io::copy(&mut limited, &mut chunk_writer).await?;
-        if copy_bytes != chunk_size {
-            return Err(NdnError::IoError(format!(
-                "copy chunk failed! expected:{} actual:{}",
-                chunk_size, copy_bytes
+        self.ensure_writable()?;
+        if chunk_size > CHUNK_DEFAULT_SIZE {
+            return Err(NdnError::InvalidParam(format!(
+                "chunk {} size {} exceeds CHUNK_DEFAULT_SIZE ({}), use SameAs ChunkList for large data",
+                chunk_id.to_string(),
+                chunk_size,
+                CHUNK_DEFAULT_SIZE
             )));
         }
-        self.complete_chunk_writer(chunk_id).await?;
+
+        let outcome = self
+            .backend
+            .open_chunk_writer(chunk_id, chunk_size, reader)
+            .await?;
+
+        if outcome == ChunkWriteOutcome::Written {
+            let chunk_item = ChunkItem::new_completed(chunk_id, chunk_size);
+            self.db.set_chunk_item(&chunk_item)?;
+        }
+
         Ok(())
     }
 
-    pub async fn put_chunk(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_data: &[u8],
-        need_verify: bool,
-    ) -> NdnResult<()> {
-        if need_verify {
-            let hash_method = chunk_id.chunk_type.to_hash_method()?;
-            let chunk_hasher = ChunkHasher::new_with_hash_method(hash_method)?;
-            let hash_bytes = chunk_hasher.calc_from_bytes(chunk_data);
-            let verify_id = if chunk_id.chunk_type.is_mix() {
-                ChunkId::from_mix_hash_result(
-                    chunk_data.len() as u64,
-                    &hash_bytes,
-                    chunk_id.chunk_type.clone(),
-                )
-            } else {
-                ChunkId::from_hash_result(&hash_bytes, chunk_id.chunk_type.clone())
-            };
-            if verify_id != *chunk_id {
-                return Err(NdnError::VerifyError(format!(
-                    "verify chunk failed! expected:{} actual:{}",
-                    chunk_id.to_string(),
-                    verify_id.to_string()
-                )));
-            }
-        }
-
-        let mut chunk_writer = self
-            .open_new_chunk_writer(chunk_id, chunk_data.len() as u64)
-            .await?;
-        chunk_writer.write_all(chunk_data).await.map_err(|e| {
-            warn!("put_chunk: write file failed! {}", e.to_string());
-            NdnError::IoError(e.to_string())
-        })?;
-        self.complete_chunk_writer(chunk_id).await?;
-
-        Ok(())
+    /// 原子写入 chunk 字节数据，backend 自动进行 hash 校验。
+    ///
+    /// chunk_data 长度不能超过 CHUNK_DEFAULT_SIZE（32MB），大文件必须使用 SameAs ChunkList 模式。
+    pub async fn put_chunk(&self, chunk_id: &ChunkId, chunk_data: &[u8]) -> NdnResult<()> {
+        let chunk_size = chunk_data.len() as u64;
+        let reader: ChunkReader = Box::pin(std::io::Cursor::new(chunk_data.to_vec()));
+        self.put_chunk_by_reader(chunk_id, chunk_size, reader).await
     }
 
     // ================================================================
@@ -799,7 +683,7 @@ mod tests {
         let data = b"hello named store".to_vec();
         let chunk_id = calc_chunk_id(&data);
 
-        store.put_chunk(&chunk_id, &data, true).await.unwrap();
+        store.put_chunk(&chunk_id, &data).await.unwrap();
 
         let (mut reader, size) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
         assert_eq!(size, data.len() as u64);
@@ -924,7 +808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_large_chunk_stream() {
+    async fn test_put_chunk_by_reader() {
         let temp_dir = TempDir::new().unwrap();
         let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
@@ -939,32 +823,34 @@ mod tests {
         let chunk_id = calc_chunk_id(&data);
         let chunk_size = data.len() as u64;
 
-        let (mut writer, _progress) = store
-            .open_chunk_writer(&chunk_id, chunk_size, 0)
+        let reader: ndn_lib::ChunkReader = Box::pin(std::io::Cursor::new(data.clone()));
+        store
+            .put_chunk_by_reader(&chunk_id, chunk_size, reader)
             .await
             .unwrap();
 
-        let mut pos = 0u64;
-        for chunk in data.chunks(1024 * 1024) {
-            writer.write_all(chunk).await.unwrap();
-            pos += chunk.len() as u64;
-            store
-                .update_chunk_progress(&chunk_id, json!({ "pos": pos }).to_string())
-                .await
-                .unwrap();
-        }
-        writer.flush().await.unwrap();
-        store.complete_chunk_writer(&chunk_id).await.unwrap();
-
         let (mut reader, size) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
         assert_eq!(size, chunk_size);
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).await.unwrap();
+        assert_eq!(read_back, data);
+    }
 
-        let hasher = ChunkHasher::new(None).unwrap();
-        let hash_method = hasher.hash_method.clone();
-        let (hash_bytes, read_size) = hasher.calc_from_reader(&mut reader).await.unwrap();
-        let read_chunk_id =
-            ChunkId::from_mix_hash_result_by_hash_method(read_size, &hash_bytes, hash_method)
-                .unwrap();
-        assert_eq!(read_chunk_id, chunk_id);
+    #[tokio::test]
+    async fn test_reject_oversized_chunk() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        // 尝试写入超过 CHUNK_DEFAULT_SIZE 的 chunk，应该被拒绝
+        let oversize = CHUNK_DEFAULT_SIZE + 1;
+        let chunk_id = calc_chunk_id(&[0u8; 1]); // dummy id
+        let reader: ndn_lib::ChunkReader = Box::pin(std::io::Cursor::new(vec![0u8; 1]));
+        let err = store
+            .put_chunk_by_reader(&chunk_id, oversize, reader)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, NdnError::InvalidParam(_)));
     }
 }

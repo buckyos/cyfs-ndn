@@ -1621,7 +1621,7 @@ impl NamedDataMgr {
     pub async fn query_chunk_state(
         &self,
         chunk_id: &ChunkId,
-    ) -> NdnResult<(named_store::ChunkStoreState, u64, String)> {
+    ) -> NdnResult<(named_store::ChunkStoreState, u64)> {
         let layout_mgr = self
             .layout_mgr
             .as_ref()

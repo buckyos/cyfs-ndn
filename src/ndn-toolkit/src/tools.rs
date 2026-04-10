@@ -106,7 +106,7 @@ pub async fn store_content_to_ndn_mgr_impl(
             }
             ContentToStore::Chunk(chunk_id, chunk_size, local_info) => {
                 let chunk_bytes = read_chunk_bytes(&local_info, chunk_size).await?;
-                store_mgr.put_chunk(&chunk_id, &chunk_bytes, true).await
+                store_mgr.put_chunk(&chunk_id, &chunk_bytes).await
             }
         },
         StoreMode::LocalFile(_, _, _) => match content {

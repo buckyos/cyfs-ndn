@@ -685,7 +685,7 @@ impl LocalFileBufferService {
                 .await
                 .map_err(|e| NdnError::IoError(format!("read chunk bytes failed: {}", e)))?;
             named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf, true)
+                .put_chunk(&segment.chunk_id, &buf)
                 .await?;
             cursor += segment.size;
         }
@@ -730,7 +730,7 @@ impl LocalFileBufferService {
                 NdnError::IoError(format!("read overlay dirty chunk bytes failed: {}", e))
             })?;
             named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf, true)
+                .put_chunk(&segment.chunk_id, &buf)
                 .await?;
             cursor = cursor.saturating_add(segment.size);
         }

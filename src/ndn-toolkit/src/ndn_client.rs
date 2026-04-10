@@ -107,7 +107,7 @@ impl NdnClient {
         match head_res.status() {
             StatusCode::OK => Ok((ChunkStoreState::Completed, content_length)),
             StatusCode::NOT_FOUND => Ok((ChunkStoreState::NotExist, 0)),
-            StatusCode::PARTIAL_CONTENT => Ok((ChunkStoreState::Incompleted, content_length)),
+            StatusCode::PARTIAL_CONTENT => Ok((ChunkStoreState::New, content_length)),
             StatusCode::CREATED => Ok((ChunkStoreState::New, 0)),
             s => Err(NdnError::RemoteError(format!("HEAD request failed: {}", s))),
         }

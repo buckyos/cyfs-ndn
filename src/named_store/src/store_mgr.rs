@@ -17,7 +17,7 @@ use crate::{
 use log::warn;
 use ndn_lib::{
     extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkReader,
-    ChunkWriter, DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
+    DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -682,13 +682,13 @@ impl NamedStoreMgr {
     pub async fn query_chunk_state(
         &self,
         chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkStoreState, u64, String)> {
+    ) -> NdnResult<(ChunkStoreState, u64)> {
         let obj_id = chunk_id.to_obj_id();
         let versions = self.versions.read().await;
         let stores = self.stores.read().await;
 
         if versions.is_empty() {
-            return Ok((ChunkStoreState::NotExist, 0, String::new()));
+            return Ok((ChunkStoreState::NotExist, 0));
         }
 
         let mut tried_stores: Vec<String> = Vec::new();
@@ -710,13 +710,13 @@ impl NamedStoreMgr {
             };
 
             let store_guard = store.lock().await;
-            let (state, size, progress) = store_guard.query_chunk_state(chunk_id).await?;
+            let (state, size) = store_guard.query_chunk_state(chunk_id).await?;
             if state != ChunkStoreState::NotExist {
-                return Ok((state, size, progress));
+                return Ok((state, size));
             }
         }
 
-        Ok((ChunkStoreState::NotExist, 0, String::new()))
+        Ok((ChunkStoreState::NotExist, 0))
     }
 
     // ==================== Chunk Read Operations ====================
@@ -971,49 +971,13 @@ impl NamedStoreMgr {
 
     // ==================== Chunk Write Operations ====================
 
-    /// Open chunk writer (uses current layout for write target)
-    pub async fn open_chunk_writer(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_size: u64,
-        offset: u64,
-    ) -> NdnResult<(ChunkWriter, String)> {
-        let obj_id = chunk_id.to_obj_id();
-        let store = self
-            .select_store_for_write(&obj_id)
-            .await
-            .ok_or_else(|| NdnError::NotFound("no available store for write".to_string()))?;
-
-        let store_guard = store.lock().await;
-        store_guard
-            .open_chunk_writer(chunk_id, chunk_size, offset)
-            .await
-    }
-
-    /// TODO:考虑到chunk writer的连续性，应该在OpenWriter后，返回store_id,或则推荐用户用原始的select_writer语义实现。
-    pub async fn open_new_chunk_writer(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_size: u64,
-    ) -> NdnResult<ChunkWriter> {
-        let obj_id = chunk_id.to_obj_id();
-        let store = self
-            .select_store_for_write(&obj_id)
-            .await
-            .ok_or_else(|| NdnError::NotFound("no available store for write".to_string()))?;
-
-        let store_guard = store.lock().await;
-        store_guard
-            .open_new_chunk_writer(chunk_id, chunk_size)
-            .await
-    }
-
-    /// Put chunk by reader (uses current layout for write target)
+    /// 原子写入 chunk：一次性从 reader 读取全部数据，backend 自动 hash 校验。
+    /// chunk_size 不能超过 CHUNK_DEFAULT_SIZE（32MB）。
     pub async fn put_chunk_by_reader(
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
-        reader: &mut ChunkReader,
+        reader: ChunkReader,
     ) -> NdnResult<()> {
         let obj_id = chunk_id.to_obj_id();
         let store = self
@@ -1027,12 +991,12 @@ impl NamedStoreMgr {
             .await
     }
 
-    /// Put chunk data (uses current layout for write target)
+    /// 原子写入 chunk 字节数据。backend 自动进行 hash 校验。
+    /// chunk_data 长度不能超过 CHUNK_DEFAULT_SIZE（32MB）。
     pub async fn put_chunk(
         &self,
         chunk_id: &ChunkId,
         chunk_data: &[u8],
-        need_verify: bool,
     ) -> NdnResult<()> {
         let obj_id = chunk_id.to_obj_id();
         let store = self
@@ -1041,9 +1005,7 @@ impl NamedStoreMgr {
             .ok_or_else(|| NdnError::NotFound("no available store for write".to_string()))?;
 
         let store_guard = store.lock().await;
-        store_guard
-            .put_chunk(chunk_id, chunk_data, need_verify)
-            .await
+        store_guard.put_chunk(chunk_id, chunk_data).await
     }
 
     /// Add chunk by link to local file (uses current layout for write target)

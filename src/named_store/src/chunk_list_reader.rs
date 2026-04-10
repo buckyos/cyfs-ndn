@@ -382,7 +382,7 @@ impl ChunkListReader {
         let mut chunk_sizes = Vec::with_capacity(chunk_list.body.len());
 
         for (index, chunk_id) in chunk_list.body.iter().enumerate() {
-            let (state, chunk_size, _) = named_store_mgr.query_chunk_state(chunk_id).await?;
+            let (state, chunk_size) = named_store_mgr.query_chunk_state(chunk_id).await?;
             if !state.can_open_reader() {
                 return Err(NdnError::NotFound(format!(
                     "chunk {} missing in local NamedStoreMgr, state={}",
@@ -607,15 +607,15 @@ mod tests {
         {
             let store = store.lock().await;
             store
-                .put_chunk(&chunk_ids[0], &chunk_a, true)
+                .put_chunk(&chunk_ids[0], &chunk_a)
                 .await
                 .unwrap();
             store
-                .put_chunk(&chunk_ids[1], &chunk_b, true)
+                .put_chunk(&chunk_ids[1], &chunk_b)
                 .await
                 .unwrap();
             store
-                .put_chunk(&chunk_ids[2], &chunk_c, true)
+                .put_chunk(&chunk_ids[2], &chunk_c)
                 .await
                 .unwrap();
         }
@@ -654,7 +654,7 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
+            store.put_chunk(&chunk_a_id, &chunk_a).await.unwrap();
         }
 
         let chunk_list =
@@ -688,12 +688,12 @@ mod tests {
 
         {
             let store = main_store.lock().await;
-            store.put_chunk(&in_main_id, &in_main, true).await.unwrap();
+            store.put_chunk(&in_main_id, &in_main).await.unwrap();
         }
         {
             let store = backup_store.lock().await;
             store
-                .put_chunk(&in_backup_id, &in_backup, true)
+                .put_chunk(&in_backup_id, &in_backup)
                 .await
                 .unwrap();
         }
@@ -739,9 +739,9 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
-            store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
-            store.put_chunk(&chunk_c_id, &chunk_c, true).await.unwrap();
+            store.put_chunk(&chunk_a_id, &chunk_a).await.unwrap();
+            store.put_chunk(&chunk_b_id, &chunk_b).await.unwrap();
+            store.put_chunk(&chunk_c_id, &chunk_c).await.unwrap();
         }
 
         let total_size = (chunk_a.len() + chunk_b.len() + chunk_c.len()) as u64;
