@@ -780,3 +780,636 @@ fn test_gc_double_check_protects() {
     assert_eq!(freed, 0);
     assert!(db.has_object_row(&obj.to_string()).unwrap());
 }
+
+// ───────────────────── additional helpers ─────────────────────
+
+/// Assert outbox contains exactly the expected entries (unordered).
+fn assert_outbox_exact(
+    db: &NamedLocalStoreDB,
+    expected: &[(EdgeOp, &ObjId, &ObjId)], // (op, referee, referrer)
+) {
+    let outbox = peek_outbox(db);
+    assert_eq!(
+        outbox.len(),
+        expected.len(),
+        "outbox length mismatch: got {:?}",
+        outbox
+    );
+    let mut expected_set: HashSet<(String, String, String)> = HashSet::new();
+    for &(ref op, referee, referrer) in expected {
+        expected_set.insert((
+            format!("{:?}", op),
+            ObjId::to_string(referee),
+            ObjId::to_string(referrer),
+        ));
+    }
+    let mut actual_set: HashSet<(String, String, String)> = HashSet::new();
+    for (op, referee, referrer) in &outbox {
+        actual_set.insert((format!("{:?}", op), referee.clone(), referrer.clone()));
+    }
+    assert_eq!(actual_set, expected_set, "outbox content mismatch");
+}
+
+/// Drain outbox and assert it is empty afterwards.
+fn drain_and_assert_empty(db: &NamedLocalStoreDB) {
+    drain_outbox(db);
+    assert!(
+        peek_outbox(db).is_empty(),
+        "outbox not empty after drain"
+    );
+}
+
+// ═══════════════════════════════════════════════════
+// High-priority tests (20–25)
+// ═══════════════════════════════════════════════════
+
+// ──────────── 20. Shared DAG: remove does not retract downstream ────────────
+// P1 -> D -> X,  P2 -> D
+// Unpin P1: D still expanded via P2's incoming, no remove(X <- D).
+
+#[test]
+fn test_shared_dag_remove_does_not_retract_downstream() {
+    let db = test_db();
+
+    let x = file_id("dag_x");
+    let d = dir_id("dag_d");
+    let p1 = dir_id("dag_p1");
+    let p2 = dir_id("dag_p2");
+
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+    db.set_object(&p1, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+    db.set_object(&p2, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+
+    // Pin both parents recursive
+    db.pin(&p1, "o1", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+    db.pin(&p2, "o2", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+
+    // D: class 1, expanded, 2 incoming refs; X: class 1
+    assert_expand(&db, &d, 1, true, ItemState::Present);
+    let d_info = db.debug_dump_expand_state(&d).unwrap();
+    assert_eq!(d_info.incoming_refs_count, 2);
+    assert_expand(&db, &x, 1, true, ItemState::Present);
+
+    // Unpin P1
+    db.unpin(&p1, "o1").unwrap();
+
+    // P1 teardown emits remove(D <- P1), drain it
+    drain_outbox(&db);
+
+    // D still has 1 incoming from P2 → class 1, children_expanded=true
+    assert_expand(&db, &d, 1, true, ItemState::Present);
+
+    // X should NOT have received a remove — still class 1
+    assert_expand(&db, &x, 1, true, ItemState::Present);
+
+    // Outbox must be empty — no spurious remove(X <- D)
+    assert!(peek_outbox(&db).is_empty());
+}
+
+// ──────────── 21. Incoming shadow then present auto-expands ────────────
+
+#[test]
+fn test_incoming_shadow_then_present_auto_expands() {
+    let db = test_db();
+
+    let x = file_id("is_x");
+    let s = dir_id("is_s");
+    let d = dir_id("is_d");
+
+    // D exists, S does not yet
+    db.set_object(&d, "cydir", "{}").unwrap();
+
+    // apply_edge(add, S <- D): S becomes shadow with class 1
+    let add_msg = EdgeMsg {
+        op: EdgeOp::Add,
+        referee: s.clone(),
+        referrer: d.clone(),
+        target_epoch: 1,
+    };
+    db.apply_edge(&add_msg).unwrap();
+
+    assert_expand(&db, &s, 1, false, ItemState::Shadow);
+
+    // No outbox (shadow can't expand)
+    assert!(peek_outbox(&db).is_empty());
+
+    // Now put S with children
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    let s_json = make_dir_json(&[("x", &x)]);
+    db.put_object_gc_aware(&s, "cydir", &s_json).unwrap();
+
+    // S: class 1, present, expanded
+    assert_expand(&db, &s, 1, true, ItemState::Present);
+
+    // Outbox: add(X <- S)
+    assert_outbox_exact(&db, &[(EdgeOp::Add, &x, &s)]);
+
+    drain_outbox(&db);
+    assert_expand(&db, &x, 1, true, ItemState::Present);
+}
+
+// ──────────── 22. fs_anchor transition outbox exactly once ────────────
+
+#[test]
+fn test_fs_anchor_transition_outbox_exactly_once() {
+    let db = test_db();
+
+    let child = file_id("fat_c");
+    let root = dir_id("fat_r");
+
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+
+    // 0 -> 1: should emit add(child <- root)
+    db.fs_acquire(&root, 1, 0).unwrap();
+    assert_outbox_exact(&db, &[(EdgeOp::Add, &child, &root)]);
+    drain_and_assert_empty(&db);
+
+    assert_expand(&db, &child, 1, true, ItemState::Present);
+
+    // 1 -> 2: no new add
+    db.fs_acquire(&root, 1, 1).unwrap();
+    assert!(peek_outbox(&db).is_empty());
+    let d = db.debug_dump_expand_state(&root).unwrap();
+    assert_eq!(d.fs_anchor_count, 2);
+
+    // 2 -> 1: no remove
+    db.fs_release(&root, 1, 1).unwrap();
+    assert!(peek_outbox(&db).is_empty());
+    let d2 = db.debug_dump_expand_state(&root).unwrap();
+    assert_eq!(d2.fs_anchor_count, 1);
+    assert!(d2.children_expanded);
+
+    // 1 -> 0: should emit remove(child <- root)
+    db.fs_release(&root, 1, 0).unwrap();
+    assert_outbox_exact(&db, &[(EdgeOp::Remove, &child, &root)]);
+    drain_and_assert_empty(&db);
+
+    assert_expand(&db, &child, 0, false, ItemState::Present);
+}
+
+// ──────────── 23. Recursive pin transition outbox exactly once ────────────
+
+#[test]
+fn test_recursive_pin_transition_outbox_exactly_once() {
+    let db = test_db();
+
+    let child = file_id("rpt_c");
+    let root = dir_id("rpt_r");
+
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+
+    // First owner pin: add(child <- root)
+    db.pin(&root, "owner1", PinScope::Recursive, None).unwrap();
+    assert_outbox_exact(&db, &[(EdgeOp::Add, &child, &root)]);
+    drain_and_assert_empty(&db);
+
+    assert_expand(&db, &child, 1, true, ItemState::Present);
+
+    // Second owner pin: no duplicate add
+    db.pin(&root, "owner2", PinScope::Recursive, None).unwrap();
+    assert!(peek_outbox(&db).is_empty());
+
+    // Remove first owner: no remove yet (second still holds)
+    db.unpin(&root, "owner1").unwrap();
+    assert!(peek_outbox(&db).is_empty());
+    assert_expand(&db, &root, 2, true, ItemState::Present);
+
+    // Remove last owner: remove(child <- root)
+    db.unpin(&root, "owner2").unwrap();
+    assert_outbox_exact(&db, &[(EdgeOp::Remove, &child, &root)]);
+    drain_and_assert_empty(&db);
+
+    assert_expand(&db, &child, 0, false, ItemState::Present);
+}
+
+// ──────────── 24. Skeleton on shared node blocks without wrong teardown ────────────
+
+#[test]
+fn test_skeleton_on_shared_node_blocks_without_wrong_teardown() {
+    let db = test_db();
+
+    // P -> D -> X; D has incoming from P
+    let x = file_id("sks_x");
+    let d = dir_id("sks_d");
+    let p = dir_id("sks_p");
+
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+    db.set_object(&p, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+
+    // Pin P recursive → D gets incoming, D expands to X
+    db.pin(&p, "owner", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+
+    assert_expand(&db, &d, 1, true, ItemState::Present);
+    assert_expand(&db, &x, 1, true, ItemState::Present);
+
+    // Add Skeleton pin on D → should tear down D -> X
+    db.pin(&d, "skel", PinScope::Skeleton, None).unwrap();
+
+    // D: class 2 (has pin), NOT expanded (skeleton blocks)
+    assert_expand(&db, &d, 2, false, ItemState::Present);
+
+    // Outbox: remove(X <- D)
+    assert_outbox_exact(&db, &[(EdgeOp::Remove, &x, &d)]);
+    drain_and_assert_empty(&db);
+
+    // X: class 0 (lost incoming)
+    assert_expand(&db, &x, 0, false, ItemState::Present);
+
+    // Remove Skeleton → should auto re-expand since D has incoming_ref
+    db.unpin(&d, "skel").unwrap();
+
+    // D: class 1 (incoming from P), children_expanded=true
+    assert_expand(&db, &d, 1, true, ItemState::Present);
+
+    // Outbox: add(X <- D)
+    assert_outbox_exact(&db, &[(EdgeOp::Add, &x, &d)]);
+    drain_and_assert_empty(&db);
+
+    assert_expand(&db, &x, 1, true, ItemState::Present);
+}
+
+// ═══════════════════════════════════════════════════
+// Medium-priority tests (25–31)
+// ═══════════════════════════════════════════════════
+
+// ──────────── 25. GC ignores zero owned_bytes rows ────────────
+
+#[test]
+fn test_gc_ignores_zero_owned_bytes_rows() {
+    let db = test_db();
+
+    // Shadow has owned_bytes=0
+    let shadow_obj = dir_id("zb_shadow");
+    let add_msg = EdgeMsg {
+        op: EdgeOp::Add,
+        referee: shadow_obj.clone(),
+        referrer: dir_id("zb_parent"),
+        target_epoch: 1,
+    };
+    db.apply_edge(&add_msg).unwrap();
+    // Remove incoming so it's class 0 but still shadow
+    let rm_msg = EdgeMsg {
+        op: EdgeOp::Remove,
+        referee: shadow_obj.clone(),
+        referrer: dir_id("zb_parent"),
+        target_epoch: 1,
+    };
+    db.apply_edge(&rm_msg).unwrap();
+    drain_outbox(&db);
+
+    // Shadow with class 0 should NOT appear in candidates
+    let candidates = db.list_gc_candidates(100).unwrap();
+    let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(
+        !ids.contains(&shadow_obj.to_string().as_str()),
+        "shadow with owned_bytes=0 should not be a GC candidate"
+    );
+
+    // Also verify with a present object that has real bytes
+    let real_obj = dir_id("zb_real");
+    db.set_object(&real_obj, "cydir", "{\"data\": true}").unwrap();
+    let candidates2 = db.list_gc_candidates(100).unwrap();
+    let ids2: Vec<&str> = candidates2.iter().map(|(id, _)| id.as_str()).collect();
+    assert!(ids2.contains(&real_obj.to_string().as_str()));
+}
+
+// ──────────── 26. Expire pins reconciles expand state ────────────
+
+#[test]
+fn test_expire_pins_reconciles_expand_state() {
+    let db = test_db();
+
+    let child = file_id("ep_c");
+    let root = dir_id("ep_r");
+
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+
+    // Pin with 1-second TTL
+    db.pin(&root, "expiring", PinScope::Recursive, Some(std::time::Duration::from_secs(1))).unwrap();
+    drain_outbox(&db);
+
+    assert_expand(&db, &root, 2, true, ItemState::Present);
+    assert_expand(&db, &child, 1, true, ItemState::Present);
+
+    // Wait for the TTL to expire
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+
+    // Expire pins
+    let expired = db.expire_pins().unwrap();
+    assert!(expired > 0, "should have expired at least one pin");
+
+    // Root: class 0, not expanded
+    assert_expand(&db, &root, 0, false, ItemState::Present);
+
+    // Outbox: remove(child <- root)
+    let outbox = peek_outbox(&db);
+    let removes: Vec<_> = outbox.iter().filter(|e| e.0 == EdgeOp::Remove).collect();
+    assert!(!removes.is_empty());
+
+    drain_outbox(&db);
+    assert_expand(&db, &child, 0, false, ItemState::Present);
+}
+
+// ──────────── 27. unpin_owner reconciles all affected objects ────────────
+
+#[test]
+fn test_unpin_owner_reconciles_all_affected_objects() {
+    let db = test_db();
+
+    let c1 = file_id("uo_c1");
+    let c2 = file_id("uo_c2");
+    let r1 = dir_id("uo_r1");
+    let r2 = dir_id("uo_r2");
+
+    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)])).unwrap();
+    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)])).unwrap();
+
+    // Same owner pins both roots
+    db.pin(&r1, "shared_owner", PinScope::Recursive, None).unwrap();
+    db.pin(&r2, "shared_owner", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+
+    assert_expand(&db, &r1, 2, true, ItemState::Present);
+    assert_expand(&db, &r2, 2, true, ItemState::Present);
+    assert_expand(&db, &c1, 1, true, ItemState::Present);
+    assert_expand(&db, &c2, 1, true, ItemState::Present);
+
+    // unpin_owner
+    let affected = db.unpin_owner("shared_owner").unwrap();
+    assert_eq!(affected, 2);
+
+    // Both roots: class 0, not expanded
+    assert_expand(&db, &r1, 0, false, ItemState::Present);
+    assert_expand(&db, &r2, 0, false, ItemState::Present);
+
+    // Outbox should have remove entries for both children
+    let outbox = peek_outbox(&db);
+    let remove_referees: HashSet<String> = outbox
+        .iter()
+        .filter(|e| e.0 == EdgeOp::Remove)
+        .map(|e| e.1.clone())
+        .collect();
+    assert!(remove_referees.contains(&c1.to_string()));
+    assert!(remove_referees.contains(&c2.to_string()));
+
+    drain_outbox(&db);
+    assert_expand(&db, &c1, 0, false, ItemState::Present);
+    assert_expand(&db, &c2, 0, false, ItemState::Present);
+}
+
+// ──────────── 28. fs_release_inode reconciles all affected objects ────────────
+
+#[test]
+fn test_fs_release_inode_reconciles_all_affected_objects() {
+    let db = test_db();
+
+    let c1 = file_id("fri_c1");
+    let c2 = file_id("fri_c2");
+    let r1 = dir_id("fri_r1");
+    let r2 = dir_id("fri_r2");
+
+    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)])).unwrap();
+    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)])).unwrap();
+
+    // Same inode anchors both objects with different field_tags
+    let inode = 42u64;
+    db.fs_acquire(&r1, inode, 0).unwrap();
+    db.fs_acquire(&r2, inode, 1).unwrap();
+    drain_outbox(&db);
+
+    assert_expand(&db, &r1, 2, true, ItemState::Present);
+    assert_expand(&db, &r2, 2, true, ItemState::Present);
+    assert_expand(&db, &c1, 1, true, ItemState::Present);
+    assert_expand(&db, &c2, 1, true, ItemState::Present);
+
+    // Release all anchors for inode
+    let affected = db.fs_release_inode(inode).unwrap();
+    assert_eq!(affected, 2);
+
+    // Both roots: class 0, fs_anchor_count=0
+    let d1 = db.debug_dump_expand_state(&r1).unwrap();
+    assert_eq!(d1.fs_anchor_count, 0);
+    assert_eq!(d1.eviction_class, 0);
+    assert!(!d1.children_expanded);
+
+    let d2 = db.debug_dump_expand_state(&r2).unwrap();
+    assert_eq!(d2.fs_anchor_count, 0);
+    assert_eq!(d2.eviction_class, 0);
+    assert!(!d2.children_expanded);
+
+    // Outbox: remove entries for children
+    let outbox = peek_outbox(&db);
+    let remove_referees: HashSet<String> = outbox
+        .iter()
+        .filter(|e| e.0 == EdgeOp::Remove)
+        .map(|e| e.1.clone())
+        .collect();
+    assert!(remove_referees.contains(&c1.to_string()));
+    assert!(remove_referees.contains(&c2.to_string()));
+
+    drain_outbox(&db);
+    assert_expand(&db, &c1, 0, false, ItemState::Present);
+    assert_expand(&db, &c2, 0, false, ItemState::Present);
+}
+
+// ──────────── 29. apply_edge remove before add is stable ────────────
+
+#[test]
+fn test_apply_edge_remove_before_add_is_stable() {
+    let db = test_db();
+
+    let child = dir_id("rba_child");
+    db.set_object(&child, "cydir", "{}").unwrap();
+
+    let parent = dir_id("rba_parent");
+
+    // Remove first (no-op, nothing to remove)
+    let rm_msg = EdgeMsg {
+        op: EdgeOp::Remove,
+        referee: child.clone(),
+        referrer: parent.clone(),
+        target_epoch: 1,
+    };
+    db.apply_edge(&rm_msg).unwrap(); // should not panic
+
+    assert_expand(&db, &child, 0, false, ItemState::Present);
+
+    // Then add
+    let add_msg = EdgeMsg {
+        op: EdgeOp::Add,
+        referee: child.clone(),
+        referrer: parent.clone(),
+        target_epoch: 1,
+    };
+    db.apply_edge(&add_msg).unwrap();
+
+    // Final state: has incoming ref
+    let d = db.debug_dump_expand_state(&child).unwrap();
+    assert_eq!(d.incoming_refs_count, 1);
+    assert_eq!(d.eviction_class, 1);
+}
+
+// ──────────── 30. apply_edge add on shadow with skeleton stays blocked ────────────
+
+#[test]
+fn test_apply_edge_add_on_shadow_with_skeleton_stays_blocked() {
+    let db = test_db();
+
+    let x = file_id("aes_x");
+    let d = dir_id("aes_d");
+    let upstream = dir_id("aes_up");
+
+    // D exists with child X, add skeleton on D
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+    db.pin(&d, "skel", PinScope::Skeleton, None).unwrap();
+
+    assert_expand(&db, &d, 2, false, ItemState::Present);
+    assert!(peek_outbox(&db).is_empty());
+
+    // Receive incoming edge: D gets class 2 (max of pin=2, incoming=1), still skeleton-blocked
+    let add_msg = EdgeMsg {
+        op: EdgeOp::Add,
+        referee: d.clone(),
+        referrer: upstream.clone(),
+        target_epoch: 1,
+    };
+    db.apply_edge(&add_msg).unwrap();
+    drain_outbox(&db);
+
+    // D: class 2, NOT expanded (skeleton blocks)
+    assert_expand(&db, &d, 2, false, ItemState::Present);
+
+    // X: class 0 (no incoming from D)
+    assert_expand(&db, &x, 0, false, ItemState::Present);
+}
+
+// ═══════════════════════════════════════════════════
+// Low-priority tests (31–34)
+// ═══════════════════════════════════════════════════
+
+// ──────────── 31. cascade_state for non-recursive pins ────────────
+
+#[test]
+fn test_cascade_state_for_non_recursive_pins() {
+    let db = test_db();
+
+    let root = dir_id("cs_nr");
+    db.set_object(&root, "cydir", "{}").unwrap();
+
+    // Skeleton pin → cascade_state = Materializing (present object)
+    db.pin(&root, "skel_owner", PinScope::Skeleton, None).unwrap();
+    let cs = db.anchor_state(&root, "skel_owner").unwrap();
+    assert_eq!(cs, CascadeStateP0::Materializing);
+
+    // Lease pin → cascade_state = Materializing
+    db.pin(&root, "lease_owner", PinScope::Lease, None).unwrap();
+    let cs2 = db.anchor_state(&root, "lease_owner").unwrap();
+    assert_eq!(cs2, CascadeStateP0::Materializing);
+
+    // Shadow object with skeleton → still Materializing (non-recursive never Pending)
+    let shadow = dir_id("cs_nr_shadow");
+    db.pin(&shadow, "skel2", PinScope::Skeleton, None).unwrap();
+    let cs3 = db.anchor_state(&shadow, "skel2").unwrap();
+    assert_eq!(cs3, CascadeStateP0::Materializing);
+
+    db.pin(&shadow, "lease2", PinScope::Lease, None).unwrap();
+    let cs4 = db.anchor_state(&shadow, "lease2").unwrap();
+    assert_eq!(cs4, CascadeStateP0::Materializing);
+}
+
+// ──────────── 32. Duplicate apply_edge does not duplicate outbox side effects ────────────
+
+#[test]
+fn test_duplicate_apply_edge_no_duplicate_outbox() {
+    let db = test_db();
+
+    let x = file_id("dae_x");
+    let d = dir_id("dae_d");
+    let parent = dir_id("dae_parent");
+
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+
+    let add_msg = EdgeMsg {
+        op: EdgeOp::Add,
+        referee: d.clone(),
+        referrer: parent.clone(),
+        target_epoch: 1,
+    };
+
+    // First add → should expand D, emit add(X <- D)
+    db.apply_edge(&add_msg).unwrap();
+    let outbox1 = peek_outbox(&db);
+    let add_count_1 = outbox1.iter().filter(|e| e.0 == EdgeOp::Add).count();
+    assert_eq!(add_count_1, 1, "first apply_edge should emit exactly one add");
+    drain_and_assert_empty(&db);
+
+    // Duplicate add → should NOT emit another add(X <- D) since already expanded
+    db.apply_edge(&add_msg).unwrap();
+    assert!(
+        peek_outbox(&db).is_empty(),
+        "duplicate apply_edge(add) should not produce outbox entries"
+    );
+
+    // Remove
+    let rm_msg = EdgeMsg {
+        op: EdgeOp::Remove,
+        referee: d.clone(),
+        referrer: parent.clone(),
+        target_epoch: 1,
+    };
+    db.apply_edge(&rm_msg).unwrap();
+    let outbox2 = peek_outbox(&db);
+    let rm_count = outbox2.iter().filter(|e| e.0 == EdgeOp::Remove).count();
+    assert_eq!(rm_count, 1, "first apply_edge(remove) should emit exactly one remove");
+    drain_and_assert_empty(&db);
+
+    // Duplicate remove → no outbox
+    db.apply_edge(&rm_msg).unwrap();
+    assert!(
+        peek_outbox(&db).is_empty(),
+        "duplicate apply_edge(remove) should not produce outbox entries"
+    );
+}
+
+// ──────────── 33. fs_release_inode only removes for last expand reason ────────────
+
+#[test]
+fn test_fs_release_inode_only_removes_last_expand_reason() {
+    let db = test_db();
+
+    let child = file_id("frl_c");
+    let root = dir_id("frl_r");
+
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+
+    // Root has both recursive pin AND fs_anchor
+    db.pin(&root, "owner", PinScope::Recursive, None).unwrap();
+    db.fs_acquire(&root, 99, 0).unwrap();
+    drain_outbox(&db);
+
+    assert_expand(&db, &root, 2, true, ItemState::Present);
+    assert_expand(&db, &child, 1, true, ItemState::Present);
+
+    // Release fs inode → root still expanded (recursive pin holds)
+    db.fs_release_inode(99).unwrap();
+    assert_expand(&db, &root, 2, true, ItemState::Present);
+
+    // No remove for child
+    assert!(peek_outbox(&db).is_empty());
+    assert_expand(&db, &child, 1, true, ItemState::Present);
+}
