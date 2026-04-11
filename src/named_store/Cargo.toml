@@ -29,3 +29,4 @@ hyper-util = { version = "0.1", features = ["tokio", "client", "http1"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+env_logger = "0.11"
