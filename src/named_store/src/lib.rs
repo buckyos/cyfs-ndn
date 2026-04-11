@@ -10,6 +10,7 @@ mod lru_hot_table;
 mod named_store;
 mod outbox_sender;
 mod store_db;
+mod ndm_zone_gateway;
 mod store_http_gateway;
 mod store_layout;
 mod store_mgr;
@@ -35,6 +36,7 @@ pub use outbox_sender::{
     EdgeRouter, HttpEdgeRouter, LoopbackRouter, MgrEdgeRouter, OutboxSender, OutboxSenderConfig,
 };
 pub use store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
+pub use ndm_zone_gateway::{NamedStoreMgrZoneGateway, NdmZoneGatewayConfig};
 pub use store_http_gateway::NamedStoreMgrHttpGateway;
 pub use store_layout::*;
 pub use store_mgr::*;

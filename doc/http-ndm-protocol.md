@@ -375,6 +375,7 @@ sequenceDiagram
 - 无法直接操作本地 NDM 进程
 - 无法直接打开本地 bucket 或 NDN Cache
 
+
 因此，纯浏览器必须先连到 **Zone Gateway 上一套面向已认证用户的上传协议**。
 
 ### 12.2 纯浏览器上传协议应做什么
@@ -393,6 +394,8 @@ sequenceDiagram
 - 调用 helper 查询该文件是否已存在
 - 如果已存在，直接返回已有 `ObjectID`
 - 如果不存在，再走完整上传流程
+
+该协议基于TUS进行设计。
 
 ### 12.3 这应成为统一 SDK 能力
 
