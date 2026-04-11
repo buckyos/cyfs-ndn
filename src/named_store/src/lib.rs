@@ -10,26 +10,26 @@ mod lru_hot_table;
 mod named_store;
 mod outbox_sender;
 mod store_db;
+mod store_http_gateway;
 mod store_layout;
 mod store_mgr;
-mod store_http_gateway;
-#[cfg(test)]
-mod test_http_roundtrip;
 #[cfg(test)]
 mod test_http_backend_mgr;
+#[cfg(test)]
+mod test_http_roundtrip;
 
 pub use backend::{
     ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
     NamedDataStoreBackendExt,
 };
-pub use http_backend::{HttpBackend, HttpBackendConfig};
-pub use http_gc_client::{HttpGcClient, HttpGcClientConfig};
-pub use local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 pub use chunk_list_reader::*;
 #[allow(unused_imports)]
 pub use diff_chunk_list::*;
 pub use gc_types::*;
+pub use http_backend::{HttpBackend, HttpBackendConfig};
+pub use http_gc_client::{HttpGcClient, HttpGcClientConfig};
 pub use limit_reader::*;
+pub use local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 pub use named_store::{NamedLocalConfig, NamedLocalStore, NamedStore, ObjectState};
 pub use outbox_sender::{
     EdgeRouter, HttpEdgeRouter, LoopbackRouter, MgrEdgeRouter, OutboxSender, OutboxSenderConfig,

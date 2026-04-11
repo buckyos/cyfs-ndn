@@ -248,8 +248,7 @@ impl NamedStoreMgr {
                 read_only: entry.readonly,
                 ..Default::default()
             };
-            let store =
-                NamedStore::from_config(Some(store_id.clone()), store_path, config).await?;
+            let store = NamedStore::from_config(Some(store_id.clone()), store_path, config).await?;
 
             let actual_store_id = store.store_id().to_string();
             if actual_store_id != store_id {
@@ -681,10 +680,7 @@ impl NamedStoreMgr {
     }
 
     /// Query chunk state (tries all layout versions)
-    pub async fn query_chunk_state(
-        &self,
-        chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkStoreState, u64)> {
+    pub async fn query_chunk_state(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkStoreState, u64)> {
         let obj_id = chunk_id.to_obj_id();
         let versions = self.versions.read().await;
         let stores = self.stores.read().await;
@@ -995,11 +991,7 @@ impl NamedStoreMgr {
 
     /// 原子写入 chunk 字节数据。backend 自动进行 hash 校验。
     /// chunk_data 长度不能超过 CHUNK_DEFAULT_SIZE（32MB）。
-    pub async fn put_chunk(
-        &self,
-        chunk_id: &ChunkId,
-        chunk_data: &[u8],
-    ) -> NdnResult<()> {
+    pub async fn put_chunk(&self, chunk_id: &ChunkId, chunk_data: &[u8]) -> NdnResult<()> {
         let obj_id = chunk_id.to_obj_id();
         let store = self
             .select_store_for_write(&obj_id)
@@ -1036,9 +1028,7 @@ impl NamedStoreMgr {
         let store = self
             .select_store_for_write(&msg.referee)
             .await
-            .ok_or_else(|| {
-                NdnError::NotFound(format!("no store for referee {}", msg.referee))
-            })?;
+            .ok_or_else(|| NdnError::NotFound(format!("no store for referee {}", msg.referee)))?;
         let store_guard = store.lock().await;
         store_guard.apply_edge(msg).await
     }
@@ -1081,12 +1071,7 @@ impl NamedStoreMgr {
     }
 
     /// Acquire an fs anchor in the bucket owning `obj_id`.
-    pub async fn fs_acquire(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let store = self
             .select_store_for_write(obj_id)
             .await
@@ -1096,12 +1081,7 @@ impl NamedStoreMgr {
     }
 
     /// Release an fs anchor in the bucket owning `obj_id`.
-    pub async fn fs_release(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_release(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let store = self
             .select_store_for_write(obj_id)
             .await
@@ -1133,7 +1113,9 @@ impl NamedStoreMgr {
             .await
             .ok_or_else(|| NdnError::NotFound("no store for fs_anchor_state".to_string()))?;
         let store_guard = store.lock().await;
-        store_guard.fs_anchor_state(obj_id, inode_id, field_tag).await
+        store_guard
+            .fs_anchor_state(obj_id, inode_id, field_tag)
+            .await
     }
 
     /// Run forced GC across all stores until target_bytes freed.
@@ -1206,11 +1188,7 @@ impl NamedStoreMgr {
     }
 
     /// Query anchor state for (obj_id, owner) — routes to owning bucket.
-    pub async fn anchor_state(
-        &self,
-        obj_id: &ObjId,
-        owner: &str,
-    ) -> NdnResult<CascadeStateP0> {
+    pub async fn anchor_state(&self, obj_id: &ObjId, owner: &str) -> NdnResult<CascadeStateP0> {
         let store = self
             .select_store_for_write(obj_id)
             .await
@@ -1222,10 +1200,7 @@ impl NamedStoreMgr {
     // ==================== Store Access ====================
 
     /// Get store by store_id
-    pub async fn get_store(
-        &self,
-        store_id: &str,
-    ) -> Option<Arc<tokio::sync::Mutex<NamedStore>>> {
+    pub async fn get_store(&self, store_id: &str) -> Option<Arc<tokio::sync::Mutex<NamedStore>>> {
         let stores = self.stores.read().await;
         stores.get(store_id).cloned()
     }

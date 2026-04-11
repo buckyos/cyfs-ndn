@@ -10,20 +10,18 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::{
-        ChunkWriteOutcome, NamedDataStoreBackend,
-    };
+    use crate::backend::{ChunkWriteOutcome, NamedDataStoreBackend};
     use crate::http_backend::{HttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
     use crate::{NamedLocalConfig, NamedStore, NamedStoreMgr, StoreLayout, StoreTarget};
 
     use bytes::Bytes;
+    use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode};
     use http_body_util::combinators::BoxBody;
     use http_body_util::{BodyExt, Full};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use cyfs_gateway_lib::HttpServer;
     use ndn_lib::{ChunkHasher, ChunkId, NdnError, ObjId};
     use std::net::SocketAddr;
     use std::path::Path;
@@ -62,19 +60,19 @@ mod tests {
                     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let gw = gw.clone();
                         async move {
-                            let (parts, body) = req.into_parts();
-                            let collected = body
-                                .collect()
-                                .await
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                            let bytes = collected.to_bytes();
-                            let boxed: BoxBody<Bytes, cyfs_gateway_lib::ServerError> =
-                                Full::new(bytes)
-                                    .map_err(|never| match never {})
-                                    .boxed();
-                            let gateway_req = http::Request::from_parts(parts, boxed);
+                            let gateway_req = req.map(|body| {
+                                body.map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::StreamError,
+                                        format!("incoming body error: {e}"),
+                                    )
+                                })
+                                .boxed()
+                            });
 
-                            let resp: http::Response<BoxBody<Bytes, cyfs_gateway_lib::ServerError>> = gw
+                            let resp: http::Response<
+                                BoxBody<Bytes, cyfs_gateway_lib::ServerError>,
+                            > = gw
                                 .serve_request(gateway_req, cyfs_gateway_lib::StreamInfo::default())
                                 .await
                                 .unwrap_or_else(|e| {
@@ -91,10 +89,11 @@ mod tests {
                             Ok::<_, std::io::Error>(resp)
                         }
                     });
-                    let _ =
-                        http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
+                    let mut builder = http1::Builder::new();
+                    builder.half_close(true);
+                    let _ = builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
                 });
             }
         });
@@ -103,10 +102,7 @@ mod tests {
     }
 
     /// Create a local NamedStore with a given store_id at a given path.
-    async fn make_local_store(
-        store_id: &str,
-        dir: &Path,
-    ) -> Arc<tokio::sync::Mutex<NamedStore>> {
+    async fn make_local_store(store_id: &str, dir: &Path) -> Arc<tokio::sync::Mutex<NamedStore>> {
         let store = NamedStore::from_config(
             Some(store_id.to_string()),
             dir.to_path_buf(),

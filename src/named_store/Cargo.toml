@@ -23,9 +23,9 @@ reqwest = { workspace = true }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = "0.1"
 futures-util = { workspace = true }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "http1"] }
 
 [dev-dependencies]
 tempfile = "3"
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1"] }
 tokio = { workspace = true }

@@ -119,12 +119,7 @@ impl HttpGcClient {
 
     // ======================== fs_acquire / fs_release ========================
 
-    pub async fn fs_acquire(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let url = self.gc_url("fs_acquire");
         let body = serde_json::json!({
             "obj_id": obj_id.to_string(),
@@ -141,12 +136,7 @@ impl HttpGcClient {
         check_no_content(resp, &url).await
     }
 
-    pub async fn fs_release(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_release(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let url = self.gc_url("fs_release");
         let body = serde_json::json!({
             "obj_id": obj_id.to_string(),
@@ -188,11 +178,7 @@ impl HttpGcClient {
     // ======================== same_as ========================
 
     /// Register a SameAs relationship for a big chunk.
-    pub async fn same_as(
-        &self,
-        big_chunk_id: &ObjId,
-        chunk_list_id: &ObjId,
-    ) -> NdnResult<()> {
+    pub async fn same_as(&self, big_chunk_id: &ObjId, chunk_list_id: &ObjId) -> NdnResult<()> {
         let url = self.gc_url("same_as");
         let body = serde_json::json!({
             "big_chunk_id": big_chunk_id.to_string(),
@@ -307,11 +293,7 @@ impl HttpGcClient {
     }
 
     /// Query anchor state for (obj_id, owner).
-    pub async fn anchor_state(
-        &self,
-        obj_id: &ObjId,
-        owner: &str,
-    ) -> NdnResult<CascadeStateP0> {
+    pub async fn anchor_state(&self, obj_id: &ObjId, owner: &str) -> NdnResult<CascadeStateP0> {
         let url = format!(
             "{}?owner={}",
             self.gc_url(&format!("anchor_state/{}", obj_id)),

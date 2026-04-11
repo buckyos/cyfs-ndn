@@ -29,9 +29,7 @@
 //!   writer 都走到 rename，它们的字节内容也必然相同（hash 校验过），
 //!   覆盖安全。
 
-use crate::backend::{
-    ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend,
-};
+use crate::backend::{ChunkPresence, ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend};
 use async_trait::async_trait;
 use log::warn;
 use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId};
@@ -68,12 +66,12 @@ impl LocalFsBackend {
         let object_dir = config.root.join(OBJECT_DIR);
 
         if !config.read_only {
-            fs::create_dir_all(&chunk_dir).await.map_err(|e| {
-                NdnError::IoError(format!("create chunk dir failed: {}", e))
-            })?;
-            fs::create_dir_all(&object_dir).await.map_err(|e| {
-                NdnError::IoError(format!("create object dir failed: {}", e))
-            })?;
+            fs::create_dir_all(&chunk_dir)
+                .await
+                .map_err(|e| NdnError::IoError(format!("create chunk dir failed: {}", e)))?;
+            fs::create_dir_all(&object_dir)
+                .await
+                .map_err(|e| NdnError::IoError(format!("create object dir failed: {}", e)))?;
         }
 
         Ok(Self {
@@ -132,9 +130,9 @@ impl LocalFsBackend {
 
     async fn ensure_parent(path: &Path) -> NdnResult<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                NdnError::IoError(format!("create dir failed: {}", e))
-            })?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|e| NdnError::IoError(format!("create dir failed: {}", e)))?;
         }
         Ok(())
     }
@@ -152,9 +150,10 @@ impl LocalFsBackend {
         let mut buf = vec![0u8; COPY_BUF_SIZE];
         while remaining > 0 {
             let want = remaining.min(buf.len() as u64) as usize;
-            let n = source.read(&mut buf[..want]).await.map_err(|e| {
-                NdnError::IoError(format!("read source failed: {}", e))
-            })?;
+            let n = source
+                .read(&mut buf[..want])
+                .await
+                .map_err(|e| NdnError::IoError(format!("read source failed: {}", e)))?;
             if n == 0 {
                 return Err(NdnError::IoError(format!(
                     "source EOF before {} bytes: short {} bytes",
@@ -162,17 +161,19 @@ impl LocalFsBackend {
                 )));
             }
             hasher.update_from_bytes(&buf[..n]);
-            tmp_file.write_all(&buf[..n]).await.map_err(|e| {
-                NdnError::IoError(format!("write tmp file failed: {}", e))
-            })?;
+            tmp_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| NdnError::IoError(format!("write tmp file failed: {}", e)))?;
             remaining -= n as u64;
         }
 
         // 校验 source 确实只有 chunk_size 字节，多一个字节都不行。
         let mut overflow = [0u8; 1];
-        let extra = source.read(&mut overflow).await.map_err(|e| {
-            NdnError::IoError(format!("probe source tail failed: {}", e))
-        })?;
+        let extra = source
+            .read(&mut overflow)
+            .await
+            .map_err(|e| NdnError::IoError(format!("probe source tail failed: {}", e)))?;
         if extra != 0 {
             return Err(NdnError::IoError(format!(
                 "source longer than declared chunk_size {}",
@@ -260,16 +261,16 @@ impl NamedDataStoreBackend for LocalFsBackend {
         ));
 
         {
-            let mut f = File::create(&tmp_path).await.map_err(|e| {
-                NdnError::IoError(format!("create object tmp failed: {}", e))
-            })?;
-            f.write_all(obj_str.as_bytes()).await.map_err(|e| {
-                NdnError::IoError(format!("write object tmp failed: {}", e))
-            })?;
+            let mut f = File::create(&tmp_path)
+                .await
+                .map_err(|e| NdnError::IoError(format!("create object tmp failed: {}", e)))?;
+            f.write_all(obj_str.as_bytes())
+                .await
+                .map_err(|e| NdnError::IoError(format!("write object tmp failed: {}", e)))?;
             f.flush().await.ok();
-            f.sync_all().await.map_err(|e| {
-                NdnError::IoError(format!("sync object tmp failed: {}", e))
-            })?;
+            f.sync_all()
+                .await
+                .map_err(|e| NdnError::IoError(format!("sync object tmp failed: {}", e)))?;
         }
 
         fs::rename(&tmp_path, &final_path).await.map_err(|e| {
@@ -336,18 +337,19 @@ impl NamedDataStoreBackend for LocalFsBackend {
             }
         };
 
-        let meta = file.metadata().await.map_err(|e| {
-            NdnError::IoError(format!("stat chunk file failed: {}", e))
-        })?;
+        let meta = file
+            .metadata()
+            .await
+            .map_err(|e| NdnError::IoError(format!("stat chunk file failed: {}", e)))?;
         let total = meta.len();
 
         if offset > total {
             return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
         }
         if offset > 0 {
-            file.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-                NdnError::IoError(format!("seek chunk file failed: {}", e))
-            })?;
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|e| NdnError::IoError(format!("seek chunk file failed: {}", e)))?;
         }
         let limited = file.take(total - offset);
         Ok((Box::pin(limited), total))
@@ -563,11 +565,7 @@ mod tests {
             .unwrap();
         while let Some(entry) = entries.next_entry().await.unwrap() {
             let name = entry.file_name().into_string().unwrap();
-            assert!(
-                !name.contains(".tmp."),
-                "tmp file leaked: {}",
-                name
-            );
+            assert!(!name.contains(".tmp."), "tmp file leaked: {}", name);
         }
     }
 

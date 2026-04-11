@@ -606,18 +606,9 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store
-                .put_chunk(&chunk_ids[0], &chunk_a)
-                .await
-                .unwrap();
-            store
-                .put_chunk(&chunk_ids[1], &chunk_b)
-                .await
-                .unwrap();
-            store
-                .put_chunk(&chunk_ids[2], &chunk_c)
-                .await
-                .unwrap();
+            store.put_chunk(&chunk_ids[0], &chunk_a).await.unwrap();
+            store.put_chunk(&chunk_ids[1], &chunk_b).await.unwrap();
+            store.put_chunk(&chunk_ids[2], &chunk_c).await.unwrap();
         }
 
         let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids).unwrap();
@@ -692,10 +683,7 @@ mod tests {
         }
         {
             let store = backup_store.lock().await;
-            store
-                .put_chunk(&in_backup_id, &in_backup)
-                .await
-                .unwrap();
+            store.put_chunk(&in_backup_id, &in_backup).await.unwrap();
         }
 
         let fallback_store = backup_store.clone();

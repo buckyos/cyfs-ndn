@@ -5,8 +5,7 @@ use crate::lru_hot_table::LruHotTable;
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkId, ChunkReader, CHUNK_DEFAULT_SIZE, NdnError, NdnResult,
-    ObjId,
+    caculate_qcid_from_file, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -124,10 +123,7 @@ impl NamedStore {
             .unwrap_or_else(|| root_path.join(CHUNK_DIR_NAME));
 
         // 创建 LocalFsBackend，root 设为 chunk_dir 的父目录
-        let backend_root = chunk_dir
-            .parent()
-            .unwrap_or(&root_path)
-            .to_path_buf();
+        let backend_root = chunk_dir.parent().unwrap_or(&root_path).to_path_buf();
         let backend = Arc::new(
             LocalFsBackend::new(LocalFsBackendConfig {
                 root: backend_root,
@@ -249,10 +245,7 @@ impl NamedStore {
         }
     }
 
-    pub async fn query_chunk_state(
-        &self,
-        chunk_id: &ChunkId,
-    ) -> NdnResult<(ChunkStoreState, u64)> {
+    pub async fn query_chunk_state(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkStoreState, u64)> {
         let chunk_item = self.get_chunk_item(chunk_id).await;
         if let Ok(chunk_item) = chunk_item {
             Ok((chunk_item.chunk_state, chunk_item.chunk_size))
@@ -317,19 +310,20 @@ impl NamedStore {
 
         real_offset += offset;
         let mut file = tokio::fs::File::open(&chunk_real_path).await.map_err(|e| {
-            warn!("open_local_link_reader: open file failed! {}", e.to_string());
+            warn!(
+                "open_local_link_reader: open file failed! {}",
+                e.to_string()
+            );
             NdnError::IoError(e.to_string())
         })?;
         if real_offset > 0 {
-            file.seek(SeekFrom::Start(real_offset))
-                .await
-                .map_err(|e| {
-                    warn!(
-                        "open_local_link_reader: seek file failed! {}",
-                        e.to_string()
-                    );
-                    NdnError::IoError(e.to_string())
-                })?;
+            file.seek(SeekFrom::Start(real_offset)).await.map_err(|e| {
+                warn!(
+                    "open_local_link_reader: seek file failed! {}",
+                    e.to_string()
+                );
+                NdnError::IoError(e.to_string())
+            })?;
         }
         let limited = file.take(limit_len - offset);
         Ok((Box::pin(limited), chunk_item.chunk_size))
@@ -431,7 +425,8 @@ impl NamedStore {
     pub async fn put_chunk(&self, chunk_id: &ChunkId, chunk_data: &[u8]) -> NdnResult<()> {
         let chunk_size = chunk_data.len() as u64;
         let reader: ChunkReader = Box::pin(std::io::Cursor::new(chunk_data.to_vec()));
-        self.put_chunk_by_reader(chunk_id, chunk_size, reader).await?;
+        self.put_chunk_by_reader(chunk_id, chunk_size, reader)
+            .await?;
         Ok(())
     }
 
@@ -480,21 +475,11 @@ impl NamedStore {
         self.db.unpin_owner(owner)
     }
 
-    pub async fn fs_acquire(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         self.db.fs_acquire(obj_id, inode_id, field_tag)
     }
 
-    pub async fn fs_release(
-        &self,
-        obj_id: &ObjId,
-        inode_id: u64,
-        field_tag: u32,
-    ) -> NdnResult<()> {
+    pub async fn fs_release(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         self.db.fs_release(obj_id, inode_id, field_tag)
     }
 
@@ -593,11 +578,7 @@ impl NamedStore {
         self.db.debug_dump_expand_state(obj_id)
     }
 
-    pub async fn anchor_state(
-        &self,
-        obj_id: &ObjId,
-        owner: &str,
-    ) -> NdnResult<CascadeStateP0> {
+    pub async fn anchor_state(&self, obj_id: &ObjId, owner: &str) -> NdnResult<CascadeStateP0> {
         self.db.anchor_state(obj_id, owner)
     }
 

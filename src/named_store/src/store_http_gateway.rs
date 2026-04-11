@@ -181,8 +181,8 @@ impl NamedStoreMgrHttpGateway {
         req: http::Request<BoxBody<Bytes, ServerError>>,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
         let body = collect_body(req).await?;
-        let obj_str =
-            String::from_utf8(body).map_err(|e| NdnError::InvalidData(format!("invalid utf8: {e}")))?;
+        let obj_str = String::from_utf8(body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid utf8: {e}")))?;
         self.store_mgr.put_object(obj_id, &obj_str).await?;
 
         Response::builder()
@@ -236,16 +236,14 @@ impl NamedStoreMgrHttpGateway {
         let chunk_id = ChunkId::from_obj_id(obj_id);
         let offset = parse_range_offset(req);
 
-        let (reader, total_size) =
-            self.store_mgr.open_chunk_reader(&chunk_id, offset).await?;
+        let (reader, total_size) = self.store_mgr.open_chunk_reader(&chunk_id, offset).await?;
 
         let remaining = total_size - offset;
 
         // 流式响应：把 ChunkReader (AsyncRead) 转为 http body stream，
         // 逐块读取，不全量缓冲。
-        let stream = tokio_stream::wrappers::ReceiverStream::new(
-            chunk_reader_to_channel(reader, remaining),
-        );
+        let stream =
+            tokio_stream::wrappers::ReceiverStream::new(chunk_reader_to_channel(reader, remaining));
         let stream_body = StreamBody::new(stream);
         let boxed_body: BoxBody<Bytes, ServerError> = BodyExt::boxed(stream_body);
 
@@ -289,22 +287,17 @@ impl NamedStoreMgrHttpGateway {
         // Parse chunk size from X-CYFS-Chunk-Size or Content-Length
         let chunk_size = parse_chunk_size(&req)?;
 
-        let body_data = collect_body(req).await?;
-        if body_data.len() as u64 != chunk_size {
-            return Err(NdnError::InvalidParam(format!(
-                "body size {} != declared chunk_size {}",
-                body_data.len(),
-                chunk_size
-            )));
+        if self.store_mgr.have_chunk(&chunk_id).await {
+            return ok_response_builder()
+                .header(H_CHUNK_ALREADY, "1")
+                .header(H_CHUNK_SIZE, chunk_size)
+                .body(empty_body())
+                .map_err(|e| NdnError::Internal(format!("build response: {e}")));
         }
 
         let outcome = self
             .store_mgr
-            .put_chunk_by_reader(
-                &chunk_id,
-                chunk_size,
-                Box::pin(std::io::Cursor::new(body_data)),
-            )
+            .put_chunk_by_reader(&chunk_id, chunk_size, request_body_into_chunk_reader(req))
             .await?;
 
         match outcome {
@@ -388,10 +381,7 @@ impl NamedStoreMgrHttpGateway {
                 if m == Method::GET && sub.starts_with("fs_anchor_state/") {
                     return self.handle_gc_fs_anchor_state(sub, &req).await;
                 }
-                Err(NdnError::Unsupported(format!(
-                    "{} /_gc/{}",
-                    m, sub
-                )))
+                Err(NdnError::Unsupported(format!("{} /_gc/{}", m, sub)))
             }
         }
     }
@@ -415,7 +405,12 @@ impl NamedStoreMgrHttpGateway {
         let pin_req: PinRequest = serde_json::from_slice(&body)
             .map_err(|e| NdnError::InvalidData(format!("invalid PinRequest JSON: {e}")))?;
         self.store_mgr
-            .pin(&pin_req.obj_id, &pin_req.owner, pin_req.scope, pin_req.ttl())
+            .pin(
+                &pin_req.obj_id,
+                &pin_req.owner,
+                pin_req.scope,
+                pin_req.ttl(),
+            )
             .await?;
         no_content_response()
     }
@@ -533,10 +528,7 @@ impl NamedStoreMgrHttpGateway {
             Some(i) => (&after_prefix[..i], &after_prefix[i + 1..]),
             None => {
                 // Check URI query string
-                let q = req
-                    .uri()
-                    .query()
-                    .unwrap_or("");
+                let q = req.uri().query().unwrap_or("");
                 (after_prefix, q)
             }
         };
@@ -708,9 +700,7 @@ fn empty_body() -> BoxBody<Bytes, ServerError> {
 }
 
 fn full_body(data: Bytes) -> BoxBody<Bytes, ServerError> {
-    Full::new(data)
-        .map_err(|never| match never {})
-        .boxed()
+    Full::new(data).map_err(|never| match never {}).boxed()
 }
 
 async fn collect_body(
@@ -724,9 +714,20 @@ async fn collect_body(
     Ok(collected.to_bytes().to_vec())
 }
 
-fn parse_chunk_size(
-    req: &http::Request<BoxBody<Bytes, ServerError>>,
-) -> Result<u64, NdnError> {
+fn request_body_into_chunk_reader(
+    req: http::Request<BoxBody<Bytes, ServerError>>,
+) -> ndn_lib::ChunkReader {
+    use futures_util::StreamExt;
+
+    let stream = req
+        .into_body()
+        .into_data_stream()
+        .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+    let reader = tokio_util::io::StreamReader::new(stream);
+    Box::pin(reader)
+}
+
+fn parse_chunk_size(req: &http::Request<BoxBody<Bytes, ServerError>>) -> Result<u64, NdnError> {
     if let Some(val) = req.headers().get(H_CHUNK_SIZE) {
         return val
             .to_str()

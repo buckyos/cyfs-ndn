@@ -6,10 +6,21 @@
 //! 资源类型由 URL 中的 obj_id 自动判定（`obj_id.is_chunk()`），不需要额外 header。
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use http::Request;
+use http_body::Frame;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, StreamBody};
+use hyper::client::conn::http1;
+use hyper_util::rt::TokioIo;
 use log::debug;
 use ndn_lib::{ChunkId, ChunkReader, NdnError, NdnResult, ObjId};
+use reqwest::Body;
 use reqwest::{Client, StatusCode};
 use tokio::io::AsyncReadExt;
+use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChunkStateInfo, ChunkWriteOutcome, NamedDataStoreBackend};
 
@@ -19,6 +30,7 @@ const H_CHUNK_ALREADY: &str = "x-cyfs-chunk-already";
 
 const CONTENT_TYPE_OBJECT: &str = "application/cyfs-object";
 const CONTENT_TYPE_OCTET: &str = "application/octet-stream";
+const STREAM_BUF_SIZE: usize = 64 * 1024;
 
 /// HTTP backend configuration.
 #[derive(Debug, Clone)]
@@ -150,7 +162,10 @@ impl NamedDataStoreBackend for HttpBackend {
     ) -> NdnResult<(ChunkReader, u64)> {
         let obj_id = chunk_id.to_obj_id();
         let url = self.url_for(&obj_id);
-        debug!("HttpBackend::open_chunk_reader GET {} offset={}", url, offset);
+        debug!(
+            "HttpBackend::open_chunk_reader GET {} offset={}",
+            url, offset
+        );
 
         let mut req = self.client.get(&url);
         if offset > 0 {
@@ -197,9 +212,8 @@ impl NamedDataStoreBackend for HttpBackend {
         // 流式：把 reqwest 的 byte stream 转成 AsyncRead，不全量缓冲
         let byte_stream = resp.bytes_stream();
         use futures_util::StreamExt;
-        let mapped = byte_stream.map(|result| {
-            result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-        });
+        let mapped = byte_stream
+            .map(|result| result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         let stream_reader = tokio_util::io::StreamReader::new(mapped);
         let reader: ChunkReader = Box::pin(stream_reader);
 
@@ -210,35 +224,42 @@ impl NamedDataStoreBackend for HttpBackend {
         &self,
         chunk_id: &ChunkId,
         chunk_size: u64,
-        mut source: ChunkReader,
+        source: ChunkReader,
     ) -> NdnResult<ChunkWriteOutcome> {
-        // 必须先读完 source 再发 HTTP 请求（reqwest 的 body 需要完整数据或 Stream）
-        let mut buf = Vec::with_capacity(chunk_size as usize);
-        let n = source
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| NdnError::IoError(format!("read source: {e}")))?;
-        if n as u64 != chunk_size {
-            return Err(NdnError::IoError(format!(
-                "source size mismatch: expected {} got {}",
-                chunk_size, n
-            )));
-        }
-
         let obj_id = chunk_id.to_obj_id();
         let url = self.url_for(&obj_id);
-        debug!("HttpBackend::open_chunk_writer PUT {} size={}", url, chunk_size);
+        debug!(
+            "HttpBackend::open_chunk_writer PUT {} size={}",
+            url, chunk_size
+        );
+
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| NdnError::InvalidParam(format!("invalid PUT url {url}: {e}")))?;
+
+        if parsed.scheme() == "http" {
+            let resp = self
+                .stream_put_chunk_http1(&parsed, chunk_size, source)
+                .await?;
+            let status = resp.status();
+            if status.is_success() {
+                let already = resp
+                    .headers()
+                    .get(H_CHUNK_ALREADY)
+                    .and_then(|v| v.to_str().ok())
+                    == Some("1");
+                if already {
+                    return Ok(ChunkWriteOutcome::AlreadyExists);
+                }
+                return Ok(ChunkWriteOutcome::Written);
+            }
+
+            let body = resp.text();
+            return Err(map_http_error(status, &body));
+        }
 
         let resp = self
-            .client
-            .put(&url)
-            .header(H_CHUNK_SIZE, chunk_size)
-            .header("content-type", CONTENT_TYPE_OCTET)
-            .body(buf)
-            .send()
-            .await
-            .map_err(|e| NdnError::RemoteError(format!("PUT {url}: {e}")))?;
-
+            .stream_put_chunk_reqwest(&url, chunk_size, source)
+            .await?;
         let status = resp.status();
         if status.is_success() {
             let already = resp
@@ -270,7 +291,9 @@ impl NamedDataStoreBackend for HttpBackend {
             .map_err(|e| NdnError::RemoteError(format!("DELETE {url}: {e}")))?;
 
         let status = resp.status();
-        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_FOUND || status.is_success()
+        if status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_FOUND
+            || status.is_success()
         {
             return Ok(());
         }
@@ -292,7 +315,9 @@ impl NamedDataStoreBackend for HttpBackend {
             .map_err(|e| NdnError::RemoteError(format!("DELETE {url}: {e}")))?;
 
         let status = resp.status();
-        if status == StatusCode::NO_CONTENT || status == StatusCode::NOT_FOUND || status.is_success()
+        if status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_FOUND
+            || status.is_success()
         {
             return Ok(());
         }
@@ -300,6 +325,157 @@ impl NamedDataStoreBackend for HttpBackend {
         let body = resp.text().await.unwrap_or_default();
         Err(map_http_error(status, &body))
     }
+}
+
+impl HttpBackend {
+    async fn stream_put_chunk_reqwest(
+        &self,
+        url: &str,
+        chunk_size: u64,
+        source: ChunkReader,
+    ) -> NdnResult<reqwest::Response> {
+        let body = Body::wrap_stream(tokio_util::io::ReaderStream::new(source));
+        self.client
+            .put(url)
+            .header(H_CHUNK_SIZE, chunk_size)
+            .header("content-type", CONTENT_TYPE_OCTET)
+            .header("content-length", chunk_size)
+            .header("expect", "100-continue")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("PUT {url}: {e}")))
+    }
+
+    async fn stream_put_chunk_http1(
+        &self,
+        url: &reqwest::Url,
+        chunk_size: u64,
+        source: ChunkReader,
+    ) -> NdnResult<SimpleHttpResponse> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| NdnError::InvalidParam(format!("missing host in {}", url)))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| NdnError::InvalidParam(format!("missing port in {}", url)))?;
+        let authority = match url.port() {
+            Some(port) => format!("{}:{}", host, port),
+            None => host.to_string(),
+        };
+        let path_and_query = match url.query() {
+            Some(query) => format!("{}?{}", url.path(), query),
+            None => url.path().to_string(),
+        };
+
+        let stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("connect {}: {}: {e}", host, port)))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = http1::handshake(io)
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("handshake {}: {e}", url)))?;
+        let conn_task = tokio::spawn(async move { conn.await });
+
+        let (body, pump_task) = chunk_reader_to_http_body(source, chunk_size);
+        let req = Request::builder()
+            .method("PUT")
+            .uri(path_and_query)
+            .header("host", authority)
+            .header(H_CHUNK_SIZE, chunk_size)
+            .header("content-type", CONTENT_TYPE_OCTET)
+            .header("content-length", chunk_size)
+            .header("expect", "100-continue")
+            .body(body)
+            .map_err(|e| NdnError::Internal(format!("build PUT request: {e}")))?;
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("PUT {url}: {e}")))?;
+
+        pump_task.abort();
+        let result = collect_simple_response(resp)
+            .await
+            .map_err(|e| NdnError::RemoteError(format!("read PUT response {url}: {e}")))?;
+
+        drop(sender);
+        let _ = conn_task.await;
+
+        Ok(result)
+    }
+}
+
+#[derive(Debug)]
+struct SimpleHttpResponse {
+    status: StatusCode,
+    headers: http::HeaderMap,
+    body: String,
+}
+
+impl SimpleHttpResponse {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    fn headers(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+
+    fn text(self) -> String {
+        self.body
+    }
+}
+
+async fn collect_simple_response(
+    resp: http::Response<hyper::body::Incoming>,
+) -> Result<SimpleHttpResponse, hyper::Error> {
+    let (parts, body) = resp.into_parts();
+    let collected = body.collect().await?;
+    Ok(SimpleHttpResponse {
+        status: parts.status,
+        headers: parts.headers,
+        body: String::from_utf8_lossy(&collected.to_bytes()).into_owned(),
+    })
+}
+
+fn chunk_reader_to_http_body(
+    mut reader: ChunkReader,
+    total: u64,
+) -> (BoxBody<Bytes, std::io::Error>, JoinHandle<()>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+
+    let task = tokio::spawn(async move {
+        let mut sent = 0u64;
+        while sent < total {
+            let to_read = std::cmp::min(STREAM_BUF_SIZE as u64, total - sent) as usize;
+            let mut buf = vec![0u8; to_read];
+            match reader.read(&mut buf).await {
+                Ok(0) => {
+                    let err = std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("source size mismatch: expected {} got {}", total, sent),
+                    );
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
+                Ok(n) => {
+                    buf.truncate(n);
+                    sent += n as u64;
+                    if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+    });
+
+    let body = BodyExt::boxed(StreamBody::new(ReceiverStream::new(rx)));
+    (body, task)
 }
 
 /// Map HTTP error status to NdnError by trying to parse JSON body first.
@@ -347,7 +523,9 @@ mod tests {
             base_url: "http://127.0.0.1:3180/ndn".to_string(),
         };
         let backend = HttpBackend::new(config);
-        let obj_id = ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789").unwrap();
+        let obj_id =
+            ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+                .unwrap();
         let url = backend.url_for(&obj_id);
         assert!(url.starts_with("http://127.0.0.1:3180/ndn/"));
         assert!(url.contains("sha256:"));
@@ -359,7 +537,9 @@ mod tests {
             base_url: "http://127.0.0.1:3180/ndn/".to_string(),
         };
         let backend = HttpBackend::new(config);
-        let obj_id = ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789").unwrap();
+        let obj_id =
+            ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
+                .unwrap();
         let url = backend.url_for(&obj_id);
         assert!(!url.contains("//ndn//"));
     }

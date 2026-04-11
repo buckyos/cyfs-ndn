@@ -6,25 +6,26 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{
-        ChunkPresence, ChunkWriteOutcome, NamedDataStoreBackend,
-        NamedDataStoreBackendExt,
+        ChunkPresence, ChunkWriteOutcome, NamedDataStoreBackend, NamedDataStoreBackendExt,
     };
     use crate::http_backend::{HttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
     use crate::{NamedLocalConfig, NamedStore, NamedStoreMgr, StoreLayout, StoreTarget};
 
     use bytes::Bytes;
-    use cyfs_gateway_lib::{HttpServer, StreamInfo};
-    use http_body_util::combinators::BoxBody;
+    use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
     use http_body_util::{BodyExt, Full};
     use hyper::server::conn::http1;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use ndn_lib::{ChunkHasher, ChunkId, NdnError, ObjId};
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
 
     fn calc_chunk_id(data: &[u8]) -> ChunkId {
         ChunkHasher::new(None)
@@ -55,18 +56,15 @@ mod tests {
                     let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                         let gw = gw.clone();
                         async move {
-                            // Convert hyper::Request<Incoming> → http::Request<BoxBody>
-                            let (parts, body) = req.into_parts();
-                            let collected = body
-                                .collect()
-                                .await
-                                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-                            let bytes = collected.to_bytes();
-                            let boxed: BoxBody<Bytes, cyfs_gateway_lib::ServerError> =
-                                Full::new(bytes)
-                                    .map_err(|never| match never {})
-                                    .boxed();
-                            let gateway_req = http::Request::from_parts(parts, boxed);
+                            let gateway_req = req.map(|body| {
+                                body.map_err(|e| {
+                                    ServerError::new(
+                                        ServerErrorCode::StreamError,
+                                        format!("incoming body error: {e}"),
+                                    )
+                                })
+                                .boxed()
+                            });
 
                             let resp = gw
                                 .serve_request(gateway_req, StreamInfo::default())
@@ -85,10 +83,11 @@ mod tests {
                             Ok::<_, std::io::Error>(resp)
                         }
                     });
-                    let _ =
-                        http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), service)
-                            .await;
+                    let mut builder = http1::Builder::new();
+                    builder.half_close(true);
+                    let _ = builder
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
                 });
             }
         });
@@ -261,5 +260,55 @@ mod tests {
             Err(e) => panic!("expected OffsetTooLarge, got: {e}"),
             Ok(_) => panic!("expected OffsetTooLarge error"),
         }
+    }
+
+    #[tokio::test]
+    async fn chunk_already_exists_returns_before_full_upload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = make_temp_store_mgr(tmp.path()).await;
+        let (base_url, _handle) = start_test_server(mgr).await;
+
+        let backend = HttpBackend::new(HttpBackendConfig {
+            base_url: format!("{}/ndn", base_url),
+        });
+
+        let data = vec![0x5au8; 2 * 1024 * 1024];
+        let chunk_id = calc_chunk_id(&data);
+        backend
+            .put_chunk_bytes(&chunk_id, data.clone())
+            .await
+            .unwrap();
+
+        let written = Arc::new(AtomicUsize::new(0));
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let writer_data = data.clone();
+        let written_clone = written.clone();
+        let writer_task = tokio::spawn(async move {
+            let step = 16 * 1024;
+            let mut offset = 0usize;
+            while offset < writer_data.len() {
+                let end = std::cmp::min(offset + step, writer_data.len());
+                writer.write_all(&writer_data[offset..end]).await?;
+                written_clone.store(end, Ordering::SeqCst);
+                offset = end;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            writer.shutdown().await
+        });
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            backend.open_chunk_writer(&chunk_id, data.len() as u64, Box::pin(reader)),
+        )
+        .await
+        .expect("already-exists PUT should finish early")
+        .unwrap();
+        assert_eq!(outcome, ChunkWriteOutcome::AlreadyExists);
+
+        let _ = writer_task.await;
+        assert!(
+            written.load(Ordering::SeqCst) < data.len(),
+            "expected client upload to be interrupted before sending full body"
+        );
     }
 }

@@ -1,8 +1,6 @@
 use crate::gc_types::*;
 use log::{debug, warn};
-use ndn_lib::{
-    ChunkId, KnownStandardObject, NdnError, NdnResult, ObjId,
-};
+use ndn_lib::{ChunkId, KnownStandardObject, NdnError, NdnResult, ObjId};
 use rusqlite::types::{FromSql, ToSql, ValueRef};
 use rusqlite::{params, Connection, Transaction};
 use std::ops::Range;
@@ -95,10 +93,7 @@ impl ChunkStoreState {
     }
 
     pub fn can_open_writer(&self) -> bool {
-        matches!(
-            self,
-            ChunkStoreState::New | ChunkStoreState::NotExist
-        )
+        matches!(self, ChunkStoreState::New | ChunkStoreState::NotExist)
     }
 
     pub fn is_local_link(&self) -> bool {
@@ -465,8 +460,7 @@ impl NamedLocalStoreDB {
             params![chunk_id.to_string()],
         )
         .map_err(|e| NdnError::DbError(e.to_string()))?;
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -479,10 +473,17 @@ impl NamedLocalStoreDB {
             .transaction()
             .map_err(|e| NdnError::DbError(e.to_string()))?;
 
-        Self::put_object_in_tx(&tx, obj_id, obj_type, obj_str, now_time, logical_size, owned_bytes)?;
+        Self::put_object_in_tx(
+            &tx,
+            obj_id,
+            obj_type,
+            obj_str,
+            now_time,
+            logical_size,
+            owned_bytes,
+        )?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -916,8 +917,7 @@ impl NamedLocalStoreDB {
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -940,8 +940,7 @@ impl NamedLocalStoreDB {
             Self::reconcile_expand_state_tx(&tx, obj_id)?;
         }
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -974,8 +973,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(count)
     }
 
@@ -1019,8 +1017,7 @@ impl NamedLocalStoreDB {
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -1049,8 +1046,7 @@ impl NamedLocalStoreDB {
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -1101,8 +1097,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(count)
     }
 
@@ -1141,8 +1136,7 @@ impl NamedLocalStoreDB {
         Self::recompute_eviction_class_tx(&tx, &referee_str)?;
         Self::reconcile_expand_state_tx(&tx, &msg.referee)?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -1278,8 +1272,7 @@ impl NamedLocalStoreDB {
         if has_pin || has_incoming || fs_count > 0 {
             // Drift correction: recompute class
             Self::recompute_eviction_class_tx(&tx, obj_id_str)?;
-            tx.commit()
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+            tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
             return Ok(0);
         }
 
@@ -1291,11 +1284,8 @@ impl NamedLocalStoreDB {
             )
             .unwrap_or(0);
 
-        tx.execute(
-            "DELETE FROM objects WHERE obj_id = ?1",
-            params![obj_id_str],
-        )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.execute("DELETE FROM objects WHERE obj_id = ?1", params![obj_id_str])
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
 
         // Also remove from chunk_items if it's a chunk
         tx.execute(
@@ -1304,8 +1294,7 @@ impl NamedLocalStoreDB {
         )
         .map_err(|e| NdnError::DbError(e.to_string()))?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(owned as u64)
     }
 
@@ -1325,8 +1314,7 @@ impl NamedLocalStoreDB {
             .map_err(|e| NdnError::DbError(e.to_string()))?;
         }
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 
@@ -1501,8 +1489,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(count)
     }
 
@@ -1549,10 +1536,17 @@ impl NamedLocalStoreDB {
             .transaction()
             .map_err(|e| NdnError::DbError(e.to_string()))?;
 
-        Self::put_object_in_tx(&tx, obj_id, obj_type, obj_str, now, logical_size, owned_bytes)?;
+        Self::put_object_in_tx(
+            &tx,
+            obj_id,
+            obj_type,
+            obj_str,
+            now,
+            logical_size,
+            owned_bytes,
+        )?;
 
-        tx.commit()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
         Ok(())
     }
 }

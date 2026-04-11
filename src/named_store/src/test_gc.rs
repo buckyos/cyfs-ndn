@@ -92,7 +92,13 @@ fn peek_outbox(db: &NamedLocalStoreDB) -> Vec<(EdgeOp, String, String)> {
     db.fetch_outbox_ready(1000)
         .unwrap()
         .into_iter()
-        .map(|e| (e.msg.op, e.msg.referee.to_string(), e.msg.referrer.to_string()))
+        .map(|e| {
+            (
+                e.msg.op,
+                e.msg.referee.to_string(),
+                e.msg.referrer.to_string(),
+            )
+        })
         .collect()
 }
 
@@ -105,12 +111,21 @@ fn assert_expand(
     expected_state: ItemState,
 ) {
     let d = db.debug_dump_expand_state(obj_id).unwrap();
-    assert_eq!(d.eviction_class, expected_class,
-        "obj {} class mismatch: got {}, want {}", obj_id, d.eviction_class, expected_class);
-    assert_eq!(d.children_expanded, expected_expanded,
-        "obj {} children_expanded mismatch: got {}, want {}", obj_id, d.children_expanded, expected_expanded);
-    assert_eq!(d.state, expected_state,
-        "obj {} state mismatch: got {:?}, want {:?}", obj_id, d.state, expected_state);
+    assert_eq!(
+        d.eviction_class, expected_class,
+        "obj {} class mismatch: got {}, want {}",
+        obj_id, d.eviction_class, expected_class
+    );
+    assert_eq!(
+        d.children_expanded, expected_expanded,
+        "obj {} children_expanded mismatch: got {}, want {}",
+        obj_id, d.children_expanded, expected_expanded
+    );
+    assert_eq!(
+        d.state, expected_state,
+        "obj {} state mismatch: got {:?}, want {:?}",
+        obj_id, d.state, expected_state
+    );
 }
 
 // ═══════════════════════════════════════════════════
@@ -127,7 +142,8 @@ fn test_plain_put_is_class0_no_outbox() {
     let dir_json = make_dir_json(&[("child", &b)]);
 
     db.set_object(&a, "cydir", &dir_json).unwrap();
-    db.set_object(&b, "cyfile", &make_file_json(&dir_id("dummy_content"))).unwrap();
+    db.set_object(&b, "cyfile", &make_file_json(&dir_id("dummy_content")))
+        .unwrap();
 
     // Both are class 0, not expanded, present
     assert_expand(&db, &a, 0, false, ItemState::Present);
@@ -150,8 +166,10 @@ fn test_recursive_pin_expands_children_outbox() {
 
     // Put objects bottom-up
     db.set_object(&content, "cydir", "{}").unwrap();
-    db.set_object(&child, "cyfile", &make_file_json(&content)).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("f", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&content))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("f", &child)]))
+        .unwrap();
 
     // Pin root recursively
     db.pin(&root, "user1", PinScope::Recursive, None).unwrap();
@@ -164,7 +182,7 @@ fn test_recursive_pin_expands_children_outbox() {
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].0, EdgeOp::Add);
     assert_eq!(outbox[0].1, child.to_string()); // referee = child
-    assert_eq!(outbox[0].2, root.to_string());  // referrer = root
+    assert_eq!(outbox[0].2, root.to_string()); // referrer = root
 
     // Drain outbox (loopback): child gets incoming_ref, becomes class 1, expands
     let drained = drain_outbox(&db);
@@ -188,8 +206,10 @@ fn test_unpin_recursive_cascades_remove() {
     let child = file_id("c01");
     let root = dir_id("r01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Pin + drain
     db.pin(&root, "owner1", PinScope::Recursive, None).unwrap();
@@ -227,11 +247,18 @@ fn test_gc_evicts_class0_preserves_class1_class2() {
 
     // All present
     db.set_object(&free_obj, "cydir", "{}").unwrap();
-    db.set_object(&pinned_obj, "cydir", &make_dir_json(&[("r", &referenced_obj)])).unwrap();
-    db.set_object(&referenced_obj, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
+    db.set_object(
+        &pinned_obj,
+        "cydir",
+        &make_dir_json(&[("r", &referenced_obj)]),
+    )
+    .unwrap();
+    db.set_object(&referenced_obj, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
 
     // Pin pinned_obj -> referenced_obj becomes class 1 via cascade
-    db.pin(&pinned_obj, "o1", PinScope::Recursive, None).unwrap();
+    db.pin(&pinned_obj, "o1", PinScope::Recursive, None)
+        .unwrap();
     drain_outbox(&db);
 
     assert_expand(&db, &free_obj, 0, false, ItemState::Present);
@@ -267,8 +294,10 @@ fn test_gc_full_cycle_pin_unpin_evict() {
     let child = file_id("fc01");
     let root = dir_id("fr01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Pin recursive
     db.pin(&root, "user", PinScope::Recursive, None).unwrap();
@@ -305,8 +334,10 @@ fn test_fs_acquire_release_lifecycle() {
     let child = file_id("fsc01");
     let root = dir_id("fsr01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // fs_acquire
     db.fs_acquire(&root, 100, 1).unwrap();
@@ -388,11 +419,14 @@ fn test_skeleton_pin_blocks_expansion() {
     let child = file_id("skc01");
     let root = dir_id("skr01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Skeleton pin: class 2 but should NOT expand
-    db.pin(&root, "skel_owner", PinScope::Skeleton, None).unwrap();
+    db.pin(&root, "skel_owner", PinScope::Skeleton, None)
+        .unwrap();
 
     assert_expand(&db, &root, 2, false, ItemState::Present);
     assert!(peek_outbox(&db).is_empty());
@@ -410,18 +444,22 @@ fn test_skeleton_after_expansion_tears_down() {
     let child = file_id("sk2c01");
     let root = dir_id("sk2r01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Recursive pin → expand
-    db.pin(&root, "rec_owner", PinScope::Recursive, None).unwrap();
+    db.pin(&root, "rec_owner", PinScope::Recursive, None)
+        .unwrap();
     drain_outbox(&db);
 
     assert_expand(&db, &root, 2, true, ItemState::Present);
     assert_expand(&db, &child, 1, true, ItemState::Present);
 
     // Now add skeleton pin → should tear down children
-    db.pin(&root, "skel_owner", PinScope::Skeleton, None).unwrap();
+    db.pin(&root, "skel_owner", PinScope::Skeleton, None)
+        .unwrap();
 
     // Root: class 2, NOT expanded (skeleton blocks)
     assert_expand(&db, &root, 2, false, ItemState::Present);
@@ -445,12 +483,16 @@ fn test_remove_skeleton_restores_expansion() {
     let child = file_id("sk3c01");
     let root = dir_id("sk3r01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Recursive + Skeleton
-    db.pin(&root, "rec_owner", PinScope::Recursive, None).unwrap();
-    db.pin(&root, "skel_owner", PinScope::Skeleton, None).unwrap();
+    db.pin(&root, "rec_owner", PinScope::Recursive, None)
+        .unwrap();
+    db.pin(&root, "skel_owner", PinScope::Skeleton, None)
+        .unwrap();
     drain_outbox(&db);
 
     // Blocked by skeleton
@@ -479,8 +521,10 @@ fn test_lease_pin_no_expand() {
     let child = file_id("lc01");
     let root = dir_id("lr01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     db.pin(&root, "lease_owner", PinScope::Lease, None).unwrap();
 
@@ -503,9 +547,12 @@ fn test_shared_dag_multi_parent() {
     let p1 = dir_id("parent1");
     let p2 = dir_id("parent2");
 
-    db.set_object(&d, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&p1, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
-    db.set_object(&p2, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+    db.set_object(&d, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&p1, "cydir", &make_dir_json(&[("d", &d)]))
+        .unwrap();
+    db.set_object(&p2, "cydir", &make_dir_json(&[("d", &d)]))
+        .unwrap();
 
     // Pin both parents
     db.pin(&p1, "owner1", PinScope::Recursive, None).unwrap();
@@ -559,8 +606,10 @@ fn test_multiple_fs_anchors() {
     let child = file_id("mfc01");
     let root = dir_id("mfr01");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Two different anchors
     db.fs_acquire(&root, 1, 0).unwrap();
@@ -613,8 +662,10 @@ fn test_gc_single_bucket_end_to_end() {
     let root = dir_id("root_e2e");
 
     db.set_object(&leaf, "cydir", "{}").unwrap();
-    db.set_object(&mid, "cydir", &make_dir_json(&[("l", &leaf)])).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("m", &mid)])).unwrap();
+    db.set_object(&mid, "cydir", &make_dir_json(&[("l", &leaf)]))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("m", &mid)]))
+        .unwrap();
 
     // Pin recursive
     db.pin(&root, "user", PinScope::Recursive, None).unwrap();
@@ -667,12 +718,18 @@ fn test_outbox_multi_child() {
     let c3 = file_id("mc3");
     let root = dir_id("mcroot");
 
-    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&c3, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[
-        ("a", &c1), ("b", &c2), ("c", &c3),
-    ])).unwrap();
+    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&c3, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(
+        &root,
+        "cydir",
+        &make_dir_json(&[("a", &c1), ("b", &c2), ("c", &c3)]),
+    )
+    .unwrap();
 
     db.pin(&root, "u", PinScope::Recursive, None).unwrap();
 
@@ -813,10 +870,7 @@ fn assert_outbox_exact(
 /// Drain outbox and assert it is empty afterwards.
 fn drain_and_assert_empty(db: &NamedLocalStoreDB) {
     drain_outbox(db);
-    assert!(
-        peek_outbox(db).is_empty(),
-        "outbox not empty after drain"
-    );
+    assert!(peek_outbox(db).is_empty(), "outbox not empty after drain");
 }
 
 // ═══════════════════════════════════════════════════
@@ -836,10 +890,14 @@ fn test_shared_dag_remove_does_not_retract_downstream() {
     let p1 = dir_id("dag_p1");
     let p2 = dir_id("dag_p2");
 
-    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
-    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
-    db.set_object(&p1, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
-    db.set_object(&p2, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy")))
+        .unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)]))
+        .unwrap();
+    db.set_object(&p1, "cydir", &make_dir_json(&[("d", &d)]))
+        .unwrap();
+    db.set_object(&p2, "cydir", &make_dir_json(&[("d", &d)]))
+        .unwrap();
 
     // Pin both parents recursive
     db.pin(&p1, "o1", PinScope::Recursive, None).unwrap();
@@ -897,7 +955,8 @@ fn test_incoming_shadow_then_present_auto_expands() {
     assert!(peek_outbox(&db).is_empty());
 
     // Now put S with children
-    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy")))
+        .unwrap();
     let s_json = make_dir_json(&[("x", &x)]);
     db.put_object_gc_aware(&s, "cydir", &s_json).unwrap();
 
@@ -920,8 +979,10 @@ fn test_fs_anchor_transition_outbox_exactly_once() {
     let child = file_id("fat_c");
     let root = dir_id("fat_r");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // 0 -> 1: should emit add(child <- root)
     db.fs_acquire(&root, 1, 0).unwrap();
@@ -960,8 +1021,10 @@ fn test_recursive_pin_transition_outbox_exactly_once() {
     let child = file_id("rpt_c");
     let root = dir_id("rpt_r");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // First owner pin: add(child <- root)
     db.pin(&root, "owner1", PinScope::Recursive, None).unwrap();
@@ -998,9 +1061,12 @@ fn test_skeleton_on_shared_node_blocks_without_wrong_teardown() {
     let d = dir_id("sks_d");
     let p = dir_id("sks_p");
 
-    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
-    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
-    db.set_object(&p, "cydir", &make_dir_json(&[("d", &d)])).unwrap();
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy")))
+        .unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)]))
+        .unwrap();
+    db.set_object(&p, "cydir", &make_dir_json(&[("d", &d)]))
+        .unwrap();
 
     // Pin P recursive → D gets incoming, D expands to X
     db.pin(&p, "owner", PinScope::Recursive, None).unwrap();
@@ -1074,7 +1140,8 @@ fn test_gc_ignores_zero_owned_bytes_rows() {
 
     // Also verify with a present object that has real bytes
     let real_obj = dir_id("zb_real");
-    db.set_object(&real_obj, "cydir", "{\"data\": true}").unwrap();
+    db.set_object(&real_obj, "cydir", "{\"data\": true}")
+        .unwrap();
     let candidates2 = db.list_gc_candidates(100).unwrap();
     let ids2: Vec<&str> = candidates2.iter().map(|(id, _)| id.as_str()).collect();
     assert!(ids2.contains(&real_obj.to_string().as_str()));
@@ -1089,11 +1156,19 @@ fn test_expire_pins_reconciles_expand_state() {
     let child = file_id("ep_c");
     let root = dir_id("ep_r");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Pin with 1-second TTL
-    db.pin(&root, "expiring", PinScope::Recursive, Some(std::time::Duration::from_secs(1))).unwrap();
+    db.pin(
+        &root,
+        "expiring",
+        PinScope::Recursive,
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .unwrap();
     drain_outbox(&db);
 
     assert_expand(&db, &root, 2, true, ItemState::Present);
@@ -1129,14 +1204,20 @@ fn test_unpin_owner_reconciles_all_affected_objects() {
     let r1 = dir_id("uo_r1");
     let r2 = dir_id("uo_r2");
 
-    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)])).unwrap();
-    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)])).unwrap();
+    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)]))
+        .unwrap();
+    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)]))
+        .unwrap();
 
     // Same owner pins both roots
-    db.pin(&r1, "shared_owner", PinScope::Recursive, None).unwrap();
-    db.pin(&r2, "shared_owner", PinScope::Recursive, None).unwrap();
+    db.pin(&r1, "shared_owner", PinScope::Recursive, None)
+        .unwrap();
+    db.pin(&r2, "shared_owner", PinScope::Recursive, None)
+        .unwrap();
     drain_outbox(&db);
 
     assert_expand(&db, &r1, 2, true, ItemState::Present);
@@ -1178,10 +1259,14 @@ fn test_fs_release_inode_reconciles_all_affected_objects() {
     let r1 = dir_id("fri_r1");
     let r2 = dir_id("fri_r2");
 
-    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)])).unwrap();
-    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)])).unwrap();
+    db.set_object(&c1, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&c2, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&r1, "cydir", &make_dir_json(&[("c", &c1)]))
+        .unwrap();
+    db.set_object(&r2, "cydir", &make_dir_json(&[("c", &c2)]))
+        .unwrap();
 
     // Same inode anchors both objects with different field_tags
     let inode = 42u64;
@@ -1272,8 +1357,10 @@ fn test_apply_edge_add_on_shadow_with_skeleton_stays_blocked() {
     let upstream = dir_id("aes_up");
 
     // D exists with child X, add skeleton on D
-    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
-    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy")))
+        .unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)]))
+        .unwrap();
     db.pin(&d, "skel", PinScope::Skeleton, None).unwrap();
 
     assert_expand(&db, &d, 2, false, ItemState::Present);
@@ -1310,7 +1397,8 @@ fn test_cascade_state_for_non_recursive_pins() {
     db.set_object(&root, "cydir", "{}").unwrap();
 
     // Skeleton pin → cascade_state = Materializing (present object)
-    db.pin(&root, "skel_owner", PinScope::Skeleton, None).unwrap();
+    db.pin(&root, "skel_owner", PinScope::Skeleton, None)
+        .unwrap();
     let cs = db.anchor_state(&root, "skel_owner").unwrap();
     assert_eq!(cs, CascadeStateP0::Materializing);
 
@@ -1340,8 +1428,10 @@ fn test_duplicate_apply_edge_no_duplicate_outbox() {
     let d = dir_id("dae_d");
     let parent = dir_id("dae_parent");
 
-    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy"))).unwrap();
-    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)])).unwrap();
+    db.set_object(&x, "cyfile", &make_file_json(&dir_id("dummy")))
+        .unwrap();
+    db.set_object(&d, "cydir", &make_dir_json(&[("x", &x)]))
+        .unwrap();
 
     let add_msg = EdgeMsg {
         op: EdgeOp::Add,
@@ -1354,7 +1444,10 @@ fn test_duplicate_apply_edge_no_duplicate_outbox() {
     db.apply_edge(&add_msg).unwrap();
     let outbox1 = peek_outbox(&db);
     let add_count_1 = outbox1.iter().filter(|e| e.0 == EdgeOp::Add).count();
-    assert_eq!(add_count_1, 1, "first apply_edge should emit exactly one add");
+    assert_eq!(
+        add_count_1, 1,
+        "first apply_edge should emit exactly one add"
+    );
     drain_and_assert_empty(&db);
 
     // Duplicate add → should NOT emit another add(X <- D) since already expanded
@@ -1374,7 +1467,10 @@ fn test_duplicate_apply_edge_no_duplicate_outbox() {
     db.apply_edge(&rm_msg).unwrap();
     let outbox2 = peek_outbox(&db);
     let rm_count = outbox2.iter().filter(|e| e.0 == EdgeOp::Remove).count();
-    assert_eq!(rm_count, 1, "first apply_edge(remove) should emit exactly one remove");
+    assert_eq!(
+        rm_count, 1,
+        "first apply_edge(remove) should emit exactly one remove"
+    );
     drain_and_assert_empty(&db);
 
     // Duplicate remove → no outbox
@@ -1394,8 +1490,10 @@ fn test_fs_release_inode_only_removes_last_expand_reason() {
     let child = file_id("frl_c");
     let root = dir_id("frl_r");
 
-    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x"))).unwrap();
-    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)])).unwrap();
+    db.set_object(&child, "cyfile", &make_file_json(&dir_id("x")))
+        .unwrap();
+    db.set_object(&root, "cydir", &make_dir_json(&[("c", &child)]))
+        .unwrap();
 
     // Root has both recursive pin AND fs_anchor
     db.pin(&root, "owner", PinScope::Recursive, None).unwrap();

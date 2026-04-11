@@ -1,7 +1,6 @@
-# cyfs protocol
+# CYFS Protocol
 
-
-
+> CYFS 或 cyfs://都是说协议，单独说cyfs是基于CYFS Protocl定义的标准对象实现的DFS
 
 ## 从Chunk开始
 
