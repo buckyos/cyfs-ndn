@@ -22,7 +22,9 @@ use ndn_lib::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -557,7 +559,96 @@ impl NamedStoreMgr {
     // ==================== Object Operations ====================
     pub async fn is_object_stored(&self, obj_id: &ObjId, inner_path: Option<String>) -> NdnResult<bool> {
         // 判断对象和其所有的children是否都已经在store里了
-        unimplemented!()
+        let mut current_obj_id = obj_id.clone();
+        let mut current_path = Self::normalize_inner_path(inner_path);
+        let mut current_obj_str: Option<String> = None;
+
+        // Follow inner_path to resolve the target object
+        loop {
+            if current_path.is_none() {
+                break;
+            }
+
+            if current_obj_id.is_chunk() {
+                return Err(NdnError::InvalidParam(format!(
+                    "chunk {} does not support inner path",
+                    current_obj_id.to_string()
+                )));
+            }
+
+            let obj_str = match current_obj_str.take() {
+                Some(s) => s,
+                None => self.get_object(&current_obj_id).await?,
+            };
+
+            let path = current_path.as_ref().unwrap().as_str();
+            let (next_obj_id, next_path, next_obj_str) = self
+                .resolve_next_obj(&current_obj_id, obj_str.as_str(), path)
+                .await?;
+            current_obj_id = next_obj_id;
+            current_path = next_path;
+            current_obj_str = next_obj_str;
+        }
+
+        // Now check if the resolved object and all its dependencies are stored
+        self.is_object_fully_stored(&current_obj_id, current_obj_str).await
+    }
+
+    /// Recursively check if an object and all its strong-referenced children are stored.
+    fn is_object_fully_stored<'a>(&'a self, obj_id: &'a ObjId, obj_str_hint: Option<String>) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'a>> {
+        Box::pin(async move {
+        if obj_id.is_chunk() {
+            let chunk_id = ChunkId::from_obj_id(obj_id);
+            return Ok(self.have_chunk(&chunk_id).await);
+        }
+
+        if obj_id.is_chunk_list() {
+            let obj_str = match obj_str_hint {
+                Some(s) => s,
+                None => self.get_object(obj_id).await?,
+            };
+            let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
+            for chunk_id in chunk_list.body.iter() {
+                if !self.have_chunk(chunk_id).await {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+
+        // Object must exist in store
+        let obj_str = match obj_str_hint {
+            Some(s) => s,
+            None => match self.query_object_by_id(obj_id).await? {
+                ObjectState::Object(s) => s,
+                ObjectState::NotExist => return Ok(false),
+            },
+        };
+
+        if obj_id.is_file_object() {
+            let file_obj: FileObject = load_named_obj(obj_str.as_str())?;
+            if file_obj.content.is_empty() {
+                return Ok(true);
+            }
+            let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+            return self.is_object_fully_stored(&content_obj_id, None).await;
+        }
+
+        if obj_id.is_dir_object() {
+            let dir_obj: DirObject = load_named_obj(obj_str.as_str())?;
+            for item in dir_obj.values() {
+                let (child_obj_id, child_obj_str) = item.get_obj_id()?;
+                let hint = if child_obj_str.is_empty() { None } else { Some(child_obj_str) };
+                if !self.is_object_fully_stored(&child_obj_id, hint).await? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+
+        // For other object types, just being present in store is sufficient
+        Ok(true)
+        })
     }
 
     /// Check if object exists (tries all layout versions)
