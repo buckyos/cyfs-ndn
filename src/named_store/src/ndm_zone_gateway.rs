@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
+use base64::Engine as _;
+
 use crate::store_mgr::NamedStoreMgr;
 
 // ======================== Constants ========================
@@ -39,12 +41,19 @@ const DEFAULT_APP_QUOTA: u64 = 512 * 1024 * 1024;
 /// GC 扫描间隔: 60 秒
 const GC_INTERVAL: Duration = Duration::from_secs(60);
 
+// ======================== TUS Protocol Constants ========================
+
+const TUS_RESUMABLE: &str = "1.0.0";
+const H_TUS_RESUMABLE: &str = "tus-resumable";
+const H_TUS_VERSION: &str = "tus-version";
+const H_TUS_EXTENSION: &str = "tus-extension";
+const H_TUS_MAX_SIZE: &str = "tus-max-size";
+
 // ======================== Custom Headers ========================
 
 const H_UPLOAD_OFFSET: &str = "upload-offset";
 const H_UPLOAD_LENGTH: &str = "upload-length";
 const H_UPLOAD_METADATA: &str = "upload-metadata";
-#[allow(dead_code)]
 const H_UPLOAD_EXPIRES: &str = "upload-expires";
 #[allow(dead_code)]
 const H_UPLOAD_CHECKSUM: &str = "upload-checksum";
@@ -116,6 +125,8 @@ pub struct UploadSession {
     pub updated_at: Instant,
     /// 完成后返回的 object id
     pub chunk_object_id: Option<String>,
+    /// 原始 Upload-Metadata header 值，用于 HEAD 回显
+    pub raw_metadata: String,
 }
 
 /// 每 App 缓存使用统计
@@ -366,6 +377,24 @@ impl NamedStoreMgrZoneGateway {
             return self.handle_object_lookup(&path).await;
         }
 
+        // OPTIONS /ndm/v1/uploads — TUS 能力发现
+        if path.starts_with("/ndm/v1/uploads") && method == Method::OPTIONS {
+            return self.handle_options();
+        }
+
+        // TUS Resumable 版本校验：POST/HEAD/PATCH 必须携带 Tus-Resumable: 1.0.0
+        if path.starts_with("/ndm/v1/uploads")
+            && matches!(method, Method::POST | Method::PATCH)
+        {
+            Self::validate_tus_resumable(req.headers())?;
+        }
+        // HEAD 也要校验（读取也需要版本协商）
+        if let Some(_) = strip_prefix_segment(&path, "/ndm/v1/uploads/") {
+            if method == Method::HEAD {
+                Self::validate_tus_resumable(req.headers())?;
+            }
+        }
+
         // POST /ndm/v1/uploads — 创建 chunk 上传会话
         if path == "/ndm/v1/uploads" && method == Method::POST {
             return self.handle_create_upload(req).await;
@@ -394,6 +423,34 @@ impl NamedStoreMgrZoneGateway {
         }
 
         Err(NdnError::NotFound(format!("unknown route: {} {}", method, path)))
+    }
+
+    /// TUS 版本校验：要求 Tus-Resumable: 1.0.0，否则返回 412 Precondition Failed
+    fn validate_tus_resumable(headers: &http::HeaderMap) -> Result<(), NdnError> {
+        match headers.get(H_TUS_RESUMABLE).and_then(|v| v.to_str().ok()) {
+            Some(v) if v == TUS_RESUMABLE => Ok(()),
+            Some(v) => Err(NdnError::VerifyError(format!(
+                "unsupported Tus-Resumable version: {}, server supports {}",
+                v, TUS_RESUMABLE
+            ))),
+            None => Err(NdnError::VerifyError(
+                "missing Tus-Resumable header, required for tus protocol".to_string(),
+            )),
+        }
+    }
+
+    /// OPTIONS 响应：返回 TUS 能力信息
+    fn handle_options(
+        &self,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
+            .header(H_TUS_VERSION, TUS_RESUMABLE)
+            .header(H_TUS_EXTENSION, "creation")
+            .header(H_TUS_MAX_SIZE, MAX_CHUNK_SIZE)
+            .body(empty_body())
+            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
     }
 
     // ======================== Object Lookup (6.1) ========================
@@ -491,6 +548,14 @@ impl NamedStoreMgrZoneGateway {
             )));
         }
 
+        // 保存原始 Upload-Metadata 值用于 HEAD 回显
+        let raw_metadata = req
+            .headers()
+            .get(H_UPLOAD_METADATA)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
         // 解析 Upload-Metadata
         let metadata = parse_upload_metadata(req.headers())?;
 
@@ -576,6 +641,7 @@ impl NamedStoreMgrZoneGateway {
                             created_at: Instant::now(),
                             updated_at: Instant::now(),
                             chunk_object_id: Some(chunk_obj_id.to_string()),
+                            raw_metadata: raw_metadata.clone(),
                         };
                         let resp = self.build_session_response(StatusCode::OK, &session);
                         state.sessions.insert(session_id.clone(), session);
@@ -618,6 +684,34 @@ impl NamedStoreMgrZoneGateway {
             .map_err(|e| NdnError::IoError(format!("create temp file: {e}")))?;
 
         let now = Instant::now();
+
+        // Upload-Length: 0 — 零长度上传，创建即完成
+        if chunk_size == 0 {
+            let session = UploadSession {
+                session_id: session_id.clone(),
+                canonical_upload_id,
+                app_id: metadata.app_id.clone(),
+                logical_path: metadata.logical_path.clone(),
+                file_hash: metadata.file_hash.clone(),
+                chunk_index: metadata.chunk_index,
+                chunk_hash: metadata.chunk_hash.clone(),
+                chunk_size: 0,
+                offset: 0,
+                status: ChunkUploadStatus::Completed,
+                temp_file_path: PathBuf::new(),
+                created_at: now,
+                updated_at: now,
+                chunk_object_id: None,
+                raw_metadata: raw_metadata.clone(),
+            };
+            // 删除临时文件（已创建但不需要）
+            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            let resp = self.build_session_response(StatusCode::CREATED, &session);
+            state.sessions.insert(session_id.clone(), session);
+            state.key_index.insert(session_key, session_id);
+            return resp;
+        }
+
         let session = UploadSession {
             session_id: session_id.clone(),
             canonical_upload_id,
@@ -633,6 +727,7 @@ impl NamedStoreMgrZoneGateway {
             created_at: now,
             updated_at: now,
             chunk_object_id: None,
+            raw_metadata,
         };
 
         let resp = self.build_session_response(StatusCode::CREATED, &session);
@@ -668,10 +763,28 @@ impl NamedStoreMgrZoneGateway {
 
         let mut builder = Response::builder()
             .status(StatusCode::OK)
+            .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
             .header(H_UPLOAD_OFFSET, session.offset)
             .header(H_UPLOAD_LENGTH, session.chunk_size)
             .header(H_NDM_CHUNK_STATUS, session.status.as_str())
-            .header(H_NDM_UPLOAD_ID, &session.canonical_upload_id);
+            .header(H_NDM_UPLOAD_ID, &session.canonical_upload_id)
+            .header("cache-control", "no-store");
+
+        // 回显原始 Upload-Metadata
+        if !session.raw_metadata.is_empty() {
+            builder = builder.header(H_UPLOAD_METADATA, &session.raw_metadata);
+        }
+
+        // 返回 Upload-Expires（活跃会话的过期时间）
+        if matches!(
+            session.status,
+            ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading
+        ) {
+            let expires_at = session.updated_at + self.config.session_ttl;
+            let remaining = expires_at.saturating_duration_since(Instant::now());
+            let expire_time = std::time::SystemTime::now() + remaining;
+            builder = builder.header(H_UPLOAD_EXPIRES, format_http_date(expire_time));
+        }
 
         if let Some(ref oid) = session.chunk_object_id {
             builder = builder.header(H_NDM_CHUNK_OBJECT_ID, oid.as_str());
@@ -689,6 +802,19 @@ impl NamedStoreMgrZoneGateway {
         session_id: &str,
         req: http::Request<BoxBody<Bytes, ServerError>>,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        // TUS 要求 PATCH Content-Type 必须是 application/offset+octet-stream
+        let content_type = req
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if content_type != "application/offset+octet-stream" {
+            return Err(NdnError::InvalidParam(format!(
+                "PATCH requires Content-Type: application/offset+octet-stream, got: {}",
+                content_type
+            )));
+        }
+
         // 解析 Upload-Offset
         let client_offset = parse_header_u64(req.headers(), H_UPLOAD_OFFSET)
             .ok_or_else(|| NdnError::InvalidParam("missing Upload-Offset header".to_string()))?;
@@ -851,6 +977,7 @@ impl NamedStoreMgrZoneGateway {
             // fallback: session somehow disappeared
             return Response::builder()
                 .status(StatusCode::NO_CONTENT)
+                .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
                 .header(H_NDM_CHUNK_STATUS, "completed")
                 .header(H_NDM_CHUNK_OBJECT_ID, chunk_obj_id)
                 .body(empty_body())
@@ -865,6 +992,7 @@ impl NamedStoreMgrZoneGateway {
         // 未写满，返回当前状态
         Response::builder()
             .status(StatusCode::NO_CONTENT)
+            .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
             .header(H_UPLOAD_OFFSET, new_offset)
             .header(H_NDM_CHUNK_STATUS, "uploading")
             .body(empty_body())
@@ -925,11 +1053,23 @@ impl NamedStoreMgrZoneGateway {
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
         let mut builder = Response::builder()
             .status(status)
+            .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
             .header("location", format!("/ndm/v1/uploads/{}", session.session_id))
             .header(H_NDM_UPLOAD_ID, &session.canonical_upload_id)
             .header(H_UPLOAD_OFFSET, session.offset)
             .header(H_UPLOAD_LENGTH, session.chunk_size)
             .header(H_NDM_CHUNK_STATUS, session.status.as_str());
+
+        // 返回 Upload-Expires（活跃会话）
+        if matches!(
+            session.status,
+            ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading
+        ) {
+            let expires_at = session.updated_at + self.config.session_ttl;
+            let remaining = expires_at.saturating_duration_since(Instant::now());
+            let expire_time = std::time::SystemTime::now() + remaining;
+            builder = builder.header(H_UPLOAD_EXPIRES, format_http_date(expire_time));
+        }
 
         if let Some(ref oid) = session.chunk_object_id {
             builder = builder.header(H_NDM_CHUNK_OBJECT_ID, oid.as_str());
@@ -1002,11 +1142,10 @@ fn parse_upload_metadata(
 }
 
 fn base64_decode(s: &str) -> Result<String, String> {
-    // 简单的 base64 解码（不引入额外依赖，手动实现标准 base64）
-    // 实际上先尝试直接当 UTF-8 用，如果看起来像 base64 再解码
-    // 这里用 Rust 标准库没有 base64，先做简单处理：直接返回原始值
-    // TODO: 在 Cargo.toml 中添加 base64 crate 后可替换为真正的 base64 解码
-    Ok(s.to_string())
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| format!("base64 decode error: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| format!("base64 decoded value is not valid UTF-8: {e}"))
 }
 
 // ======================== Path Validation ========================
@@ -1045,6 +1184,59 @@ fn validate_logical_path(path: &str) -> Result<(), NdnError> {
 }
 
 // ======================== Helpers ========================
+
+/// 格式化 SystemTime 为 HTTP 日期格式（RFC 7231）
+fn format_http_date(time: std::time::SystemTime) -> String {
+    let dur = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs();
+    // 手动计算 HTTP-date（避免引入 chrono/httpdate 依赖）
+    const DAYS_PER_MONTH: [[u64; 12]; 2] = [
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31],
+    ];
+    const WDAY: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let sec = (secs % 60) as u32;
+    let min = ((secs / 60) % 60) as u32;
+    let hour = ((secs / 3600) % 24) as u32;
+    let mut days = secs / 86400;
+    let wday = (days % 7) as usize;
+
+    let mut year: u64 = 1970;
+    loop {
+        let ydays = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if days < ydays {
+            break;
+        }
+        days -= ydays;
+        year += 1;
+    }
+    let leap = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+        1
+    } else {
+        0
+    };
+    let mut mon = 0usize;
+    while mon < 11 && days >= DAYS_PER_MONTH[leap][mon] {
+        days -= DAYS_PER_MONTH[leap][mon];
+        mon += 1;
+    }
+    let mday = days + 1;
+
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WDAY[wday], mday, MON[mon], year, hour, min, sec
+    )
+}
 
 fn strip_prefix_segment(path: &str, prefix: &str) -> Option<String> {
     let rest = path.strip_prefix(prefix)?;
@@ -1137,6 +1329,9 @@ fn ndm_error_to_status(e: &NdnError) -> (StatusCode, String) {
         NdnError::InvalidParam(_) => (StatusCode::BAD_REQUEST, "invalid_param".to_string()),
         NdnError::InvalidData(_) => (StatusCode::BAD_REQUEST, "invalid_data".to_string()),
         NdnError::InvalidId(_) => (StatusCode::BAD_REQUEST, "invalid_id".to_string()),
+        NdnError::VerifyError(msg) if msg.contains("Tus-Resumable") => {
+            (StatusCode::PRECONDITION_FAILED, "precondition_failed".to_string())
+        }
         NdnError::VerifyError(_) => (StatusCode::CONFLICT, "offset_conflict".to_string()),
         NdnError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "permission_denied".to_string()),
         NdnError::AlreadyExists(_) => (StatusCode::CONFLICT, "already_exists".to_string()),

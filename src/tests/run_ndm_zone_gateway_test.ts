@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-all
+#!/usr/bin/env -S deno run --allow-all --node-modules-dir=auto
 /**
  * NDM Zone Gateway integration tests.
  *
@@ -6,8 +6,11 @@
  * upload protocol through both raw fetch (for fine-grained header checks) and
  * the tus-js-client library (for standard TUS compatibility).
  *
- * Usage:
- *   deno run --allow-all src/tests/run_ndm_zone_gateway_test.ts
+ * Usage (from project root):
+ *   deno run --allow-all --node-modules-dir=auto src/tests/run_ndm_zone_gateway_test.ts
+ *
+ * Or directly (requires chmod +x):
+ *   ./src/tests/run_ndm_zone_gateway_test.ts
  */
 
 import * as tus from "npm:tus-js-client@4";
@@ -19,19 +22,27 @@ import { Readable } from "node:stream";
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/** TUS protocol version required by the server. */
+const TUS_RESUMABLE = "1.0.0";
+
+/** Common TUS headers included in every protocol request. */
+const TUS_HEADERS: Record<string, string> = {
+  "tus-resumable": TUS_RESUMABLE,
+};
+
 /** Base64-encode a UTF-8 string (for TUS Upload-Metadata values). */
 function b64(s: string): string {
   return btoa(s);
 }
 
-/** Build a standard TUS Upload-Metadata header value. */
+/** Build a standard TUS Upload-Metadata header value (key base64val,...). */
 function buildUploadMetadata(meta: Record<string, string>): string {
   return Object.entries(meta)
     .map(([k, v]) => `${k} ${b64(v)}`)
     .join(",");
 }
 
-/** Build a simple key=value Upload-Metadata (supported by the server). */
+/** Build a simple key=value Upload-Metadata (also supported by the server). */
 function buildSimpleMetadata(meta: Record<string, string>): string {
   return Object.entries(meta)
     .map(([k, v]) => `${k}=${v}`)
@@ -169,6 +180,7 @@ async function testCreateUploadSession(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "1024",
       "upload-metadata": metadata,
     },
@@ -183,11 +195,12 @@ async function testCreateUploadSession(baseUrl: string) {
   assertEqual(resp.headers.get("ndm-chunk-status"), "pending", "status should be pending");
   assertEqual(resp.headers.get("upload-offset"), "0", "offset should be 0");
   assertEqual(resp.headers.get("upload-length"), "1024", "length should be 1024");
+  // Verify server echoes Tus-Resumable
+  assertEqual(resp.headers.get("tus-resumable"), TUS_RESUMABLE, "should echo tus-resumable");
   await resp.body?.cancel();
 }
 
 async function testHeadUploadSession(baseUrl: string) {
-  // Create a session first
   const metadata = buildSimpleMetadata({
     app_id: "test-app",
     logical_path: "docs/head-test.txt",
@@ -198,6 +211,7 @@ async function testHeadUploadSession(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "512",
       "upload-metadata": metadata,
     },
@@ -206,7 +220,10 @@ async function testHeadUploadSession(baseUrl: string) {
   await createResp.body?.cancel();
 
   // HEAD the session
-  const headResp = await fetch(`${baseUrl}${location}`, { method: "HEAD" });
+  const headResp = await fetch(`${baseUrl}${location}`, {
+    method: "HEAD",
+    headers: { ...TUS_HEADERS },
+  });
   assertEqual(headResp.status, 200, "HEAD should return 200");
   assertEqual(headResp.headers.get("upload-offset"), "0", "offset should be 0");
   assertEqual(headResp.headers.get("upload-length"), "512", "length should be 512");
@@ -229,6 +246,7 @@ async function testSinglePatchUpload(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": String(chunkData.length),
       "upload-metadata": metadata,
     },
@@ -241,6 +259,7 @@ async function testSinglePatchUpload(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -270,6 +289,7 @@ async function testMultiPatchResume(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": String(totalSize),
       "upload-metadata": metadata,
     },
@@ -282,6 +302,7 @@ async function testMultiPatchResume(baseUrl: string) {
   const patch1 = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -293,7 +314,10 @@ async function testMultiPatchResume(baseUrl: string) {
   await patch1.body?.cancel();
 
   // HEAD to verify offset
-  const headResp = await fetch(`${baseUrl}${location}`, { method: "HEAD" });
+  const headResp = await fetch(`${baseUrl}${location}`, {
+    method: "HEAD",
+    headers: { ...TUS_HEADERS },
+  });
   assertEqual(headResp.headers.get("upload-offset"), String(half), "HEAD offset should be half");
   assertEqual(headResp.headers.get("ndm-chunk-status"), "uploading", "HEAD status should be uploading");
   await headResp.body?.cancel();
@@ -302,6 +326,7 @@ async function testMultiPatchResume(baseUrl: string) {
   const patch2 = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": String(half),
       "content-type": "application/offset+octet-stream",
     },
@@ -325,6 +350,7 @@ async function testIdempotentCreate(baseUrl: string) {
   });
 
   const headers = {
+    ...TUS_HEADERS,
     "upload-length": "2048",
     "upload-metadata": metadata,
   };
@@ -370,6 +396,7 @@ async function testObjectLookupAfterUpload(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": String(chunkData.length),
       "upload-metadata": metadata,
     },
@@ -380,6 +407,7 @@ async function testObjectLookupAfterUpload(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -400,6 +428,26 @@ async function testObjectLookupAfterUpload(baseUrl: string) {
   assertEqual(lookupBody.object_id, objectId, "object_id should match");
 }
 
+async function testErrorMissingTusResumable(baseUrl: string) {
+  // POST without Tus-Resumable header should return 412
+  const metadata = buildSimpleMetadata({
+    app_id: "test-app",
+    logical_path: "docs/no-tus.txt",
+    chunk_index: "0",
+  });
+
+  const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      // intentionally omit tus-resumable
+      "upload-length": "1024",
+      "upload-metadata": metadata,
+    },
+  });
+  assertEqual(resp.status, 412, "missing Tus-Resumable should return 412");
+  await resp.body?.cancel();
+}
+
 async function testErrorMissingUploadLength(baseUrl: string) {
   const metadata = buildSimpleMetadata({
     app_id: "test-app",
@@ -410,6 +458,7 @@ async function testErrorMissingUploadLength(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-metadata": metadata,
       // missing upload-length
     },
@@ -422,6 +471,7 @@ async function testErrorMissingMetadata(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "1024",
       // missing upload-metadata
     },
@@ -440,6 +490,7 @@ async function testErrorInvalidLogicalPath(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "1024",
       "upload-metadata": metadata,
     },
@@ -458,6 +509,7 @@ async function testErrorAbsoluteLogicalPath(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "1024",
       "upload-metadata": metadata,
     },
@@ -478,6 +530,7 @@ async function testErrorOffsetMismatch(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "1024",
       "upload-metadata": metadata,
     },
@@ -489,6 +542,7 @@ async function testErrorOffsetMismatch(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "100",
       "content-type": "application/offset+octet-stream",
     },
@@ -510,6 +564,7 @@ async function testErrorExceedChunkSize(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "64",
       "upload-metadata": metadata,
     },
@@ -521,6 +576,7 @@ async function testErrorExceedChunkSize(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -533,6 +589,7 @@ async function testErrorExceedChunkSize(baseUrl: string) {
 async function testErrorSessionNotFound(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads/nonexistent_session_id`, {
     method: "HEAD",
+    headers: { ...TUS_HEADERS },
   });
   assertEqual(resp.status, 404, "non-existent session HEAD should return 404");
   await resp.body?.cancel();
@@ -540,6 +597,7 @@ async function testErrorSessionNotFound(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}/ndm/v1/uploads/nonexistent_session_id`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -565,6 +623,7 @@ async function testErrorChunkTooLarge(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": String(64 * 1024 * 1024), // 64 MiB > 32 MiB max
       "upload-metadata": metadata,
     },
@@ -577,24 +636,20 @@ async function testTusClientUpload(baseUrl: string) {
   const chunkData = encoder.encode("tus-client-upload-test-data-0123456789");
   const buf = Buffer.from(chunkData);
 
-  // tus-js-client base64-encodes metadata values. Since the server's
-  // base64_decode is currently a no-op (returns raw input), the encoded
-  // values are used literally. We must choose values whose base64 forms:
-  //   1) have no '=' padding (string length must be a multiple of 3)
-  //   2) contain only chars that pass validate_logical_path ([A-Za-z0-9/_\-.])
-  //      — base64 may produce '+' which would be rejected.
-  // In practice: short, 3-byte-aligned ASCII values without '+' in base64.
+  // tus-js-client base64-encodes metadata values per the TUS spec.
+  // The server decodes them with the base64 crate.
+  // Choose values whose base64 forms pass validate_logical_path (alphanumeric
+  // plus / - _ . only) and have no '=' padding (length multiple of 3).
   return new Promise<void>((resolve, reject) => {
     const upload = new tus.Upload(buf, {
       endpoint: `${baseUrl}/ndm/v1/uploads`,
       chunkSize: chunkData.length,
       retryDelays: [],
       metadata: {
-        // "abc" -> base64 "YWJj" (safe), "ab/c.d" -> "YWIvYy5k" (safe)
-        app_id: "abc",                 // b64: YWJj
-        logical_path: "ab/c.d",       // b64: YWIvYy5k
-        chunk_index: "0",             // b64: MA (2 bytes → has ==? no, "0" is 1 byte → MA==)
-        file_hash: "tus",             // b64: dHVz
+        app_id: "tus-app",
+        logical_path: "tus/test.bin",
+        chunk_index: "0",
+        file_hash: "tus001",
       },
       onError: (error: Error) => {
         reject(new Error(`tus upload error: ${error.message}`));
@@ -627,6 +682,7 @@ async function testTusClientResume(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": String(totalSize),
       "upload-metadata": metadata,
     },
@@ -640,6 +696,7 @@ async function testTusClientResume(baseUrl: string) {
   const patch1 = await fetch(sessionUrl, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -682,7 +739,7 @@ async function testStaleSessionInvalidation(baseUrl: string) {
 
   const resp1 = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
-    headers: { "upload-length": "512", "upload-metadata": meta1 },
+    headers: { ...TUS_HEADERS, "upload-length": "512", "upload-metadata": meta1 },
   });
   const loc1 = resp1.headers.get("location")!;
   await resp1.body?.cancel();
@@ -698,7 +755,7 @@ async function testStaleSessionInvalidation(baseUrl: string) {
 
   const resp2 = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
-    headers: { "upload-length": "512", "upload-metadata": meta2 },
+    headers: { ...TUS_HEADERS, "upload-length": "512", "upload-metadata": meta2 },
   });
   assertEqual(resp2.status, 201, "new file_hash should create a new session");
   const loc2 = resp2.headers.get("location")!;
@@ -707,7 +764,10 @@ async function testStaleSessionInvalidation(baseUrl: string) {
   assert(loc1 !== loc2, "new session should have a different location");
 
   // The old session should be gone
-  const headOld = await fetch(`${baseUrl}${loc1}`, { method: "HEAD" });
+  const headOld = await fetch(`${baseUrl}${loc1}`, {
+    method: "HEAD",
+    headers: { ...TUS_HEADERS },
+  });
   assertEqual(headOld.status, 404, "old session should be invalidated (404)");
   await headOld.body?.cancel();
 }
@@ -723,6 +783,7 @@ async function testEmptyPatchBody(baseUrl: string) {
   const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
     method: "POST",
     headers: {
+      ...TUS_HEADERS,
       "upload-length": "256",
       "upload-metadata": metadata,
     },
@@ -733,6 +794,7 @@ async function testEmptyPatchBody(baseUrl: string) {
   const patchResp = await fetch(`${baseUrl}${location}`, {
     method: "PATCH",
     headers: {
+      ...TUS_HEADERS,
       "upload-offset": "0",
       "content-type": "application/offset+octet-stream",
     },
@@ -745,6 +807,24 @@ async function testEmptyPatchBody(baseUrl: string) {
 async function testCyfsRouteNotImplemented(baseUrl: string) {
   const resp = await fetch(`${baseUrl}/cyfs/some/path`);
   assertEqual(resp.status, 405, "CYFS route should return 405 (not implemented)");
+  await resp.body?.cancel();
+}
+
+async function testOptionsDiscovery(baseUrl: string) {
+  const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "OPTIONS",
+  });
+  assertEqual(resp.status, 204, "OPTIONS should return 204");
+  assertEqual(resp.headers.get("tus-resumable"), TUS_RESUMABLE, "should return tus-resumable");
+  assertEqual(resp.headers.get("tus-version"), TUS_RESUMABLE, "should return tus-version");
+  assert(
+    resp.headers.get("tus-extension") !== null,
+    "should return tus-extension",
+  );
+  assert(
+    resp.headers.get("tus-max-size") !== null,
+    "should return tus-max-size",
+  );
   await resp.body?.cancel();
 }
 
@@ -796,6 +876,10 @@ async function main() {
     await runTest("object lookup: after upload", () => testObjectLookupAfterUpload(server!.baseUrl));
     await runTest("lookup: missing params", () => testLookupMissingParams(server!.baseUrl));
     await runTest("lookup: invalid scope", () => testLookupInvalidScope(server!.baseUrl));
+
+    // --- TUS protocol ---
+    await runTest("OPTIONS discovery", () => testOptionsDiscovery(server!.baseUrl));
+    await runTest("error: missing Tus-Resumable", () => testErrorMissingTusResumable(server!.baseUrl));
 
     // --- Error cases ---
     await runTest("error: missing upload-length", () => testErrorMissingUploadLength(server!.baseUrl));

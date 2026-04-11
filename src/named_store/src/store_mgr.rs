@@ -555,6 +555,10 @@ impl NamedStoreMgr {
     }
 
     // ==================== Object Operations ====================
+    pub async fn is_object_stored(&self, obj_id: &ObjId, inner_path: Option<String>) -> NdnResult<bool> {
+        // 判断对象和其所有的children是否都已经在store里了
+        unimplemented!()
+    }
 
     /// Check if object exists (tries all layout versions)
     pub async fn is_object_exist(&self, obj_id: &ObjId) -> NdnResult<bool> {
