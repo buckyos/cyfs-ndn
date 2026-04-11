@@ -329,6 +329,13 @@ impl HttpServer for NamedStoreMgrZoneGateway {
         req: http::Request<BoxBody<Bytes, ServerError>>,
         _info: StreamInfo,
     ) -> ServerResult<http::Response<BoxBody<Bytes, ServerError>>> {
+        let is_tus_path = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+            .starts_with("/ndm/v1/uploads");
+
         let result = self.route_request(req).await;
         match result {
             Ok(resp) => {
@@ -338,7 +345,14 @@ impl HttpServer for NamedStoreMgrZoneGateway {
             Err(e) => {
                 let (status, error_code) = ndm_error_to_status(&e);
                 warn!("ndm-zone-gateway request failed: {} -> {}", status, e);
-                Ok(build_error_response(status, &error_code, &e.to_string()))
+                let is_version_mismatch = matches!(&e, NdnError::VerifyError(msg) if msg.contains("Tus-Resumable"));
+                Ok(build_error_response(
+                    status,
+                    &error_code,
+                    &e.to_string(),
+                    is_tus_path,
+                    is_version_mismatch,
+                ))
             }
         }
     }
@@ -369,7 +383,14 @@ impl NamedStoreMgrZoneGateway {
             .map(|pq| pq.as_str())
             .unwrap_or("/")
             .to_string();
-        let method = req.method().clone();
+        // tus 1.0.0: honor X-HTTP-Method-Override so restricted environments
+        // can tunnel PATCH/DELETE over POST
+        let method = req
+            .headers()
+            .get("x-http-method-override")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<Method>().ok())
+            .unwrap_or_else(|| req.method().clone());
 
         // ---- NDM upload protocol ----
         // GET /ndm/v1/objects/lookup?scope=...&quick_hash=...
@@ -447,7 +468,7 @@ impl NamedStoreMgrZoneGateway {
             .status(StatusCode::NO_CONTENT)
             .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
             .header(H_TUS_VERSION, TUS_RESUMABLE)
-            .header(H_TUS_EXTENSION, "creation")
+            .header(H_TUS_EXTENSION, "creation,expiration")
             .header(H_TUS_MAX_SIZE, MAX_CHUNK_SIZE)
             .body(empty_body())
             .map_err(|e| NdnError::Internal(format!("build response: {e}")))
@@ -542,10 +563,13 @@ impl NamedStoreMgrZoneGateway {
             .ok_or_else(|| NdnError::InvalidParam("missing Upload-Length header".to_string()))?;
 
         if chunk_size > MAX_CHUNK_SIZE {
-            return Err(NdnError::InvalidParam(format!(
-                "chunk size {} exceeds max {} (32 MiB)",
-                chunk_size, MAX_CHUNK_SIZE
-            )));
+            return Ok(build_error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                &format!("chunk size {} exceeds max {} (32 MiB)", chunk_size, MAX_CHUNK_SIZE),
+                true,
+                false,
+            ));
         }
 
         // 保存原始 Upload-Metadata 值用于 HEAD 回显
@@ -1303,6 +1327,8 @@ fn build_error_response(
     status: StatusCode,
     error_code: &str,
     message: &str,
+    is_tus: bool,
+    is_version_mismatch: bool,
 ) -> http::Response<BoxBody<Bytes, ServerError>> {
     let body = serde_json::json!({
         "error": error_code,
@@ -1310,9 +1336,20 @@ fn build_error_response(
     })
     .to_string();
 
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json; charset=utf-8")
+        .header("content-type", "application/json; charset=utf-8");
+
+    // tus protocol: every non-OPTIONS response must carry Tus-Resumable
+    if is_tus {
+        builder = builder.header(H_TUS_RESUMABLE, TUS_RESUMABLE);
+    }
+    // tus protocol: 412 version mismatch must also include Tus-Version
+    if is_version_mismatch {
+        builder = builder.header(H_TUS_VERSION, TUS_RESUMABLE);
+    }
+
+    builder
         .body(full_body(Bytes::from(body)))
         .unwrap_or_else(|_| {
             Response::builder()
