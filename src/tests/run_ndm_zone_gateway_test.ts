@@ -628,7 +628,7 @@ async function testErrorChunkTooLarge(baseUrl: string) {
       "upload-metadata": metadata,
     },
   });
-  assertEqual(resp.status, 400, "chunk too large should return 400");
+  assertEqual(resp.status, 413, "chunk too large should return 413 Payload Too Large");
   await resp.body?.cancel();
 }
 
