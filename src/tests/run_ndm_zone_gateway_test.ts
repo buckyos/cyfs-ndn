@@ -284,6 +284,71 @@ async function testSinglePatchUpload(baseUrl: string) {
   await patchResp.body?.cancel();
 }
 
+async function testDuplicatePatchAfterCompletion(baseUrl: string) {
+  const chunkData = new Uint8Array(1024);
+  crypto.getRandomValues(chunkData);
+
+  const metadata = buildSimpleMetadata({
+    app_id: "test-app",
+    logical_path: "docs/duplicate-complete.bin",
+    chunk_index: "0",
+    file_hash: "duplicate-complete",
+  });
+
+  const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-length": String(chunkData.length),
+      "upload-metadata": metadata,
+    },
+  });
+  assertEqual(createResp.status, 201, "create should return 201");
+  const location = createResp.headers.get("location")!;
+  await createResp.body?.cancel();
+
+  const patchResp = await fetch(`${baseUrl}${location}`, {
+    method: "PATCH",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-offset": "0",
+      "content-type": "application/offset+octet-stream",
+    },
+    body: chunkData,
+  });
+  assertEqual(patchResp.status, 204, "initial PATCH should return 204");
+  const objectId = patchResp.headers.get("ndm-chunk-object-id");
+  assert(objectId !== null && objectId.length > 0, "initial PATCH should return chunk object id");
+  await patchResp.body?.cancel();
+
+  const duplicateResp = await fetch(`${baseUrl}${location}`, {
+    method: "PATCH",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-offset": "0",
+      "content-type": "application/offset+octet-stream",
+    },
+    body: chunkData,
+  });
+  assertEqual(duplicateResp.status, 204, "duplicate PATCH should still return 204");
+  assertEqual(
+    duplicateResp.headers.get("upload-offset"),
+    String(chunkData.length),
+    "duplicate PATCH should report the completed offset",
+  );
+  assertEqual(
+    duplicateResp.headers.get("ndm-chunk-status"),
+    "completed",
+    "duplicate PATCH should keep the session completed",
+  );
+  assertEqual(
+    duplicateResp.headers.get("ndm-chunk-object-id"),
+    objectId,
+    "duplicate PATCH should return the existing chunk object id",
+  );
+  await duplicateResp.body?.cancel();
+}
+
 async function testMultiPatchResume(baseUrl: string) {
   const totalSize = 1024;
   const chunkData = new Uint8Array(totalSize);
@@ -1131,6 +1196,7 @@ async function main() {
     await runTest("create upload session", () => testCreateUploadSession(server!.baseUrl));
     await runTest("HEAD upload session", () => testHeadUploadSession(server!.baseUrl));
     await runTest("single PATCH upload (complete)", () => testSinglePatchUpload(server!.baseUrl));
+    await runTest("duplicate PATCH after completion", () => testDuplicatePatchAfterCompletion(server!.baseUrl));
     await runTest("multi-PATCH resume upload", () => testMultiPatchResume(server!.baseUrl));
     await runTest("idempotent session creation", () => testIdempotentCreate(server!.baseUrl));
     await runTest("stale session invalidation", () => testStaleSessionInvalidation(server!.baseUrl));

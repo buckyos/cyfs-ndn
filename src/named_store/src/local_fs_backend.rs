@@ -199,6 +199,11 @@ impl LocalFsBackend {
             hasher.finalize_chunk_id()
         };
         if got != *chunk_id {
+            warn!(
+                "LocalFsBackend: chunk hash mismatch, expected={}, got={}",
+                chunk_id.to_string(),
+                got.to_string()
+            );
             return Err(NdnError::VerifyError(format!(
                 "chunk hash mismatch: expected {} got {}",
                 chunk_id.to_string(),

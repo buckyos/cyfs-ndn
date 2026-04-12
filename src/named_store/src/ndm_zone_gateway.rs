@@ -988,6 +988,31 @@ impl NamedStoreMgrZoneGateway {
         let client_offset = parse_header_u64(req.headers(), H_UPLOAD_OFFSET)
             .ok_or_else(|| NdnError::InvalidParam("missing Upload-Offset header".to_string()))?;
 
+        let completed_response = {
+            let state = self.state.read().await;
+            let session = state
+                .sessions
+                .get(session_id)
+                .ok_or_else(|| NdnError::NotFound(format!("session {} not found", session_id)))?;
+
+            match session.status {
+                ChunkUploadStatus::Completed | ChunkUploadStatus::Skipped => {
+                    Some(self.build_session_response(StatusCode::NO_CONTENT, session)?)
+                }
+                ChunkUploadStatus::Pending
+                | ChunkUploadStatus::Uploading
+                | ChunkUploadStatus::Expired => None,
+            }
+        };
+
+        if let Some(resp) = completed_response {
+            // A browser/proxy may retry PATCH after the chunk is already marked
+            // completed. Drain the body before replying so the TCP connection is
+            // not reset while the client is still sending bytes.
+            let _ = collect_body(req).await?;
+            return Ok(resp);
+        }
+
         // 先读状态检查
         {
             let state = self.state.read().await;
@@ -995,12 +1020,8 @@ impl NamedStoreMgrZoneGateway {
                 .sessions
                 .get(session_id)
                 .ok_or_else(|| NdnError::NotFound(format!("session {} not found", session_id)))?;
-
             // 检查状态
             match session.status {
-                ChunkUploadStatus::Completed | ChunkUploadStatus::Skipped => {
-                    return self.build_session_response(StatusCode::NO_CONTENT, session);
-                }
                 ChunkUploadStatus::Expired => {
                     return Err(NdnError::NotReady(format!(
                         "session {} expired, cache evicted (410 Gone)",
@@ -1008,6 +1029,9 @@ impl NamedStoreMgrZoneGateway {
                     )));
                 }
                 ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading => {}
+                ChunkUploadStatus::Completed | ChunkUploadStatus::Skipped => {
+                    unreachable!("completed/skipped sessions are handled before validation")
+                }
             }
 
             // 检查过期
