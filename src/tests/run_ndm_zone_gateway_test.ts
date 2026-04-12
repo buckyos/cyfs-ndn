@@ -167,6 +167,17 @@ function assertEqual(actual: unknown, expected: unknown, msg: string) {
   }
 }
 
+async function postJson(baseUrl: string, path: string, body: unknown): Promise<Response> {
+  return fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "accept": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+}
+
 // ===================== Test cases =====================
 
 async function testCreateUploadSession(baseUrl: string) {
@@ -848,6 +859,164 @@ async function testLookupInvalidScope(baseUrl: string) {
   await resp.body?.cancel();
 }
 
+async function testStoreObjectRpcRoundtrip(baseUrl: string) {
+  const objId = "file:1111111111111111111111111111111111111111111111111111111111111111";
+  const objData = JSON.stringify({
+    kind: "test",
+    value: "structured-store-object-roundtrip",
+  });
+
+  const putResp = await postJson(baseUrl, "/ndm/v1/store/put_object", {
+    obj_id: objId,
+    obj_data: objData,
+  });
+  assertEqual(putResp.status, 204, "put_object should return 204");
+  await putResp.body?.cancel();
+
+  const queryResp = await postJson(baseUrl, "/ndm/v1/store/query_object_by_id", {
+    obj_id: objId,
+  });
+  assertEqual(queryResp.status, 200, "query_object_by_id should return 200");
+  const queryBody = await queryResp.json();
+  assertEqual(queryBody.state, "object", "query_object_by_id should report object state");
+  assertEqual(queryBody.obj_data, objData, "query_object_by_id should return stored object data");
+
+  const getResp = await postJson(baseUrl, "/ndm/v1/store/get_object", {
+    obj_id: objId,
+  });
+  assertEqual(getResp.status, 200, "get_object should return 200");
+  const getBody = await getResp.json();
+  assertEqual(getBody.obj_id, objId, "get_object should echo obj_id");
+  assertEqual(getBody.obj_data, objData, "get_object should return stored object data");
+
+  const removeResp = await postJson(baseUrl, "/ndm/v1/store/remove_object", {
+    obj_id: objId,
+  });
+  assertEqual(removeResp.status, 204, "remove_object should return 204");
+  await removeResp.body?.cancel();
+
+  const queryAfterRemoveResp = await postJson(baseUrl, "/ndm/v1/store/query_object_by_id", {
+    obj_id: objId,
+  });
+  assertEqual(queryAfterRemoveResp.status, 200, "query after remove should still return 200");
+  const queryAfterRemoveBody = await queryAfterRemoveResp.json();
+  assertEqual(queryAfterRemoveBody.state, "not_exist", "object should be removed");
+}
+
+async function testStoreQueryChunkStateAfterUpload(baseUrl: string) {
+  const chunkData = encoder.encode("store-query-chunk-state-after-upload");
+  const metadata = buildSimpleMetadata({
+    app_id: "test-app",
+    logical_path: "docs/store-query-chunk-state.bin",
+    chunk_index: "0",
+    file_hash: "store-query-chunk-state",
+  });
+
+  const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-length": String(chunkData.length),
+      "upload-metadata": metadata,
+    },
+  });
+  const location = createResp.headers.get("location")!;
+  await createResp.body?.cancel();
+
+  const patchResp = await fetch(`${baseUrl}${location}`, {
+    method: "PATCH",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-offset": "0",
+      "content-type": "application/offset+octet-stream",
+    },
+    body: chunkData,
+  });
+  assertEqual(patchResp.status, 204, "chunk upload should complete");
+  const chunkId = patchResp.headers.get("ndm-chunk-object-id")!;
+  await patchResp.body?.cancel();
+
+  const stateResp = await postJson(baseUrl, "/ndm/v1/store/query_chunk_state", {
+    chunk_id: chunkId,
+  });
+  assertEqual(stateResp.status, 200, "query_chunk_state should return 200");
+  const stateBody = await stateResp.json();
+  assertEqual(stateBody.state, "completed", "uploaded chunk should be completed");
+  assertEqual(stateBody.chunk_size, chunkData.length, "chunk size should match uploaded bytes");
+}
+
+async function testStoreChunkRpcRejectsNonChunkId(baseUrl: string) {
+  const nonChunkObjId = "file:2222222222222222222222222222222222222222222222222222222222222222";
+
+  for (const methodName of ["have_chunk", "query_chunk_state", "remove_chunk"]) {
+    const resp = await postJson(baseUrl, `/ndm/v1/store/${methodName}`, {
+      chunk_id: nonChunkObjId,
+    });
+    assertEqual(resp.status, 400, `${methodName} should reject non-chunk ids`);
+    const body = await resp.json();
+    assertEqual(body.error, "invalid_id", `${methodName} should return invalid_id`);
+  }
+}
+
+async function testStoreAddChunkBySameAsRejectsNonChunkId(baseUrl: string) {
+  const resp = await postJson(baseUrl, "/ndm/v1/store/add_chunk_by_same_as", {
+    big_chunk_id: "file:3333333333333333333333333333333333333333333333333333333333333333",
+    chunk_list_id: "chunklist:4444444444444444444444444444444444444444444444444444444444444444",
+    big_chunk_size: 1024,
+  });
+  assertEqual(resp.status, 400, "add_chunk_by_same_as should reject non-chunk big_chunk_id");
+  const body = await resp.json();
+  assertEqual(body.error, "invalid_id", "should return invalid_id");
+}
+
+async function testStoreObjectRpcRejectsChunkIds(baseUrl: string) {
+  const chunkData = encoder.encode("object-rpc-should-reject-chunk-id");
+  const metadata = buildSimpleMetadata({
+    app_id: "test-app",
+    logical_path: "docs/object-rpc-rejects-chunk.bin",
+    chunk_index: "0",
+    file_hash: "object-rpc-rejects-chunk",
+  });
+
+  const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-length": String(chunkData.length),
+      "upload-metadata": metadata,
+    },
+  });
+  const location = createResp.headers.get("location")!;
+  await createResp.body?.cancel();
+
+  const patchResp = await fetch(`${baseUrl}${location}`, {
+    method: "PATCH",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-offset": "0",
+      "content-type": "application/offset+octet-stream",
+    },
+    body: chunkData,
+  });
+  const chunkId = patchResp.headers.get("ndm-chunk-object-id")!;
+  await patchResp.body?.cancel();
+
+  const putResp = await postJson(baseUrl, "/ndm/v1/store/put_object", {
+    obj_id: chunkId,
+    obj_data: "{\"should\":\"fail\"}",
+  });
+  assertEqual(putResp.status, 400, "put_object should reject chunk ids");
+  const putBody = await putResp.json();
+  assertEqual(putBody.error, "invalid_param", "put_object should return invalid_param");
+
+  const removeResp = await postJson(baseUrl, "/ndm/v1/store/remove_object", {
+    obj_id: chunkId,
+  });
+  assertEqual(removeResp.status, 400, "remove_object should reject chunk ids");
+  const removeBody = await removeResp.json();
+  assertEqual(removeBody.error, "invalid_param", "remove_object should return invalid_param");
+}
+
 // ===================== Main =====================
 
 async function main() {
@@ -876,6 +1045,13 @@ async function main() {
     await runTest("object lookup: after upload", () => testObjectLookupAfterUpload(server!.baseUrl));
     await runTest("lookup: missing params", () => testLookupMissingParams(server!.baseUrl));
     await runTest("lookup: invalid scope", () => testLookupInvalidScope(server!.baseUrl));
+
+    // --- Structured store API ---
+    await runTest("store RPC: object roundtrip", () => testStoreObjectRpcRoundtrip(server!.baseUrl));
+    await runTest("store RPC: query chunk state after upload", () => testStoreQueryChunkStateAfterUpload(server!.baseUrl));
+    await runTest("store RPC: chunk methods reject non-chunk ids", () => testStoreChunkRpcRejectsNonChunkId(server!.baseUrl));
+    await runTest("store RPC: add_chunk_by_same_as rejects non-chunk id", () => testStoreAddChunkBySameAsRejectsNonChunkId(server!.baseUrl));
+    await runTest("store RPC: object methods reject chunk ids", () => testStoreObjectRpcRejectsChunkIds(server!.baseUrl));
 
     // --- TUS protocol ---
     await runTest("OPTIONS discovery", () => testOptionsDiscovery(server!.baseUrl));

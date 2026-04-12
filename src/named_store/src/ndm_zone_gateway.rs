@@ -1344,6 +1344,11 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let obj_id = ObjId::new(&r.obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                if obj_id.is_chunk() {
+                    return Err(NdnError::InvalidParam(
+                        "put_object does not accept chunk ids; use chunk upload protocol instead".to_string(),
+                    ));
+                }
                 self.store_mgr.put_object(&obj_id, &r.obj_data).await?;
                 no_content_response()
             }
@@ -1354,6 +1359,11 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let obj_id = ObjId::new(&r.obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                if obj_id.is_chunk() {
+                    return Err(NdnError::InvalidParam(
+                        "remove_object does not accept chunk ids; use remove_chunk instead".to_string(),
+                    ));
+                }
                 self.store_mgr.remove_object(&obj_id).await?;
                 no_content_response()
             }
@@ -1363,9 +1373,7 @@ impl NamedStoreMgrZoneGateway {
                 let body = collect_body(req).await?;
                 let r: ChunkIdRequest = serde_json::from_slice(&body)
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
-                let obj_id = ObjId::new(&r.chunk_id)
-                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
-                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                let chunk_id = ChunkId::new(&r.chunk_id)?;
                 let exists = self.store_mgr.have_chunk(&chunk_id).await;
                 json_response(&serde_json::json!({ "exists": exists }))
             }
@@ -1374,9 +1382,7 @@ impl NamedStoreMgrZoneGateway {
                 let body = collect_body(req).await?;
                 let r: ChunkIdRequest = serde_json::from_slice(&body)
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
-                let obj_id = ObjId::new(&r.chunk_id)
-                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
-                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                let chunk_id = ChunkId::new(&r.chunk_id)?;
                 let (state, size) = self.store_mgr.query_chunk_state(&chunk_id).await?;
                 json_response(&chunk_store_state_to_json(state, size))
             }
@@ -1385,9 +1391,7 @@ impl NamedStoreMgrZoneGateway {
                 let body = collect_body(req).await?;
                 let r: ChunkIdRequest = serde_json::from_slice(&body)
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
-                let obj_id = ObjId::new(&r.chunk_id)
-                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
-                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                let chunk_id = ChunkId::new(&r.chunk_id)?;
                 self.store_mgr.remove_chunk(&chunk_id).await?;
                 no_content_response()
             }
@@ -1396,9 +1400,7 @@ impl NamedStoreMgrZoneGateway {
                 let body = collect_body(req).await?;
                 let r: AddChunkBySameAsRequest = serde_json::from_slice(&body)
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
-                let big_obj_id = ObjId::new(&r.big_chunk_id)
-                    .map_err(|e| NdnError::InvalidId(format!("invalid big_chunk_id: {e}")))?;
-                let big_chunk_id = ChunkId::from_obj_id(&big_obj_id);
+                let big_chunk_id = ChunkId::new(&r.big_chunk_id)?;
                 let chunk_list_id = ObjId::new(&r.chunk_list_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid chunk_list_id: {e}")))?;
                 self.store_mgr
