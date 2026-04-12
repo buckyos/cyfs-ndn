@@ -1622,14 +1622,9 @@ fn validate_logical_path(path: &str) -> Result<(), NdnError> {
             "logical_path must not start with '/' (must be relative)".to_string(),
         ));
     }
-    // 只允许 URL-safe 字符
+    // 允许常见文件名字符，但拒绝控制字符和 Windows 路径分隔符。
     for ch in path.chars() {
-        if !ch.is_ascii_alphanumeric()
-            && ch != '/'
-            && ch != '-'
-            && ch != '_'
-            && ch != '.'
-        {
+        if !ch.is_ascii() || ch.is_ascii_control() || ch == '\\' {
             return Err(NdnError::InvalidParam(format!(
                 "logical_path contains unsafe character: '{}'",
                 ch

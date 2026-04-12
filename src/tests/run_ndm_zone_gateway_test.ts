@@ -539,6 +539,32 @@ async function testErrorAbsoluteLogicalPath(baseUrl: string) {
   await resp.body?.cancel();
 }
 
+async function testLogicalPathAllowsSpacesAndParentheses(baseUrl: string) {
+  const metadata = buildUploadMetadata({
+    app_id: "default",
+    logical_path: "agent_loop (1).py",
+    chunk_index: "0",
+    file_hash: "cyfile:testhash001",
+  });
+
+  const resp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-length": "32",
+      "upload-metadata": metadata,
+    },
+  });
+
+  assertEqual(resp.status, 201, "logical_path with spaces/parentheses should be accepted");
+  assertEqual(
+    resp.headers.get("ndm-upload-id"),
+    "path:default/agent_loop (1).py",
+    "server should preserve logical_path in NDM-Upload-ID",
+  );
+  await resp.body?.cancel();
+}
+
 async function testErrorOffsetMismatch(baseUrl: string) {
   const metadata = buildSimpleMetadata({
     app_id: "test-app",
@@ -1132,6 +1158,7 @@ async function main() {
     await runTest("error: missing metadata", () => testErrorMissingMetadata(server!.baseUrl));
     await runTest("error: path traversal", () => testErrorInvalidLogicalPath(server!.baseUrl));
     await runTest("error: absolute path", () => testErrorAbsoluteLogicalPath(server!.baseUrl));
+    await runTest("logical_path: allow spaces and parentheses", () => testLogicalPathAllowsSpacesAndParentheses(server!.baseUrl));
     await runTest("error: offset mismatch", () => testErrorOffsetMismatch(server!.baseUrl));
     await runTest("error: exceed chunk size", () => testErrorExceedChunkSize(server!.baseUrl));
     await runTest("error: session not found", () => testErrorSessionNotFound(server!.baseUrl));
