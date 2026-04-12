@@ -513,11 +513,9 @@ impl NamedStoreMgrZoneGateway {
         match scope.as_str() {
             "app" | "global" => {
                 // 用 quick_hash 作为 ObjId 尝试在 store 中查找
-                // 当前实现：尝试将 quick_hash 解析为 ObjId 并查找
                 let obj_id = match ObjId::new(quick_hash) {
                     Ok(id) => id,
                     Err(_) => {
-                        // quick_hash 不是有效的 ObjId 格式，返回 404
                         return Response::builder()
                             .status(StatusCode::NOT_FOUND)
                             .header("content-type", "application/json; charset=utf-8")
@@ -528,6 +526,17 @@ impl NamedStoreMgrZoneGateway {
                     }
                 };
 
+                // chunk 类型：走 query_chunk_state，返回与 store RPC 对齐的状态
+                if obj_id.is_chunk() {
+                    let chunk_id = ChunkId::from_obj_id(&obj_id);
+                    let (state, size) = self.store_mgr.query_chunk_state(&chunk_id).await?;
+                    let mut resp = chunk_store_state_to_json(state, size);
+                    resp["object_id"] = serde_json::json!(obj_id.to_string());
+                    resp["scope"] = serde_json::json!(scope);
+                    return json_response(&resp);
+                }
+
+                // 非 chunk 对象：��� is_object_stored
                 let inner_path = params.get("inner_path").cloned();
 
                 match self.store_mgr.is_object_stored(&obj_id, inner_path).await {
