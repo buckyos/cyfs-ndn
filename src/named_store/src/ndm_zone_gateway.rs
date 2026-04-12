@@ -511,39 +511,27 @@ impl NamedStoreMgrZoneGateway {
                     }
                 };
 
-                // 对于 chunk 类型，检查 chunk 是否存在
-                if obj_id.is_chunk() {
-                    let chunk_id = ChunkId::from_obj_id(&obj_id);
-                    if self.store_mgr.have_chunk(&chunk_id).await {
-                        return json_response(&serde_json::json!({
+                let inner_path = params.get("inner_path").cloned();
+
+                match self.store_mgr.is_object_stored(&obj_id, inner_path).await {
+                    Ok(true) => {
+                        json_response(&serde_json::json!({
                             "object_id": obj_id.to_string(),
                             "scope": scope,
                             "exists": true,
-                        }));
+                        }))
                     }
-                } else {
-                    // 对于 object 类型，尝试获取
-                    match self.store_mgr.get_object(&obj_id).await {
-                        Ok(_) => {
-                            return json_response(&serde_json::json!({
-                                "object_id": obj_id.to_string(),
-                                "scope": scope,
-                                "exists": true,
-                            }));
-                        }
-                        Err(NdnError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
+                    Ok(false) | Err(NdnError::NotFound(_)) => {
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "application/json; charset=utf-8")
+                            .body(full_body(Bytes::from(
+                                r#"{"error":"not_found","message":"object not found"}"#,
+                            )))
+                            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
                     }
+                    Err(e) => Err(e),
                 }
-
-                // 未命中
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header("content-type", "application/json; charset=utf-8")
-                    .body(full_body(Bytes::from(
-                        r#"{"error":"not_found","message":"object not found"}"#,
-                    )))
-                    .map_err(|e| NdnError::Internal(format!("build response: {e}")))
             }
             _ => Err(NdnError::InvalidParam(format!(
                 "invalid scope: {}, expected 'app' or 'global'",

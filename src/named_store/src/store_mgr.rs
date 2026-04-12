@@ -557,7 +557,10 @@ impl NamedStoreMgr {
     }
 
     // ==================== Object Operations ====================
+    
     pub async fn is_object_stored(&self, obj_id: &ObjId, inner_path: Option<String>) -> NdnResult<bool> {
+        //TODO这个函数的开销还是很大的，应考虑结合GC相关状态做短路返回（尤其是一些热点Object一旦完成扫描，在下一次GC前的状态其实是可以复用的)
+        
         // 判断对象和其所有的children是否都已经在store里了
         let mut current_obj_id = obj_id.clone();
         let mut current_path = Self::normalize_inner_path(inner_path);
@@ -599,7 +602,14 @@ impl NamedStoreMgr {
         Box::pin(async move {
         if obj_id.is_chunk() {
             let chunk_id = ChunkId::from_obj_id(obj_id);
-            return Ok(self.have_chunk(&chunk_id).await);
+            let (state, _size) = self.query_chunk_state(&chunk_id).await?;
+            return match state {
+                ChunkStoreState::Completed | ChunkStoreState::LocalLink(_) => Ok(true),
+                ChunkStoreState::SameAs(chunk_list_id) => {
+                    self.is_object_fully_stored(&chunk_list_id, None).await
+                }
+                _ => Ok(false),
+            };
         }
 
         if obj_id.is_chunk_list() {
@@ -609,7 +619,8 @@ impl NamedStoreMgr {
             };
             let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
             for chunk_id in chunk_list.body.iter() {
-                if !self.have_chunk(chunk_id).await {
+                let sub_obj_id = chunk_id.to_obj_id();
+                if !self.is_object_fully_stored(&sub_obj_id, None).await? {
                     return Ok(false);
                 }
             }
@@ -737,41 +748,10 @@ impl NamedStoreMgr {
 
     // ==================== Chunk State Operations ====================
 
-    /// Check if chunk exists (tries all layout versions)
+    /// Check if chunk and all its dependencies are stored.
     pub async fn have_chunk(&self, chunk_id: &ChunkId) -> bool {
         let obj_id = chunk_id.to_obj_id();
-        let versions = self.versions.read().await;
-        let stores = self.stores.read().await;
-
-        if versions.is_empty() {
-            return false;
-        }
-
-        let mut tried_stores: Vec<String> = Vec::new();
-
-        for version in versions.iter() {
-            let target = match version.layout.select_primary_target(&obj_id) {
-                Some(t) => t,
-                None => continue,
-            };
-
-            if tried_stores.contains(&target.store_id) {
-                continue;
-            }
-            tried_stores.push(target.store_id.clone());
-
-            let store = match stores.get(&target.store_id) {
-                Some(s) => s,
-                None => continue,
-            };
-
-            let store_guard = store.lock().await;
-            if store_guard.have_chunk(chunk_id).await {
-                return true;
-            }
-        }
-
-        false
+        self.is_object_stored(&obj_id, None).await.unwrap_or(false)
     }
 
     /// Query chunk state (tries all layout versions)
