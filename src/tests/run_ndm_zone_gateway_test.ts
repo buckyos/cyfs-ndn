@@ -386,12 +386,21 @@ async function testIdempotentCreate(baseUrl: string) {
 }
 
 async function testObjectLookupNotFound(baseUrl: string) {
-  const resp = await fetch(
-    `${baseUrl}/ndm/v1/objects/lookup?scope=app&quick_hash=chunksha256:0000000000000000000000000000000000000000000000000000000000000000`,
+  // Chunk-type id: lookup now goes through query_chunk_state, returns state
+  const chunkResp = await fetch(
+    `${baseUrl}/ndm/v1/objects/lookup?scope=app&quick_hash=sha256:0000000000000000000000000000000000000000000000000000000000000000`,
   );
-  assertEqual(resp.status, 404, "lookup for non-existent object should return 404");
-  const body = await resp.json();
-  assertEqual(body.error, "not_found", "error code should be not_found");
+  assertEqual(chunkResp.status, 200, "chunk lookup should return 200 with state");
+  const chunkBody = await chunkResp.json();
+  assertEqual(chunkBody.state, "not_exist", "non-existent chunk should have state not_exist");
+
+  // Non-chunk id: still returns 404
+  const objResp = await fetch(
+    `${baseUrl}/ndm/v1/objects/lookup?scope=app&quick_hash=file:0000000000000000000000000000000000000000000000000000000000000000`,
+  );
+  assertEqual(objResp.status, 404, "lookup for non-existent object should return 404");
+  const objBody = await objResp.json();
+  assertEqual(objBody.error, "not_found", "error code should be not_found");
 }
 
 async function testObjectLookupAfterUpload(baseUrl: string) {
@@ -427,7 +436,7 @@ async function testObjectLookupAfterUpload(baseUrl: string) {
   const objectId = patchResp.headers.get("ndm-chunk-object-id")!;
   await patchResp.body?.cancel();
 
-  // Now lookup using the object id.
+  // Now lookup using the object id (chunk type → returns chunk state).
   // Note: the server's parse_query_params does not URL-decode, so we must NOT
   // encode the colon in chunk id formats like "mix256:abcdef..."
   const lookupResp = await fetch(
@@ -435,8 +444,9 @@ async function testObjectLookupAfterUpload(baseUrl: string) {
   );
   assertEqual(lookupResp.status, 200, "lookup should return 200");
   const lookupBody = await lookupResp.json();
-  assertEqual(lookupBody.exists, true, "object should exist");
+  assertEqual(lookupBody.state, "completed", "uploaded chunk should have state completed");
   assertEqual(lookupBody.object_id, objectId, "object_id should match");
+  assertEqual(lookupBody.chunk_size, chunkData.length, "chunk_size should match uploaded bytes");
 }
 
 async function testErrorMissingTusResumable(baseUrl: string) {
@@ -945,6 +955,65 @@ async function testStoreQueryChunkStateAfterUpload(baseUrl: string) {
   assertEqual(stateBody.chunk_size, chunkData.length, "chunk size should match uploaded bytes");
 }
 
+async function testLookupChunkReturnsSameAsState(baseUrl: string) {
+  // 1. Upload a small chunk to get a real completed chunk id
+  const chunkData = encoder.encode("lookup-same-as-test-payload-data");
+  const metadata = buildSimpleMetadata({
+    app_id: "test-app",
+    logical_path: "docs/lookup-same-as.bin",
+    chunk_index: "0",
+    file_hash: "lookup-same-as",
+  });
+
+  const createResp = await fetch(`${baseUrl}/ndm/v1/uploads`, {
+    method: "POST",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-length": String(chunkData.length),
+      "upload-metadata": metadata,
+    },
+  });
+  const location = createResp.headers.get("location")!;
+  await createResp.body?.cancel();
+
+  const patchResp = await fetch(`${baseUrl}${location}`, {
+    method: "PATCH",
+    headers: {
+      ...TUS_HEADERS,
+      "upload-offset": "0",
+      "content-type": "application/offset+octet-stream",
+    },
+    body: chunkData,
+  });
+  // This is the real completed chunk; use its id as the chunk_list_id for same_as
+  const completedChunkId = patchResp.headers.get("ndm-chunk-object-id")!;
+  await patchResp.body?.cancel();
+
+  // 2. Register a "big chunk" as same_as pointing to the completed chunk (as chunklist)
+  //    We use a fabricated big_chunk_id that is a valid chunk hash but not yet stored.
+  const bigChunkId = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const chunkListId = completedChunkId; // reuse as chunklist reference
+
+  const sameAsResp = await postJson(baseUrl, "/ndm/v1/store/add_chunk_by_same_as", {
+    big_chunk_id: bigChunkId,
+    chunk_list_id: chunkListId,
+    big_chunk_size: 4096,
+  });
+  assertEqual(sameAsResp.status, 204, "add_chunk_by_same_as should return 204");
+  await sameAsResp.body?.cancel();
+
+  // 3. Lookup the big chunk id — should return same_as state
+  const lookupResp = await fetch(
+    `${baseUrl}/ndm/v1/objects/lookup?scope=global&quick_hash=${bigChunkId}`,
+  );
+  assertEqual(lookupResp.status, 200, "lookup same_as chunk should return 200");
+  const lookupBody = await lookupResp.json();
+  assertEqual(lookupBody.state, "same_as", "big chunk should have state same_as");
+  assertEqual(lookupBody.same_as, chunkListId, "same_as should point to the chunk list id");
+  assertEqual(lookupBody.chunk_size, 4096, "chunk_size should match big_chunk_size");
+  assertEqual(lookupBody.object_id, bigChunkId, "object_id should match big_chunk_id");
+}
+
 async function testStoreChunkRpcRejectsNonChunkId(baseUrl: string) {
   const nonChunkObjId = "file:2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -1052,6 +1121,7 @@ async function main() {
     await runTest("store RPC: chunk methods reject non-chunk ids", () => testStoreChunkRpcRejectsNonChunkId(server!.baseUrl));
     await runTest("store RPC: add_chunk_by_same_as rejects non-chunk id", () => testStoreAddChunkBySameAsRejectsNonChunkId(server!.baseUrl));
     await runTest("store RPC: object methods reject chunk ids", () => testStoreObjectRpcRejectsChunkIds(server!.baseUrl));
+    await runTest("lookup: chunk returns same_as state", () => testLookupChunkReturnsSameAsState(server!.baseUrl));
 
     // --- TUS protocol ---
     await runTest("OPTIONS discovery", () => testOptionsDiscovery(server!.baseUrl));
