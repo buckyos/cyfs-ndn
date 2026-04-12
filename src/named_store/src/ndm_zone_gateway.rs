@@ -5,6 +5,7 @@
 //! - 基于 chunk 的上传会话创建、断点续传、完成与持久化
 //! - Gateway 侧缓存、配额、TTL/LRU 清理与状态管理
 //! - 并发上传同一 chunk 时的互斥与幂等
+//! - 结构化 store 控制面 API 的协议设计见 `doc/ndm_zone_gateway_structured_api.md`
 //!
 //! CYFS get/download 支持在下个迭代导入旧实现，当前仅做占位。
 
@@ -25,6 +26,11 @@ use tokio::sync::RwLock;
 
 use base64::Engine as _;
 
+use serde::Deserialize;
+
+use crate::gc_types::{EdgeMsg, PinRequest};
+use crate::named_store::ObjectState;
+use crate::store_db::ChunkStoreState;
 use crate::store_mgr::NamedStoreMgr;
 
 // ======================== Constants ========================
@@ -433,6 +439,17 @@ impl NamedStoreMgrZoneGateway {
                     )))
                 }
             }
+        }
+
+        // ---- Structured store control-plane API ----
+        if let Some(method_name) = strip_prefix_segment(&path, "/ndm/v1/store/") {
+            if method == Method::POST {
+                return self.handle_store_rpc(&method_name, req).await;
+            }
+            return Err(NdnError::Unsupported(format!(
+                "store API only accepts POST, got {}",
+                method
+            )));
         }
 
         // ---- CYFS get/download 占位（下个迭代导入旧实现） ----
@@ -1090,6 +1107,422 @@ impl NamedStoreMgrZoneGateway {
         builder
             .body(empty_body())
             .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+    }
+}
+
+// ======================== Structured Store RPC ========================
+
+/// Request body for endpoints that take only an obj_id.
+#[derive(Deserialize)]
+struct ObjIdRequest {
+    obj_id: String,
+}
+
+/// Request body for open_object / is_object_stored.
+#[derive(Deserialize)]
+struct ObjIdWithInnerPathRequest {
+    obj_id: String,
+    #[serde(default)]
+    inner_path: Option<String>,
+}
+
+/// Request body for get_dir_child.
+#[derive(Deserialize)]
+struct GetDirChildRequest {
+    dir_obj_id: String,
+    item_name: String,
+}
+
+/// Request body for put_object.
+#[derive(Deserialize)]
+struct PutObjectRequest {
+    obj_id: String,
+    obj_data: String,
+}
+
+/// Request body for chunk endpoints that take only a chunk_id.
+#[derive(Deserialize)]
+struct ChunkIdRequest {
+    chunk_id: String,
+}
+
+/// Request body for add_chunk_by_same_as.
+#[derive(Deserialize)]
+struct AddChunkBySameAsRequest {
+    big_chunk_id: String,
+    chunk_list_id: String,
+    big_chunk_size: u64,
+}
+
+/// Request body for unpin.
+#[derive(Deserialize)]
+struct UnpinRequest {
+    obj_id: String,
+    owner: String,
+}
+
+/// Request body for unpin_owner.
+#[derive(Deserialize)]
+struct OwnerRequest {
+    owner: String,
+}
+
+/// Request body for fs_acquire / fs_release / fs_anchor_state.
+#[derive(Deserialize)]
+struct FsAnchorRequest {
+    obj_id: String,
+    inode_id: u64,
+    field_tag: u32,
+}
+
+/// Request body for fs_release_inode.
+#[derive(Deserialize)]
+struct InodeRequest {
+    inode_id: u64,
+}
+
+/// Request body for forced_gc_until.
+#[derive(Deserialize)]
+struct ForcedGcRequest {
+    target_bytes: u64,
+}
+
+/// Request body for anchor_state.
+#[derive(Deserialize)]
+struct AnchorStateRequest {
+    obj_id: String,
+    owner: String,
+}
+
+/// Normalize inner_path: empty / "/" → None.
+fn normalize_inner_path(p: Option<String>) -> Option<String> {
+    match p.as_deref() {
+        None | Some("") | Some("/") => None,
+        _ => p,
+    }
+}
+
+/// Serialize ObjectState to JSON value.
+fn object_state_to_json(state: ObjectState) -> serde_json::Value {
+    match state {
+        ObjectState::NotExist => serde_json::json!({ "state": "not_exist" }),
+        ObjectState::Object(data) => serde_json::json!({ "state": "object", "obj_data": data }),
+    }
+}
+
+/// Serialize ChunkStoreState + chunk_size to JSON value.
+fn chunk_store_state_to_json(state: ChunkStoreState, chunk_size: u64) -> serde_json::Value {
+    match state {
+        ChunkStoreState::New => serde_json::json!({
+            "state": "new",
+            "chunk_size": chunk_size,
+        }),
+        ChunkStoreState::Completed => serde_json::json!({
+            "state": "completed",
+            "chunk_size": chunk_size,
+        }),
+        ChunkStoreState::Disabled => serde_json::json!({
+            "state": "disabled",
+            "chunk_size": chunk_size,
+        }),
+        ChunkStoreState::NotExist => serde_json::json!({
+            "state": "not_exist",
+            "chunk_size": chunk_size,
+        }),
+        ChunkStoreState::LocalLink(info) => {
+            let mut v = serde_json::json!({
+                "state": "local_link",
+                "chunk_size": chunk_size,
+                "local_info": {
+                    "qcid": info.qcid,
+                    "last_modify_time": info.last_modify_time,
+                },
+            });
+            if let Some(range) = info.range {
+                v["local_info"]["range"] = serde_json::json!({
+                    "start": range.start,
+                    "end": range.end,
+                });
+            }
+            v
+        }
+        ChunkStoreState::SameAs(obj_id) => serde_json::json!({
+            "state": "same_as",
+            "chunk_size": chunk_size,
+            "same_as": obj_id.to_string(),
+        }),
+    }
+}
+
+fn no_content_response() -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(empty_body())
+        .map_err(|e| NdnError::Internal(format!("build response: {e}")))
+}
+
+impl NamedStoreMgrZoneGateway {
+    async fn handle_store_rpc(
+        &self,
+        method_name: &str,
+        req: http::Request<BoxBody<Bytes, ServerError>>,
+    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+        match method_name {
+            // ---- Object interfaces ----
+            "get_object" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let obj_data = self.store_mgr.get_object(&obj_id).await?;
+                json_response(&serde_json::json!({
+                    "obj_id": obj_id.to_string(),
+                    "obj_data": obj_data,
+                }))
+            }
+
+            "open_object" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdWithInnerPathRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let inner_path = normalize_inner_path(r.inner_path);
+                let obj_data = self.store_mgr.open_object(&obj_id, inner_path).await?;
+                json_response(&serde_json::json!({
+                    "obj_data": obj_data,
+                }))
+            }
+
+            "get_dir_child" => {
+                let body = collect_body(req).await?;
+                let r: GetDirChildRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let dir_obj_id = ObjId::new(&r.dir_obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid dir_obj_id: {e}")))?;
+                let child_id = self.store_mgr.get_dir_child(&dir_obj_id, &r.item_name).await?;
+                json_response(&serde_json::json!({
+                    "obj_id": child_id.to_string(),
+                }))
+            }
+
+            "is_object_stored" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdWithInnerPathRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let inner_path = normalize_inner_path(r.inner_path);
+                let stored = self.store_mgr.is_object_stored(&obj_id, inner_path).await?;
+                json_response(&serde_json::json!({ "stored": stored }))
+            }
+
+            "is_object_exist" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let exists = self.store_mgr.is_object_exist(&obj_id).await?;
+                json_response(&serde_json::json!({ "exists": exists }))
+            }
+
+            "query_object_by_id" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let state = self.store_mgr.query_object_by_id(&obj_id).await?;
+                json_response(&object_state_to_json(state))
+            }
+
+            "put_object" => {
+                let body = collect_body(req).await?;
+                let r: PutObjectRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                self.store_mgr.put_object(&obj_id, &r.obj_data).await?;
+                no_content_response()
+            }
+
+            "remove_object" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                self.store_mgr.remove_object(&obj_id).await?;
+                no_content_response()
+            }
+
+            // ---- Chunk metadata interfaces ----
+            "have_chunk" => {
+                let body = collect_body(req).await?;
+                let r: ChunkIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.chunk_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
+                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                let exists = self.store_mgr.have_chunk(&chunk_id).await;
+                json_response(&serde_json::json!({ "exists": exists }))
+            }
+
+            "query_chunk_state" => {
+                let body = collect_body(req).await?;
+                let r: ChunkIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.chunk_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
+                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                let (state, size) = self.store_mgr.query_chunk_state(&chunk_id).await?;
+                json_response(&chunk_store_state_to_json(state, size))
+            }
+
+            "remove_chunk" => {
+                let body = collect_body(req).await?;
+                let r: ChunkIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.chunk_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_id: {e}")))?;
+                let chunk_id = ChunkId::from_obj_id(&obj_id);
+                self.store_mgr.remove_chunk(&chunk_id).await?;
+                no_content_response()
+            }
+
+            "add_chunk_by_same_as" => {
+                let body = collect_body(req).await?;
+                let r: AddChunkBySameAsRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let big_obj_id = ObjId::new(&r.big_chunk_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid big_chunk_id: {e}")))?;
+                let big_chunk_id = ChunkId::from_obj_id(&big_obj_id);
+                let chunk_list_id = ObjId::new(&r.chunk_list_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid chunk_list_id: {e}")))?;
+                self.store_mgr
+                    .add_chunk_by_same_as(&big_chunk_id, r.big_chunk_size, &chunk_list_id)
+                    .await?;
+                no_content_response()
+            }
+
+            // ---- GC / Anchor / Debug interfaces ----
+            "apply_edge" => {
+                let body = collect_body(req).await?;
+                let msg: EdgeMsg = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid EdgeMsg JSON: {e}")))?;
+                self.store_mgr.apply_edge(msg).await?;
+                no_content_response()
+            }
+
+            "pin" => {
+                let body = collect_body(req).await?;
+                let pin_req: PinRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid PinRequest JSON: {e}")))?;
+                self.store_mgr
+                    .pin(&pin_req.obj_id, &pin_req.owner, pin_req.scope, pin_req.ttl())
+                    .await?;
+                no_content_response()
+            }
+
+            "unpin" => {
+                let body = collect_body(req).await?;
+                let r: UnpinRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                self.store_mgr.unpin(&obj_id, &r.owner).await?;
+                no_content_response()
+            }
+
+            "unpin_owner" => {
+                let body = collect_body(req).await?;
+                let r: OwnerRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let count = self.store_mgr.unpin_owner(&r.owner).await?;
+                json_response(&serde_json::json!({ "count": count }))
+            }
+
+            "fs_acquire" => {
+                let body = collect_body(req).await?;
+                let r: FsAnchorRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                self.store_mgr.fs_acquire(&obj_id, r.inode_id, r.field_tag).await?;
+                no_content_response()
+            }
+
+            "fs_release" => {
+                let body = collect_body(req).await?;
+                let r: FsAnchorRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                self.store_mgr.fs_release(&obj_id, r.inode_id, r.field_tag).await?;
+                no_content_response()
+            }
+
+            "fs_release_inode" => {
+                let body = collect_body(req).await?;
+                let r: InodeRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let count = self.store_mgr.fs_release_inode(r.inode_id).await?;
+                json_response(&serde_json::json!({ "count": count }))
+            }
+
+            "fs_anchor_state" => {
+                let body = collect_body(req).await?;
+                let r: FsAnchorRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let state = self.store_mgr.fs_anchor_state(&obj_id, r.inode_id, r.field_tag).await?;
+                json_response(&serde_json::json!({ "state": state.as_str() }))
+            }
+
+            "forced_gc_until" => {
+                let body = collect_body(req).await?;
+                let r: ForcedGcRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let freed_bytes = self.store_mgr.forced_gc_until(r.target_bytes).await?;
+                json_response(&serde_json::json!({ "freed_bytes": freed_bytes }))
+            }
+
+            "outbox_count" => {
+                let _body = collect_body(req).await?;
+                let count = self.store_mgr.outbox_count().await?;
+                json_response(&serde_json::json!({ "count": count }))
+            }
+
+            "debug_dump_expand_state" => {
+                let body = collect_body(req).await?;
+                let r: ObjIdRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let debug = self.store_mgr.debug_dump_expand_state(&obj_id).await?;
+                let v = serde_json::to_value(&debug)
+                    .map_err(|e| NdnError::Internal(format!("serialize ExpandDebug: {e}")))?;
+                json_response(&v)
+            }
+
+            "anchor_state" => {
+                let body = collect_body(req).await?;
+                let r: AnchorStateRequest = serde_json::from_slice(&body)
+                    .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
+                let obj_id = ObjId::new(&r.obj_id)
+                    .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
+                let state = self.store_mgr.anchor_state(&obj_id, &r.owner).await?;
+                json_response(&serde_json::json!({ "state": state.as_str() }))
+            }
+
+            _ => Err(NdnError::NotFound(format!(
+                "unknown store method: {}",
+                method_name
+            ))),
+        }
     }
 }
 
