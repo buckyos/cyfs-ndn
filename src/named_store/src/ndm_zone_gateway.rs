@@ -67,6 +67,104 @@ const H_NDM_UPLOAD_ID: &str = "ndm-upload-id";
 const H_NDM_CHUNK_STATUS: &str = "ndm-chunk-status";
 const H_NDM_CHUNK_OBJECT_ID: &str = "ndm-chunk-object-id";
 
+fn remove_temp_cache_file(
+    path: &Path,
+    reason: &str,
+    session_id: &str,
+    app_id: &str,
+    logical_path: &str,
+    chunk_index: u32,
+    cached_bytes: u64,
+) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    info!(
+        "removing upload cache file: reason={}, session={}, app={}, path={}, chunk={}, cached_bytes={}, temp_file={}",
+        reason,
+        session_id,
+        app_id,
+        logical_path,
+        chunk_index,
+        cached_bytes,
+        path.display()
+    );
+
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                "upload cache file already absent: reason={}, session={}, temp_file={}",
+                reason,
+                session_id,
+                path.display()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to remove upload cache file: reason={}, session={}, app={}, path={}, chunk={}, temp_file={}, err={}",
+                reason,
+                session_id,
+                app_id,
+                logical_path,
+                chunk_index,
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
+async fn remove_temp_cache_file_async(
+    path: &Path,
+    reason: &str,
+    session_id: &str,
+    app_id: &str,
+    logical_path: &str,
+    chunk_index: u32,
+    cached_bytes: u64,
+) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    info!(
+        "removing upload cache file: reason={}, session={}, app={}, path={}, chunk={}, cached_bytes={}, temp_file={}",
+        reason,
+        session_id,
+        app_id,
+        logical_path,
+        chunk_index,
+        cached_bytes,
+        path.display()
+    );
+
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!(
+                "upload cache file already absent: reason={}, session={}, temp_file={}",
+                reason,
+                session_id,
+                path.display()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "failed to remove upload cache file: reason={}, session={}, app={}, path={}, chunk={}, temp_file={}, err={}",
+                reason,
+                session_id,
+                app_id,
+                logical_path,
+                chunk_index,
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
 // ======================== Upload Session Types ========================
 
 /// chunk 上传状态机
@@ -176,7 +274,8 @@ impl UploadStateManager {
     fn generate_session_id(&mut self) -> String {
         let seq = self.next_session_seq;
         self.next_session_seq += 1;
-        format!("us_{:016x}_{:08x}",
+        format!(
+            "us_{:016x}_{:08x}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -186,10 +285,12 @@ impl UploadStateManager {
     }
 
     fn get_or_create_app_usage(&mut self, app_id: &str) -> &mut AppCacheUsage {
-        self.app_usage.entry(app_id.to_string()).or_insert(AppCacheUsage {
-            bytes_in_use: 0,
-            quota_bytes: DEFAULT_APP_QUOTA,
-        })
+        self.app_usage
+            .entry(app_id.to_string())
+            .or_insert(AppCacheUsage {
+                bytes_in_use: 0,
+                quota_bytes: DEFAULT_APP_QUOTA,
+            })
     }
 
     /// LRU 淘汰：按 updated_at 从最旧开始淘汰，直到释放出 needed 字节
@@ -200,7 +301,10 @@ impl UploadStateManager {
             .iter()
             .filter(|(_, s)| {
                 s.app_id == app_id
-                    && matches!(s.status, ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading)
+                    && matches!(
+                        s.status,
+                        ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading
+                    )
             })
             .map(|(id, s)| (id.clone(), s.updated_at, s.offset))
             .collect();
@@ -221,7 +325,15 @@ impl UploadStateManager {
                 };
                 self.key_index.remove(&key);
                 // 删除临时文件
-                let _ = std::fs::remove_file(&session.temp_file_path);
+                remove_temp_cache_file(
+                    &session.temp_file_path,
+                    "lru_evict",
+                    &session.session_id,
+                    &session.app_id,
+                    &session.logical_path,
+                    session.chunk_index,
+                    session.offset,
+                );
                 freed += offset_bytes;
             }
         }
@@ -240,8 +352,10 @@ impl UploadStateManager {
             .sessions
             .iter()
             .filter(|(_, s)| {
-                matches!(s.status, ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading)
-                    && now.duration_since(s.updated_at) > ttl
+                matches!(
+                    s.status,
+                    ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading
+                ) && now.duration_since(s.updated_at) > ttl
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -260,7 +374,15 @@ impl UploadStateManager {
                     usage.bytes_in_use = usage.bytes_in_use.saturating_sub(session.offset);
                 }
                 // 删除临时文件
-                let _ = std::fs::remove_file(&session.temp_file_path);
+                remove_temp_cache_file(
+                    &session.temp_file_path,
+                    "ttl_expired",
+                    &session.session_id,
+                    &session.app_id,
+                    &session.logical_path,
+                    session.chunk_index,
+                    session.offset,
+                );
                 info!(
                     "expired upload session {} (app={}, path={}, chunk={})",
                     sid, session.app_id, session.logical_path, session.chunk_index
@@ -351,7 +473,8 @@ impl HttpServer for NamedStoreMgrZoneGateway {
             Err(e) => {
                 let (status, error_code) = ndm_error_to_status(&e);
                 warn!("ndm-zone-gateway request failed: {} -> {}", status, e);
-                let is_version_mismatch = matches!(&e, NdnError::VerifyError(msg) if msg.contains("Tus-Resumable"));
+                let is_version_mismatch =
+                    matches!(&e, NdnError::VerifyError(msg) if msg.contains("Tus-Resumable"));
                 Ok(build_error_response(
                     status,
                     &error_code,
@@ -410,9 +533,7 @@ impl NamedStoreMgrZoneGateway {
         }
 
         // TUS Resumable 版本校验：POST/HEAD/PATCH 必须携带 Tus-Resumable: 1.0.0
-        if path.starts_with("/ndm/v1/uploads")
-            && matches!(method, Method::POST | Method::PATCH)
-        {
+        if path.starts_with("/ndm/v1/uploads") && matches!(method, Method::POST | Method::PATCH) {
             Self::validate_tus_resumable(req.headers())?;
         }
         // HEAD 也要校验（读取也需要版本协商）
@@ -460,7 +581,10 @@ impl NamedStoreMgrZoneGateway {
             ));
         }
 
-        Err(NdnError::NotFound(format!("unknown route: {} {}", method, path)))
+        Err(NdnError::NotFound(format!(
+            "unknown route: {} {}",
+            method, path
+        )))
     }
 
     /// TUS 版本校验：要求 Tus-Resumable: 1.0.0，否则返回 412 Precondition Failed
@@ -478,9 +602,7 @@ impl NamedStoreMgrZoneGateway {
     }
 
     /// OPTIONS 响应：返回 TUS 能力信息
-    fn handle_options(
-        &self,
-    ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
+    fn handle_options(&self) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
         Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
@@ -497,10 +619,7 @@ impl NamedStoreMgrZoneGateway {
         &self,
         path: &str,
     ) -> Result<http::Response<BoxBody<Bytes, ServerError>>, NdnError> {
-        let query_str = path
-            .split_once('?')
-            .map(|(_, q)| q)
-            .unwrap_or("");
+        let query_str = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params = parse_query_params(query_str);
 
         let scope = params
@@ -540,22 +659,18 @@ impl NamedStoreMgrZoneGateway {
                 let inner_path = params.get("inner_path").cloned();
 
                 match self.store_mgr.is_object_stored(&obj_id, inner_path).await {
-                    Ok(true) => {
-                        json_response(&serde_json::json!({
-                            "object_id": obj_id.to_string(),
-                            "scope": scope,
-                            "exists": true,
-                        }))
-                    }
-                    Ok(false) | Err(NdnError::NotFound(_)) => {
-                        Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .header("content-type", "application/json; charset=utf-8")
-                            .body(full_body(Bytes::from(
-                                r#"{"error":"not_found","message":"object not found"}"#,
-                            )))
-                            .map_err(|e| NdnError::Internal(format!("build response: {e}")))
-                    }
+                    Ok(true) => json_response(&serde_json::json!({
+                        "object_id": obj_id.to_string(),
+                        "scope": scope,
+                        "exists": true,
+                    })),
+                    Ok(false) | Err(NdnError::NotFound(_)) => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header("content-type", "application/json; charset=utf-8")
+                        .body(full_body(Bytes::from(
+                            r#"{"error":"not_found","message":"object not found"}"#,
+                        )))
+                        .map_err(|e| NdnError::Internal(format!("build response: {e}"))),
                     Err(e) => Err(e),
                 }
             }
@@ -580,7 +695,10 @@ impl NamedStoreMgrZoneGateway {
             return Ok(build_error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "payload_too_large",
-                &format!("chunk size {} exceeds max {} (32 MiB)", chunk_size, MAX_CHUNK_SIZE),
+                &format!(
+                    "chunk size {} exceeds max {} (32 MiB)",
+                    chunk_size, MAX_CHUNK_SIZE
+                ),
                 true,
                 false,
             ));
@@ -601,8 +719,10 @@ impl NamedStoreMgrZoneGateway {
         validate_logical_path(&metadata.logical_path)?;
 
         // 生成 canonical upload id
-        let canonical_upload_id = if let Some(ref custom_id) =
-            req.headers().get(H_NDM_UPLOAD_ID).and_then(|v| v.to_str().ok().map(String::from))
+        let canonical_upload_id = if let Some(ref custom_id) = req
+            .headers()
+            .get(H_NDM_UPLOAD_ID)
+            .and_then(|v| v.to_str().ok().map(String::from))
         {
             custom_id.clone()
         } else {
@@ -620,7 +740,12 @@ impl NamedStoreMgrZoneGateway {
         let mut state = self.state.write().await;
 
         // 检查同一路径是否有旧的 file_hash 不同的未完成会话，若有则清理
-        self.invalidate_stale_sessions(&mut state, &metadata.app_id, &metadata.logical_path, &file_hash);
+        self.invalidate_stale_sessions(
+            &mut state,
+            &metadata.app_id,
+            &metadata.logical_path,
+            &file_hash,
+        );
 
         // 幂等检查：相同 key 是否已有会话
         if let Some(existing_sid) = state.key_index.get(&session_key).cloned() {
@@ -628,27 +753,26 @@ impl NamedStoreMgrZoneGateway {
                 match existing.status {
                     ChunkUploadStatus::Completed => {
                         // chunk 已完成
-                        return self.build_session_response(
-                            StatusCode::OK,
-                            existing,
-                        );
+                        return self.build_session_response(StatusCode::OK, existing);
                     }
                     ChunkUploadStatus::Skipped => {
-                        return self.build_session_response(
-                            StatusCode::OK,
-                            existing,
-                        );
+                        return self.build_session_response(StatusCode::OK, existing);
                     }
                     ChunkUploadStatus::Pending | ChunkUploadStatus::Uploading => {
                         // 返回已有会话
-                        return self.build_session_response(
-                            StatusCode::OK,
-                            existing,
-                        );
+                        return self.build_session_response(StatusCode::OK, existing);
                     }
                     ChunkUploadStatus::Expired => {
                         // 清理过期会话，重新创建
-                        let _ = std::fs::remove_file(&existing.temp_file_path);
+                        remove_temp_cache_file(
+                            &existing.temp_file_path,
+                            "recreate_expired_session",
+                            &existing.session_id,
+                            &existing.app_id,
+                            &existing.logical_path,
+                            existing.chunk_index,
+                            existing.offset,
+                        );
                         state.sessions.remove(&existing_sid);
                         state.key_index.remove(&session_key);
                     }
@@ -696,7 +820,8 @@ impl NamedStoreMgrZoneGateway {
             if usage.bytes_in_use + chunk_size > usage.quota_bytes {
                 // 尝试 LRU 淘汰
                 let needed = (usage.bytes_in_use + chunk_size) - usage.quota_bytes;
-                let freed = state.evict_lru_for_app(&metadata.app_id, needed, &self.config.cache_dir);
+                let freed =
+                    state.evict_lru_for_app(&metadata.app_id, needed, &self.config.cache_dir);
                 let usage = state.get_or_create_app_usage(&metadata.app_id);
                 if usage.bytes_in_use + chunk_size > usage.quota_bytes {
                     return Err(NdnError::IoError(format!(
@@ -711,10 +836,7 @@ impl NamedStoreMgrZoneGateway {
         let session_id = state.generate_session_id();
         let temp_dir = self.config.cache_dir.join(&metadata.app_id);
         let _ = std::fs::create_dir_all(&temp_dir);
-        let temp_file_path = temp_dir.join(format!(
-            "{}_{}.tmp",
-            session_id, metadata.chunk_index
-        ));
+        let temp_file_path = temp_dir.join(format!("{}_{}.tmp", session_id, metadata.chunk_index));
 
         // 创建空临时文件
         tokio::fs::File::create(&temp_file_path)
@@ -743,7 +865,16 @@ impl NamedStoreMgrZoneGateway {
                 raw_metadata: raw_metadata.clone(),
             };
             // 删除临时文件（已创建但不需要）
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            remove_temp_cache_file_async(
+                &temp_file_path,
+                "zero_length_upload",
+                &session_id,
+                &metadata.app_id,
+                &metadata.logical_path,
+                metadata.chunk_index,
+                0,
+            )
+            .await;
             let resp = self.build_session_response(StatusCode::CREATED, &session);
             state.sessions.insert(session_id.clone(), session);
             state.key_index.insert(session_key, session_id);
@@ -908,7 +1039,16 @@ impl NamedStoreMgrZoneGateway {
         let mut state = self.state.write().await;
 
         // 提取 session 信息并校验
-        let (temp_file_path, chunk_size, chunk_hash, app_id, new_offset, is_complete) = {
+        let (
+            temp_file_path,
+            chunk_size,
+            chunk_hash,
+            app_id,
+            logical_path,
+            chunk_index,
+            new_offset,
+            is_complete,
+        ) = {
             let session = state
                 .sessions
                 .get_mut(session_id)
@@ -953,10 +1093,21 @@ impl NamedStoreMgrZoneGateway {
             let chunk_size = session.chunk_size;
             let chunk_hash = session.chunk_hash.clone();
             let app_id = session.app_id.clone();
+            let logical_path = session.logical_path.clone();
+            let chunk_index = session.chunk_index;
             let new_offset = session.offset;
             let is_complete = session.offset == session.chunk_size;
 
-            (temp_path, chunk_size, chunk_hash, app_id, new_offset, is_complete)
+            (
+                temp_path,
+                chunk_size,
+                chunk_hash,
+                app_id,
+                logical_path,
+                chunk_index,
+                new_offset,
+                is_complete,
+            )
         };
 
         // 如果已写满，持久化到对象存储
@@ -987,12 +1138,21 @@ impl NamedStoreMgrZoneGateway {
                 .map_err(|e| NdnError::IoError(format!("open temp file for persist: {e}")))?;
             let reader: ndn_lib::ChunkReader = Box::pin(file);
 
-            let _outcome = self
+            let outcome = self
                 .store_mgr
                 .put_chunk_by_reader(&chunk_id, chunk_size, reader)
                 .await?;
-
             let chunk_obj_id = chunk_id.to_obj_id().to_string();
+            info!(
+                "stored uploaded chunk into store: session={}, app={}, path={}, chunk={}, chunk_obj_id={}, chunk_size={}, outcome={:?}",
+                session_id,
+                app_id,
+                logical_path,
+                chunk_index,
+                chunk_obj_id,
+                chunk_size,
+                outcome
+            );
 
             // 更新 session 状态
             if let Some(session) = state.sessions.get_mut(session_id) {
@@ -1006,7 +1166,16 @@ impl NamedStoreMgrZoneGateway {
             }
 
             // 删除临时文件
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            remove_temp_cache_file_async(
+                &temp_file_path,
+                "chunk_persisted",
+                session_id,
+                &app_id,
+                &logical_path,
+                chunk_index,
+                chunk_size,
+            )
+            .await;
 
             // 构建响应
             if let Some(session) = state.sessions.get(session_id) {
@@ -1074,7 +1243,15 @@ impl NamedStoreMgrZoneGateway {
                 if let Some(usage) = state.app_usage.get_mut(app_id) {
                     usage.bytes_in_use = usage.bytes_in_use.saturating_sub(session.offset);
                 }
-                let _ = std::fs::remove_file(&session.temp_file_path);
+                remove_temp_cache_file(
+                    &session.temp_file_path,
+                    "invalidate_stale_session",
+                    &session.session_id,
+                    &session.app_id,
+                    &session.logical_path,
+                    session.chunk_index,
+                    session.offset,
+                );
                 info!(
                     "invalidated stale session {} (file_hash changed, app={}, path={})",
                     sid, app_id, logical_path
@@ -1092,7 +1269,10 @@ impl NamedStoreMgrZoneGateway {
         let mut builder = Response::builder()
             .status(status)
             .header(H_TUS_RESUMABLE, TUS_RESUMABLE)
-            .header("location", format!("/ndm/v1/uploads/{}", session.session_id))
+            .header(
+                "location",
+                format!("/ndm/v1/uploads/{}", session.session_id),
+            )
             .header(H_NDM_UPLOAD_ID, &session.canonical_upload_id)
             .header(H_UPLOAD_OFFSET, session.offset)
             .header(H_UPLOAD_LENGTH, session.chunk_size)
@@ -1310,7 +1490,10 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let dir_obj_id = ObjId::new(&r.dir_obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid dir_obj_id: {e}")))?;
-                let child_id = self.store_mgr.get_dir_child(&dir_obj_id, &r.item_name).await?;
+                let child_id = self
+                    .store_mgr
+                    .get_dir_child(&dir_obj_id, &r.item_name)
+                    .await?;
                 json_response(&serde_json::json!({
                     "obj_id": child_id.to_string(),
                 }))
@@ -1355,7 +1538,8 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
                 if obj_id.is_chunk() {
                     return Err(NdnError::InvalidParam(
-                        "put_object does not accept chunk ids; use chunk upload protocol instead".to_string(),
+                        "put_object does not accept chunk ids; use chunk upload protocol instead"
+                            .to_string(),
                     ));
                 }
                 self.store_mgr.put_object(&obj_id, &r.obj_data).await?;
@@ -1370,7 +1554,8 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
                 if obj_id.is_chunk() {
                     return Err(NdnError::InvalidParam(
-                        "remove_object does not accept chunk ids; use remove_chunk instead".to_string(),
+                        "remove_object does not accept chunk ids; use remove_chunk instead"
+                            .to_string(),
                     ));
                 }
                 self.store_mgr.remove_object(&obj_id).await?;
@@ -1432,7 +1617,12 @@ impl NamedStoreMgrZoneGateway {
                 let pin_req: PinRequest = serde_json::from_slice(&body)
                     .map_err(|e| NdnError::InvalidData(format!("invalid PinRequest JSON: {e}")))?;
                 self.store_mgr
-                    .pin(&pin_req.obj_id, &pin_req.owner, pin_req.scope, pin_req.ttl())
+                    .pin(
+                        &pin_req.obj_id,
+                        &pin_req.owner,
+                        pin_req.scope,
+                        pin_req.ttl(),
+                    )
                     .await?;
                 no_content_response()
             }
@@ -1461,7 +1651,9 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let obj_id = ObjId::new(&r.obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
-                self.store_mgr.fs_acquire(&obj_id, r.inode_id, r.field_tag).await?;
+                self.store_mgr
+                    .fs_acquire(&obj_id, r.inode_id, r.field_tag)
+                    .await?;
                 no_content_response()
             }
 
@@ -1471,7 +1663,9 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let obj_id = ObjId::new(&r.obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
-                self.store_mgr.fs_release(&obj_id, r.inode_id, r.field_tag).await?;
+                self.store_mgr
+                    .fs_release(&obj_id, r.inode_id, r.field_tag)
+                    .await?;
                 no_content_response()
             }
 
@@ -1489,7 +1683,10 @@ impl NamedStoreMgrZoneGateway {
                     .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?;
                 let obj_id = ObjId::new(&r.obj_id)
                     .map_err(|e| NdnError::InvalidId(format!("invalid obj_id: {e}")))?;
-                let state = self.store_mgr.fs_anchor_state(&obj_id, r.inode_id, r.field_tag).await?;
+                let state = self
+                    .store_mgr
+                    .fs_anchor_state(&obj_id, r.inode_id, r.field_tag)
+                    .await?;
                 json_response(&serde_json::json!({ "state": state.as_str() }))
             }
 
@@ -1542,9 +1739,7 @@ impl NamedStoreMgrZoneGateway {
 /// 解析 Upload-Metadata header。
 /// 格式: key1 base64val1,key2 base64val2,...
 /// 也支持简化的 key=value 格式（非 base64）
-fn parse_upload_metadata(
-    headers: &http::HeaderMap,
-) -> Result<UploadMetadata, NdnError> {
+fn parse_upload_metadata(headers: &http::HeaderMap) -> Result<UploadMetadata, NdnError> {
     let raw = headers
         .get(H_UPLOAD_METADATA)
         .and_then(|v| v.to_str().ok())
@@ -1559,7 +1754,8 @@ fn parse_upload_metadata(
         }
         // 尝试 "key base64val" 格式（tus 标准）
         if let Some((key, encoded)) = pair.split_once(' ') {
-            let decoded = base64_decode(encoded.trim()).unwrap_or_else(|_| encoded.trim().to_string());
+            let decoded =
+                base64_decode(encoded.trim()).unwrap_or_else(|_| encoded.trim().to_string());
             fields.insert(key.trim().to_string(), decoded);
         } else if let Some((key, val)) = pair.split_once('=') {
             // 简化的 key=value 格式
@@ -1572,12 +1768,9 @@ fn parse_upload_metadata(
         .cloned()
         .ok_or_else(|| NdnError::InvalidParam("Upload-Metadata missing app_id".to_string()))?;
 
-    let logical_path = fields
-        .get("logical_path")
-        .cloned()
-        .ok_or_else(|| {
-            NdnError::InvalidParam("Upload-Metadata missing logical_path".to_string())
-        })?;
+    let logical_path = fields.get("logical_path").cloned().ok_or_else(|| {
+        NdnError::InvalidParam("Upload-Metadata missing logical_path".to_string())
+    })?;
 
     let chunk_index = fields
         .get("chunk_index")
@@ -1793,9 +1986,10 @@ fn ndm_error_to_status(e: &NdnError) -> (StatusCode, String) {
         NdnError::InvalidParam(_) => (StatusCode::BAD_REQUEST, "invalid_param".to_string()),
         NdnError::InvalidData(_) => (StatusCode::BAD_REQUEST, "invalid_data".to_string()),
         NdnError::InvalidId(_) => (StatusCode::BAD_REQUEST, "invalid_id".to_string()),
-        NdnError::VerifyError(msg) if msg.contains("Tus-Resumable") => {
-            (StatusCode::PRECONDITION_FAILED, "precondition_failed".to_string())
-        }
+        NdnError::VerifyError(msg) if msg.contains("Tus-Resumable") => (
+            StatusCode::PRECONDITION_FAILED,
+            "precondition_failed".to_string(),
+        ),
         NdnError::VerifyError(_) => (StatusCode::CONFLICT, "offset_conflict".to_string()),
         NdnError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "permission_denied".to_string()),
         NdnError::AlreadyExists(_) => (StatusCode::CONFLICT, "already_exists".to_string()),

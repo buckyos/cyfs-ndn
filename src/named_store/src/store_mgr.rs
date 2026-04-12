@@ -15,7 +15,7 @@ use crate::{
     ChunkLocalInfo, ChunkStoreState, ChunkWriteOutcome, LayoutVersion, NamedLocalConfig,
     NamedStore, ObjectState, SimpleChunkListReader, StoreLayout, StoreTarget,
 };
-use log::warn;
+use log::{info, warn};
 use ndn_lib::{
     extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkReader,
     DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
@@ -557,10 +557,14 @@ impl NamedStoreMgr {
     }
 
     // ==================== Object Operations ====================
-    
-    pub async fn is_object_stored(&self, obj_id: &ObjId, inner_path: Option<String>) -> NdnResult<bool> {
+
+    pub async fn is_object_stored(
+        &self,
+        obj_id: &ObjId,
+        inner_path: Option<String>,
+    ) -> NdnResult<bool> {
         //TODO这个函数的开销还是很大的，应考虑结合GC相关状态做短路返回（尤其是一些热点Object一旦完成扫描，在下一次GC前的状态其实是可以复用的)
-        
+
         // 判断对象和其所有的children是否都已经在store里了
         let mut current_obj_id = obj_id.clone();
         let mut current_path = Self::normalize_inner_path(inner_path);
@@ -594,71 +598,90 @@ impl NamedStoreMgr {
         }
 
         // Now check if the resolved object and all its dependencies are stored
-        self.is_object_fully_stored(&current_obj_id, current_obj_str).await
+        self.is_object_fully_stored(&current_obj_id, current_obj_str)
+            .await
     }
 
     /// Recursively check if an object and all its strong-referenced children are stored.
-    fn is_object_fully_stored<'a>(&'a self, obj_id: &'a ObjId, obj_str_hint: Option<String>) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'a>> {
+    fn is_object_fully_stored<'a>(
+        &'a self,
+        obj_id: &'a ObjId,
+        obj_str_hint: Option<String>,
+    ) -> Pin<Box<dyn Future<Output = NdnResult<bool>> + Send + 'a>> {
         Box::pin(async move {
-        if obj_id.is_chunk() {
-            let chunk_id = ChunkId::from_obj_id(obj_id);
-            let (state, _size) = self.query_chunk_state(&chunk_id).await?;
-            return match state {
-                ChunkStoreState::Completed | ChunkStoreState::LocalLink(_) => Ok(true),
-                ChunkStoreState::SameAs(chunk_list_id) => {
-                    self.is_object_fully_stored(&chunk_list_id, None).await
-                }
-                _ => Ok(false),
-            };
-        }
-
-        if obj_id.is_chunk_list() {
-            let obj_str = match obj_str_hint {
-                Some(s) => s,
-                None => self.get_object(obj_id).await?,
-            };
-            let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
-            for chunk_id in chunk_list.body.iter() {
-                let sub_obj_id = chunk_id.to_obj_id();
-                if !self.is_object_fully_stored(&sub_obj_id, None).await? {
-                    return Ok(false);
-                }
+            if obj_id.is_chunk() {
+                let chunk_id = ChunkId::from_obj_id(obj_id);
+                let (state, _size) = self.query_chunk_state(&chunk_id).await?;
+                return match state {
+                    ChunkStoreState::Completed | ChunkStoreState::LocalLink(_) => Ok(true),
+                    ChunkStoreState::SameAs(chunk_list_id) => {
+                        self.is_object_fully_stored(&chunk_list_id, None).await
+                    }
+                    ChunkStoreState::NotExist => {
+                        info!("is_object_stored=false: chunk not found, obj_id={}", obj_id);
+                        Ok(false)
+                    }
+                    _ => Ok(false),
+                };
             }
-            return Ok(true);
-        }
 
-        // Object must exist in store
-        let obj_str = match obj_str_hint {
-            Some(s) => s,
-            None => match self.query_object_by_id(obj_id).await? {
-                ObjectState::Object(s) => s,
-                ObjectState::NotExist => return Ok(false),
-            },
-        };
-
-        if obj_id.is_file_object() {
-            let file_obj: FileObject = load_named_obj(obj_str.as_str())?;
-            if file_obj.content.is_empty() {
+            if obj_id.is_chunk_list() {
+                let obj_str = match obj_str_hint {
+                    Some(s) => s,
+                    None => self.get_object(obj_id).await?,
+                };
+                let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
+                for chunk_id in chunk_list.body.iter() {
+                    let sub_obj_id = chunk_id.to_obj_id();
+                    if !self.is_object_fully_stored(&sub_obj_id, None).await? {
+                        return Ok(false);
+                    }
+                }
                 return Ok(true);
             }
-            let content_obj_id = ObjId::new(file_obj.content.as_str())?;
-            return self.is_object_fully_stored(&content_obj_id, None).await;
-        }
 
-        if obj_id.is_dir_object() {
-            let dir_obj: DirObject = load_named_obj(obj_str.as_str())?;
-            for item in dir_obj.values() {
-                let (child_obj_id, child_obj_str) = item.get_obj_id()?;
-                let hint = if child_obj_str.is_empty() { None } else { Some(child_obj_str) };
-                if !self.is_object_fully_stored(&child_obj_id, hint).await? {
-                    return Ok(false);
+            // Object must exist in store
+            let obj_str = match obj_str_hint {
+                Some(s) => s,
+                None => match self.query_object_by_id(obj_id).await? {
+                    ObjectState::Object(s) => s,
+                    ObjectState::NotExist => {
+                        info!(
+                            "is_object_stored=false: object not found, obj_id={}",
+                            obj_id
+                        );
+                        return Ok(false);
+                    }
+                },
+            };
+
+            if obj_id.is_file_object() {
+                let file_obj: FileObject = load_named_obj(obj_str.as_str())?;
+                if file_obj.content.is_empty() {
+                    return Ok(true);
                 }
+                let content_obj_id = ObjId::new(file_obj.content.as_str())?;
+                return self.is_object_fully_stored(&content_obj_id, None).await;
             }
-            return Ok(true);
-        }
 
-        // For other object types, just being present in store is sufficient
-        Ok(true)
+            if obj_id.is_dir_object() {
+                let dir_obj: DirObject = load_named_obj(obj_str.as_str())?;
+                for item in dir_obj.values() {
+                    let (child_obj_id, child_obj_str) = item.get_obj_id()?;
+                    let hint = if child_obj_str.is_empty() {
+                        None
+                    } else {
+                        Some(child_obj_str)
+                    };
+                    if !self.is_object_fully_stored(&child_obj_id, hint).await? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+
+            // For other object types, just being present in store is sufficient
+            Ok(true)
         })
     }
 
