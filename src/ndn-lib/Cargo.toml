@@ -10,6 +10,7 @@ anyhow = "*"
 base58 = "*"
 serde = { workspace = true }
 serde_json = { workspace = true } 
+serde_jcs = "0.2.0"
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "*"

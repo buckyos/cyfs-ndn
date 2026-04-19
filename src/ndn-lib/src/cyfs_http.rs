@@ -10,11 +10,10 @@ enum CYFSUrlMode {
 
 #[derive(Debug, Clone)]
 pub struct CYFSHttpRespHeaders {
-    
-    pub obj_id: Option<ObjId>,                      //cyfs-obj-id
-    pub obj_size: Option<u64>,                      //该chunk对象的大小，以字节为单位
+    pub obj_id: Option<ObjId>, //cyfs-obj-id
+    pub obj_size: Option<u64>, //该chunk对象的大小，以字节为单位
     //if use R-Path http mode ,need this
-    pub path_obj: Option<String>,                   //cyfs-path-obj jwt
+    pub path_obj: Option<String>, //cyfs-path-obj jwt
 
     pub root_obj_id: Option<ObjId>,                 //cyfs-root-obj-id
     pub mtree_path: String,                         //cyfs-mtree-path
