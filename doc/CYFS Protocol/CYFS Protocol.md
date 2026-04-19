@@ -2,7 +2,7 @@
 
 > `CYFS` 或 `cyfs://` 都是在说协议；单独说 `cyfs` 时，通常指基于 CYFS Protocol 定义的标准对象实现的 DFS。
 
-当前文档状态：0.9，最新草案，领先所有实现。
+当前文档状态：0.9，最新草案，领先现有代码实现。
 
 ## Named Data Network (NDN)的基本概念
 
@@ -22,7 +22,7 @@ d1127e660d0de222a3383609d74ff8d4b4ba97a226f861e184e1f92eee25d3b9  README.md
 sha256:d1127e660d0de222a3383609d74ff8d4b4ba97a226f861e184e1f92eee25d3b9
 ```
 
-其格式为 `{hash_type}:{hash_data_hex_text}`。
+其格式为 `{hash_type}:{hash_data_hex_text}`。我们称作`标准ObjId`
 
 上述 `ChunkId` 还有另一种 base32 编码方式：
 
@@ -37,6 +37,8 @@ base32 编码规范（MUST）：
 - **统一使用小写字母**；解析时应先转换为小写再解码，以兼容 URL 子域名大小写不敏感的场景。
 
 在系统中，使用上述两种 `ChunkId` 来表达同一个`不再修改的数据块`是等价的。
+
+> 原则上,base32编码的objid只用在URL中，其他地方都应该使用标准的objid string
 
 ### 通过 ChunkId 可靠地获取数据
 
@@ -201,7 +203,6 @@ obj_hash_bytes = varint(u64(data_length))  ||  raw_hash_bytes(base_algorithm)
 
 对应的文本形式仍为 `{obj_type}:{hex(obj_hash_bytes)}`，但解析时需要先从 hex 字节中剥离 varint 前缀，再参与哈希比对。
 
-`qcid` 可以视为特殊的定长 mix 变体，规则相同（仍然是“长度前缀 + 原始哈希”）。
 
 `cyfile` 是 `cyfs://` 定义的标准对象。标准对象约定了一些字段的含义和是否可选；同时得益于 JSON 的可扩展性，用户也可以在此基础上扩展自己的自定义字段。
 
@@ -798,6 +799,12 @@ Pull 调度器可以根据历史记录和到源的距离，决定 `chunk x` 从 
 所以必须能识别并重定向 Pull 目标。这通常依赖明文的 CYFS 流量，或者依赖 Zone 内可共享可信私钥时对 HTTPS 级流量进行拦截。
 
 ## 附录：协议参考
+
+### 特殊的ObjId
+
+`qcid` 可以视为特殊的定长 mix 变体，规则相同（仍然是“长度前缀 + 原始哈希”）。
+`clist` chunklist， 其ObjId用和mix256一致的方法在id中编码了长度信息，其长度是整个chunklist所有的chunk的大小的总和
+
 
 ### 含有 ObjId 和 inner_path 的 URL
 
