@@ -13,6 +13,12 @@
 
 另外，`/cyfs/*` 与 `/ndn/*` 下载路径在本实现中仍是占位，尚未接入旧下载逻辑。
 
+这里的 upload session 是明确的 `per chunk session`：
+
+- 一次 `POST /ndm/v1/uploads` 只对应一个 chunk；
+- 一个文件若被切成多个 chunk，就需要为每个 chunk 分别创建一个 session；
+- 文件级上传在当前协议里只是客户端侧编排，不是服务端侧的一等会话对象。
+
 ## 2. 总览
 
 ### 2.1 监听与基础行为
@@ -240,6 +246,12 @@ app_id bXlfYXBw,logical_path ZG9jcy9yZWFkbWUudHh0,chunk_index MA==
 
 ### 5.4 会话标识与状态
 
+当前实现中的“上传会话”始终是 chunk 级，而不是文件级：
+
+- 一个 session 只跟踪一个 chunk 的 `offset/status/temp_file`
+- 同一文件的不同 chunk 会拥有不同的 `session_id`
+- 文件级上传进度需要由客户端在多个 chunk session 之上自行汇总
+
 #### 5.4.1 `session_id`
 
 服务端生成格式：
@@ -323,6 +335,12 @@ us_{unix_millis_hex}_{seq_hex}
    - 直接创建 `completed` 会话
    - 删除刚创建的临时文件
    - 返回 `201 Created`
+
+对接侧需要注意：
+
+- 每个 chunk 都需要各自调用一次 `POST /ndm/v1/uploads`
+- 之后每个 chunk 再分别走自己的 `HEAD/PATCH`
+- 即使某个 chunk 通过 `chunk_hash` 命中秒传，当前实现也会创建一个 `skipped` session，只是无需继续上传数据
 
 #### 特殊错误
 
@@ -577,3 +595,215 @@ CYFS get/download not yet implemented in zone gateway, coming in next iteration
 6. 收集所有 chunk object id，交给上层对象组装逻辑
 
 这也是当前 `NamedStoreMgrZoneGateway` 实现已经稳定支持的最小闭环。
+
+## 9. 标准 tus-client 视角示例
+
+这一节用“标准 tus client 如何接这个协议”的角度说明实际用法。
+
+核心结论只有一条：
+
+- 不要把“整个文件”交给一个 tus upload
+- 要先在客户端把文件切成多个 chunk
+- 然后为每个 chunk 分别创建一个 tus upload
+
+但在进入 chunk 上传之前，标准接入流程还应该先做一次“整文件级 skip 检查”：
+
+- 客户端先计算文件的 `qcid`，并作为 `quick_hash`
+- 调用 `GET /ndm/v1/objects/lookup?scope=app&quick_hash=...`
+- 若已命中，则整个文件直接跳过，不再创建任何 chunk session
+- 只有未命中时，才进入后续的 per-chunk tus upload
+
+也就是说，当前网关协议更接近：
+
+```text
+1 file = N chunks = N tus uploads = N session_id
+```
+
+### 9.1 错误示例：把整文件当成一个 tus upload
+
+下面这种思路不适用于当前协议：
+
+```js
+new tus.Upload(file, {
+  endpoint: "/ndm/v1/uploads",
+})
+```
+
+原因是：
+
+- `POST /ndm/v1/uploads` 的 `Upload-Length` 语义是“单个 chunk 的长度”
+- 服务端会为这次 `POST` 创建一个 chunk 级 session
+- 若直接上传整文件，服务端不会替客户端自动切 chunk
+
+### 9.2 正确示例：先切 chunk，再为每个 chunk 创建 tus upload
+
+下面给一个 `tus-js-client` 风格的伪代码示例。重点不是具体库 API，而是接入方式：
+
+```js
+import * as tus from "tus-js-client";
+
+const CHUNK_SIZE = 32 * 1024 * 1024;
+
+async function lookupWholeFileByQcid(qcid, scope = "app") {
+  const url = `/ndm/v1/objects/lookup?scope=${encodeURIComponent(scope)}&quick_hash=${encodeURIComponent(qcid)}`;
+  const resp = await fetch(url, { method: "GET" });
+
+  if (resp.status === 404) {
+    return null;
+  }
+
+  if (!resp.ok) {
+    throw new Error(`lookup failed: ${resp.status}`);
+  }
+
+  return await resp.json();
+}
+
+function buildMetadata(file, appId, logicalPath, fileHash, chunkIndex, chunkHash) {
+  return {
+    app_id: appId,
+    logical_path: logicalPath,
+    file_name: file.name,
+    file_size: String(file.size),
+    file_hash: fileHash ?? "",
+    chunk_index: String(chunkIndex),
+    chunk_hash: chunkHash ?? "",
+    mime_type: file.type || "application/octet-stream",
+  };
+}
+
+async function uploadFile(file, appId, logicalPath, qcid, fileHash, chunkHashes = []) {
+  const wholeFileHit = await lookupWholeFileByQcid(qcid, "app");
+
+  if (wholeFileHit?.exists || wholeFileHit?.state === "completed") {
+    return {
+      skippedByQcid: true,
+      objectId: wholeFileHit.object_id,
+      chunks: [],
+    };
+  }
+
+  const chunkCount = Math.ceil(file.size / CHUNK_SIZE);
+  const chunkResults = [];
+
+  for (let chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+    const start = chunkIndex * CHUNK_SIZE;
+    const end = Math.min(file.size, start + CHUNK_SIZE);
+    const chunkBlob = file.slice(start, end);
+
+    const result = await uploadOneChunk({
+      chunkBlob,
+      file,
+      appId,
+      logicalPath,
+      fileHash,
+      chunkIndex,
+      chunkHash: chunkHashes[chunkIndex],
+    });
+
+    chunkResults.push(result);
+  }
+
+  return {
+    skippedByQcid: false,
+    objectId: null,
+    chunks: chunkResults,
+  };
+}
+
+function uploadOneChunk({
+  chunkBlob,
+  file,
+  appId,
+  logicalPath,
+  fileHash,
+  chunkIndex,
+  chunkHash,
+}) {
+  return new Promise((resolve, reject) => {
+    const upload = new tus.Upload(chunkBlob, {
+      endpoint: "/ndm/v1/uploads",
+      retryDelays: [0, 1000, 3000, 5000],
+      metadata: buildMetadata(file, appId, logicalPath, fileHash, chunkIndex, chunkHash),
+      onError(error) {
+        reject(error);
+      },
+      onSuccess() {
+        const xhr = upload._req?.getUnderlyingObject?.();
+        resolve({
+          chunkIndex,
+          uploadUrl: upload.url,
+          chunkObjectId: xhr?.getResponseHeader("NDM-Chunk-Object-ID") || null,
+        });
+      },
+    });
+
+    upload.start();
+  });
+}
+```
+
+### 9.3 这个示例在协议层面做了什么
+
+以上代码实际对应的是：
+
+1. 客户端先计算整个文件的 `qcid`
+2. 先调用 `GET /ndm/v1/objects/lookup`
+3. 若命中：
+   - 直接结束
+   - 不创建任何 chunk session
+4. 若未命中：
+   - 再把 `file` 按 `32 MiB` 切块
+   - 每个 `chunkBlob` 各自发起一次 `POST /ndm/v1/uploads`
+   - 网关为每个 chunk 返回一个独立的 `session_id`
+   - tus client 再按标准流程对这个 session 做 `HEAD/PATCH`
+   - chunk 完成后，从响应头读取 `NDM-Chunk-Object-ID`
+5. 所有 chunk 完成后，客户端再做文件级组装
+
+### 9.4 tus client 接入时要注意的点
+
+- `endpoint` 始终是 `/ndm/v1/uploads`
+- 真正区分不同 chunk 的不是 URL，而是每次 `POST` 时提交的 `Upload-Metadata.chunk_index`
+- `logical_path` 对同一个文件的所有 chunk 应保持一致
+- `file_hash` 对同一个文件的所有 chunk 应保持一致
+- `chunk_index` 必须按 chunk 分别填写
+- 如果客户端已经有 chunk 内容哈希，建议填写 `chunk_hash`，这样服务端可能直接返回 `skipped`
+
+### 9.5 关于秒传 chunk 的表现
+
+如果某个 chunk 提供了 `chunk_hash`，并且服务端已经存在该 chunk，对标准 tus client 来说通常会表现为：
+
+1. `POST /ndm/v1/uploads`
+2. 服务端直接返回 `200 OK`
+3. 响应头里有：
+   - `NDM-Chunk-Status: skipped`
+   - `Upload-Offset: {Upload-Length}`
+   - `NDM-Chunk-Object-ID: ...`
+4. 这个 chunk 不需要再继续 `PATCH`
+
+也就是说，虽然它仍然创建了一个 chunk session，但这个 session 一创建就是“已完成可复用”的状态。
+
+### 9.6 关于基于 qcid 的整文件 skip
+
+整文件 skip 和 chunk skip 是两层逻辑：
+
+- 第一层是整文件级 skip：
+  - 先用 `qcid` 调 `GET /ndm/v1/objects/lookup`
+  - 若命中，整个文件上传流程直接结束
+  - 此时不会创建任何 chunk session
+- 第二层是 chunk 级 skip：
+  - 整文件未命中后，单个 chunk 仍可通过 `chunk_hash` 命中
+  - 这种情况下会创建 `skipped` session，但不会传 chunk 数据
+
+两者可以同时存在，推荐客户端都实现。
+
+### 9.7 若使用自动续传能力
+
+若 tus client 自带 URL 存储或自动 resume，建议它的 resume key 至少包含：
+
+- `app_id`
+- `logical_path`
+- `file_hash`
+- `chunk_index`
+
+不要只用 `logical_path` 作为恢复键，否则同一路径下新旧文件切换时容易串 session。
