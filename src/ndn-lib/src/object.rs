@@ -815,7 +815,7 @@ mod tests {
 
         let path_object = PathObject {
             path: "/repo/apps/demo".to_string(),
-            uptime: 1_700_000_200,
+            iat: 1_700_000_200,
             target: ObjId::new("cyfile:1234567890abcdef").unwrap(),
             exp: 1_700_086_600,
         };

@@ -68,7 +68,7 @@ impl NamedObject for FileObject {
 #[derive(Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub struct PathObject {
     pub path: String,
-    pub uptime: u64,
+    pub iat: u64,
     pub target: ObjId,
     pub exp: u64,
 }
@@ -77,7 +77,7 @@ impl PathObject {
     pub fn new(path: String, target: ObjId) -> Self {
         Self {
             path,
-            uptime: buckyos_get_unix_timestamp(),
+            iat: buckyos_get_unix_timestamp(),
             target,
             exp: buckyos_get_unix_timestamp() + 3600 * 24 * 365 * 3,
         }
