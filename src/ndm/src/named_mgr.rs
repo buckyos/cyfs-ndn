@@ -19,7 +19,7 @@ use named_store::{
 };
 use ndn_lib::{
     load_named_obj, ChunkId, DirObject, FileObject, NdmPath, NdnError, NdnResult, ObjId,
-    SimpleChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    ChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 
 use crate::{
@@ -1094,10 +1094,10 @@ impl NamedDataMgr {
         load_named_obj(obj_str.as_str())
     }
 
-    async fn load_chunk_list(&self, obj_id: &ObjId) -> NdnResult<SimpleChunkList> {
+    async fn load_chunk_list(&self, obj_id: &ObjId) -> NdnResult<ChunkList> {
         let obj_str = self.get_object(obj_id).await?;
         let chunk_list: Vec<ChunkId> = load_named_obj(obj_str.as_str())?;
-        SimpleChunkList::from_chunk_list(chunk_list)
+        ChunkList::from_chunk_list(chunk_list)
     }
 
     fn obj_kind_from_obj_id(obj_id: &ObjId) -> ObjectKind {
@@ -1237,22 +1237,22 @@ impl NamedDataMgr {
         }
     }
 
-    fn base_simple_chunk_list(file_handle: &FileBufferRecord) -> NdnResult<SimpleChunkList> {
+    fn base_simple_chunk_list(file_handle: &FileBufferRecord) -> NdnResult<ChunkList> {
         match &file_handle.base_reader {
-            FileBufferBaseReader::None => Ok(SimpleChunkList::new()),
+            FileBufferBaseReader::None => Ok(ChunkList::new()),
             FileBufferBaseReader::BaseChunkList(chunk_ids) => {
                 if chunk_ids.is_empty() {
-                    return Ok(SimpleChunkList::new());
+                    return Ok(ChunkList::new());
                 }
 
-                match SimpleChunkList::from_chunk_list(chunk_ids.clone()) {
+                match ChunkList::from_chunk_list(chunk_ids.clone()) {
                     Ok(list) => Ok(list),
                     Err(_) => {
                         let total_size = chunk_ids
                             .iter()
                             .filter_map(|chunk_id| chunk_id.get_length())
                             .sum::<u64>();
-                        Ok(SimpleChunkList {
+                        Ok(ChunkList {
                             total_size,
                             body: chunk_ids.clone(),
                         })
@@ -1262,14 +1262,14 @@ impl NamedDataMgr {
         }
     }
 
-    fn clone_chunk_list(list: &SimpleChunkList) -> SimpleChunkList {
-        SimpleChunkList {
+    fn clone_chunk_list(list: &ChunkList) -> ChunkList {
+        ChunkList {
             total_size: list.total_size,
             body: list.body.clone(),
         }
     }
 
-    fn simple_chunk_list_id(list: &SimpleChunkList) -> ObjId {
+    fn simple_chunk_list_id(list: &ChunkList) -> ObjId {
         let (id, _) = Self::clone_chunk_list(list).gen_obj_id();
         id
     }
@@ -1346,7 +1346,7 @@ impl NamedDataMgr {
             return Ok(vec![ChunkId::from_obj_id(&content_id)]);
         }
 
-        if content_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+        if content_id.obj_type == OBJ_TYPE_CHUNK_LIST {
             let chunk_list = match self.load_chunk_list(&content_id).await {
                 Ok(list) => list,
                 Err(_) => return Ok(Vec::new()),

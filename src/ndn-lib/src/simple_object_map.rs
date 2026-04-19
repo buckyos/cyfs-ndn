@@ -1,6 +1,8 @@
+//Simple Object Map是相对元素较少的map
+
 use crate::{
     build_named_object_by_json, build_named_object_by_jwt, object::ObjId, NdnError, NdnResult,
-    OBJ_TYPE_OBJMAP_SIMPLE,
+    OBJ_TYPE_OBJMAP,
 };
 use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -292,7 +294,7 @@ mod test {
         assert_eq!(simple_map1.len(), 3);
 
         let (simple_map1_obj_id, simple_map1_obj_str) = simple_map1
-            .gen_obj_id_with_real_obj(OBJ_TYPE_OBJMAP_SIMPLE, &mut real_obj)
+            .gen_obj_id_with_real_obj(OBJ_TYPE_OBJMAP, &mut real_obj)
             .unwrap();
         println!("simple_map1_obj_id: {}", simple_map1_obj_id.to_string());
         println!("simple_map1_obj_str: {}", simple_map1_obj_str);

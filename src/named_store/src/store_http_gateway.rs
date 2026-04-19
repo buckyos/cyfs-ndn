@@ -622,7 +622,7 @@ impl NamedStoreMgrHttpGateway {
 
         // Parse chunk list to compute big_chunk_size
         let obj_json = ndn_lib::load_named_object_from_obj_str(&chunk_list_str)?;
-        let chunk_list = ndn_lib::SimpleChunkList::from_json_value(obj_json)
+        let chunk_list = ndn_lib::ChunkList::from_json_value(obj_json)
             .map_err(|e| NdnError::InvalidData(format!("invalid chunk list: {e}")))?;
         let big_chunk_size = chunk_list.total_size;
 

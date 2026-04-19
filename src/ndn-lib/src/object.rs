@@ -1,9 +1,7 @@
-use crate::{ChunkType, HashMethod, NdnError, NdnResult, OBJ_TYPE_TRIE};
+use crate::{ChunkType, HashMethod, NdnError, NdnResult};
 use crate::{
-    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_CHUNK_LIST_FIX_SIZE, OBJ_TYPE_CHUNK_LIST_SIMPLE,
-    OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_LIST,
-    OBJ_TYPE_LIST_SIMPLE, OBJ_TYPE_OBJMAP, OBJ_TYPE_OBJMAP_SIMPLE, OBJ_TYPE_PACK, OBJ_TYPE_PKG,
-    OBJ_TYPE_TRIE_SIMPLE,
+    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_LIST, OBJ_TYPE_OBJMAP,
+    OBJ_TYPE_PACK, OBJ_TYPE_PKG,
 };
 use buckyos_kit::get_by_json_path;
 use jsonwebtoken::{encode, DecodingKeyKind, EncodingKey};
@@ -93,7 +91,7 @@ impl ObjId {
     }
 
     pub fn is_chunk_list(&self) -> bool {
-        self.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE
+        self.obj_type == OBJ_TYPE_CHUNK_LIST
     }
 
     pub fn is_json(&self) -> bool {
@@ -118,13 +116,9 @@ impl ObjId {
     pub fn is_container(&self) -> bool {
         match self.obj_type.as_str() {
             OBJ_TYPE_DIR => true,
-            OBJ_TYPE_TRIE | OBJ_TYPE_TRIE_SIMPLE => true,
-            OBJ_TYPE_OBJMAP | OBJ_TYPE_OBJMAP_SIMPLE => true,
-            OBJ_TYPE_LIST | OBJ_TYPE_LIST_SIMPLE => true,
-            OBJ_TYPE_CHUNK_LIST
-            | OBJ_TYPE_CHUNK_LIST_SIMPLE
-            | OBJ_TYPE_CHUNK_LIST_FIX_SIZE
-            | OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE => true,
+            OBJ_TYPE_OBJMAP => true,
+            OBJ_TYPE_LIST => true,
+            OBJ_TYPE_CHUNK_LIST => true,
             _ => false,
         }
     }
@@ -132,11 +126,9 @@ impl ObjId {
     // Check if the object is a big container, which means it is collection and not in simple mode
     pub fn is_big_container(&self) -> bool {
         match self.obj_type.as_str() {
-            OBJ_TYPE_TRIE => true,
             OBJ_TYPE_OBJMAP => true,
             OBJ_TYPE_LIST => true,
             OBJ_TYPE_CHUNK_LIST => true,
-            OBJ_TYPE_CHUNK_LIST_FIX_SIZE => true,
             _ => false,
         }
     }

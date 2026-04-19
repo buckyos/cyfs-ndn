@@ -12,7 +12,7 @@ use named_store::{ChunkStoreState, NamedStoreMgr};
 use ndn_lib::{
     copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers, verify_named_object_from_str,
     CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader, DirObject, FileObject, NdnAction,
-    NdnError, NdnProgressCallback, NdnResult, ObjId, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE,
+    NdnError, NdnProgressCallback, NdnResult, ObjId, StoreMode, OBJ_TYPE_CHUNK_LIST,
     OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 
@@ -329,7 +329,7 @@ impl NdnClient {
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
     ) -> NdnResult<u64> {
         let chunk_list_obj = self.get_obj_by_id(chunk_list_id.clone()).await?;
-        let chunk_list = ndn_lib::SimpleChunkList::from_json_value(chunk_list_obj)?;
+        let chunk_list = ndn_lib::ChunkList::from_json_value(chunk_list_obj)?;
 
         let mut offset = 0u64;
         for chunk_id in chunk_list.body {
@@ -383,7 +383,7 @@ impl NdnClient {
             return Ok(());
         }
 
-        if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+        if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST {
             self.pull_chunklist(&content_obj_id, pull_mode, progress_callback)
                 .await?;
             return Ok(());

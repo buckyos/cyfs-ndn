@@ -107,34 +107,34 @@ impl From<std::io::Error> for NdnError {
     }
 }
 
+pub const OBJ_TYPE_PKG: &str = "pkg"; // package
 pub const OBJ_TYPE_FILE: &str = "cyfile";
 pub const OBJ_TYPE_DIR: &str = "cydir";
-pub const OBJ_TYPE_MSG: &str = "cymsg";
-pub const OBJ_TYPE_MSG_RECE: &str = "cymsgr";
 pub const OBJ_TYPE_PATH: &str = "cypath";
+
 pub const OBJ_TYPE_INCLUSION_PROOF: &str = "cyinc"; // curator -> creator: content inclusion proof (recommend JWT signed by curator)
 pub const OBJ_TYPE_RELATION: &str = "cyrel";
 pub const OBJ_TYPE_ACTION: &str = "cyact";
+
+
+//pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
+//pub const OBJ_TYPE_TRIE_SIMPLE: &str = "cytrie-s"; // simple trie object map
+//pub const OBJ_TYPE_OBJMAP: &str = "cymap-mtp"; // object map
+pub const OBJ_TYPE_OBJMAP: &str = "cymap"; // simple object map
+//pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
+pub const OBJ_TYPE_LIST: &str = "cylist"; // simple object list
+//pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
+pub const OBJ_TYPE_CHUNK_LIST: &str = "clist"; // simple chunk list with mixhash chunk
+//pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list with fixed size
+//pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
 pub const OBJ_TYPE_PACK: &str = "cypack"; // object set
-
-pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
-pub const OBJ_TYPE_TRIE_SIMPLE: &str = "cytrie-s"; // simple trie object map
-
-pub const OBJ_TYPE_OBJMAP: &str = "cymap-mtp"; // object map
-pub const OBJ_TYPE_OBJMAP_SIMPLE: &str = "cymap"; // simple object map
-
-pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
-pub const OBJ_TYPE_LIST_SIMPLE: &str = "cylist"; // simple object list
-
-pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
-pub const OBJ_TYPE_CHUNK_LIST_SIMPLE: &str = "clist"; // simple chunk list with mixhash chunk
-pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list with fixed size
-pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
-
-pub const OBJ_TYPE_PKG: &str = "pkg"; // package
 
 pub const RELATION_TYPE_SAME: &str = "same";
 pub const RELATION_TYPE_PART_OF: &str = "part_of";
+
+pub const OBJ_TYPE_MSG: &str = "cymsg";
+//TODO: reception for any object?
+pub const OBJ_TYPE_MSG_RECE: &str = "cymsgr";
 
 #[derive(Debug, Clone)]
 pub enum NdnAction {
@@ -333,7 +333,7 @@ fn is_descendant_path(potential_child: &String, potential_parent: &String) -> bo
 pub enum KnownStandardObject {
     Dir(DirObject, String),
     File(FileObject, String),
-    ChunkList(SimpleChunkList, String),
+    ChunkList(ChunkList, String),
 }
 
 impl KnownStandardObject {
@@ -360,8 +360,8 @@ impl KnownStandardObject {
                 })?;
                 return Ok(KnownStandardObject::File(file_obj, obj_data.to_string()));
             }
-            OBJ_TYPE_CHUNK_LIST_SIMPLE => {
-                let chunk_list = SimpleChunkList::from_json(obj_data)?;
+            OBJ_TYPE_CHUNK_LIST => {
+                let chunk_list = ChunkList::from_json(obj_data)?;
                 return Ok(KnownStandardObject::ChunkList(
                     chunk_list,
                     obj_data.to_string(),

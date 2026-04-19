@@ -24,7 +24,7 @@ use ndn_lib::{
     caculate_qcid_from_file, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers,
     verify_named_object_from_str, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader,
     DirObject, FileObject, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId,
-    ProgressCallbackResult, SimpleChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST_SIMPLE, OBJ_TYPE_FILE,
+    ProgressCallbackResult, ChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_FILE,
 };
 
 #[derive(Clone)]
@@ -87,7 +87,7 @@ pub enum CyfsHead {
     },
     ChunkList {
         obj_id: ObjId,
-        chunk_list: SimpleChunkList,
+        chunk_list: ChunkList,
         obj_str: String,
     },
 }
@@ -177,7 +177,7 @@ enum PullDescriptor {
         file_action: Option<NdnAction>,
     },
     ChunkList {
-        chunk_list: SimpleChunkList,
+        chunk_list: ChunkList,
         metadata_to_store: Vec<KnownObjectToStore>,
         result_obj_id: Option<ObjId>,
         file_action: Option<NdnAction>,
@@ -471,7 +471,7 @@ impl CyfsNdnClient {
                 .await;
         }
 
-        if content_obj_id.obj_type != OBJ_TYPE_CHUNK_LIST_SIMPLE {
+        if content_obj_id.obj_type != OBJ_TYPE_CHUNK_LIST {
             return Err(NdnError::Unsupported(format!(
                 "unsupported file content obj type: {}",
                 content_obj_id.obj_type
@@ -481,7 +481,7 @@ impl CyfsNdnClient {
         let chunk_list_obj = self
             .get_verified_object_by_id(base, &content_obj_id)
             .await?;
-        let chunk_list = SimpleChunkList::from_json_value(chunk_list_obj.obj_json)?;
+        let chunk_list = ChunkList::from_json_value(chunk_list_obj.obj_json)?;
         let chunklist_store = KnownObjectToStore {
             obj_id: chunk_list_obj.obj_id.clone(),
             obj_str: chunk_list_obj.obj_str.clone(),
@@ -528,7 +528,7 @@ impl CyfsNdnClient {
         target_store_mgr: Option<NamedStoreMgr>,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
         chunklist_store: KnownObjectToStore,
-        chunk_list: SimpleChunkList,
+        chunk_list: ChunkList,
         file_obj: Option<KnownObjectToStore>,
         file_size: u64,
     ) -> NdnResult<CyfsPullResult> {
@@ -859,8 +859,8 @@ impl CyfsNdnResponse {
             ))
         })?;
 
-        let obj_json = if effective_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
-            let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
+        let obj_json = if effective_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST {
+            let chunk_list = ChunkList::from_json(obj_str.as_str())?;
             let (real_obj_id, _) = clone_chunk_list(&chunk_list)?.gen_obj_id();
             if real_obj_id != effective_obj_id {
                 return Err(NdnError::InvalidId(format!(
@@ -990,11 +990,11 @@ impl CyfsNdnResponse {
                 .await;
         }
 
-        if effective_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+        if effective_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST {
             let request = self.request.clone();
             let client = self.client.clone();
             let verified_obj = self.into_verified_object().await?;
-            let chunk_list = SimpleChunkList::from_json_value(verified_obj.obj_json)?;
+            let chunk_list = ChunkList::from_json_value(verified_obj.obj_json)?;
             return client
                 .pull_chunk_list_by_object(
                     &request.resolved_url,
@@ -1054,12 +1054,12 @@ impl CyfsNdnResponse {
                             file_action: Some(NdnAction::FileOK(obj_id.clone(), obj.size)),
                         }));
                     }
-                    if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE {
+                    if content_obj_id.obj_type == OBJ_TYPE_CHUNK_LIST {
                         let chunk_list_obj = self
                             .client
                             .get_verified_object_by_id(&self.request.resolved_url, &content_obj_id)
                             .await?;
-                        let chunk_list = SimpleChunkList::from_json_value(chunk_list_obj.obj_json)?;
+                        let chunk_list = ChunkList::from_json_value(chunk_list_obj.obj_json)?;
                         return Ok(Some(PullDescriptor::ChunkList {
                             chunk_list,
                             metadata_to_store: vec![
@@ -1228,7 +1228,7 @@ impl CyfsNdnResponse {
 
     async fn pull_raw_chunk_list(
         self,
-        chunk_list: SimpleChunkList,
+        chunk_list: ChunkList,
         pull_mode: StoreMode,
         target_store_mgr: Option<NamedStoreMgr>,
         metadata_to_store: Vec<KnownObjectToStore>,
@@ -1600,7 +1600,7 @@ fn parse_cyfs_head_value(raw: &str) -> NdnResult<CyfsHead> {
         }
     }
 
-    if let Ok(chunk_list) = SimpleChunkList::from_json_value(value.clone()) {
+    if let Ok(chunk_list) = ChunkList::from_json_value(value.clone()) {
         let (obj_id, obj_str) = clone_chunk_list(&chunk_list)?.gen_obj_id();
         return Ok(CyfsHead::ChunkList {
             obj_id,
@@ -1661,8 +1661,8 @@ impl CyfsHeadEnvelope {
     }
 }
 
-fn clone_chunk_list(chunk_list: &SimpleChunkList) -> NdnResult<SimpleChunkList> {
-    SimpleChunkList::from_chunk_list(chunk_list.body.clone())
+fn clone_chunk_list(chunk_list: &ChunkList) -> NdnResult<ChunkList> {
+    ChunkList::from_chunk_list(chunk_list.body.clone())
 }
 
 fn verify_chunk_bytes(chunk_id: &ChunkId, chunk_bytes: &[u8]) -> NdnResult<()> {

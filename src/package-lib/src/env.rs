@@ -1043,7 +1043,7 @@ mod tests {
     use buckyos_kit::*;
     use name_lib::DID;
     use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-    use ndn_lib::{FileObject, ObjId, SimpleChunkList, StoreMode, CHUNK_DEFAULT_SIZE};
+    use ndn_lib::{FileObject, ObjId, ChunkList, StoreMode, CHUNK_DEFAULT_SIZE};
     use ndn_toolkit::{cacl_file_object, CheckMode};
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -1543,7 +1543,7 @@ mod tests {
         pkg_meta.size = file_obj.size;
         pkg_meta.content = file_obj.content.clone();
 
-        let chunk_list = SimpleChunkList::from_json(
+        let chunk_list = ChunkList::from_json(
             store_mgr
                 .get_object(&ObjId::new(&pkg_meta.content).unwrap())
                 .await
@@ -1612,7 +1612,7 @@ mod tests {
         dep_meta.size = dep_file_obj.size;
         dep_meta.content = dep_file_obj.content.clone();
 
-        let chunk_list = SimpleChunkList::from_json(
+        let chunk_list = ChunkList::from_json(
             store_mgr
                 .get_object(&ObjId::new(&dep_meta.content).unwrap())
                 .await

@@ -11,7 +11,7 @@ use named_store::{
 use ndn_lib::{
     ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind, MsgObject,
     NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, RefItem,
-    RefRole, RefTarget, SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    RefRole, RefTarget, ChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
@@ -91,8 +91,8 @@ async fn create_test_named_mgr(base_dir: &Path) -> NamedStoreMgr {
     create_test_store_mgr(base_dir).await
 }
 
-fn clone_chunk_list(chunk_list: &SimpleChunkList) -> SimpleChunkList {
-    SimpleChunkList::from_chunk_list(chunk_list.body.clone()).unwrap()
+fn clone_chunk_list(chunk_list: &ChunkList) -> ChunkList {
+    ChunkList::from_chunk_list(chunk_list.body.clone()).unwrap()
 }
 
 fn small_file_size() -> usize {
@@ -142,7 +142,7 @@ async fn build_chunk_list_from_file(
     file_path: &Path,
     chunk_size: usize,
     store_mgr: &NamedStoreMgr,
-) -> SimpleChunkList {
+) -> ChunkList {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
     let mut chunk_ids = Vec::new();
 
@@ -158,13 +158,13 @@ async fn build_chunk_list_from_file(
         chunk_ids.push(chunk_id);
     }
 
-    SimpleChunkList::from_chunk_list(chunk_ids).unwrap()
+    ChunkList::from_chunk_list(chunk_ids).unwrap()
 }
 
 async fn assert_chunk_list_matches_file(
     file_path: &Path,
     store_mgr: NamedStoreMgr,
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
     offset: u64,
 ) {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
@@ -280,7 +280,7 @@ async fn test_chunk_list_main() {
     assert_eq!(chunk_list.body.len(), file_size.div_ceil(chunk_size));
 
     let (chunk_list_id, chunk_list_str) = clone_chunk_list(&chunk_list).gen_obj_id();
-    let parsed_chunk_list = SimpleChunkList::from_json(&chunk_list_str).unwrap();
+    let parsed_chunk_list = ChunkList::from_json(&chunk_list_str).unwrap();
     assert_eq!(parsed_chunk_list.total_size, chunk_list.total_size);
     assert_eq!(parsed_chunk_list.body, chunk_list.body);
 
@@ -421,7 +421,7 @@ async fn test_check_file_object_content_ready() {
 
     let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
     let removed_chunk = chunk_list.body[0].clone();
     store_mgr.remove_chunk(&removed_chunk).await.unwrap();
 
@@ -459,7 +459,7 @@ async fn test_get_chunklist_from_known_named_object() {
 
     let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let expected_chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
 
     let chunk_ids = get_chunklist_from_known_named_object(
         &store_mgr,
@@ -530,7 +530,7 @@ async fn test_get_chunklist_from_msg_object_output_refs() {
     )
     .unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let expected_chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
 
     let msg_obj = MsgObject {
         from: did_web("alice.example.com"),
@@ -810,7 +810,7 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
         chunk_ids.push(chunk_id);
     }
 
-    let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids.clone()).unwrap();
+    let chunk_list = ChunkList::from_chunk_list(chunk_ids.clone()).unwrap();
     let (chunk_list_id, chunk_list_str) = clone_chunk_list(&chunk_list).gen_obj_id();
     let file_obj = FileObject::new(
         "largefile.bin".to_string(),

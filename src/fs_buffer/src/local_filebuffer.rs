@@ -13,7 +13,7 @@ use named_store::{
 use ndm_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use ndn_lib::{
     caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, FileObject,
-    NamedObject, NdnError, NdnResult, ObjId, SimpleChunkList, CHUNK_DEFAULT_SIZE,
+    NamedObject, NdnError, NdnResult, ObjId, ChunkList, CHUNK_DEFAULT_SIZE,
     MIN_QCID_FILE_SIZE,
 };
 use tokio::fs::{self, OpenOptions};
@@ -397,7 +397,7 @@ impl LocalFileBufferService {
             ));
         }
 
-        let simple_chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let simple_chunk_list = ChunkList::from_chunk_list(chunk_ids)?;
         let (chunk_list_obj_id, chunk_list_obj_str) = simple_chunk_list.gen_obj_id();
         Ok(ContentLayout::ChunkList {
             segments,
@@ -409,9 +409,9 @@ impl LocalFileBufferService {
     fn simple_chunk_list_from_ids_with_sizes(
         chunk_ids: Vec<ChunkId>,
         chunk_sizes: &[u64],
-    ) -> NdnResult<SimpleChunkList> {
+    ) -> NdnResult<ChunkList> {
         let total_size: u64 = chunk_sizes.iter().sum();
-        match SimpleChunkList::from_chunk_list(chunk_ids.clone()) {
+        match ChunkList::from_chunk_list(chunk_ids.clone()) {
             Ok(list) => {
                 if list.total_size != total_size {
                     return Err(NdnError::InvalidData(format!(
@@ -421,7 +421,7 @@ impl LocalFileBufferService {
                 }
                 Ok(list)
             }
-            Err(_) => Ok(SimpleChunkList {
+            Err(_) => Ok(ChunkList {
                 total_size,
                 body: chunk_ids,
             }),
@@ -504,7 +504,7 @@ impl LocalFileBufferService {
 
     fn overlay_content_layout(
         &self,
-        merged_chunk_list: SimpleChunkList,
+        merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
     ) -> NdnResult<ContentLayout> {
         if merged_chunk_list.body.len() != merged_chunk_sizes.len() {
@@ -560,7 +560,7 @@ impl LocalFileBufferService {
         &self,
         file_inode_id: u64,
         diff_file_path: &PathBuf,
-        merged_chunk_list: SimpleChunkList,
+        merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
         existing_linked_at: Option<u64>,
     ) -> NdnResult<FinalizeData> {
@@ -1595,7 +1595,7 @@ impl FileBufferService for LocalFileBufferService {
 mod tests {
     use super::*;
     use ndn_lib::{
-        ChunkHasher, ChunkType, FileObject, NamedObject, SimpleChunkList, CHUNK_DEFAULT_SIZE,
+        ChunkHasher, ChunkType, FileObject, NamedObject, ChunkList, CHUNK_DEFAULT_SIZE,
     };
     use tempfile::tempdir;
 
@@ -1862,7 +1862,7 @@ mod tests {
             .unwrap()
             .calc_mix_chunk_id_from_bytes(&second)
             .unwrap();
-        let simple_chunk_list = SimpleChunkList::from_chunk_list(vec![chunk_1, chunk_2]).unwrap();
+        let simple_chunk_list = ChunkList::from_chunk_list(vec![chunk_1, chunk_2]).unwrap();
         let (content_obj_id, _) = simple_chunk_list.gen_obj_id();
         assert!(content_obj_id.is_chunk_list());
 

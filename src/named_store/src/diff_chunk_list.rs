@@ -1,5 +1,5 @@
 use crate::{chunk_list_reader::OpenChunkReader, NamedStoreMgr};
-use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, SimpleChunkList};
+use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, ChunkList};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -130,7 +130,7 @@ pub struct DiffChunkListReader {
 impl DiffChunkListReader {
     pub async fn new(
         named_store_mgr: Arc<NamedStoreMgr>,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         diff_chunk_list: DiffChunkList,
         seek_from: SeekFrom,
         auto_cache: bool,
@@ -151,7 +151,7 @@ impl DiffChunkListReader {
 
     pub async fn with_options(
         named_store_mgr: Arc<NamedStoreMgr>,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         diff_chunk_list: DiffChunkList,
         seek_from: SeekFrom,
         options: DiffChunkListReaderOptions,
@@ -219,7 +219,7 @@ impl DiffChunkListReader {
 
     pub async fn from_writer_state(
         named_store_mgr: Arc<NamedStoreMgr>,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         writer_state: &DiffChunkListWriterState,
         seek_from: SeekFrom,
         open_chunk_reader: Option<OpenChunkReader>,
@@ -258,7 +258,7 @@ impl DiffChunkListReader {
 
     pub async fn from_writer_state_file(
         named_store_mgr: Arc<NamedStoreMgr>,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         diff_file_path: impl AsRef<Path>,
         seek_from: SeekFrom,
         open_chunk_reader: Option<OpenChunkReader>,
@@ -285,7 +285,7 @@ impl DiffChunkListReader {
     pub async fn build_simple_chunk_list(
         &self,
         store_to_named_store_mgr: bool,
-    ) -> NdnResult<SimpleChunkList> {
+    ) -> NdnResult<ChunkList> {
         let mut chunk_ids = Vec::with_capacity(self.merged_chunks.len());
 
         for merged_chunk in &self.merged_chunks {
@@ -315,7 +315,7 @@ impl DiffChunkListReader {
             }
         }
 
-        SimpleChunkList::from_chunk_list(chunk_ids)
+        ChunkList::from_chunk_list(chunk_ids)
     }
 
     async fn read_diff_chunk_bytes(&self, entry: &DiffEntryMeta) -> NdnResult<Vec<u8>> {
@@ -623,7 +623,7 @@ pub struct DiffChunkListDirtyChunk {
 }
 
 pub struct DiffChunkListMergedState {
-    pub merged_chunk_list: SimpleChunkList,
+    pub merged_chunk_list: ChunkList,
     pub merged_chunk_sizes: Vec<u64>,
     pub dirty_chunks: Vec<DiffChunkListDirtyChunk>,
 }
@@ -658,7 +658,7 @@ impl DiffChunkListWriter {
     pub async fn new(
         named_store_mgr: Arc<NamedStoreMgr>,
         base_chunk_list_id: ObjId,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         diff_file_path: impl AsRef<Path>,
         options: DiffChunkListWriterOptions,
     ) -> NdnResult<Self> {
@@ -716,7 +716,7 @@ impl DiffChunkListWriter {
 
     pub async fn open_from_state(
         named_store_mgr: Arc<NamedStoreMgr>,
-        base_chunk_list: SimpleChunkList,
+        base_chunk_list: ChunkList,
         state: DiffChunkListWriterState,
         open_chunk_reader: Option<OpenChunkReader>,
     ) -> NdnResult<Self> {
@@ -933,7 +933,7 @@ impl DiffChunkListWriter {
         Ok(state)
     }
 
-    pub async fn finalize(self, named_mode: bool) -> NdnResult<(DiffChunkList, SimpleChunkList)> {
+    pub async fn finalize(self, named_mode: bool) -> NdnResult<(DiffChunkList, ChunkList)> {
         let persisted = self.persist_dirty_chunks_to_diff_file(named_mode).await?;
 
         let merged_chunk_ids = Self::build_merged_chunk_ids(
@@ -1315,9 +1315,9 @@ fn to_io_error(err: NdnError) -> std::io::Error {
 fn build_simple_chunk_list_from_ids(
     chunk_ids: Vec<ChunkId>,
     merged_chunk_sizes: &[u64],
-) -> NdnResult<SimpleChunkList> {
+) -> NdnResult<ChunkList> {
     let merged_total: u64 = merged_chunk_sizes.iter().sum();
-    match SimpleChunkList::from_chunk_list(chunk_ids.clone()) {
+    match ChunkList::from_chunk_list(chunk_ids.clone()) {
         Ok(list) => {
             if list.total_size != merged_total {
                 return Err(NdnError::InvalidData(format!(
@@ -1327,7 +1327,7 @@ fn build_simple_chunk_list_from_ids(
             }
             Ok(list)
         }
-        Err(_) => Ok(SimpleChunkList {
+        Err(_) => Ok(ChunkList {
             total_size: merged_total,
             body: chunk_ids,
         }),
@@ -1426,7 +1426,7 @@ fn validate_diff_file_len(entries: &[DiffEntryMeta], file_size: u64) -> NdnResul
 }
 
 fn build_merged_chunks(
-    base_chunk_list: &SimpleChunkList,
+    base_chunk_list: &ChunkList,
     base_chunk_sizes: &[u64],
     diff_entries: &[DiffEntryMeta],
 ) -> NdnResult<Vec<MergedChunkMeta>> {
@@ -1544,7 +1544,7 @@ fn resolve_diff_chunk_sizes(
 
 async fn resolve_chunk_sizes_for_list(
     named_store_mgr: &Arc<NamedStoreMgr>,
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
     local_mode: bool,
     fixed_chunk_size: Option<u64>,
     explicit_chunk_sizes: Option<Vec<u64>>,
@@ -1583,7 +1583,7 @@ async fn resolve_chunk_sizes_for_list(
     ))
 }
 
-fn resolve_mix_chunk_sizes(chunk_list: &SimpleChunkList) -> Option<Vec<u64>> {
+fn resolve_mix_chunk_sizes(chunk_list: &ChunkList) -> Option<Vec<u64>> {
     let mut sizes = Vec::with_capacity(chunk_list.body.len());
     for chunk_id in &chunk_list.body {
         let Some(chunk_size) = chunk_id.get_length() else {
@@ -1595,7 +1595,7 @@ fn resolve_mix_chunk_sizes(chunk_list: &SimpleChunkList) -> Option<Vec<u64>> {
 }
 
 fn resolve_fixed_chunk_sizes(
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
     fixed_chunk_size: u64,
 ) -> NdnResult<Vec<u64>> {
     if chunk_list.body.is_empty() {
@@ -1639,7 +1639,7 @@ fn resolve_fixed_chunk_sizes(
 
 async fn ensure_chunks_available_in_local(
     named_store_mgr: &Arc<NamedStoreMgr>,
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
     expected_sizes: Option<&Vec<u64>>,
 ) -> NdnResult<Vec<u64>> {
     let mut chunk_sizes = Vec::with_capacity(chunk_list.body.len());
@@ -1682,8 +1682,8 @@ mod tests {
             .unwrap()
     }
 
-    fn clone_chunk_list(chunk_list: &SimpleChunkList) -> SimpleChunkList {
-        SimpleChunkList {
+    fn clone_chunk_list(chunk_list: &ChunkList) -> ChunkList {
+        ChunkList {
             total_size: chunk_list.total_size,
             body: chunk_list.body.clone(),
         }
@@ -1728,7 +1728,7 @@ mod tests {
     async fn setup_base_chunk_list(
         store: &Arc<tokio::sync::Mutex<NamedLocalStore>>,
         chunks: &[Vec<u8>],
-    ) -> SimpleChunkList {
+    ) -> ChunkList {
         let chunk_ids: Vec<ChunkId> = chunks
             .iter()
             .map(|chunk| calc_mix_chunk_id(chunk))
@@ -1741,7 +1741,7 @@ mod tests {
             }
         }
 
-        SimpleChunkList::from_chunk_list(chunk_ids).unwrap()
+        ChunkList::from_chunk_list(chunk_ids).unwrap()
     }
 
     #[tokio::test]

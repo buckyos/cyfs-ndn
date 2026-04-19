@@ -18,7 +18,7 @@ use crate::{
 use log::{info, warn};
 use ndn_lib::{
     extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkReader,
-    DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleChunkList, SimpleMapItem,
+    DirObject, FileObject, NdnError, NdnResult, ObjId, ChunkList, SimpleMapItem,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -630,7 +630,7 @@ impl NamedStoreMgr {
                     Some(s) => s,
                     None => self.get_object(obj_id).await?,
                 };
-                let chunk_list = SimpleChunkList::from_json(obj_str.as_str())?;
+                let chunk_list = ChunkList::from_json(obj_str.as_str())?;
                 for chunk_id in chunk_list.body.iter() {
                     let sub_obj_id = chunk_id.to_obj_id();
                     if !self.is_object_fully_stored(&sub_obj_id, None).await? {
@@ -898,7 +898,7 @@ impl NamedStoreMgr {
 
         let chunklist_json = self.get_object(chunklist_id).await?;
         let vec_chunk_id: Vec<ChunkId> = load_named_obj(chunklist_json.as_str())?;
-        let chunk_list = SimpleChunkList::from_chunk_list(vec_chunk_id)?;
+        let chunk_list = ChunkList::from_chunk_list(vec_chunk_id)?;
 
         let total_size = chunk_list.total_size;
         let reader = SimpleChunkListReader::new(
@@ -917,7 +917,7 @@ impl NamedStoreMgr {
         offset: u64,
     ) -> NdnResult<(ChunkReader, u64)> {
         let vec_chunk_id: Vec<ChunkId> = load_named_obj(chunklist_json)?;
-        let chunk_list = SimpleChunkList::from_chunk_list(vec_chunk_id)?;
+        let chunk_list = ChunkList::from_chunk_list(vec_chunk_id)?;
         let total_size = chunk_list.total_size;
         let reader = SimpleChunkListReader::new(
             Arc::new(self.clone()),

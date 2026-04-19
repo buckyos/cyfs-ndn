@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use ndn_lib::{
     caculate_qcid_from_file, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkType,
     DirObject, FileObject, MsgObject, NamedObject, NdnAction, NdnError, NdnProgressCallback,
-    NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, SimpleChunkList, StoreMode,
+    NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, ChunkList, StoreMode,
     CHUNK_DEFAULT_SIZE,
 };
 
@@ -285,7 +285,7 @@ pub async fn cacl_file_object(
     }
 
     if use_chunk_list_now {
-        let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let chunk_list = ChunkList::from_chunk_list(chunk_ids)?;
         let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
         file_obj_result.content = chunk_list_id.to_string();
 
@@ -322,7 +322,7 @@ pub async fn collect_missing_chunks_for_file_object(
 
     if content_obj_id.is_chunk_list() {
         let chunklist_json = store_mgr.get_object(&content_obj_id).await?;
-        let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str())?;
+        let chunk_list = ChunkList::from_json(chunklist_json.as_str())?;
         let mut missing_chunks = Vec::new();
 
         for chunk_id in chunk_list.body.iter() {
@@ -598,7 +598,7 @@ pub async fn copy_dir_from_ndn_mgr(
 async fn ensure_chunk_list_chunks_ready(
     store_mgr: &NamedStoreMgr,
     owner_obj_id: &ObjId,
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
 ) -> NdnResult<Vec<ChunkId>> {
     let mut missing_chunks = Vec::new();
     for chunk_id in chunk_list.body.iter() {
@@ -709,7 +709,7 @@ async fn get_chunklist_from_known_named_object_impl(
     }
 
     if obj_id.is_chunk_list() {
-        let chunk_list = SimpleChunkList::from_json_value(obj_json.clone())?;
+        let chunk_list = ChunkList::from_json_value(obj_json.clone())?;
         return ensure_chunk_list_chunks_ready(store_mgr, obj_id, &chunk_list).await;
     }
 
