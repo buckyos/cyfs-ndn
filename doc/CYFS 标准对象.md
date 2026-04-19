@@ -99,7 +99,10 @@ sha256:0203040506  <->  onugcmrvgy5aeayeauda
 
 ### 3.1 计算公式
 
+> JSON的稳定编码兼容 RFC 8785 (JCS)
+
 对“标准 JSON 对象”（非 Chunk、非容器派生特殊规则）使用以下规则（`build_named_object_by_json`）：
+
 
 1. 将待计算对象表示为 JSON 值 `V`。
 2. 对 `V` 进行稳定化（递归排序 JSON object key；数组保持顺序）。
