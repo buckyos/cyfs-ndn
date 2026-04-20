@@ -134,7 +134,7 @@ pub const RELATION_TYPE_PART_OF: &str = "part_of";
 
 pub const OBJ_TYPE_MSG: &str = "cymsg";
 //TODO: reception for any object?
-pub const OBJ_TYPE_MSG_RECE: &str = "cymsgr";
+pub const OBJ_TYPE_RECEIPT: &str = "cyrece";
 
 #[derive(Debug, Clone)]
 pub enum NdnAction {

@@ -728,16 +728,12 @@ async fn test_cyfs_ndn_client_object_uses_cyfs_head() {
         chunk_id.to_string(),
     );
     let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
-    let head_str = serde_json::json!({
-        "obj_id": file_obj_id.to_string()
-    })
-    .to_string();
 
     let body = file_obj_str.clone();
-    let head = head_str.clone();
+    let obj_id_header = file_obj_id.to_string();
     let route = warp::path!("alias" / "fileobj").map(move || {
         warp::http::Response::builder()
-            .header("cyfs-head", head.clone())
+            .header("cyfs-obj-id", obj_id_header.clone())
             .body(body.clone())
             .unwrap()
     });
@@ -819,22 +815,30 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
     );
     let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
 
-    let file_bytes_for_route = file_bytes.clone();
     let chunk_list_id_str = chunk_list_id.to_string();
     let chunk_list_str_for_route = chunk_list_str.clone();
     let file_obj_id_str = file_obj_id.to_string();
     let file_obj_str_for_route = file_obj_str.clone();
+    let chunk_map_for_route = chunk_map.clone();
     let route = warp::path!("largefile" / String).map(move |obj_id: String| {
         if obj_id == file_obj_id_str {
             return warp::http::Response::builder()
-                .header("cyfs-head", file_obj_str_for_route.clone())
-                .body(file_bytes_for_route.clone())
+                .header("cyfs-obj-id", file_obj_id_str.clone())
+                .body(file_obj_str_for_route.clone().into_bytes())
                 .unwrap();
         }
 
         if obj_id == chunk_list_id_str {
             return warp::http::Response::builder()
+                .header("cyfs-obj-id", chunk_list_id_str.clone())
                 .body(chunk_list_str_for_route.clone().into_bytes())
+                .unwrap();
+        }
+
+        if let Some(bytes) = chunk_map_for_route.get(&obj_id) {
+            return warp::http::Response::builder()
+                .header("cyfs-obj-id", obj_id.clone())
+                .body(bytes.clone())
                 .unwrap();
         }
 

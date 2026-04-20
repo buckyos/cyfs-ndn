@@ -464,7 +464,7 @@ mod tests {
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
     use crate::{
         ActionObject, CanonValue, InclusionProof, MachineContent, MsgContent, MsgContentFormat,
-        MsgObjKind, MsgObject, MsgReceiptObj, PathObject, ReceiptStatus, RefItem, RefRole,
+        MsgObjKind, MsgObject, ReceiptObj, PathObject, ReceiptStatus, RefItem, RefRole,
         RefTarget, RelationObject, TopicThread, ACTION_TYPE_VIEWED,
     };
     use name_lib::DID;
@@ -892,12 +892,11 @@ mod tests {
             ]),
         };
 
-        let msg_receipt = MsgReceiptObj {
-            msg_id: ObjId::new("cymsg:010203040506").unwrap(),
+        let msg_receipt = ReceiptObj {
+            obj_id: ObjId::new("cymsg:010203040506").unwrap(),
             iss: did_web("inbox.example.com"),
-            reader: did_web("bob.example.com"),
-            group_id: Some(did_web("group.example.com")),
-            at_ms: 1_700_000_100_000,
+            channel: Some("group".to_string()),
+            iat: 1_700_000_100_000,
             status: ReceiptStatus::Accepted,
             reason: Some("delivered".to_string()),
         };

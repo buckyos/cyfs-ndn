@@ -1,6 +1,6 @@
 //! Message object definitions.
 
-use crate::{NamedObject, ObjId, OBJ_TYPE_MSG, OBJ_TYPE_MSG_RECE};
+use crate::{NamedObject, ObjId, OBJ_TYPE_MSG, OBJ_TYPE_RECEIPT};
 use buckyos_kit::buckyos_get_unix_timestamp;
 use name_lib::DID;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -323,20 +323,20 @@ pub enum ReceiptStatus {
 
 /// Optional immutable delivery receipt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MsgReceiptObj {
-    pub msg_id: ObjId,
+pub struct ReceiptObj {
+    pub obj_id: ObjId,
     pub iss: DID,
-    pub reader: DID,
-    pub group_id: Option<DID>,
-    pub at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub channel: Option<String>,
+    pub iat: u64,
     pub status: ReceiptStatus,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reason: Option<String>,
 }
 
-impl NamedObject for MsgReceiptObj {
+impl NamedObject for ReceiptObj {
     fn get_obj_type() -> &'static str {
-        OBJ_TYPE_MSG_RECE
+        OBJ_TYPE_RECEIPT
     }
 }
 
@@ -384,11 +384,11 @@ mod tests {
         );
     }
 
-    fn assert_receipt_roundtrip_consistency(original: &MsgReceiptObj) -> MsgReceiptObj {
+    fn assert_receipt_roundtrip_consistency(original: &ReceiptObj) -> ReceiptObj {
         let s1 = serde_json::to_string(original).unwrap();
-        let d1: MsgReceiptObj = serde_json::from_str(&s1).unwrap();
+        let d1: ReceiptObj = serde_json::from_str(&s1).unwrap();
         let s2 = serde_json::to_string(&d1).unwrap();
-        let d2: MsgReceiptObj = serde_json::from_str(&s2).unwrap();
+        let d2: ReceiptObj = serde_json::from_str(&s2).unwrap();
 
         assert_eq!(d1, d2);
 
@@ -401,16 +401,16 @@ mod tests {
         let (id2, _) = d2.gen_obj_id();
         assert_eq!(id0, id1);
         assert_eq!(id1, id2);
-        assert_eq!(id2.obj_type, OBJ_TYPE_MSG_RECE);
+        assert_eq!(id2.obj_type, OBJ_TYPE_RECEIPT);
 
         let (id3, _) =
-            build_named_object_by_json(OBJ_TYPE_MSG_RECE, &serde_json::to_value(&d2).unwrap());
+            build_named_object_by_json(OBJ_TYPE_RECEIPT, &serde_json::to_value(&d2).unwrap());
         assert_eq!(id2, id3);
 
         d2
     }
 
-    fn print_receipt_json(case_name: &str, receipt: &MsgReceiptObj) {
+    fn print_receipt_json(case_name: &str, receipt: &ReceiptObj) {
         println!(
             "{} json: {}",
             case_name,
@@ -965,12 +965,11 @@ mod tests {
 
     #[test]
     fn test_msg_receipt_obj_minimal() {
-        let receipt = MsgReceiptObj {
-            msg_id: ObjId::new("cymsg:1234567890abcdef").unwrap(),
+        let receipt = ReceiptObj {
+            obj_id: ObjId::new("cymsg:1234567890abcdef").unwrap(),
             iss: did_web("msg-receipt.example.com"),
-            reader: did_web("alice.example.com"),
-            group_id: None,
-            at_ms: 1735689700000,
+            channel: None,
+            iat: 1735689700000,
             status: ReceiptStatus::Accepted,
             reason: None,
         };
@@ -979,24 +978,23 @@ mod tests {
         let value = serde_json::to_value(&receipt).unwrap();
         assert!(value.get("reason").is_none());
         assert_eq!(value["iss"], json!("did:web:msg-receipt.example.com"));
-        assert_eq!(value["reader"], json!("did:web:alice.example.com"));
+        assert!(value.get("channel").is_none());
 
         let normalized = assert_receipt_roundtrip_consistency(&receipt);
         assert_eq!(normalized.iss, did_web("msg-receipt.example.com"));
-        assert_eq!(normalized.reader, did_web("alice.example.com"));
-        assert_eq!(normalized.group_id, None);
+        assert_eq!(normalized.channel, None);
+        assert_eq!(normalized.iat, 1735689700000);
         assert_eq!(normalized.status, ReceiptStatus::Accepted);
         assert_eq!(normalized.reason, None);
     }
 
     #[test]
     fn test_msg_receipt_obj_with_issuer_and_reason() {
-        let receipt = MsgReceiptObj {
-            msg_id: ObjId::new("cymsg:abcdef1234567890").unwrap(),
+        let receipt = ReceiptObj {
+            obj_id: ObjId::new("cymsg:abcdef1234567890").unwrap(),
             iss: did_web("inbox-router.example.com"),
-            reader: did_web("bob.example.com"),
-            group_id: Some(did_web("dev-team.chat.example.com")),
-            at_ms: 1735689710000,
+            channel: Some("group".to_string()),
+            iat: 1735689710000,
             status: ReceiptStatus::Rejected,
             reason: Some("policy_denied".to_string()),
         };
@@ -1004,11 +1002,8 @@ mod tests {
 
         let normalized = assert_receipt_roundtrip_consistency(&receipt);
         assert_eq!(normalized.iss, did_web("inbox-router.example.com"));
-        assert_eq!(normalized.reader, did_web("bob.example.com"));
-        assert_eq!(
-            normalized.group_id,
-            Some(did_web("dev-team.chat.example.com"))
-        );
+        assert_eq!(normalized.channel, Some("group".to_string()));
+        assert_eq!(normalized.iat, 1735689710000);
         assert_eq!(normalized.status, ReceiptStatus::Rejected);
         assert_eq!(normalized.reason, Some("policy_denied".to_string()));
     }
@@ -1016,29 +1011,27 @@ mod tests {
     #[test]
     fn test_msg_receipt_obj_from_json_and_obj_id_consistency() {
         let raw = json!({
-            "msg_id": "cymsg:00112233445566778899aabbccddeeff",
+            "obj_id": "cymsg:00112233445566778899aabbccddeeff",
             "iss": "did:web:inbox.example.com",
-            "reader": "did:web:carol.example.com",
-            "group_id": "did:web:dev-team.chat.example.com",
-            "at_ms": 1735689720000u64,
+            "channel": "group",
+            "iat": 1735689720000u64,
             "status": "quarantined",
             "reason": "needs_manual_review"
         });
 
-        let receipt: MsgReceiptObj = serde_json::from_value(raw).unwrap();
+        let receipt: ReceiptObj = serde_json::from_value(raw).unwrap();
         assert_eq!(receipt.iss, did_web("inbox.example.com"));
-        assert_eq!(receipt.reader, did_web("carol.example.com"));
-        assert_eq!(receipt.group_id, Some(did_web("dev-team.chat.example.com")));
-        assert_eq!(receipt.at_ms, 1735689720000u64);
+        assert_eq!(receipt.channel, Some("group".to_string()));
+        assert_eq!(receipt.iat, 1735689720000u64);
         assert_eq!(receipt.status, ReceiptStatus::Quarantined);
         assert_eq!(receipt.reason, Some("needs_manual_review".to_string()));
         print_receipt_json("receipt_from_json", &receipt);
 
         let (obj_id, _) = receipt.gen_obj_id();
-        assert_eq!(obj_id.obj_type, OBJ_TYPE_MSG_RECE);
+        assert_eq!(obj_id.obj_type, OBJ_TYPE_RECEIPT);
 
         let (obj_id2, _) =
-            build_named_object_by_json(OBJ_TYPE_MSG_RECE, &serde_json::to_value(&receipt).unwrap());
+            build_named_object_by_json(OBJ_TYPE_RECEIPT, &serde_json::to_value(&receipt).unwrap());
         assert_eq!(obj_id, obj_id2);
     }
 }
