@@ -4,14 +4,14 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 
 ## Core Principles
 
-- The FUSE layer is a thin adapter over `NamedFileMgr` (NDM).
+- The FUSE layer is a thin adapter over `NamedFileMgr` (NFS).
 - Avoid direct use of `store_mgr` / `fs_buffer` from the FUSE request path.
-- Any data persistence or linking is managed by NDM semantics, not local filesystem semantics.
+- Any data persistence or linking is managed by NFS semantics, not local filesystem semantics.
 
 ## Path & Inode Semantics
 
-- Inodes are derived from NDM inode IDs when available; otherwise a stable synthetic inode is created.
-- Path resolution is delegated to NDM (`resolve_path`, `stat`, `list_*`).
+- Inodes are derived from NFS inode IDs when available; otherwise a stable synthetic inode is created.
+- Path resolution is delegated to NFS (`resolve_path`, `stat`, `list_*`).
 - TODO: Define cache invalidation strategy for inode/path maps.
 
 ## Supported Operations (Target)
@@ -19,7 +19,7 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 ### Lookup / Getattr
 
 - Map `lookup` and `getattr` to `NamedFileMgr::stat`.
-- Use NDM inode ID when present.
+- Use NFS inode ID when present.
 - TODO: Define UID/GID/permissions mapping rules (currently fixed 755/644).
 
 ### Readdir
@@ -37,7 +37,7 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 
 - Use `open_file_writer` with `OpenWriteFlag` derived from flags.
 - Use `close_file` on release.
-- TODO: Define `O_TRUNC` and `O_APPEND` mapping for NDM write state.
+- TODO: Define `O_TRUNC` and `O_APPEND` mapping for NFS write state.
 - TODO: Define `fsync` / `flush` expectations and commit policy.
 
 ### Mkdir / Unlink / Rename
@@ -49,18 +49,18 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 ## Link Semantics
 
 - Local filesystem hardlink/symlink creation must be rejected.
-- NDM can create internal links (e.g., `symlink`), which may be exposed via a dedicated command or extended API.
-- TODO: Decide if/when to map FUSE `link`/`symlink` to NDM `symlink`.
+- NFS can create internal links (e.g., `symlink`), which may be exposed via a dedicated command or extended API.
+- TODO: Decide if/when to map FUSE `link`/`symlink` to NFS `symlink`.
 
 ## Unsupported Operations (Current)
 
 - `setattr`, `symlink`, `link`, `mknod`, `readlink`, `xattr`.
-- TODO: Revisit unsupported operations list after NDM capability review.
+- TODO: Revisit unsupported operations list after NFS capability review.
 
 ## Error Mapping
 
 - Map `NdnError` to standard `errno` values (ENOENT, EEXIST, EINVAL, EPERM, ENOSYS, EIO).
-- TODO: Add explicit mapping for permission/auth errors from future NDM policies.
+- TODO: Add explicit mapping for permission/auth errors from future NFS policies.
 
 ## Security & Permissions
 

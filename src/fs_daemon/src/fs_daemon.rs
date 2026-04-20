@@ -6,7 +6,7 @@ use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
 use log::{debug, info, warn};
 use named_store::{NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
 use cyfs::{
-    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NdmFileWriter, OpenWriteFlag, PathKind,
+    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NfsFileWriter, OpenWriteFlag, PathKind,
     ReadOptions,
 };
 use ndn_lib::{NfsPath, NdnError, NdnResult};
@@ -98,7 +98,7 @@ impl Default for StoreConfigEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct FsDaemonServiceConfig {
-    #[serde(alias = "instance", alias = "cyfs_instance_id", alias = "ndm_instance_id")]
+    #[serde(alias = "instance", alias = "cyfs_instance_id")]
     instance_id: String,
     #[serde(alias = "buffer_dir", alias = "fs_buffer_path")]
     fs_buffer_dir: PathBuf,
@@ -265,7 +265,7 @@ impl InodeTable {
 }
 
 struct OpenHandle {
-    writer: NdmFileWriter,
+    writer: NfsFileWriter,
     inode_id: u64,
 }
 

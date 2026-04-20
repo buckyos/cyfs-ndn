@@ -283,7 +283,7 @@
 ## C. 物化/状态机相关（Working/Cooling/Linked/Finalized 的坑）
 
 这些用例如果 **没有“手工物化/查询状态”的工具** 会变成“等待型、非确定性”
-如果有类似 `ndmctl finalize <path>`、`ndmctl inode_state <path>` 的调试接口，建议直接用它让测试确定性。
+如果有类似 `cyfsctl finalize <path>`、`cyfsctl inode_state <path>` 的调试接口，建议直接用它让测试确定性。
 
 ### C01 close 后很快 reopen 并写入（覆盖设计文档里提到的 CAS 竞态）
 

@@ -1,4 +1,4 @@
-//! CYFS core orchestration layer built on Named File Manager (NDM)
+//! CYFS core orchestration layer built on Named File Manager (NFS)
 //!
 //! This module coordinates fs_meta, fs_buffer, and named_store to provide
 //! a unified file/directory namespace with overlay semantics.
@@ -78,13 +78,13 @@ pub struct ReadOptions {
 /// Inner path for accessing content within an object
 pub type InnerPath = String;
 
-pub struct NdmFileWriter {
+pub struct NfsFileWriter {
     writer: DiffChunkListWriter,
     fb: FileBufferRecord,
     fsbuffer: Arc<dyn FileBufferService>,
 }
 
-impl NdmFileWriter {
+impl NfsFileWriter {
     pub async fn seek(&mut self, seek_from: SeekFrom) -> NdnResult<u64> {
         self.writer.seek(seek_from)
     }
@@ -96,7 +96,7 @@ impl NdmFileWriter {
     pub async fn flush(&mut self) -> NdnResult<()> {
         let writer_state = self.writer.close().await.map_err(|e| {
             warn!(
-                "NdmFileWriter::flush: close writer failed, inode_id={}, err={}",
+                "NfsFileWriter::flush: close writer failed, inode_id={}, err={}",
                 self.fb.file_inode_id, e
             );
             e
@@ -104,7 +104,7 @@ impl NdmFileWriter {
         let diff_state = NamedFileMgr::diff_state_from_writer_state(&writer_state);
         let mut state = self.fb.diff_state.write().map_err(|_| {
             warn!(
-                "NdmFileWriter::flush: diff_state lock poisoned, inode_id={}",
+                "NfsFileWriter::flush: diff_state lock poisoned, inode_id={}",
                 self.fb.file_inode_id
             );
             NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
@@ -113,19 +113,19 @@ impl NdmFileWriter {
         drop(state);
 
         debug!(
-            "NdmFileWriter::flush: fsbuffer.flush, inode_id={}, diff_file={}",
+            "NfsFileWriter::flush: fsbuffer.flush, inode_id={}, diff_file={}",
             self.fb.file_inode_id,
             self.fb.diff_file_path.display()
         );
         self.fsbuffer.flush(&self.fb).await.map_err(|e| {
             warn!(
-                "NdmFileWriter::flush: fsbuffer.flush failed, inode_id={}, err={}",
+                "NfsFileWriter::flush: fsbuffer.flush failed, inode_id={}, err={}",
                 self.fb.file_inode_id, e
             );
             e
         })?;
         info!(
-            "NdmFileWriter::flush: writer state flushed, inode_id={}, total_size={}",
+            "NfsFileWriter::flush: writer state flushed, inode_id={}, total_size={}",
             self.fb.file_inode_id, writer_state.total_size
         );
         Ok(())
@@ -1364,7 +1364,7 @@ impl NamedFileMgr {
         path: &NfsPath,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
-    ) -> NdnResult<(NdmFileWriter, IndexNodeId)> {
+    ) -> NdnResult<(NfsFileWriter, IndexNodeId)> {
         debug!(
             "NamedFileMgr::open_file_writer: fsmeta.open_file_writer, path={}, flag={:?}, expected_size={:?}",
             path.as_str(),
@@ -1472,7 +1472,7 @@ impl NamedFileMgr {
             inode_id
         );
         Ok((
-            NdmFileWriter {
+            NfsFileWriter {
                 writer,
                 fb: file_handle,
                 fsbuffer: self.fsbuffer.clone(),
@@ -1568,7 +1568,7 @@ impl NamedFileMgr {
 
     // ========== Pull Operations,need more think ==========
 
-    // pub async fn pull(&self, path: &NdmPath, ctx: PullContext) -> NdnResult<()> {
+    // pub async fn pull(&self, path: &NfsPath, ctx: PullContext) -> NdnResult<()> {
     //     let stat = self.stat(path).await?;
     //     if let Some(obj_id) = stat.obj_id {
     //         self.pull_by_objid(obj_id, ctx).await

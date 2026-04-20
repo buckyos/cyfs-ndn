@@ -20,7 +20,7 @@ use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::buffer_db::LocalFileBufferDB;
-use crate::fb_service::{FileBufferService, NdmPath, WriteLease};
+use crate::fb_service::{FileBufferService, NfsPath, WriteLease};
 
 static HANDLE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -991,7 +991,7 @@ impl LocalFileBufferService {
 impl FileBufferService for LocalFileBufferService {
     async fn alloc_buffer(
         &self,
-        _path: &NdmPath,
+        _path: &NfsPath,
         file_inode_id: u64,
         base_chunk_list: Vec<ChunkId>,
         _lease: &WriteLease,
@@ -1615,7 +1615,7 @@ mod tests {
         let service = LocalFileBufferService::new(base.clone(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/a.txt".to_string()),
+                &NfsPath("/a.txt".to_string()),
                 100,
                 vec![],
                 &test_lease(),
@@ -1653,7 +1653,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/b.txt".to_string()),
+                &NfsPath("/b.txt".to_string()),
                 101,
                 vec![],
                 &test_lease(),
@@ -1680,7 +1680,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/c.txt".to_string()),
+                &NfsPath("/c.txt".to_string()),
                 102,
                 vec![],
                 &test_lease(),
@@ -1701,7 +1701,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/d.txt".to_string()),
+                &NfsPath("/d.txt".to_string()),
                 103,
                 vec![],
                 &test_lease(),
@@ -1740,7 +1740,7 @@ mod tests {
         let dirty_chunk_bytes = b"diff-chunk";
         let fb = service
             .alloc_buffer(
-                &NdmPath("/e.txt".to_string()),
+                &NfsPath("/e.txt".to_string()),
                 104,
                 vec![base_chunk.clone()],
                 &test_lease(),
@@ -1793,7 +1793,7 @@ mod tests {
         let base_chunk = ChunkId::from_mix_hash_result(huge_size, &[0x11; 32], ChunkType::Mix256);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/overlay-linked.txt".to_string()),
+                &NfsPath("/overlay-linked.txt".to_string()),
                 107,
                 vec![base_chunk.clone()],
                 &test_lease(),
@@ -1827,7 +1827,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/big.txt".to_string()),
+                &NfsPath("/big.txt".to_string()),
                 105,
                 vec![],
                 &test_lease(),
@@ -1881,7 +1881,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/linked-big.txt".to_string()),
+                &NfsPath("/linked-big.txt".to_string()),
                 106,
                 vec![],
                 &test_lease(),

@@ -4474,7 +4474,7 @@ impl cyfs::FsMetaHandler for FSMetaService {
         );
         let fb = buffer
             .alloc_buffer(
-                &fs_buffer::NdmPath(fb_path),
+                &fs_buffer::NfsPath(fb_path),
                 file_id,
                 existing_chunks,
                 &lease,
