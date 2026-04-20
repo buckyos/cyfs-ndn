@@ -8,7 +8,7 @@ mod tests {
     use crate::backend::{
         ChunkPresence, ChunkWriteOutcome, NamedDataStoreBackend, NamedDataStoreBackendExt,
     };
-    use crate::http_backend::{HttpBackend, HttpBackendConfig};
+    use crate::http_backend::{NamedStoreHttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
     use crate::{NamedLocalConfig, NamedStore, NamedDataMgr, StoreLayout, StoreTarget};
 
@@ -134,7 +134,7 @@ mod tests {
         let mgr = make_temp_store_mgr(tmp.path()).await;
         let (base_url, _handle) = start_test_server(mgr).await;
 
-        let backend = HttpBackend::new(HttpBackendConfig {
+        let backend = NamedStoreHttpBackend::new(HttpBackendConfig {
             base_url: format!("{}/ndn", base_url),
         });
 
@@ -177,7 +177,7 @@ mod tests {
         let mgr = make_temp_store_mgr(tmp.path()).await;
         let (base_url, _handle) = start_test_server(mgr).await;
 
-        let backend = HttpBackend::new(HttpBackendConfig {
+        let backend = NamedStoreHttpBackend::new(HttpBackendConfig {
             base_url: format!("{}/ndn", base_url),
         });
 
@@ -240,7 +240,7 @@ mod tests {
         let mgr = make_temp_store_mgr(tmp.path()).await;
         let (base_url, _handle) = start_test_server(mgr).await;
 
-        let backend = HttpBackend::new(HttpBackendConfig {
+        let backend = NamedStoreHttpBackend::new(HttpBackendConfig {
             base_url: format!("{}/ndn", base_url),
         });
 
@@ -268,7 +268,7 @@ mod tests {
         let mgr = make_temp_store_mgr(tmp.path()).await;
         let (base_url, _handle) = start_test_server(mgr).await;
 
-        let backend = HttpBackend::new(HttpBackendConfig {
+        let backend = NamedStoreHttpBackend::new(HttpBackendConfig {
             base_url: format!("{}/ndn", base_url),
         });
 

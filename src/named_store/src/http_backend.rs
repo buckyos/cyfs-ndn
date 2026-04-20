@@ -41,12 +41,12 @@ pub struct HttpBackendConfig {
 }
 
 /// HTTP client backend for `NamedDataStoreBackend`.
-pub struct HttpBackend {
+pub struct NamedStoreHttpBackend {
     config: HttpBackendConfig,
     client: Client,
 }
 
-impl HttpBackend {
+impl NamedStoreHttpBackend {
     pub fn new(config: HttpBackendConfig) -> Self {
         let client = Client::new();
         Self { config, client }
@@ -63,7 +63,7 @@ impl HttpBackend {
 }
 
 #[async_trait]
-impl NamedDataStoreBackend for HttpBackend {
+impl NamedDataStoreBackend for NamedStoreHttpBackend {
     // ======================== Object ========================
 
     async fn get_object(&self, obj_id: &ObjId) -> NdnResult<String> {
@@ -327,7 +327,7 @@ impl NamedDataStoreBackend for HttpBackend {
     }
 }
 
-impl HttpBackend {
+impl NamedStoreHttpBackend {
     async fn stream_put_chunk_reqwest(
         &self,
         url: &str,
@@ -522,7 +522,7 @@ mod tests {
         let config = HttpBackendConfig {
             base_url: "http://127.0.0.1:3180/ndn".to_string(),
         };
-        let backend = HttpBackend::new(config);
+        let backend = NamedStoreHttpBackend::new(config);
         let obj_id =
             ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
                 .unwrap();
@@ -536,7 +536,7 @@ mod tests {
         let config = HttpBackendConfig {
             base_url: "http://127.0.0.1:3180/ndn/".to_string(),
         };
-        let backend = HttpBackend::new(config);
+        let backend = NamedStoreHttpBackend::new(config);
         let obj_id =
             ObjId::new("sha256:abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
                 .unwrap();

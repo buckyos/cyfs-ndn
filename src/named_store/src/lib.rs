@@ -27,7 +27,7 @@ pub use chunk_list_reader::*;
 #[allow(unused_imports)]
 pub use diff_chunk_list::*;
 pub use gc_types::*;
-pub use http_backend::{HttpBackend, HttpBackendConfig};
+pub use http_backend::{NamedStoreHttpBackend, HttpBackendConfig};
 pub use http_gc_client::{HttpGcClient, HttpGcClientConfig};
 pub use limit_reader::*;
 pub use local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};

@@ -11,7 +11,7 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{ChunkWriteOutcome, NamedDataStoreBackend};
-    use crate::http_backend::{HttpBackend, HttpBackendConfig};
+    use crate::http_backend::{NamedStoreHttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
     use crate::{NamedLocalConfig, NamedStore, NamedDataMgr, StoreLayout, StoreTarget};
 
@@ -119,7 +119,7 @@ mod tests {
         db_dir: &Path,
         base_url: &str,
     ) -> Arc<tokio::sync::Mutex<NamedStore>> {
-        let backend = Arc::new(HttpBackend::new(HttpBackendConfig {
+        let backend = Arc::new(NamedStoreHttpBackend::new(HttpBackendConfig {
             base_url: format!("{}/ndn", base_url),
         })) as Arc<dyn NamedDataStoreBackend>;
 
