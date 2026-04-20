@@ -416,7 +416,8 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
 }
 
 pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
-    if obj_str.find("{").is_some() {
+    let head = obj_str.trim_start();
+    if head.starts_with('{') || head.starts_with('[') {
         let obj_json = serde_json::from_str(obj_str).map_err(|e| {
             NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string()))
         })?;

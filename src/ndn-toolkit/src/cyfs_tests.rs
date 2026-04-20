@@ -31,7 +31,7 @@ use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
 use ndn_lib::{
     build_named_object_by_json, cyfs_parse_url, ChunkHasher, ChunkId, ChunkList, ChunkType,
     FileObject, HashMethod, NamedObject, NdnError, ObjId, CYFS_CASCADES_MAX_LEN,
-    CYFS_HEADER_OBJ_ID, OBJ_TYPE_CHUNK_LIST,
+    CYFS_HEADER_OBJ_ID, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_FILE,
 };
 
 // =====================================================================
@@ -712,6 +712,197 @@ fn raw_01_client_raw_toggle_adds_query_parameter() {
     assert!(parsed.resp_raw);
     let parsed2 = cyfs_parse_url("http://zone.example/obj/@/x").unwrap();
     assert!(!parsed2.resp_raw);
+}
+
+// =====================================================================
+// ChunkList streaming — O-Link roots whose obj_type is `clist`, and
+// FileObject roots whose `content` resolves to a ChunkList, must stream
+// the concatenated chunk bytes (legacy `open_chunklist_reader` behavior).
+// =====================================================================
+
+/// Drive a raw HTTP GET through the server and collect status, headers, and
+/// body bytes. Avoids the CyfsNdnClient verification pipeline so these tests
+/// exercise the server response shape directly.
+async fn server_get(
+    server: &Arc<NdnDirServer>,
+    path_and_query: &str,
+) -> (
+    http::StatusCode,
+    http::HeaderMap<HttpHeaderValue>,
+    Vec<u8>,
+) {
+    let req = HttpRequest::builder()
+        .method("GET")
+        .uri(path_and_query)
+        .header(http::header::HOST, "local.test")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = server.serve_request(req).await;
+    let (parts, body) = resp.into_parts();
+    let collected = body.collect().await.unwrap();
+    (parts.status, parts.headers, collected.to_bytes().to_vec())
+}
+
+/// Build a two-chunk ChunkList with mixed sizes, register each chunk and the
+/// ChunkList object in the store, and return the ChunkList id, canonical
+/// JSON, and the concatenated raw bytes.
+async fn put_chunklist_with_parts(
+    store_mgr: &NamedStoreMgr,
+    parts: &[Vec<u8>],
+) -> (ObjId, String, Vec<u8>) {
+    let mut ids = Vec::with_capacity(parts.len());
+    let mut concat = Vec::new();
+    for part in parts {
+        let id = mix256_from_bytes(part);
+        store_mgr.put_chunk(&id, part).await.unwrap();
+        ids.push(id);
+        concat.extend_from_slice(part);
+    }
+    let chunk_list = ChunkList::from_chunk_list(ids).unwrap();
+    let (list_id, list_str) = chunk_list.gen_obj_id();
+    store_mgr.put_object(&list_id, &list_str).await.unwrap();
+    (list_id, list_str, concat)
+}
+
+/// CLIST-DIR-01: O-Link root `/ndn/<chunk_list_id>` must stream the
+/// concatenated chunk bytes rather than returning the ChunkList JSON — the
+/// server must honor the legacy `open_chunklist_reader` shortcut.
+#[tokio::test]
+async fn clist_dir_01_root_chunklist_streams_concatenated_bytes() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, store_mgr) = make_server_client_pair(tmp.path()).await;
+
+    let parts = vec![deterministic_bytes(2048), deterministic_bytes(137)];
+    let (list_id, list_str, expected) = put_chunklist_with_parts(&store_mgr, &parts).await;
+    assert_eq!(list_id.obj_type, OBJ_TYPE_CHUNK_LIST);
+
+    let path = format!("/ndn/{}", list_id.to_string());
+    let (status, headers, body) = server_get(&server, &path).await;
+    assert_eq!(
+        status,
+        http::StatusCode::OK,
+        "body: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Body must be the concatenated chunk bytes, NOT the ChunkList JSON.
+    assert_eq!(body, expected);
+    assert_ne!(body, list_str.as_bytes());
+
+    // cyfs-obj-id must name the ChunkList itself; content-type is octet-stream.
+    let obj_id_hdr = headers
+        .get(CYFS_HEADER_OBJ_ID)
+        .expect("cyfs-obj-id missing")
+        .to_str()
+        .unwrap();
+    assert_eq!(obj_id_hdr, list_id.to_string());
+    assert_eq!(
+        headers
+            .get(http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        headers
+            .get(http::header::CONTENT_LENGTH)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        expected.len() as u64
+    );
+}
+
+/// CLIST-DIR-02: `?resp=raw` on a ChunkList root must still return the raw
+/// canonical JSON (the shortcut only applies when verification is enabled).
+#[tokio::test]
+async fn clist_dir_02_root_chunklist_resp_raw_returns_json() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, store_mgr) = make_server_client_pair(tmp.path()).await;
+
+    let parts = vec![deterministic_bytes(1024), deterministic_bytes(64)];
+    let (list_id, list_str, concat) = put_chunklist_with_parts(&store_mgr, &parts).await;
+
+    let path = format!("/ndn/{}?resp=raw", list_id.to_string());
+    let (status, headers, body) = server_get(&server, &path).await;
+    assert_eq!(status, http::StatusCode::OK);
+
+    // Raw mode: body is the canonical JSON, cyfs headers are absent.
+    assert_eq!(body, list_str.as_bytes());
+    assert_ne!(body, concat);
+    assert!(headers.get(CYFS_HEADER_OBJ_ID).is_none());
+}
+
+/// CLIST-DIR-03: O-Link root FileObject whose `content` is a ChunkList must
+/// stream the concatenated bytes AND inline the FileObject JSON as
+/// `cyfs-parents-0`, mirroring the chunk-content branch's shortcut.
+#[tokio::test]
+async fn clist_dir_03_file_object_content_chunklist_streams_content() {
+    let tmp = TempDir::new().unwrap();
+    let (server, _, store_mgr) = make_server_client_pair(tmp.path()).await;
+
+    let parts = vec![deterministic_bytes(2048), deterministic_bytes(512)];
+    let (list_id, list_canonical, expected) =
+        put_chunklist_with_parts(&store_mgr, &parts).await;
+    let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
+
+    let file_obj =
+        FileObject::new("big.bin".to_string(), total, list_id.to_string());
+    let file_json = serde_json::to_value(&file_obj).unwrap();
+    let (file_obj_id, file_canonical) =
+        build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
+    store_mgr
+        .put_object(&file_obj_id, &file_canonical)
+        .await
+        .unwrap();
+
+    let path = format!("/ndn/{}", file_obj_id.to_string());
+    let (status, headers, body) = server_get(&server, &path).await;
+    assert_eq!(status, http::StatusCode::OK);
+
+    // Body is the streamed chunklist content — not the FileObject JSON, not
+    // the ChunkList JSON.
+    assert_eq!(body, expected);
+    assert_ne!(body, file_canonical.as_bytes());
+    assert_ne!(body, list_canonical.as_bytes());
+
+    // cyfs-obj-id names the ChunkList (the content), cyfs-parents-0 inlines
+    // the FileObject canonical JSON so the client can walk its id.
+    let obj_id_hdr = headers
+        .get(CYFS_HEADER_OBJ_ID)
+        .expect("cyfs-obj-id missing")
+        .to_str()
+        .unwrap();
+    assert_eq!(obj_id_hdr, list_id.to_string());
+    let parent0 = headers
+        .get("cyfs-parents-0")
+        .expect("cyfs-parents-0 missing")
+        .to_str()
+        .unwrap();
+    assert!(
+        parent0.contains(&file_obj_id.to_string()) || parent0.starts_with("json:"),
+        "cyfs-parents-0 should reference the FileObject (got {})",
+        parent0
+    );
+    assert!(
+        headers.get("cyfs-parents-1").is_none(),
+        "only the FileObject should be in the parents chain"
+    );
+
+    // cyfs-chunk-size reflects the FileObject.size (== concatenated bytes).
+    assert_eq!(
+        headers
+            .get("cyfs-chunk-size")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        total
+    );
 }
 
 // =====================================================================

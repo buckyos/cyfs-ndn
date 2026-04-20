@@ -36,7 +36,7 @@ use ndn_lib::{
     apply_cyfs_resp_headers, build_named_object_by_json, caculate_qcid_from_file,
     calculate_file_chunk_id, named_obj_to_jwt, CYFSHttpRespHeaders, ChunkId, ChunkReader,
     ChunkType, CyfsParent, DirObject, FileObject, NdnError, NdnResult, ObjId, PathObject,
-    OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 use named_store::{ChunkLocalInfo, NamedStoreMgr};
 
@@ -485,8 +485,24 @@ impl NdnDirServer {
             );
         }
 
-        // FileObject shortcut: stream the referenced chunk, inline the
-        // FileObject as `cyfs-parents-0`.
+        // ChunkList root: stream the concatenated chunk bytes directly,
+        // mirroring the legacy `open_chunklist_reader` behavior.
+        if obj_type == OBJ_TYPE_CHUNK_LIST {
+            let mut cyfs_headers = CYFSHttpRespHeaders::default();
+            cyfs_headers.obj_id = Some(obj_id.clone());
+            cyfs_headers.path_obj = path_obj_jwt;
+            return self
+                .build_chunklist_response(
+                    &obj_id,
+                    head_only,
+                    range_header,
+                    Some(cyfs_headers),
+                )
+                .await;
+        }
+
+        // FileObject shortcut: stream the referenced chunk (or chunk list),
+        // inline the FileObject as `cyfs-parents-0`.
         if obj_type == OBJ_TYPE_FILE {
             if let Ok(file_obj) = serde_json::from_value::<FileObject>(obj_json.clone()) {
                 let content_obj_id = ObjId::new(file_obj.content.as_str())?;
@@ -508,8 +524,24 @@ impl NdnDirServer {
                         )
                         .await;
                 }
-                // FileObject with ChunkList / nested content — fall through
-                // to the generic JSON response.
+                if content_obj_id.is_chunk_list() {
+                    let (_, file_canonical) = build_named_object_by_json(OBJ_TYPE_FILE, &obj_json);
+                    let mut cyfs_headers = CYFSHttpRespHeaders::default();
+                    cyfs_headers.obj_id = Some(content_obj_id.clone());
+                    cyfs_headers.chunk_size = Some(file_obj.size);
+                    cyfs_headers.path_obj = path_obj_jwt;
+                    cyfs_headers.parents.push(CyfsParent::Json(file_canonical));
+                    return self
+                        .build_chunklist_response(
+                            &content_obj_id,
+                            head_only,
+                            range_header,
+                            Some(cyfs_headers),
+                        )
+                        .await;
+                }
+                // FileObject with nested non-chunk content — fall through to
+                // the generic JSON response.
             }
         }
 
@@ -726,41 +758,39 @@ impl NdnDirServer {
             }
             Err(e) => return Err(e),
         };
-        if offset > total_size {
-            return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
-        }
-        let remaining = total_size - offset;
+        finalize_stream_response(
+            reader,
+            total_size,
+            offset,
+            head_only,
+            cyfs_headers,
+            &chunk_id.to_string(),
+        )
+    }
 
-        let mut builder = Response::builder()
-            .header(http::header::CONTENT_TYPE, CONTENT_TYPE_OCTET)
-            .header(http::header::ACCEPT_RANGES, "bytes")
-            .header(http::header::CONTENT_LENGTH, remaining);
-        if offset == 0 {
-            builder = builder.status(StatusCode::OK);
-        } else {
-            builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
-                http::header::CONTENT_RANGE,
-                format!("bytes {}-{}/{}", offset, total_size - 1, total_size),
-            );
-        }
-        let cyfs_headers = cyfs_headers.map(|mut h| {
-            if h.chunk_size.is_none() {
-                h.chunk_size = Some(total_size);
-            }
-            h
-        });
-        if let Some(h) = cyfs_headers.as_ref() {
-            apply_cyfs_headers(&mut builder, h)?;
-        }
-
-        let body = if head_only {
-            empty_body()
-        } else {
-            chunk_reader_to_body(reader, remaining)
-        };
-        builder
-            .body(body)
-            .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)))
+    /// Stream a ChunkList object's concatenated bytes. Mirrors the behavior
+    /// of [`NamedStoreMgr::open_chunklist_reader`] used by the legacy server.
+    async fn build_chunklist_response(
+        &self,
+        chunklist_id: &ObjId,
+        head_only: bool,
+        range_header: Option<&str>,
+        cyfs_headers: Option<CYFSHttpRespHeaders>,
+    ) -> NdnResult<Response<ServerBody>> {
+        let offset = parse_range_offset(range_header).unwrap_or(0);
+        let (reader, total_size) = self
+            .config
+            .store_mgr
+            .open_chunklist_reader(chunklist_id, offset)
+            .await?;
+        finalize_stream_response(
+            reader,
+            total_size,
+            offset,
+            head_only,
+            cyfs_headers,
+            &chunklist_id.to_string(),
+        )
     }
 
     // ---------------- Auto-objectification ----------------
@@ -1605,6 +1635,51 @@ fn empty_body() -> ServerBody {
 
 fn full_body(data: Bytes) -> ServerBody {
     Full::new(data).map_err(|never| match never {}).boxed()
+}
+
+fn finalize_stream_response(
+    reader: ChunkReader,
+    total_size: u64,
+    offset: u64,
+    head_only: bool,
+    cyfs_headers: Option<CYFSHttpRespHeaders>,
+    id_for_error: &str,
+) -> NdnResult<Response<ServerBody>> {
+    if offset > total_size {
+        return Err(NdnError::OffsetTooLarge(id_for_error.to_string()));
+    }
+    let remaining = total_size - offset;
+
+    let mut builder = Response::builder()
+        .header(http::header::CONTENT_TYPE, CONTENT_TYPE_OCTET)
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::CONTENT_LENGTH, remaining);
+    if offset == 0 {
+        builder = builder.status(StatusCode::OK);
+    } else {
+        builder = builder.status(StatusCode::PARTIAL_CONTENT).header(
+            http::header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", offset, total_size - 1, total_size),
+        );
+    }
+    let cyfs_headers = cyfs_headers.map(|mut h| {
+        if h.chunk_size.is_none() {
+            h.chunk_size = Some(total_size);
+        }
+        h
+    });
+    if let Some(h) = cyfs_headers.as_ref() {
+        apply_cyfs_headers(&mut builder, h)?;
+    }
+
+    let body = if head_only {
+        empty_body()
+    } else {
+        chunk_reader_to_body(reader, remaining)
+    };
+    builder
+        .body(body)
+        .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)))
 }
 
 fn chunk_reader_to_body(reader: ChunkReader, total: u64) -> ServerBody {
