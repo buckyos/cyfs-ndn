@@ -11,3 +11,6 @@ pub use tools::*;
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod cyfs_tests;
