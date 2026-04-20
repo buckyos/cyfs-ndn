@@ -572,13 +572,15 @@ impl NdnDirServer {
         }
         let mut cur = start.clone();
         for (i, field) in fields.iter().enumerate() {
-            let mut next = cur.get(field.as_str()).cloned();
-            if next.is_none() {
-                if let Ok(idx) = field.parse::<usize>() {
-                    next = cur.get(idx).cloned();
-                }
-            }
-            let next = next.unwrap_or(serde_json::Value::Null);
+            let next = if let Ok(idx) = field.parse::<usize>() {
+                cur.get(idx).cloned().ok_or_else(|| {
+                    NdnError::NotFound(format!("inner_path index {} not found", idx))
+                })?
+            } else {
+                cur.get(field.as_str()).cloned().ok_or_else(|| {
+                    NdnError::NotFound(format!("inner_path field '{}' not found", field))
+                })?
+            };
             let has_more = i + 1 < fields.len();
             if has_more {
                 if let Ok(obj_id) = ObjId::from_value(&next) {
@@ -741,6 +743,12 @@ impl NdnDirServer {
                 format!("bytes {}-{}/{}", offset, total_size - 1, total_size),
             );
         }
+        let cyfs_headers = cyfs_headers.map(|mut h| {
+            if h.chunk_size.is_none() {
+                h.chunk_size = Some(total_size);
+            }
+            h
+        });
         if let Some(h) = cyfs_headers.as_ref() {
             apply_cyfs_headers(&mut builder, h)?;
         }
