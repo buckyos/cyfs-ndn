@@ -807,3 +807,47 @@ function uploadOneChunk({
 - `chunk_index`
 
 不要只用 `logical_path` 作为恢复键，否则同一路径下新旧文件切换时容易串 session。
+
+
+------------
+基于下面原始文档为实现动机
+
+### Zone 内上传
+
+- 在纯浏览器环境中，使用 `tus` 协议上传。
+- 在增强浏览器环境中，使用 `NDM Cache` 实现上传。
+- 在有 `cyfs-gateway` 的环境中，使用 `rtcp` 协议实现上传。
+
+> 对应能力是 `named-store` 的 `open_chunk_writer`。
+
+- 在纯浏览器中同步文件夹。
+
+> “同步文件夹”是一个很重的场景，我们并不认为它适合在浏览器单页环境下工作。这里仅用于说明 `cyfs://` 的设计方向。
+
+用户流程：
+
+1. 在浏览器中选择要同步的文件夹。
+2. 通过 WebSocket 建立 `rhttp tunnel`。
+3. `file-sync-backend` 通过该 `rhttp tunnel`，用标准的 `DirObject Pull` 语义获得更新的文件。
+
+`cyfs rhttp tunnel` 的基本框架是：让“服务器”也可以从“客户端”下载 Chunk 数据。
+
+- tunnel protocol
+
+基于 WebSocket。  
+允许服务器通过 tunnel 发送请求（携带 stream session id）；发送请求后，客户端通过 `rhttp stream` 发送响应。
+
+- rhttp stream protocol
+
+客户端使用 `HTTP POST` 连接服务器的特定 URL。  
+根据 `HTTP POST Header` 里的字段，找到等待中的 stream session；匹配成功后，将该 stream session 的响应通过 `HTTP POST Body` 发送出去。
+
+基于 `rhttp` 协议，客户端 `upload dir` 的流程会变成 `server download dir`，流程如下：
+
+1. client 访问服务器业务接口，得到 `upload dir` 对应的 tunnel session。
+2. server 启动 `dir download session`。
+3.1 client 使用 `cyfs rhttp tunnel` 协议与服务器建立 WebSocket 连接。  
+3.2 client 在本地运行一个 `ndn_router`，准备处理来自 server 的 `get_obj` 和 `pull_chunk` 请求。  
+4. server 的 `dir download session` 创建成功，并持有一个 tunnel session 对象。  
+5. server 运行 `dir download logic`，基于该 tunnel 创建 `get_obj` 和 `pull_chunk`。
+

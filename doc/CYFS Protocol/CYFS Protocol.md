@@ -102,11 +102,22 @@ cyfs-path-obj: $path_jwt
 
 这个对象只说明一件事：某个路径（不含域名）当前指向哪个 `NamedObject` 的 `ObjectId`，以及这条绑定关系的签发时间 `iat` 与过期时间 `exp`（字段命名与标准 JWT 生态一致）。
 
+为避免实现分歧，`PathObject JWT` 的 Header 需要补充下面几个约束：
+
+- `alg` **MUST** 明确填写签名算法。当前实现基线 **MUST 支持 `EdDSA`（Ed25519）**；为了兼容现有 WebPKI / P-256 生态，**MAY 支持 `ES256`**。
+- `alg = none` **MUST NOT** 被接受。
+- `kid` **SHOULD** 填写，用于指明“应使用哪把已发布公钥来验证该 JWT”。
+
+当可信公钥来自 DID Document 时，`kid` 最好直接使用对应 `verificationMethod.id`（完整 DID URL，或至少是可在该 DID Document 内唯一解析的 fragment）；客户端解析到 `kid` 后，应当在该 DID Document 中找到对应公钥，并确认这把 key 被允许用于此类声明的签名验证。
+
+当可信公钥来自 DNS Record 或 BNS 时，`kid` 的语义可以退化为“该发布体系下的 key 名称 / 版本号 / 记录名”；只要客户端能在当前 `zoneid` 对应的可信 key 集里唯一定位到同一把公钥即可。
+
 在使用 `target ObjectId` 之前，需要先验证 `PathObject`（JWT）：
 
 0. 获得可信公钥，通常它与 URL 的 hostname 相关。
-1. 使用公钥验证 JWT，确定该路径确实指向该 `ObjectId`。
-2. 与本地缓存的 `PathObject`（如有）比较时间戳，防止重放攻击。
+1. 根据 JWT Header 中的 `alg` 与 `kid` 选择正确的公钥，并使用该公钥验证 JWT，确定该路径确实指向该 `ObjectId`。
+2. 检查 `iat` / `exp` 是否处于可接受时间窗口内，防止过期绑定被当作当前绑定使用。
+3. 与本地缓存的 `PathObject`（如有）比较 `iat` 等版本信息，避免旧版本绑定覆盖新版本绑定。
 
 获得可信公钥的流程是解耦的。`cyfs://` 通过一个可扩展的框架，目前支持下面 3 种方法来获取验证 `PathObject` 的公钥：
 
@@ -203,6 +214,8 @@ obj_hash_bytes = varint(u64(data_length))  ||  raw_hash_bytes(base_algorithm)
 
 对应的文本形式仍为 `{obj_type}:{hex(obj_hash_bytes)}`，但解析时需要先从 hex 字节中剥离 varint 前缀，再参与哈希比对。
 
+这里要注意：`mix*` 前缀里的 `data_length`，语义永远是**这一个 Chunk 自身的字节长度**。后文 `clist` 也会在 `ObjectId` 前缀里编码一个长度字段，但那里的长度语义不同，表示的是**整个 `ChunkList` 还原后内容的总字节长度**，而不是某个成员 Chunk 的长度。
+
 
 `cyfile` 是 `cyfs://` 定义的标准对象。标准对象约定了一些字段的含义和是否可选；同时得益于 JSON 的可扩展性，用户也可以在此基础上扩展自己的自定义字段。
 
@@ -235,22 +248,33 @@ open_reader_by_url("http://$zone_id/ndn/all_images/@/readme/@/content")
 
 <header>
 cyfs-path-obj: $path_jwt      (target 是 $dir_obj_id)
-cyfs-parents: [$dir_obj, $file_obj]
+cyfs-parents-0: json:$base64url_dir_obj
+cyfs-parents-1: json:$base64url_file_obj
 cyfs-obj-id: $objid
 cyfs-chunk-size: $full_chunk_size
 </header>
 <body />
 ```
 
-这里的例子里包含两层 `inner_path`，因此 `cyfs-parents` 里也包含 2 个完整对象：`DirObject` 和 `FileObject`。
+这里的例子里包含两层 `inner_path`，因此响应里也包含 2 个按顺序编号的 `cyfs-parents-N` Header：`cyfs-parents-0` 对应 `DirObject`，`cyfs-parents-1` 对应 `FileObject`。
+
+`cyfs-parents-N` 的编码规则如下：
+
+- `N` 从 `0` 开始递增，表示 `inner_path` 链上的父对象顺序；编号 **MUST** 连续，不能跳号。
+- 每个 Header 只承载一个 parent item，避免把整个数组塞进单个 Header 带来的长度限制、多值解析和联合类型歧义。
+- Header value 采用带前缀的字符串形式：
+  - `oid:$objid`：表示这一项只是一个 `ObjectId`。
+  - `json:$base64url_canonical_json`：表示这一项是完整 `NamedObject JSON` 的 UTF-8 canonical JSON，再做 base64url 编码后的结果。
+
+之所以不用单个 `cyfs-parents: [ ... ]`，是因为父对象链很容易触发通用 HTTP Header 长度限制（很多实现默认只有几 KB），而 `json:$base64url...` 这种单项编码也更容易区分“这是完整对象”还是“只是对象 id”。
 
 客户端基于这些 Header 的验证流程可以简化为：
 
 1. 从原始 URL 中拆出语义路径部分和两层 `inner_path`。这里 `cyfs-path-obj` 负责把语义路径绑定到 `DirObject`。
 2. 获取 `$zone_id` 对应的可信公钥，验证 `cyfs-path-obj` 的签名，确认它的 `target` 确实是 `DirObject` 的 `ObjectId`。
-3. 对 `cyfs-parents[0]` 做标准 `NamedObject` 校验，确认 `DirObject` 的 JSON 与 `cyfs-path-obj.target` 匹配。
-4. 在 `DirObject` 上执行第一层 `inner_path`，例如 `/readme`，确认其结果确实指向 `cyfs-parents[1]` 对应的 `FileObject`。
-5. 对 `cyfs-parents[1]` 做标准 `NamedObject` 校验，确认 `FileObject` 的 JSON 自己是可验证的。
+3. 解码 `cyfs-parents-0`，对其中的 `DirObject` 做标准 `NamedObject` 校验，确认它的 JSON 与 `cyfs-path-obj.target` 匹配。
+4. 在 `DirObject` 上执行第一层 `inner_path`，例如 `/readme`，确认其结果确实指向 `cyfs-parents-1` 对应的 `FileObject`。
+5. 解码 `cyfs-parents-1`，对其中的 `FileObject` 做标准 `NamedObject` 校验，确认该对象本身是可验证的。
 6. 在 `FileObject` 上执行第二层 `inner_path`，例如 `/content`，确认其结果等于 `cyfs-obj-id`。
 7. 最后验证 HTTP Body：
    - 如果 Body 是 `NamedObject JSON`，就按前文的稳定编码规则重新计算 `ObjectId`，并与 `cyfs-obj-id` 比较。
@@ -278,6 +302,43 @@ cyfs-chunk-size: $full_chunk_size
 6. 如果某一段最终结果**不是** `ObjectId`（可以是 JSON 对象、数组或标量），则该值就是最终返回值；此时**不会再自动跨段**。
 7. 如果一段的最终结果不是 `ObjectId`，但 URL 里后面还有新的 `"/@/"` 段，则该请求非法。客户端若确实希望继续深入这个 JSON 值内部，应当把更深的字段路径直接写在当前段内（参见规则 1），而不是再加一个 `"/@/"`。
 
+下面用一个对比例子说明规则 4：
+
+假设：
+
+- `/a` 指向一个 `ObjectId = X`
+- `X` 解引用后得到一个 `DirObject`
+- 在 `X` 的 JSON 上继续取 `/b`，得到另一个 `ObjectId = Y`
+
+那么下面两种写法都是合法的：
+
+```text
+/root/@/a/b
+/root/@/a/@/b
+```
+
+它们的求值过程分别是：
+
+- `/root/@/a/b`
+  - 在同一段内先取 `/a`，得到 `ObjectId X`
+  - 因为 `a/b` 还没有走完，所以**在同一段内自动解引用** `X`
+  - 再在 `X` 的 JSON 上继续取 `/b`，得到 `ObjectId Y`
+  - 因为这一整段的最终结果是 `Y`，所以按默认规则继续解引用并返回 `Y` 指向的内容
+
+- `/root/@/a/@/b`
+  - 第一段只执行 `/a`，得到 `ObjectId X`
+  - 因为第一段已经结束，且结果是 `X`，所以**在段边界处**自动把 `X` 作为下一段的当前对象
+  - 第二段再在 `X` 上执行 `/b`，得到 `ObjectId Y`
+  - 因为第二段的最终结果是 `Y`，所以继续解引用并返回 `Y` 指向的内容
+
+在这个例子里，两种写法的最终返回内容通常相同。它们真正的区别主要体现在**验证链的表达方式**上：
+
+- 写成 `/root/@/a/b` 时，客户端逻辑上只看到“一个段”，服务端未必需要把 `X` 单独列为一个明确的中间 parent。
+- 写成 `/root/@/a/@/b` 时，`X` 是显式的段边界对象，服务端更容易把它单独体现在 `cyfs-parents-N` 链里，验证路径也更清晰。
+
+因此，二者不是语义上互相矛盾的两种规则，而是“更紧凑的写法”和“更显式的对象边界写法”。  
+**推荐做法是：当你已经知道某一步会跨过一个 `ObjectId` 边界，并且希望验证链更清楚时，优先写成 `"/@/"` 分段形式。**
+
 > 一句话概括：**`/` 在段内做 JSON Path，`/@/` 只在 ObjectId 边界使用。**
 
 ### 得到 Raw Object JSON
@@ -304,23 +365,41 @@ readme.md 的 FileObject JSON
 - **对 Chunk URL** 加 `resp=raw` 仍然合法：服务端按正常 Chunk 语义返回字节流（支持 HTTP Range），只是**不附加任何 CYFS 验证 Header**（不带 `cyfs-obj-id` 等）。客户端可自行根据 URL 里的 `ChunkId` 做校验。
 - **与 `inner_path` 组合**时：`resp=raw` 只改变“是否展开/是否加辅助 Header”，不改变寻址结果本身。最后一段 `inner_path` 的最终值是什么，就原样返回什么——指向 `ObjectId` 则返回该 ObjectId（JSON 字符串形式，或 hostname 里的 base32），指向普通 value 则返回该 value。服务端**不会**因为结果是 `ObjectId` 就自动继续解引用。
 
+⚠️ 安全提示：`resp=raw` **不附带任何可信 Header**，因此它只适合下面两类场景：
+
+- URL 根定位本身就是直接对象链接（O Link），客户端可以直接用 URL 里的 `ObjectId/ChunkId` 校验响应体。
+- 客户端已经通过其它请求独立验证了根对象，此次只是批量读取其 child 对象的 raw JSON 或 raw value。
+
+如果对语义 URL 直接使用 `resp=raw`，那么它在可信性上就退化成了传统 HTTP GET：客户端可以得到数据，但**不能**依赖这次响应本身证明“这个语义路径当前确实绑定到了这个对象”。
+
 ### ChunkList
 
-任意长度的内容都可以计算 Hash 并得到 `ChunkId`，但 `cyfs://` 从整体系统性能出发，约定**构造 ChunkList 时默认使用的 Chunk 大小上限为 `32MB`**。也就是说，所有人按该上限切分同一个文件，会得到完全一致的 `ChunkList`，从而保证可互操作的去中心化多源加速。
+从 `NamedObject` 的表达能力上看，`ChunkList` 里的每个 `ChunkId` 原则上都可以对应任意大小的 Chunk；也就是说，**`ChunkList` 作为一种对象结构，本身并不限制其成员 Chunk 的大小**。
 
-关于 `32MB` 这个数字：
+但对 `cyfs://` 来说，仅仅“允许表达”还不够。为了保证不同实现针对同一个文件都能构造出**完全一致**的 `ChunkList`，协议还必须定义一套统一的标准切分算法。
+
+因此，`cyfs://` 约定：**构造标准 `ChunkList` 时，Chunk 大小上限固定为 `32MiB`（`33554432` 字节）**。这里的“固定上限”指的是：
+
+- 按文件字节流顺序切分。
+- 每个非最后一个 Chunk 的大小都**必须**是 `32MiB`。
+- 最后一个 Chunk 允许小于 `32MiB`。
+
+只有采用这套固定规则，所有人针对同一个文件切分时，才会得到完全一致的 `ChunkList`，从而保证可互操作的去中心化多源加速。
+
+关于 `32MiB` 这个数字：
 
 - 它来源于底层 `named-store` 块存储引擎的最佳工作区间（在内存开销、随机寻址成本、网络往返开销和多源调度粒度之间取得平衡）。
-- 协议本身**并不强制** Chunk 大小为 32MB：`ChunkId` 既可以指向小 Chunk，也可以指向更大的 Chunk（作为`SameAs`等价源存在）。这里的 `32MB` 只是“构造标准 ChunkList 时的默认分块尺寸”。
-- 未来如果需要将默认分块尺寸上调（例如提升到 64MB 或 128MB），**不需要**修改 `ChunkId` 的编码格式，只需要引入新的 ChunkList 类型常量（如 `clist-fix` 已经预留了“定长 chunk list”的元数据）。
+- 这里的强制性只作用于**标准 `ChunkList` 的构造规则**，并不作用于所有独立存在的 Chunk：`ChunkId` 既可以指向小 Chunk，也可以指向更大的 Chunk（作为 `SameAs` 等价源存在）。
+- 因此应区分两件事：`ChunkList` 这个对象格式允许记录任意大小的 Chunk；而“标准 `ChunkList` 如何从一个文件生成出来”则必须遵守 `32MiB` 规则。
+
 
 它的逻辑很简单：
 
-1. 先把大文件按 `32MB` 分块。
-2. 每一块分别计算 `ChunkId`。
+1. 先把大文件按 `32MiB` 固定上限顺序分块。
+2. 每一块分别计算 mix256类型的 `ChunkId`。
 3. 再把这些 `ChunkId` 按顺序组成一个列表对象。
 
-一个 `SimpleChunkList` 的 JSON 形态就是一个字符串数组，例如：
+一个 `ChunkList` 的 JSON 形态就是一个字符串数组，例如：
 
 ```json
 [
@@ -329,12 +408,12 @@ readme.md 的 FileObject JSON
 ]
 ```
 
-`ChunkList` 自己也有一个 `ObjectId`。需要注意的是，`SimpleChunkList` 的 `ObjectId` 不是普通 `NamedObject` 的“稳定 JSON 直接 Hash”，而是由下面两部分共同决定：
+`ChunkList` 自己也有一个 `ObjectId`。需要注意的是，`ChunkList` 的 `ObjectId` 不是普通 `NamedObject` 的“稳定 JSON 直接 Hash”，而是由下面两部分共同决定：
 
 - `ChunkId` 列表的顺序内容。
-- 整个文件的总大小 `total_size`。
+- 整ChunkList的总大小 `total_size`。
 
-**SimpleChunkList ObjectId 的精确算法**（`obj_type = "clist"`）：
+**ChunkList ObjectId 的精确算法**（`obj_type = "clist"`）：
 
 ```text
 S           = RFC 8785 canonical JSON of the ChunkId array  // 如上面 JSON 示例
@@ -344,6 +423,13 @@ ObjectId    = "clist:" || hex(obj_hash)
 ```
 
 其中 `total_size` 是该列表拼接还原后**原始文件的字节总长度**（不是 ChunkList JSON 的字节数，也不是各 Chunk 的长度之和的可见部分——如果最后一个 Chunk 是截短的，`total_size` 就是该截短后的真实长度）。
+
+这里容易和前文 `mix*` 的长度前缀混淆，二者虽然都使用 `varint(u64(length))`，但语义并不相同：
+
+- 对 `mix*` 来说，前缀里的 `length` 是**单个 Chunk 本身的长度**。
+- 对 `clist` 来说，前缀里的 `total_size` 是**整个 `ChunkList` 依次拼接后还原出的完整内容总长度**。
+
+也就是说，`clist` 前缀编码的是“这份逻辑大文件有多大”，而不是“列表里某一个 Chunk 有多大”。
 
 这种“长度前缀 + 内容哈希”的编码形式与前文 `mix*` 哈希的思路一致：客户端拿到 `clist:...` 之后，仅凭 ObjectId 字符串就可以知道待下载文件的总大小，无需先抓取 ChunkList JSON。
 
@@ -371,6 +457,45 @@ file_reader = open_reader_by_url("http://$zone_id/sha256:213788234cfb679121c148b
 
 这里的 `SameAs` 指的是服务端内部的一种“内容等价”关系：一个大 `ChunkId` 对应的内容，等价于某个 `ChunkList` 依次拼接后的结果。
 
+这里需要特别说明：`SameAs` 本身首先是**服务端内部的存储与调度语义**，并不是说客户端必须无条件相信“某个 `ChunkList` 等价于某个大 `ChunkId`”。真正的可信性，仍然来自**对原始请求目标 `ChunkIdA` 的最终校验**。
+
+也就是说，当客户端请求：
+
+```text
+open_reader_by_url("http://$zone_id/$chunk_id_a")
+```
+
+服务端完全可以在内部执行下面的流程：
+
+1. 查询本地 `SameAs($chunk_id_a -> $chunk_list_b)`。
+2. 打开 `ChunkListB`，按顺序读取其中列出的 sub-chunks。
+3. 把这些 sub-chunks 依次拼接成一个连续字节流返回给客户端。
+
+从客户端视角看，自己请求的仍然是 `$chunk_id_a`，因此验证规则也保持不变：
+
+1. 以 URL 中的 `$chunk_id_a` 作为最终目标 `ChunkId`。
+2. 按收到的字节流顺序做增量 Hash。
+3. 同时累计总字节数，并与 `$chunk_id_a`（若是 `mix*`）或响应中的 `cyfs-chunk-size` 做一致性检查。
+4. 整个流结束后，比对最终算出的 `ChunkId` 是否等于 `$chunk_id_a`。
+
+只要最后一步成立，就说明：
+
+```text
+concat(ChunkListB) == ChunkA
+```
+
+于是 `SameAs($chunk_id_a -> $chunk_list_b)` 这条关系就在内容层面被验证了。
+
+因此，`SameAs` 的关键点在于：
+
+- **下载前**：`SameAs` 只是一个调度提示，告诉系统“可以用 `ChunkListB` 来尝试满足对 `ChunkA` 的读取”。
+- **下载后**：只有当拼接后的完整结果重新计算得到的 `ChunkId` 确实等于 `ChunkA` 时，这条 `SameAs` 才真正被验证成立。
+
+这也解释了为什么 `SameAs` 很适合做“大 Chunk 的兼容访问”，却不改变协议的可信根：可信根始终是**用户最初请求的那个 `ObjectId/ChunkId`**，而不是服务端临时选择的内部展开路径。
+
+对于 `HTTP Range` 场景，客户端在没有拿到完整内容之前，通常只能先信任“这个 Range 来自一个可能正确的 `SameAs` 展开”；只有在后续把整份内容补齐并完成一次完整 Hash 后，才能把这条 `SameAs` 关系升级为本地可信缓存。也就是说，`Range` 校验解决的是“这一段字节没坏”，而 `SameAs` 的最终确认仍然依赖一次完整内容校验。
+
+
 ### 使用 `container_id/@/key` 可信地获取对象
 
 注：本章内容目前还是实验性设计，尚未定稿。
@@ -379,7 +504,7 @@ file_reader = open_reader_by_url("http://$zone_id/sha256:213788234cfb679121c148b
 
 对于小容器，`key` 访问的可验证性与标准的 `NamedObject + inner_path` 一致：都是先拿到完整的父对象，再判断 `key` 指向的 child `ObjectId`。
 
-当容器里含有大量元素（超过 `4096` 个）时，我们称其为大容器。大容器的困难在于：无法把完整容器 JSON 放进 `cyfs-parents`。此时可以切换到`部分可验证获取模式`。它的核心设计是：在信任 `container ObjectId` 的前提下，通过类似 Merkle Tree 的理论，相信：
+当容器里含有大量元素（超过 `4096` 个）时，我们称其为大容器。大容器的困难在于：无法把完整容器 JSON 继续塞进一组 `cyfs-parents-N` Header。此时可以切换到`部分可验证获取模式`。它的核心设计是：在信任 `container ObjectId` 的前提下，通过类似 Merkle Tree 的理论，相信：
 
 ```text
 container[key] = target_obj_id
@@ -396,7 +521,7 @@ http://$zoneid/$container_id/@/key/@/content
 时，可以返回：
 
 ```text
-cyfs-parents: [$parent_obj]
+cyfs-parents-0: json:$base64url_parent_obj
 cyfs-inner-proof: [$proof-data]   <= 证明 $container_id[key] = ObjId($parent_obj)
 cyfs-obj-id: $content_obj_id
 <body: content obj data>
@@ -427,7 +552,7 @@ cyfs-obj-id: $content_obj_id
 
 客户端验证流程如下：
 
-1. 先验证 `cyfs-parents[0]`，也就是 `parent_obj`。如果它是一个 `NamedObject`，就按前文的稳定编码规则重新计算它的 `ObjectId`。
+1. 先解码并验证 `cyfs-parents-0`，也就是 `parent_obj`。如果它是一个 `NamedObject`，就按前文的稳定编码规则重新计算它的 `ObjectId`。
 2. 用 `cyfs-inner-proof` 验证大容器关系：确认 `$container_id[key] = ObjId($parent_obj)`。
 3. 在 `parent_obj` 上继续执行下一层 `inner_path`，也就是这里的 `/content`，得到目标 `content_obj_id`。
 4. 检查这个结果是否等于 Header 里的 `cyfs-obj-id`。
@@ -441,356 +566,70 @@ cyfs-obj-id: $content_obj_id
 container_id -> key -> parent_obj -> /content -> cyfs-obj-id -> body
 ```
 
-## 内容的发布与 Zone 内上传
-
-CYFS 本身没有“上传公共数据”的统一协议设计，因为 CYFS 的定位是在互联网上高效可靠地获取公共数据，实现 `Content Network`。
-
-**No Push! `cyfs://` 是 `pull-first` 的协议。** 跨 Zone 之间**不存在**“我把内容推给你”的语义，所有跨 Zone 分发最终都落在“对方主动 Pull”上。
-
-但在单个 Zone 内部，很多产品逻辑仍然会出现“传统的上传行为”——比如用户在手机上选择一张照片，用 MessageHub 给朋友发送消息，在消息真正发出前，需要先把照片从手机搬到 OOD 上。这是**Zone 内**的发布流程，不违反 pull-first 约束。本章节基于这类场景讨论 Zone 内的上传设计。
-
-### Zone 内上传
-
-- 在纯浏览器环境中，使用 `tus` 协议上传。
-- 在增强浏览器环境中，使用 `NDM Cache` 实现上传。
-- 在有 `cyfs-gateway` 的环境中，使用 `rtcp` 协议实现上传。
-
-> 对应能力是 `named-store` 的 `open_chunk_writer`。
-
-- 在纯浏览器中同步文件夹。
-
-> “同步文件夹”是一个很重的场景，我们并不认为它适合在浏览器单页环境下工作。这里仅用于说明 `cyfs://` 的设计方向。
-
-用户流程：
-
-1. 在浏览器中选择要同步的文件夹。
-2. 通过 WebSocket 建立 `rhttp tunnel`。
-3. `file-sync-backend` 通过该 `rhttp tunnel`，用标准的 `DirObject Pull` 语义获得更新的文件。
-
-`cyfs rhttp tunnel` 的基本框架是：让“服务器”也可以从“客户端”下载 Chunk 数据。
-
-- tunnel protocol
-
-基于 WebSocket。  
-允许服务器通过 tunnel 发送请求（携带 stream session id）；发送请求后，客户端通过 `rhttp stream` 发送响应。
-
-- rhttp stream protocol
-
-客户端使用 `HTTP POST` 连接服务器的特定 URL。  
-根据 `HTTP POST Header` 里的字段，找到等待中的 stream session；匹配成功后，将该 stream session 的响应通过 `HTTP POST Body` 发送出去。
-
-基于 `rhttp` 协议，客户端 `upload dir` 的流程会变成 `server download dir`，流程如下：
-
-1. client 访问服务器业务接口，得到 `upload dir` 对应的 tunnel session。
-2. server 启动 `dir download session`。
-3.1 client 使用 `cyfs rhttp tunnel` 协议与服务器建立 WebSocket 连接。  
-3.2 client 在本地运行一个 `ndn_router`，准备处理来自 server 的 `get_obj` 和 `pull_chunk` 请求。  
-4. server 的 `dir download session` 创建成功，并持有一个 tunnel session 对象。  
-5. server 运行 `dir download logic`，基于该 tunnel 创建 `get_obj` 和 `pull_chunk`。
-
-### Zone 间传播
-
-> STATUS: draft — 语义已定，跨 Zone 传播的完整触发/重试/取消流程仍在打磨中。
-
-Zone 间**没有上传的概念**。如果 `ZoneA` 给 `ZoneB` 发送一个带附件的 `MessageObject`，并不会有所谓“附件上传”的逻辑。
-
-其核心流程如下：
-
-```text
-ZoneA Call ZoneB.sendmsg(MessageObject)
-ZoneB.onmsg(MessageObject):
-    业务逻辑判断
-    决定下载附件
-ZoneB.open_reader_by_url(MessageObject.ref_obj[0])
-```
-
-## 内容购买与认证
-
-严格的身份认证走的是 Zone 内的 NDM 相关协议，这里不展开讨论。落到 `cyfs://` 协议上，通常已经是跨 Zone 访问，此时至少偏向“半公开”场景，因为数据一旦到了公网，就没有 100% 可靠的方法阻止其继续传播。这里描述的是 `cyfs://` 里的“君子协定”——协议只保证**诚实节点**会按约束传播和访问，并不在密码学上阻止恶意节点复制与转发。换句话说，这是一种**弱强制 + 基于声誉**的约束：配合 `cyfs-cascades`、`Reference` 等上下文信号，正常节点会选择遵守；恶意节点虽然技术上可以绕过，但也会因此失去后续收益分配、Curator 信用背书等上层好处。
-
-```headers
-cyfs-original-user: $user-did
-Reference:
-```
-
-### 基于 ReferencePath 的权限控制
-
-> STATUS: draft — 概念已经在 `cyfs-cascades` / `Reference` Header 上落地，但细化的判定规则仍在实验中。
-
-这里的核心思路是：请求方不仅表明“我是谁”，还表明“我是因为什么上游动作或页面跳转来到这里的”。对于一些半公开内容，服务端并不追求绝对防扩散，而是希望把访问能力绑定在某条业务链路上。
-
-因此，权限控制可以同时参考：
-
-- `cyfs-original-user`：谁发起了请求。
-- `Reference` / `ReferencePath`：请求是从哪条内容传播链路进入的。
-- `cyfs-cascades`：请求背后的动作链，例如“浏览页面 -> 点击购买 -> 请求附件”。
-
-这种机制更接近“带上下文的访问约束”，而不是传统意义上的强访问控制。
-
-### 验证购买收据
-
-CYFS 构建 `Content Network` 的一个关键要素，是形成 Content 的交易。其典型流程是：
-
-1. 用户访问链接，链接告知 Content 的商品信息和购买方法（兼容 HTTP 402）。
-2. 用户根据购买方法的指引完成购买，得到收据。我们自带的去中心购买方法是基于 USDB 的内容购买合约。
-3. 用户再次访问链接，并携带自己的收据。
-4. CYFS 网关对用户身份和收据进行验证，然后返回内容数据。
-
-## Content Network的传播证明
-
-`Content Network 的传播证明`并不是一个单一格式的“万能凭证”，而是一组可以组合起来的、可验证的声明对象。  
-它的设计目标不是证明“世界真相”，而是低成本、可计算地证明：
-
-- 谁在什么时候，对哪个内容，做过什么高价值动作。
-- 这个内容是否被某个可信主体收录、推荐、引用、再创作或继续传播。
-- 一条传播链上，哪些动作只是低成本转发，哪些动作代表了更高成本的注意力投入与信用背书。
-
-这正对应了 AI-Native 场景下的核心诉求：传播不再只是“转发次数”，而是一个结构化的注意力分配过程。  
-在这个过程中，协议需要记录的不是“内容火不火”这种平台内部指标，而是可跨平台复用的、由不同主体独立签发的传播侧事实。
-
-任何内容在网络中的发布与传播，至少存在 4 个核心角色：
-
-- `Owner / Author`：内容的创造者或权利主体（**供给侧的起点**）。
-- `Curator / 收录者`：决定把内容纳入某个目录、集合、榜单或上下文的人（**供给侧的发现/背书**）。
-- `Sharer / 传播者`：决定把内容沿某条社交链、消息链或引用链继续扩散的人（**供给侧的路径扩散**）。
-- `Consumer / 消费者`：真正下载、安装、停留、继续传播的终端用户（**需求侧的反馈来源**）。
-
-其中 `Owner / Curator / Sharer` 构成“供给链路”三位一体（协议主要保护它们之间的信用分配），`Consumer` 则从需求侧闭环给出使用反馈。`Content 的传播证明` 的真正目标，就是把这 4 类角色留下的高价值行为都表达成可验证对象。  
-也就是说，协议不只关心“内容有没有被传播”，还关心：
-
-- 是谁发布了这个内容。
-- 是谁发现并收录了它。
-- 是谁把它继续带到了新的传播路径上。
-- 最终有没有形成真实消费，而不只是机械刷量。
-
-CYFS设计了一些标准对象来承载这套语义：
-
-- `cyact` / `ActionObject`：表达“某主体对象对某目标对象做了某个动作”。
-- `cyinc` / `InclusionProof`：表达“某个 curator 把某内容收录进自己的目录/集合”。
-- `cyrel` / `RelationObject`：表达“两个内容对象之间存在某种弱关系”，例如 `same`、`part_of`。
-
-这些对象的共同特点是：
-
-1. 它们首先是 `NamedObject`，因此内容本身可哈希、可缓存、可引用。
-2. 它们描述的是“传播相关事实”，而不是直接承载传播策略。
-3. 真正的信任来自“对象内容 + 签发者身份 + 分发上下文”的组合，而不是只看某一个字段。
-
-从语义上说，CYFS 想表达的不是“平台给内容打分”，而是把传播拆成一组可计算的原子事实：
-
-- `download`
-- `installed`
-- `shared`
-- `purchased`
-
-
-然后由上层 App/Agent 根据主体信用、传播路径、内容类型、时间窗口和支付关系，去自行计算权重。
-
-这也意味着：  
-CYFS 里的“行为证明”本质上不是单点日志，而是一张角色化的事实网：
-
-- `Owner` 提供内容原点。
-- `Curator` 提供发现与筛选。
-- `Sharer` 提供路径扩散。
-- `Consumer` 的下载、安装、停留、再次传播，提供真实使用反馈。
-
-只有把这些事实拼起来，才能支撑一个健康的内容网络:公平传播、收益分配和反机器人信用体系。
-
-### 安装证明
-
-安装证明的核心语义不是“某个二进制曾被下载过”，而是：
-
-> 某个主体确实把某个内容作为可执行/可使用对象接纳到了自己的环境里。
-
-这在传播体系里是一个明显高于“浏览”和“下载”的动作，因为安装意味着更强的注意力投入、更高的风险承担，以及更明确的认可。其载体是 `cyact`：
-
-
-安装证明的设计意图有三层：
-
-1. 它是内容传播的高价值反馈信号，可用于衡量“内容真的被使用了”，而不只是被看见了。
-2. 它可以成为后续动作的基础。例如一个 `shared` 行为可以通过 `base_on` 指向某个 `installed` 行为，表示“我分享它，是因为我已经装过并用过它”。
-3. 它可以参与信用计算。高信用主体签发的安装证明，比匿名或低信用主体签发的安装证明更有参考价值。
-
-因此，安装证明不是许可证，也不是 DRM。  
-它表达的是一个可验证的传播事实：`某主体对象对某内容对象执行了 installed 动作`。
-
-### 下载证明
-
-下载证明的核心语义是：
-
-> 某个主体至少完成过一次对指定内容的获取。
-
-它比浏览更强，但比安装更弱。 主要由 `cyact` 承载。
-在内容网络和多源加速网络里，下载证明之所以重要，是因为它既能作为“这个内容确实有人要”的需求信号，也能作为“这个节点最近确实接触过这份内容”的供给线索。
-
-这里需要强调一个设计意图：  
-CYFS 并不要求“每个下载都由中心服务器记账”。下载证明更适合由下载方、网关、缓存节点、代理 Agent 分别签发为独立声明，再由上层按信用关系去组合判断。
-
-`ActionObject.base_on` 在这里很关键，它允许把下载纳入动作链。例如：
-
-- `purchased -> download`
-- `shared -> download`
-- `download -> installed`
-
-这样，下载证明不再是一个孤立事件，而是传播路径里的一个节点。
-
-对 P2P 加速而言，下载证明还有一个额外语义：
-
-> 某个节点最近拿到过这个内容，因此它“可能”成为后续一段时间内的有效源。
-
-注意这里是“可能”，不是强承诺。  
-协议层证明的是“发生过下载”，不是“未来一定持续做上传服务”。
-
-因此它适合做：
-
-- 传播热度信号
-- 潜在供给信号
-- 后续安装/使用/分享行为的前置节点
-
-但它本身不应直接等价为最终收益分配依据，否则很容易被脚本刷量污染。
-
-### 收录证明
-
-收录证明是今天互联网上语义最明确、最成熟的一类传播证明。
-
-它的核心语义是：
-
-> 某个 curator 明确地把某内容收进了自己的目录、集合、榜单或推荐空间。
-
-这不是“看过”，也不是“转发过”，而是一种更高成本的策展动作。  
-在 AI-Native 网络里，这类动作尤其重要，因为传播权重不应该只来自低成本点击，还应该来自可信主体的主动收录。
-
-当前实现里，`InclusionProof` 直接表达了这套语义：
-
-- `content_id`：被收录内容的 `ObjId`
-- `content_obj`：收录时引用的内容快照或关键字段，避免只靠一个裸 `ObjId`
-- `curator`：收录者 DID
-- `collection`：收录进哪个集合/目录
-- `rank`：收录者对内容给出的排序/评级信号
-- `editor`：如果 curator 是组织，哪些 editor 参与了这次策展
-- `review_url`：外部评测或说明页
-- `iat/exp`：收录声明的时间范围
-- `meta`：附加维度，例如“真实性评分”“稳定性”“适用人群”等
-
-协议层里，收录证明的关键设计意图有四点：
-
-1. 它让“内容发现”从平台私有索引，变成了可外带、可引用、可传播的策展声明。
-2. 它允许同一内容被多个 curator 独立收录，天然形成多链路视角，而不是只存在一个全局真榜单。
-3. 它把“谁收录了什么”变成协议事实，便于 Agent 做去中心化聚合、去重和权重计算。
-4. 它强调“收录者信用”比“收录数量”更重要。十个匿名收录，不一定比一个高信用 curator 的收录更有价值。
-
-因此，收录证明本质上是在为去中心化内容发现提供“目录层的注意力证明”。收录可以是单向的，也可以是双向的。
-
-- 单向收录：收录者自行声明“我收录了这个内容”，不需要作者事先认可。
-- 双向收录：除了收录者证明之外，作者或 Owner 也明确认可该收录关系。
-
-协议层先把这两者都允许表达出来；至于在收益分成、官方榜单、品牌分发等场景里更信任哪一种，是上层策略问题，而不是底层协议强行限定。
-
-### 分享证明
-
-分享证明的核心语义不是“对象被复制了一份”，而是：
-
-> 某个主体主动决定把某内容继续分发给新的对象、联系人、群组或传播空间。
-
-在 AI-Native 网络里，分享是一次明确的注意力再分配。  
-它回答的是“我决定把它传播给谁”，而不只是“我看过它”。
-
-基于现有实现，分享证明通常不会只靠一个对象完成，而是由多种对象共同构成：
-
-1. `cyact` / `ActionObject`
-   - `action = "shared"`
-   - 用来表达“分享这个动作已经发生”
-   - `base_on` 可指向更早的 `download`、`installed`、`purchased`、`viewed` 等动作
-
-2. `cymsg` / `MsgObject`
-   - 用来表达“分享是通过哪条消息、向哪些接收者、带着哪些附加上下文发生的”
-   - `content.refs` 可以挂接被分享的内容对象
-   - `proof` 字段可承载某个外部证明引用
-
-3. `cymsgr` / `MsgReceiptObj`
-   - 用来表达“某条分享消息已被谁接收/接受/隔离/拒绝”
-   - 它不是分享动作本身，但能为“分享已触达”提供侧证
-
-4. `cyrel` / `RelationObject`
-   - 当分享不是原样转发，而是摘录、节选、再创作、聚合时，`RelationObject` 可以表达新内容与原内容之间的关系
-   - 当前实现已有 `same` 与 `part_of` 两类语义，足够表达“原样等价传播”和“局部片段传播”
-
-因此，分享证明最好理解为一个小型证明包，而不是单条日志：
-
-- `shared` 说明“有人做了传播动作”
-- `MsgObject` 说明“传播面向谁、以什么形式传播”
-- `MsgReceiptObj` 说明“传播是否触达”
-- `RelationObject` 说明“传播的是原文、片段还是再创作版本”
-
-这正好对应 AI-Native 文档里提到的传播升级：
-
-> 再创作 + 再传播
-
-也就是说，CYFS 并不把“传播”理解成只有一种转发按钮。  
-协议层承认至少存在三种不同价值的传播：
-
-1. 原样传播：重点是触达范围。
-2. 带评论传播：重点是传播者的信用背书。
-3. 再创作传播：重点是新旧内容关系与新的注意力增量。
-
-从设计意图上看，分享证明最终要支持的不是“统计转发数”，而是让 Agent 能够回答下面这些问题：
-
-- 这个内容是谁先传播给我的？
-- 哪条传播链路的信用更高？
-- 这次传播是原样转发，还是带有新的解释、整理或摘录？
-- 哪些分享只是噪声扩散，哪些分享代表了高成本的推荐行为？
-
-当这些问题能被协议层对象回答时，传播权重、推荐系统、策展网络和 P2P 激励才有去中心化实现的基础。
-
-### “内容消费证明”
-
-（本章节是协议占位，并未完成)
-
-`内容消费证明`是比“传播证明”更深一层的概念：它关注的不是“内容有没有被拿到”，而是：
-
-> 用户是否真的在这个内容上投入了时间、注意力，甚至形成了后续行为。
-
-从协议分层看，可以把它理解为：
-
-- `download`：拿到了内容。
-- `installed`：把内容接纳进自己的环境。
-- `shared`：愿意继续传播。
-- `content consumption proof`：真实使用、真实停留、真实受益。
-
-这一层现有还没有一个专门标准对象落地，但设计方向已经很明确：
-
-1. 它应该建立在前面的行为链之上，而不是凭空独立出现。
-2. 它通常需要更多隐私保护，很多场景更适合用 ZK 或其它隐私机制传播。
-3. 它需要更强的反机器人能力，不能只靠单边自报，而需要多角色、多阶段交叉验证。
-
-所以本章中的安装、下载、收录、分享证明，可以看作是 `内容消费证明` 之前的基础层。  
-它们先把传播网络中的“谁发现、谁拿到、谁认可、谁继续扩散”表达清楚，之后才能进一步谈“谁真的用了它，以及这份使用如何参与经济分配”。
 
 ## CYFS 网络的传输加速
 
+当FileObject都基于ChunkList构造后，我们就得到了如下的好处
+- 下载一个文件时，可以基于Chunk同时开始下载，如果有一些Chunk已经在另一个文件中存在，那么无需下载
+- 所有的Chunk都是可验证的，因此可以从任何来源下载。
 
-### 多源发现（Tracker）
-
-- 原始 URL。
-- `Reference`，也就是“谁传播了这个内容”。
-- 本地 Cache：由基础环境搭建者提供，可在一个范围内实现加速，例如在台式机上看过的内容，稍后又在笔记本上看。
-- 收录者信息。
-
-收录者通常也是一个 Tracker，可以查询到更多源，类似传统 BitTorrent。  
-同时也可以通过基于下载证明的激励，建立更健康的 `P2P` 体系。最近获取过某个内容的 Zone，也会在一段时间内继续为该内容提供加速支持。
-
-### 主动加速
-
-在 Pull 流程中，可以根据 File 的多源信息，同时从不同源获取不同 Chunk。  
+在此基础上，我们能实现简单可靠的传输加速。在 Pull 流程中，可以根据 File 的多源信息，同时从不同源获取不同 Chunk。  
 从可验证性角度看，一个 Chunk 的一次完整读取只能对应一个已知 `ChunkId`，但不同 Chunk 可以来自不同源。
 
 对于速度过慢的 Chunk，可以切换源下载，既可以断点续传，也可以重头开始。  
 Pull 调度器可以根据历史记录和到源的距离，决定 `chunk x` 从 `source y` 下载。
 
+### 多源发现
+
+消费者(Consumer)如何发现多个源呢?
+核心原则是：**源发现**和**内容校验**是两件彼此解耦的事。我们可以用很多不完全可信的办法去“猜测谁可能有这个内容”，但一旦真正开始下载，仍然只依赖 `ChunkId/ObjectId` 做最终验证。
+
+因此，多源发现本质上是在收集“谁可能持有这个内容”的线索。常见线索包括：
+
+- 原始源 URL。
+- `Reference`，也就是“谁传播了这个内容”。
+- 收录者。
+- 本地 Cache：由基础环境搭建者提供，可在一个范围内实现加速，例如在台式机上看过的内容，稍后又在笔记本上看。
+
+原始源 URL 是最直接的来源：当一个 `FileObject`、`ChunkId` 或语义 URL 被发布时，最初发布它的 Zone 通常就是第一个可用源。
+
+`Reference` 代表传播路径。比如某个内容是 Alice 通过 feed、消息或页面跳转带给 Bob 的，那么 Alice 至少在最近一段时间里“很可能”持有这个内容，或者知道哪里能拿到这个内容。因此，传播者不一定是最终数据源，但通常是发现更多源的重要入口。
+
+收录者同样很关键。一个收录者既然愿意把内容纳入自己的目录、榜单或集合，它通常就会在自己的基础设施上保留该内容，或者至少维护“谁有这个内容”的索引。对用户来说，收录者一方面提供内容发现，另一方面也天然扮演了 Tracker 的角色。
+
+本地 Cache 则是最容易被忽略、但实际非常重要的一类源。很多情况下，用户并不是第一次接触某个内容，只是换了一台设备、换了一条传播路径或再次打开了同一个对象。只要 Zone 内基础设施之间能够共享“本地最近拿到过哪些 Chunk”的事实，就能显著降低重复下载成本。
+
+在协议实现上，一个 Pull 调度器通常会把这些线索统一整理成一个候选源列表：
+
+```text
+candidate_sources = [
+    original_source,
+    referrers,
+    curators,
+    tracker_results,
+    local_cache_nodes
+]
+```
+
+然后再结合最近的下载证明、时延、失败率、带宽估计和距离，决定每个 Chunk 具体从哪个源拉取。
+
+这里要强调：`谁告诉我“某个源可能有数据”` 与 `这个源返回的数据是否可信` 完全是两套逻辑。前者可以很宽松，后者必须严格。正是这种解耦，才让 CYFS 能在开放网络中同时获得“多源加速”和“内容可信”。
+
+
+收录者通常也是一个 Tracker，可以查询到更多源，类似传统 BitTorrent。
+
+> Tracker协议还未做详细的设计，但其基本返回结构是一个 数组，说明"谁拥有哪些Chunk"，可以从下载证明中反推出来
+
+### 有激励的P2P网络
+收录者通常会设计一定的激励机制，要求下载者提供“下载证明"
+同时也可以通过基于下载证明的激励，建立更健康的 `P2P` 体系。最近获取过某个内容的 Zone，也会在一段时间内继续为该内容提供加速支持。
+
+
 ### 透明加速
 
-> 本章节内容为占位，未做详细设计
+> 本章节内容为占位，还未做详细的协议设计
 
-核心思路是：把 Pull 请求透明地拦截到 Cache Node，实现方式与现有透明加速网关类似。但因为要实现：
+核心思路是：网络基础设施(比如路由器) 把 Pull 请求透明地拦截到 Cache Node，实现方式与现有透明加速网关类似。但因为要实现：
 
 ```text
 将 Client 发往源 X 的请求，重定向到更快的源 Y
@@ -798,13 +637,203 @@ Pull 调度器可以根据历史记录和到源的距离，决定 `chunk x` 从 
 
 所以必须能识别并重定向 Pull 目标。这通常依赖明文的 CYFS 流量，或者依赖 Zone 内可共享可信私钥时对 HTTPS 级流量进行拦截。
 
+## 内容购买与认证
+
+> 我只返回数据给 '满足于条件的用户'
+
+这里的认证描述的是 `cyfs://` 里的“君子协定”:协议只保证**诚实节点**会按约束传播和访问，并不在密码学上阻止恶意节点复制与转发。换句话说，这是一种**弱强制 + 基于声誉**的约束：配合 `cyfs-cascades`、`Reference` 等上下文信号，正常节点会选择遵守；恶意节点虽然技术上可以绕过，但也会因此失去后续收益分配、Curator 信用背书等上层好处。而且基于CYFS构建的Content Network的多源特性，一个节点拒绝返回数据给用户，通常不能100%保证用户无法得到数据。这个君子协定设计的目的是希望被大部分诚实节点遵守，提高”不道德节点“的作恶成本。严格的身份认证通常是写相关的，走的是 Zone 内的 NDM 相关协议，这里不展开讨论。落到 `cyfs://` 协议上，通常已经是跨 Zone 访问，此时至少偏向“半公开”场景，因为数据一旦到了公网，就没有 100% 可靠的方法阻止其继续传播。
+
+```headers
+cyfs-original-user: $user-did
+Reference:
+```
+
+这里的核心思路是：请求方不仅表明“我是谁”，还表明“我是因为什么上游动作或页面跳转来到这里的”。对于一些半公开内容，服务端并不追求绝对防扩散，而是希望把访问能力绑定在某条业务链路上。
+
+因此，权限控制可以同时参考：
+
+- `cyfs-original-user`：谁发起了请求，这里有基于DID的身份信息
+- `Reference` / `ReferencePath`：请求是从哪条内容传播链路进入的。
+- `cyfs-cascades`：请求背后的动作链，例如“浏览页面 -> 点击购买 -> 请求附件”。
+- `cyfs-proofs`：JWT格式的证明，基于original-user的身份构造
+
+这种机制更接近“带上下文的访问约束”，而不是传统意义上的强访问控制。
+
+这里需要特别说明“购买收据”和“访问许可”之间的边界。  
+在 `cyfs://` 里，收据首先表达的是一个**经济事实**，例如：
+
+```text
+用户 Alice 购买了内容 movie:xxx
+```
+
+这条事实的主要价值是：网络里的诚实节点可以围绕它继续做收益分配、传播归因和后续激励。  
+但它**不天然等价于**“只有 Alice 本人才能继续读取这个内容”。在很多 `Content Network` 场景里，别的用户携带这张收据继续访问，并不被协议视为有问题。比如 Alice 购买了一份研究报告，把报告链接和购买收据一起分享给 Bob；Bob 再带着这张收据去访问另一个诚实的 CYFS Gateway，该网关完全可以接受这张收据，因为它证明的是“这份内容已经有人为其付费”，而不是“只有付款人本人才能看到”。
+
+这也正是前面“君子协定”那一节的落点：CYFS 记录和传播的是“谁付过钱、谁带来了这次传播、谁因为这次传播获得后续收益”这些事实，而不是试图在公网里用密码学绝对阻止二次扩散。  
+如果某个业务确实需要“收据只能由付款人本人使用”的强约束，那应当把这种约束明确写进业务规则，并通常配合更强的 Zone 内身份认证去实现；它不是 `cyfs://` 默认假设的唯一模式。
+
+### 验证购买收据
+
+购买收据的设计目标，并不只是“付了钱才能看内容”这么简单。从 `Content Network` 的视角看，它更像是在协议层引入一种**可验证的收益分配起点**：当用户真正消费了某个内容，就能围绕这次消费，透明地把利益连接到`作者、收录者、传播者、消费者`这几类角色。
+
+这里的核心思想是：
+
+- 协议要保障“通过发布内容直接获得收入”的权利，而不是把定价、结算、分发全部交给中心化平台。
+- 收益分配的起点应该尽量接近真实消费行为，而不是只看平台内部的展示量、点击量或模糊分成规则。
+- 最理想的路径仍然是`消费者直接付费给创作者`，但协议也允许围绕收录、传播、导购等动作做后续分账。
+- 购买凭证应该是**可携带、可缓存、可跨站点复用**的对象，而不是某个平台数据库里一条只能本平台识别的状态。
+
+因此，购买收据在协议里通常至少要绑定下面这些信息：
+
+- 谁买的：购买者 DID，说明“最初是谁完成了这次购买”。
+- 买了什么：目标内容的 `ObjectId`，或某个内容集合/版本范围。
+- 买到了什么权利：例如永久读取、限时读取、可下载次数、是否允许继续传播、是否允许他人基于该收据继续读取等。
+- 付了多少钱：金额、币种、结算合约或订单号。
+- 这张收据是否仍然有效：签发时间、过期时间、撤销状态。
+
+这样，网关在“验证购买收据”时，做的事情就比较清晰了：
+
+1. 验证收据本身的签名、链上状态或合约状态，确认它不是伪造的。
+2. 读取收据里的业务语义：它到底是“付款事实证明”，还是“只绑定付款人本人的访问许可”。
+3. 验证收据覆盖的内容范围，确认它确实允许读取当前请求的对象。
+4. 如果业务规则要求“付款人与请求人一致”，再检查收据里的购买者身份是否与当前请求中的 `cyfs-original-user` 匹配；如果业务规则允许转交或继续传播，则这一步可以不要求一致。
+5. 验证收据仍在有效期内，且没有被撤销或重复消费到超限。
+
+当这些条件满足后，网关就可以把“用户有权读取这个内容”转化成一次正常的 `cyfs:// GET` 返回。也就是说，收据解决的是“这次读取是否被授权”，而内容本身的完整性校验仍然完全由 `ObjectId/ChunkId` 负责。
+
+CYFS协议的一个根本设计目标，是为了保障
+- 每个人都有通过发布内容获得收入的自由和权利
+- 网络本身就是内容发行的基础设施
+- 更合理的经济模型，让内容发行流程中的每个角色都能得到合理的收入，但最合理的是`消费者直接付费给创作者`
+
+1. 用户访问链接，链接告知 Content 的商品信息和购买方法（兼容 HTTP 402）。
+2. 用户根据购买方法的指引完成购买，得到收据。我们自带的去中心购买方法是基于 USDB 的内容购买合约。
+3. 用户再次访问链接，并携带自己的收据。
+4. CYFS 网关对用户身份和收据进行验证，然后返回内容数据。
+
+
+
+## 内容的发布与Zone 内上传
+
+CYFS 本身没有“上传公共数据”的统一协议设计，因为 CYFS 的定位是在互联网上高效可靠地获取公共数据，实现 `Content Network`。
+
+**No Push! `cyfs://` 是 `pull-first` 的协议。** 跨 Zone 之间**不存在**“我把内容推给你”的语义，所有跨 Zone 分发最终都落在“对方主动 Pull”上。
+
+但在单个 Zone 内部，很多产品逻辑仍然会出现“传统的上传行为”——比如用户在手机上选择一张照片，用 MessageHub 给朋友发送消息，在消息真正发出前，需要先把照片从手机搬到 OOD 上。这是**Zone 内**的发布流程，不违反 pull-first 约束。关于Zone内的数据流转，参考NDM系列协议(Named Data Maanger Protocol)的设计
+
+### Zone间的内容传播
+
+
+Zone 间**没有上传的概念**。如果 `ZoneA` 给 `ZoneB` 发送一个带附件的 `MessageObject`，并不会有所谓“附件上传”的逻辑。
+
+其核心流程如下：`ZoneA` 只是把“消息对象”和“附件引用”交给 `ZoneB`，真正的数据流动仍然发生在 `ZoneB` 后续主动发起的 Pull 中。
+
+也就是说，在跨 Zone 场景里要区分两件事：
+
+1. **消息到达**：`MessageObject` 本身是一个较小的 `NamedObject`，可以通过应用层 API 直接送达。
+2. **内容获取**：附件、引用对象、页面资源等较大的 `NamedData`，永远由接收方按需拉取。
+
+因此，`sendmsg` 更像是在说：
+
+```text
+“我通知你：这里有一个对象，和一些你可以选择去 Pull 的引用。”
+```
+
+而不是：
+
+```text
+“我已经把附件推送到了你的 Zone 里。”
+```
+
+`ZoneB` 在收到消息后，通常会自己完成下面这些判断：
+
+- 这个消息是否合法，发送者是否可信。
+- 自己是否真的需要附件。
+- 附件应该立刻下载、延迟下载，还是根本不下载。
+- 应该优先从 `ZoneA` 拉，还是先向本地 Cache、收录者或其它已知源查询更快的来源。
+
+只有在这些业务判断完成之后，`ZoneB` 才会对 `MessageObject.ref_obj[i]` 执行标准的 `open_reader_by_url` / `get_object_by_url`。一旦开始 Pull，后续流程就重新回到本文前面介绍的通用 CYFS 下载语义：验证 `PathObject`、验证 `NamedObject`、验证 `ChunkId`，必要时再走 `ChunkList`、`SameAs` 和多源调度。
+
+这个设计有两个重要好处：
+
+- 它保持了 `pull-first` 的统一语义。跨 Zone 的数据分发无需单独再设计一套“远程上传协议”。
+- 它让接收方始终拥有最终控制权。是否下载、何时下载、从谁下载，都由接收方决定，而不是由发送方强行推送。
+
+因此，跨 Zone 传播的本质不是“上传附件”，而是“发送一个可验证的引用，然后等待对方决定是否消费这个引用”。
+
+```text
+ZoneA Call ZoneB.sendmsg(MessageObject) # sendmsg是一个app service API
+ZoneB.onmsg(MessageObject): # ZoneB自己的业务处理流程
+    业务逻辑判断
+    决定下载附件
+ZoneB.open_reader_by_url(MessageObject.ref_obj[0]) # ZoneB决定从ZoneA下载内容
+```
+
+
 ## 附录：协议参考
 
-### 特殊的ObjId
+### ObjId的计算规则
 
-`qcid` 可以视为特殊的定长 mix 变体，规则相同（仍然是“长度前缀 + 原始哈希”）。
-`clist` chunklist， 其ObjId用和mix256一致的方法在id中编码了长度信息，其长度是整个chunklist所有的chunk的大小的总和
+`ObjId` 的本质是：
 
+```text
+{obj_type}:{obj_hash_bytes}
+```
+
+其中左侧的 `obj_type` 说明“这是哪一类对象”，右侧的 `obj_hash_bytes` 说明“这一类对象是如何被唯一绑定到具体内容上的”。在文本表达上，最常见的是：
+
+```text
+{obj_type}:{hex(obj_hash_bytes)}
+```
+
+在 URL hostname 等场景里，也可以使用前文约定的 base32 等价形式。
+
+对协议实现来说，关键不是“长得像不像 Hash”，而是**不同类型的对象，`obj_hash_bytes` 的构造规则可能不同**。目前主要分成下面几类：
+
+1. 标准 ChunkId  
+   对原始字节直接计算标准哈希。
+
+   ```text
+   obj_hash_bytes = raw_hash_bytes(data)
+   ObjectId       = "{hash_type}:" + hex(obj_hash_bytes)
+   ```
+
+2. 标准 NamedObject  
+   对对象的 canonical JSON 做 Hash。
+
+   ```text
+   S              = RFC 8785 canonical JSON bytes
+   obj_hash_bytes = sha256(S)
+   ObjectId       = "{obj_type}:" + hex(obj_hash_bytes)
+   ```
+
+3. 带长度信息的对象  
+   在摘要前面拼一个 `varint(length)`，让客户端仅凭 `ObjectId` 就能知道逻辑大小。`mix*` 与 `clist` 都属于这一类。
+
+   ```text
+   obj_hash_bytes = varint(u64(length)) || raw_digest_bytes
+   ObjectId       = "{obj_type}:" + hex(obj_hash_bytes)
+   ```
+
+   这类对象里，`length` 的语义要按 `obj_type` 区分：
+
+   | 类型 | `length` 的语义 |
+   | --- | --- |
+   | `mix*` | 单个 Chunk 自身的字节长度 |
+   | `clist` | 整个 `ChunkList` 依次拼接后还原出的总字节长度 |
+
+4. 特殊规则对象  
+   少数标准对象会在“canonical JSON + Hash”的基础上再增加额外绑定信息，其规则由该对象自己的标准定义决定。
+
+因此，一个实现只要掌握两件事，就能正确处理 CYFS `ObjId`：
+
+- 先根据 `obj_type` 确定该类型使用哪一种 `obj_hash_bytes` 计算规则。
+- 再按该规则对对象内容重新计算，并与文本里的 `obj_hash_bytes` 比较。
+
+#### 特殊的ObjId
+- `mix256`:在ObjId中编码了Chunk长度的sha256,是系统中用的最多的chunkId类型。
+- `qcid`:快速全文Hash,取文件的5片数据进行mix256。这通常用于一些非严格场景的文件秒传和LocalLink模式的改变发现。
+- `clist` chunklist， 其ObjId用和mix256一致的方法在id中编码了长度信息，其长度是整个chunklist所有的chunk的大小的总和
 
 ### 含有 ObjId 和 inner_path 的 URL
 
@@ -820,6 +849,7 @@ CYFS URL 可以分成两层：
 ```text
 http://$zone_id/$obj_id
 http://$zone_id/ndn/$chunk_id
+http://$objid.$zoneid/
 ```
 
 - 语义链接（R Link）
@@ -864,13 +894,16 @@ http://$zone_id/$container_id/@/key/@/content
 在该对象上执行 `/readme`，得到 `FileObject`；  
 再在该对象上执行 `/content`，得到最终 `ChunkId` 并返回对应内容。
 
-### 辅助验证的 HTTP Header 扩展
+### CYFS HTTP Header 扩展
 
 **CYFS RespHeader扩展**
 
 - `cyfs-obj-id`: `ObjectId`。如果返回内容是一个 `NamedObject`，或者是一个 Chunk（或其 Range），则填写。如果返回的是 `NamedObject` 的某个非 `ObjectId` 字段值，则不填写。
 - `cyfs-path-obj`: `JWT`。只有请求中包含语义路径时才会使用，用于证明“语义路径 -> 根对象”的绑定关系。
-- `cyfs-parents`: `Array<json|ObjectId>`。用于给出 `inner_path` 解析过程中需要的父对象；小对象场景里通常直接塞完整对象，大对象场景里也可以只给出必要的 `ObjectId`。
+- `cyfs-parents-N`: `String`。用于给出 `inner_path` 解析过程中需要的父对象，`N` 从 `0` 开始连续编号。单项值格式为：
+  - `oid:$objid`
+  - `json:$base64url_canonical_json`
+  小对象场景里通常直接给完整对象；大对象场景里也可以只给必要的 `ObjectId`，再配合 `cyfs-inner-proof` 验证。服务端 **SHOULD** 避免把过大的完整对象直接塞进 Header；当某个 parent object 过大时，应优先返回 `oid:` 形式，或切换到额外 proof / 二次获取的模式。
 - `cyfs-inner-proof`: `Array<json>`。用于证明 `$child_objid = resolve($parent_obj, inner_path)`；典型场景是大容器或 Merkle Tree 路径证明。
 - `cyfs-chunk-size`: `u64`。当返回的是 Chunk 或 Chunk Range 时，表示该 Chunk 的完整大小，不受 HTTP Range 影响。
 
@@ -892,7 +925,7 @@ get_object_by_url(any://$clientid/$listenerid/$objid)
 1. 发起请求并获得 Body。
 2. 如果 URL 已经包含 `ObjectId`，则直接对 Body 重新计算 `ObjectId` 并校验。
 3. 如果 URL 是语义链接，则先验证 `cyfs-path-obj`，再根据其中的 `target` 对 Body 做校验。
-4. 如果响应还包含 `cyfs-parents` 或 `cyfs-inner-proof`，则继续验证 `inner_path` 链路。
+4. 如果响应还包含 `cyfs-parents-N` 或 `cyfs-inner-proof`，则继续验证 `inner_path` 链路。
 
 ### `open_reader_by_url` 流程
 
