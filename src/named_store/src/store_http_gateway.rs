@@ -16,7 +16,7 @@ use ndn_lib::{ChunkId, NdnError, ObjId};
 use std::sync::Arc;
 
 use crate::gc_types::{EdgeMsg, PinRequest};
-use crate::store_mgr::NamedStoreMgr;
+use crate::ndm::NamedDataMgr;
 
 // Custom headers
 const H_CHUNK_STATE: &str = "x-cyfs-chunk-state";
@@ -32,21 +32,21 @@ const STREAM_BUF_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct NamedStoreMgrHttpGateway {
-    store_mgr: Arc<NamedStoreMgr>,
+    store_mgr: Arc<NamedDataMgr>,
     /// When `false`, all `/_gc/*` endpoints return `gc_disabled` error.
     /// Large-scale deployments can set this to `false` to run in Data-only mode.
     gc_enabled: bool,
 }
 
 impl NamedStoreMgrHttpGateway {
-    pub fn new(store_mgr: Arc<NamedStoreMgr>) -> Self {
+    pub fn new(store_mgr: Arc<NamedDataMgr>) -> Self {
         Self {
             store_mgr,
             gc_enabled: true,
         }
     }
 
-    pub fn new_data_only(store_mgr: Arc<NamedStoreMgr>) -> Self {
+    pub fn new_data_only(store_mgr: Arc<NamedDataMgr>) -> Self {
         Self {
             store_mgr,
             gc_enabled: false,

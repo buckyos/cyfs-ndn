@@ -1,7 +1,7 @@
 use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
 use log::{debug, info, warn};
-use named_store::NamedStoreMgr;
+use named_store::NamedDataMgr;
 use cyfs::{
     ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry,
     FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, NfsInstanceId, NodeKind, NodeRecord,
@@ -271,7 +271,7 @@ pub struct FSMetaService {
     /// File buffer service for managing write buffers (required for high-level file operations)
     fb_service: Option<Arc<dyn FileBufferService>>,
     /// Named store manager for resolving base DirObject children
-    store_mgr: Option<Arc<NamedStoreMgr>>,
+    store_mgr: Option<Arc<NamedDataMgr>>,
     /// Background task manager for deferred operations (finalize/lazy migration)
     background_mgr: Arc<Mutex<BackgroundMgr>>,
 }
@@ -334,7 +334,7 @@ impl FSMetaService {
     }
 
     /// Set named store manager for DirObject child resolution.
-    pub fn with_named_store(mut self, store_mgr: Arc<NamedStoreMgr>) -> Self {
+    pub fn with_named_store(mut self, store_mgr: Arc<NamedDataMgr>) -> Self {
         debug!("fsmeta configured named_store manager");
         self.store_mgr = Some(store_mgr);
         self

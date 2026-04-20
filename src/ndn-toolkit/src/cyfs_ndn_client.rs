@@ -6,7 +6,7 @@ use hyper_util::client::legacy::connect::Connect;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use name_lib::decode_jwt_claim_without_verify;
-use named_store::{ChunkLocalInfo, NamedStoreMgr};
+use named_store::{ChunkLocalInfo, NamedDataMgr};
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde_json::Value;
@@ -217,7 +217,7 @@ where
 #[derive(Clone)]
 pub struct CyfsNdnClient {
     transport: Arc<dyn CyfsHttpTransport>,
-    default_store_mgr: Option<NamedStoreMgr>,
+    default_store_mgr: Option<NamedDataMgr>,
     default_remote_url: Option<String>,
     session_token: Option<String>,
     obj_id_in_host: bool,
@@ -227,7 +227,7 @@ pub struct CyfsNdnClient {
 pub struct CyfsNdnClientBuilder {
     http_builder: reqwest::ClientBuilder,
     transport: Option<Arc<dyn CyfsHttpTransport>>,
-    default_store_mgr: Option<NamedStoreMgr>,
+    default_store_mgr: Option<NamedDataMgr>,
     default_remote_url: Option<String>,
     session_token: Option<String>,
     obj_id_in_host: bool,
@@ -262,7 +262,7 @@ impl CyfsNdnClientBuilder {
         self
     }
 
-    pub fn default_store_mgr(mut self, store_mgr: NamedStoreMgr) -> Self {
+    pub fn default_store_mgr(mut self, store_mgr: NamedDataMgr) -> Self {
         self.default_store_mgr = Some(store_mgr);
         self
     }
@@ -565,7 +565,7 @@ impl CyfsNdnRequestBuilder {
     pub async fn pull_to_local_file_with_named_store(
         self,
         local_path: impl Into<PathBuf>,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
     ) -> NdnResult<CyfsPullResult> {
         self.send()
             .await?
@@ -576,7 +576,7 @@ impl CyfsNdnRequestBuilder {
             .await
     }
 
-    pub async fn pull_to_named_store(self, store_mgr: &NamedStoreMgr) -> NdnResult<CyfsPullResult> {
+    pub async fn pull_to_named_store(self, store_mgr: &NamedDataMgr) -> NdnResult<CyfsPullResult> {
         self.send()
             .await?
             .pull(StoreMode::StoreInNamedMgr, Some(store_mgr.clone()))
@@ -1136,7 +1136,7 @@ impl CyfsNdnResponse {
     pub async fn pull_to_local_file_with_named_store(
         self,
         local_path: impl Into<PathBuf>,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
     ) -> NdnResult<CyfsPullResult> {
         self.pull(
             StoreMode::LocalFile(local_path.into(), 0..0, true),
@@ -1145,7 +1145,7 @@ impl CyfsNdnResponse {
         .await
     }
 
-    pub async fn pull_to_named_store(self, store_mgr: &NamedStoreMgr) -> NdnResult<CyfsPullResult> {
+    pub async fn pull_to_named_store(self, store_mgr: &NamedDataMgr) -> NdnResult<CyfsPullResult> {
         self.pull(StoreMode::StoreInNamedMgr, Some(store_mgr.clone()))
             .await
     }
@@ -1153,7 +1153,7 @@ impl CyfsNdnResponse {
     pub async fn pull(
         self,
         pull_mode: StoreMode,
-        store_mgr: Option<NamedStoreMgr>,
+        store_mgr: Option<NamedDataMgr>,
     ) -> NdnResult<CyfsPullResult> {
         let target_store_mgr =
             resolve_target_store_mgr(&pull_mode, store_mgr, self.client.default_store_mgr.clone())?;
@@ -1333,7 +1333,7 @@ impl CyfsNdnResponse {
         self,
         chunk_id: ChunkId,
         pull_mode: StoreMode,
-        target_store_mgr: Option<NamedStoreMgr>,
+        target_store_mgr: Option<NamedDataMgr>,
         metadata_to_store: Vec<KnownObjectToStore>,
         file_action: Option<NdnAction>,
     ) -> NdnResult<CyfsPullResult> {
@@ -1476,7 +1476,7 @@ impl CyfsNdnResponse {
         self,
         chunk_list: ChunkList,
         pull_mode: StoreMode,
-        target_store_mgr: Option<NamedStoreMgr>,
+        target_store_mgr: Option<NamedDataMgr>,
         metadata_to_store: Vec<KnownObjectToStore>,
         file_action: Option<NdnAction>,
         file_size: u64,
@@ -1571,7 +1571,7 @@ impl CyfsNdnClient {
         file_obj_store: KnownObjectToStore,
         file_obj: FileObject,
         pull_mode: StoreMode,
-        target_store_mgr: Option<NamedStoreMgr>,
+        target_store_mgr: Option<NamedDataMgr>,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
     ) -> NdnResult<CyfsPullResult> {
         let content_obj_id = ObjId::new(file_obj.content.as_str())?;
@@ -1650,7 +1650,7 @@ impl CyfsNdnClient {
         &self,
         base: &ResolvedUrl,
         pull_mode: StoreMode,
-        target_store_mgr: Option<NamedStoreMgr>,
+        target_store_mgr: Option<NamedDataMgr>,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
         chunklist_store: KnownObjectToStore,
         chunk_list: ChunkList,
@@ -1757,9 +1757,9 @@ impl CyfsNdnClient {
 
 fn resolve_target_store_mgr(
     pull_mode: &StoreMode,
-    explicit_store_mgr: Option<NamedStoreMgr>,
-    default_store_mgr: Option<NamedStoreMgr>,
-) -> NdnResult<Option<NamedStoreMgr>> {
+    explicit_store_mgr: Option<NamedDataMgr>,
+    default_store_mgr: Option<NamedDataMgr>,
+) -> NdnResult<Option<NamedDataMgr>> {
     if matches!(pull_mode, StoreMode::StoreInNamedMgr) || pull_mode.need_store_to_named_mgr() {
         return explicit_store_mgr
             .or(default_store_mgr)
@@ -1813,7 +1813,7 @@ async fn file_last_modify_time(path: &Path) -> NdnResult<u64> {
 
 async fn finalize_local_links(
     pull_mode: &StoreMode,
-    store_mgr: Option<&NamedStoreMgr>,
+    store_mgr: Option<&NamedDataMgr>,
     links: &[LocalChunkLink],
     local_path: Option<&PathBuf>,
 ) -> NdnResult<()> {

@@ -82,7 +82,7 @@ use tokio::sync::{oneshot, Mutex as TokioMutex};
 use async_compression::tokio::bufread::GzipDecoder;
 use async_fd_lock::RwLockWriteGuard;
 use async_fd_lock::{LockRead, LockWrite};
-use named_store::NamedStoreMgr;
+use named_store::NamedDataMgr;
 use ndn_lib::*;
 use ndn_toolkit::{check_file_object_content_ready, collect_missing_chunks_for_file_object};
 use tokio::fs::File;
@@ -392,7 +392,7 @@ impl PackageEnv {
     pub async fn check_pkg_ready(
         meta_index_db: &PathBuf,
         pkg_id: &str,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
     ) -> PkgResult<()> {
         let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
@@ -429,7 +429,7 @@ impl PackageEnv {
     pub async fn check_deps_ready(
         meta_index_db: &PathBuf,
         pkg_id: &str,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
     ) -> PkgResult<()> {
         let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
@@ -457,7 +457,7 @@ impl PackageEnv {
     async fn check_deps_ready_impl(
         meta_index_db: &PathBuf,
         pkg_meta: &PackageMeta,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
         visiting: &mut HashSet<String>,
     ) -> PkgResult<()> {
@@ -606,7 +606,7 @@ impl PackageEnv {
                 )
             })?;
 
-        let store_mgr = NamedStoreMgr::get_store_mgr(&store_config_path)
+        let store_mgr = NamedDataMgr::get_store_mgr(&store_config_path)
             .await
             .map_err(|e| {
                 PkgError::InstallError(
@@ -1042,7 +1042,7 @@ mod tests {
     use super::*;
     use buckyos_kit::*;
     use name_lib::DID;
-    use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
+    use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
     use ndn_lib::{FileObject, ObjId, ChunkList, StoreMode, CHUNK_DEFAULT_SIZE};
     use ndn_toolkit::{cacl_file_object, CheckMode};
     use tempfile::tempdir;
@@ -1088,14 +1088,14 @@ mod tests {
         pkg_dir
     }
 
-    async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
+    async fn create_test_store_mgr(base_dir: &Path) -> NamedDataMgr {
         let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
             .await
             .unwrap();
         let store_id = store.store_id().to_string();
         let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = NamedStoreMgr::new();
+        let store_mgr = NamedDataMgr::new();
         store_mgr.register_store(store_ref).await;
         store_mgr
             .add_layout(StoreLayout::new(

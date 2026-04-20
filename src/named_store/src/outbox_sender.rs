@@ -85,11 +85,11 @@ impl EdgeRouter for HttpEdgeRouter {
 /// For multi-bucket same-machine deployments: routes via Maglev
 /// to the correct local store and calls `apply_edge` directly.
 pub struct MgrEdgeRouter {
-    store_mgr: std::sync::Arc<crate::store_mgr::NamedStoreMgr>,
+    store_mgr: std::sync::Arc<crate::ndm::NamedDataMgr>,
 }
 
 impl MgrEdgeRouter {
-    pub fn new(store_mgr: std::sync::Arc<crate::store_mgr::NamedStoreMgr>) -> Self {
+    pub fn new(store_mgr: std::sync::Arc<crate::ndm::NamedDataMgr>) -> Self {
         Self { store_mgr }
     }
 }

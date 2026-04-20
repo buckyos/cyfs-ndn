@@ -38,7 +38,7 @@ use ndn_lib::{
     ChunkType, CyfsParent, DirObject, FileObject, NdnError, NdnResult, ObjId, PathObject,
     OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
-use named_store::{ChunkLocalInfo, NamedStoreMgr};
+use named_store::{ChunkLocalInfo, NamedDataMgr};
 
 const INNER_PATH_DELIMITER: &str = "/@/";
 
@@ -76,7 +76,7 @@ pub enum NdnDirServerMode {
 #[derive(Clone)]
 pub struct NdnDirServerConfig {
     pub semantic_root: PathBuf,
-    pub store_mgr: Arc<NamedStoreMgr>,
+    pub store_mgr: Arc<NamedDataMgr>,
     pub mode: NdnDirServerMode,
     /// URL prefix to strip before resolving against `semantic_root`, e.g.
     /// `"/ndn"` — requests to `/ndn/readme.txt` then resolve `/readme.txt`.
@@ -97,7 +97,7 @@ pub struct NdnDirServerConfig {
 impl NdnDirServerConfig {
     pub fn new(
         semantic_root: impl Into<PathBuf>,
-        store_mgr: Arc<NamedStoreMgr>,
+        store_mgr: Arc<NamedDataMgr>,
         mode: NdnDirServerMode,
     ) -> Self {
         Self {
@@ -208,7 +208,7 @@ impl NdnDirServer {
         &self.config
     }
 
-    pub fn store_mgr(&self) -> &Arc<NamedStoreMgr> {
+    pub fn store_mgr(&self) -> &Arc<NamedDataMgr> {
         &self.config.store_mgr
     }
 

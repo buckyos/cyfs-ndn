@@ -505,7 +505,7 @@ db.pin_internal(
 |---|---|
 | `src/named_store/src/store_db.rs` | 增加 `fs_anchors`、`incoming_refs`、`edge_outbox`、`pins`，以及 `fs_anchor_count` / `eviction_class` / `logical_size` / `owned_bytes` / `children_expanded` 列；实现 `recompute_eviction_class`、`reconcile_expand_state` |
 | `src/named_store/src/local_store.rs` | `put_*` 改成 O(1) cache 写入 + `Lease`；实现 `pin` / `unpin` / `fs_acquire` / `fs_release` / `apply_edge`；`Skeleton` 改成硬屏障语义 |
-| `src/named_store/src/store_mgr.rs` | 增加 sender / flusher / migration worker；暴露 `await_cascade_idle()` |
+| `src/named_store/src/ndm.rs` | 增加 sender / flusher / migration worker；暴露 `await_cascade_idle()` |
 | `src/ndn-lib/...` | `HasRefs` trait 与 `parse_obj_refs`；`SameAs` 返回 `[chunk_list_id]` |
 | `src/fs_meta/src/fs_meta_service.rs` | 删除 `obj_stat` 相关表与 handler；六个写路径接入 `fs_acquire` / `fs_release`，事务共享 |
 | `src/cyfs-lib/src/fsmeta_client.rs` | 删除 `obj_stat_*` API；加入必要的 `fs_acquire/release` 客户端能力（若跨进程）；暴露 `fs_anchor_state` 读接口给 UI 层 |

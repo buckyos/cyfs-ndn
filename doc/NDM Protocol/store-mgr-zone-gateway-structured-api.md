@@ -7,7 +7,7 @@
 - `GET /ndm/v1/objects/lookup`：上传前查重；
 - `/ndm/v1/uploads/*`：基于 TUS 的 chunk 上传协议。
 
-但 `src/named_store/src/store_mgr.rs` 里还有一批**不依赖 ChunkReader/ChunkWriter 的结构化接口**，目前没有统一的 Zone Gateway 协议承载。本文定义一组新的 HTTP JSON API，用于让 `ndm_zone_gateway.rs` 在不引入流式 chunk/data-plane 语义的前提下，直接暴露 `store_mgr` 的控制面能力。
+但 `src/named_store/src/ndm.rs` 里还有一批**不依赖 ChunkReader/ChunkWriter 的结构化接口**，目前没有统一的 Zone Gateway 协议承载。本文定义一组新的 HTTP JSON API，用于让 `ndm_zone_gateway.rs` 在不引入流式 chunk/data-plane 语义的前提下，直接暴露 `store_mgr` 的控制面能力。
 
 本文只覆盖：
 
@@ -37,7 +37,7 @@
 
 其下采用**方法型 RPC 路由**，而不是继续扩展资源型 URI。原因如下：
 
-1. `store_mgr.rs` 本身就是一组方法语义，和 RPC 映射天然一一对应；
+1. `ndm.rs` 本身就是一组方法语义，和 RPC 映射天然一一对应；
 2. `obj_id`、`inner_path`、`owner`、`inode_id`、`field_tag` 等参数组合较多，统一放 JSON body 更容易避免 URL 编码歧义；
 3. `ChunkStoreState`、`ObjectState` 这类返回值并不是天然的 REST 资源，更适合结构化 JSON 响应；
 4. 后续继续补接口时，不会和现有 `/ndm/v1/uploads/*`、`/cyfs/*`、`/ndn/*` 路由混在一起。
@@ -109,7 +109,7 @@
 ### 3.2 `inner_path`
 
 - 允许省略、空串、`"/"`，都视为 `None`；
-- 非空时必须按 `store_mgr.rs` 的规则规范化为以 `/` 开头；
+- 非空时必须按 `ndm.rs` 的规则规范化为以 `/` 开头；
 - 不在网关层做额外语义扩展，只做安全与格式校验。
 
 ### 3.3 `ObjectState` 的 JSON 投影
@@ -283,7 +283,7 @@
 说明：
 
 - 这里的 `stored=true` 不是“根对象存在”而是“目标对象及其强依赖都可用”；
-- 对 chunk / chunklist / file / dir 的递归判断逻辑保持与 `store_mgr.rs` 一致。
+- 对 chunk / chunklist / file / dir 的递归判断逻辑保持与 `ndm.rs` 一致。
 
 ### 4.1.5 `is_object_exist`
 
@@ -680,9 +680,9 @@
 
 ---
 
-## 5. `store_mgr.rs` 到 API 的映射表
+## 5. `ndm.rs` 到 API 的映射表
 
-| `store_mgr.rs` 方法 | 是否纳入 | API |
+| `ndm.rs` 方法 | 是否纳入 | API |
 | --- | --- | --- |
 | `get_object` | 是 | `POST /ndm/v1/store/get_object` |
 | `open_object` | 是 | `POST /ndm/v1/store/open_object` |
@@ -792,7 +792,7 @@ struct ObjIdRequest {
 
 ## 8. 结论
 
-建议在 `ndm_zone_gateway.rs` 中补一组新的 `POST /ndm/v1/store/{method}` JSON RPC 端点，用来覆盖 `store_mgr.rs` 中所有**非流式、非原始二进制**的方法。这样有几个直接收益：
+建议在 `ndm_zone_gateway.rs` 中补一组新的 `POST /ndm/v1/store/{method}` JSON RPC 端点，用来覆盖 `ndm.rs` 中所有**非流式、非原始二进制**的方法。这样有几个直接收益：
 
 1. `store_mgr` 的对象树解析、chunk 元数据判断、GC 控制能力都可以通过 Zone Gateway 统一暴露；
 2. 不会污染现有 TUS 上传路由；

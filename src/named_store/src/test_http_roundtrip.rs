@@ -10,7 +10,7 @@ mod tests {
     };
     use crate::http_backend::{HttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
-    use crate::{NamedLocalConfig, NamedStore, NamedStoreMgr, StoreLayout, StoreTarget};
+    use crate::{NamedLocalConfig, NamedStore, NamedDataMgr, StoreLayout, StoreTarget};
 
     use bytes::Bytes;
     use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode, StreamInfo};
@@ -37,7 +37,7 @@ mod tests {
     /// Start a test HTTP server backed by `NamedStoreMgrHttpGateway`.
     /// Returns `(base_url, JoinHandle)`.
     async fn start_test_server(
-        store_mgr: Arc<NamedStoreMgr>,
+        store_mgr: Arc<NamedDataMgr>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let gateway = Arc::new(NamedStoreMgrHttpGateway::new(store_mgr));
 
@@ -96,7 +96,7 @@ mod tests {
     }
 
     /// Create a temp NamedStoreMgr with one store.
-    async fn make_temp_store_mgr(dir: &std::path::Path) -> Arc<NamedStoreMgr> {
+    async fn make_temp_store_mgr(dir: &std::path::Path) -> Arc<NamedDataMgr> {
         let store = NamedStore::from_config(
             Some("test-store".to_string()),
             dir.to_path_buf(),
@@ -106,7 +106,7 @@ mod tests {
         .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
 
-        let mgr = NamedStoreMgr::new();
+        let mgr = NamedDataMgr::new();
         mgr.register_store(store).await;
 
         let layout = StoreLayout::new(

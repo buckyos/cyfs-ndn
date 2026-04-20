@@ -31,7 +31,7 @@ use serde::Deserialize;
 use crate::gc_types::{EdgeMsg, PinRequest};
 use crate::named_store::ObjectState;
 use crate::store_db::ChunkStoreState;
-use crate::store_mgr::NamedStoreMgr;
+use crate::ndm::NamedDataMgr;
 
 // ======================== Constants ========================
 
@@ -418,13 +418,13 @@ impl Default for NdmZoneGatewayConfig {
 
 #[derive(Clone)]
 pub struct NamedStoreMgrZoneGateway {
-    store_mgr: Arc<NamedStoreMgr>,
+    store_mgr: Arc<NamedDataMgr>,
     state: Arc<RwLock<UploadStateManager>>,
     config: NdmZoneGatewayConfig,
 }
 
 impl NamedStoreMgrZoneGateway {
-    pub fn new(store_mgr: Arc<NamedStoreMgr>, config: NdmZoneGatewayConfig) -> Self {
+    pub fn new(store_mgr: Arc<NamedDataMgr>, config: NdmZoneGatewayConfig) -> Self {
         let gw = Self {
             store_mgr,
             state: Arc::new(RwLock::new(UploadStateManager::new())),

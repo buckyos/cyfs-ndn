@@ -39,7 +39,7 @@ async fn main() {
     .expect("create NamedStore");
     let store = Arc::new(tokio::sync::Mutex::new(store));
 
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
     mgr.register_store(store).await;
 
     let layout = StoreLayout::new(

@@ -14,7 +14,7 @@ use fs_buffer::{FileBufferBaseReader, FileBufferDiffState, FileBufferRecord, Fil
 use log::{debug, info, warn};
 use named_store::{
     DiffChunkList, DiffChunkListReader, DiffChunkListWriter, DiffChunkListWriterOptions,
-    DiffChunkListWriterState, NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout,
+    DiffChunkListWriterState, NamedLocalConfig, NamedLocalStore, NamedDataMgr, StoreLayout,
     StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
@@ -233,7 +233,7 @@ pub struct NamedFileMgr {
 
     /// Optional store layout manager for multi-version store fallback
     /// When set, get_object operations will try multiple layout versions
-    layout_mgr: Option<Arc<NamedStoreMgr>>,
+    layout_mgr: Option<Arc<NamedDataMgr>>,
 
     list_session_seq: AtomicU64,
     list_sessions: Arc<tokio::sync::Mutex<HashMap<u64, NamedListSession>>>,
@@ -266,7 +266,7 @@ impl NamedFileMgr {
         buffer: Arc<dyn FileBufferService>,
         fetcher: Option<Arc<dyn NdnFetcher>>,
         default_commit_policy: CommitPolicy,
-        layout_mgr: Arc<NamedStoreMgr>,
+        layout_mgr: Arc<NamedDataMgr>,
     ) -> Self {
         Self {
             instance,
@@ -281,12 +281,12 @@ impl NamedFileMgr {
     }
 
     /// Set the store layout manager
-    pub fn set_layout_mgr(&mut self, layout_mgr: Arc<NamedStoreMgr>) {
+    pub fn set_layout_mgr(&mut self, layout_mgr: Arc<NamedDataMgr>) {
         self.layout_mgr = Some(layout_mgr);
     }
 
     /// Get the store layout manager if set
-    pub fn layout_mgr(&self) -> Option<&Arc<NamedStoreMgr>> {
+    pub fn layout_mgr(&self) -> Option<&Arc<NamedDataMgr>> {
         self.layout_mgr.as_ref()
     }
 

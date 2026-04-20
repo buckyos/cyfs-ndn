@@ -5,7 +5,7 @@ use crate::{
 };
 use name_lib::DID;
 use named_store::{
-    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
+    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedDataMgr, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
@@ -58,14 +58,14 @@ fn did_web(host: &str) -> DID {
     DID::new("web", host)
 }
 
-async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
+async fn create_test_store_mgr(base_dir: &Path) -> NamedDataMgr {
     let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
         .await
         .unwrap();
     let store_id = store.store_id().to_string();
     let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-    let store_mgr = NamedStoreMgr::new();
+    let store_mgr = NamedDataMgr::new();
     store_mgr.register_store(store_ref).await;
     store_mgr
         .add_layout(StoreLayout::new(
@@ -87,7 +87,7 @@ async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
     store_mgr
 }
 
-async fn create_test_named_mgr(base_dir: &Path) -> NamedStoreMgr {
+async fn create_test_named_mgr(base_dir: &Path) -> NamedDataMgr {
     create_test_store_mgr(base_dir).await
 }
 
@@ -141,7 +141,7 @@ fn assert_dir_shape(dir_obj: &DirObject) {
 async fn build_chunk_list_from_file(
     file_path: &Path,
     chunk_size: usize,
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
 ) -> ChunkList {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
     let mut chunk_ids = Vec::new();
@@ -163,7 +163,7 @@ async fn build_chunk_list_from_file(
 
 async fn assert_chunk_list_matches_file(
     file_path: &Path,
-    store_mgr: NamedStoreMgr,
+    store_mgr: NamedDataMgr,
     chunk_list: &ChunkList,
     offset: u64,
 ) {
@@ -182,7 +182,7 @@ async fn assert_chunk_list_matches_file(
     assert_eq!(read_back, file_bytes[offset as usize..].to_vec());
 }
 
-async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expected: &str) {
+async fn assert_object_stored(store_mgr: &NamedDataMgr, obj_id: &ObjId, expected: &str) {
     let stored = store_mgr.get_object(obj_id).await.unwrap();
     match (
         serde_json::from_str::<serde_json::Value>(&stored),
@@ -193,7 +193,7 @@ async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expecte
     }
 }
 
-async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, expected: &[u8]) {
+async fn assert_completed_chunk(store_mgr: &NamedDataMgr, chunk_id: &ChunkId, expected: &[u8]) {
     let (state, size) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(state, ChunkStoreState::Completed);
     assert_eq!(size, expected.len() as u64);
@@ -205,7 +205,7 @@ async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, e
 }
 
 async fn assert_local_link_chunk(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     chunk_id: &ChunkId,
     expected_path: &Path,
     expected_range: Option<std::ops::Range<u64>>,
@@ -236,7 +236,7 @@ async fn assert_local_link_chunk(
 }
 
 async fn assert_local_link_reader_fails_after_source_mutation(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     chunk_id: &ChunkId,
     source_path: &Path,
 ) {

@@ -4,7 +4,7 @@ mod tests {
     use buckyos_kit::init_logging;
     use fs_buffer::{LocalFileBufferService, SessionId};
     use krpc::{RPCContext, RPCErrors};
-    use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
+    use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
     use cyfs::{
         ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
         NodeRecord, NodeState, OpenWriteFlag,
@@ -58,7 +58,7 @@ mod tests {
     }
 
     async fn create_test_service_with_store(
-    ) -> (FSMetaService, TempDir, TempDir, Arc<NamedStoreMgr>) {
+    ) -> (FSMetaService, TempDir, TempDir, Arc<NamedDataMgr>) {
         ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();
@@ -71,7 +71,7 @@ mod tests {
         let store_id = store.store_id().to_string();
         let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = Arc::new(NamedStoreMgr::new());
+        let store_mgr = Arc::new(NamedDataMgr::new());
         store_mgr.register_store(store_ref).await;
         store_mgr.add_layout(build_test_layout(&store_id)).await;
 
@@ -83,7 +83,7 @@ mod tests {
     }
 
     async fn create_test_service_with_store_and_buffer(
-    ) -> (FSMetaService, TempDir, TempDir, TempDir, Arc<NamedStoreMgr>) {
+    ) -> (FSMetaService, TempDir, TempDir, TempDir, Arc<NamedDataMgr>) {
         ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();
@@ -97,7 +97,7 @@ mod tests {
         let store_id = store.store_id().to_string();
         let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = Arc::new(NamedStoreMgr::new());
+        let store_mgr = Arc::new(NamedDataMgr::new());
         store_mgr.register_store(store_ref).await;
         store_mgr.add_layout(build_test_layout(&store_id)).await;
 

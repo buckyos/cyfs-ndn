@@ -27,7 +27,7 @@ use crate::cyfs_ndn_client::{
     CyfsTransportResponse, PathObjectVerifier,
 };
 use crate::cyfs_ndn_dir_server::{NdnDirServer, NdnDirServerConfig, NdnDirServerMode};
-use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
+use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
 use ndn_lib::{
     build_named_object_by_json, cyfs_parse_url, ChunkHasher, ChunkId, ChunkList, ChunkType,
     FileObject, HashMethod, NamedObject, NdnError, ObjId, CYFS_CASCADES_MAX_LEN,
@@ -44,14 +44,14 @@ fn deterministic_bytes(len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn create_test_store_mgr(base_dir: &Path) -> Arc<NamedStoreMgr> {
+async fn create_test_store_mgr(base_dir: &Path) -> Arc<NamedDataMgr> {
     let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
         .await
         .unwrap();
     let store_id = store.store_id().to_string();
     let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-    let store_mgr = NamedStoreMgr::new();
+    let store_mgr = NamedDataMgr::new();
     store_mgr.register_store(store_ref).await;
     store_mgr
         .add_layout(StoreLayout::new(
@@ -186,7 +186,7 @@ impl CyfsHttpTransport for InProcServerTransport {
 
 async fn make_server_client_pair(
     base_dir: &Path,
-) -> (Arc<NdnDirServer>, CyfsNdnClient, Arc<NamedStoreMgr>) {
+) -> (Arc<NdnDirServer>, CyfsNdnClient, Arc<NamedDataMgr>) {
     let store_mgr = create_test_store_mgr(&base_dir.join("store")).await;
     let semantic_root = base_dir.join("root");
     tokio::fs::create_dir_all(&semantic_root).await.unwrap();
@@ -747,7 +747,7 @@ async fn server_get(
 /// ChunkList object in the store, and return the ChunkList id, canonical
 /// JSON, and the concatenated raw bytes.
 async fn put_chunklist_with_parts(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     parts: &[Vec<u8>],
 ) -> (ObjId, String, Vec<u8>) {
     let mut ids = Vec::with_capacity(parts.len());

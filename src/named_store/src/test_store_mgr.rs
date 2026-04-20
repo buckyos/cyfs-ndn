@@ -89,7 +89,7 @@ fn test_resolve_next_obj_cache_lru() {
 
 #[tokio::test]
 async fn test_resolve_next_obj_reuse_cached_subpath() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     let dir1 = DirObject::new(Some("dir1".to_string()));
     let (dir1_obj_id, dir1_obj_str) = dir1.gen_obj_id().unwrap();
@@ -137,7 +137,7 @@ async fn test_resolve_next_obj_reuse_cached_subpath() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_basic() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     // Initially empty
     assert_eq!(mgr.version_count().await, 0);
@@ -147,7 +147,7 @@ async fn test_store_layout_mgr_basic() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_add_versions() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     let targets1 = vec![create_test_target("store1", 1, true, false)];
     let layout1 = create_layout_with_epoch(1, targets1);
@@ -201,7 +201,7 @@ async fn test_store_layout_mgr_add_versions() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_version_ordering() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     // Add versions out of order
     let targets2 = vec![create_test_target("store1", 1, true, false)];
@@ -229,7 +229,7 @@ async fn test_store_layout_mgr_version_ordering() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_compact() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     for epoch in 1..=3 {
         let targets = vec![create_test_target("store1", 1, true, false)];
@@ -247,7 +247,7 @@ async fn test_store_layout_mgr_compact() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_custom_max_versions() {
-    let mgr = NamedStoreMgr::with_max_versions(2);
+    let mgr = NamedDataMgr::with_max_versions(2);
 
     for epoch in 1..=5 {
         let targets = vec![create_test_target("store1", 1, true, false)];
@@ -267,7 +267,7 @@ async fn test_store_layout_mgr_custom_max_versions() {
 
 #[tokio::test]
 async fn test_store_layout_mgr_replace_same_epoch() {
-    let mgr = NamedStoreMgr::new();
+    let mgr = NamedDataMgr::new();
 
     let targets1 = vec![create_test_target("store1", 1, true, false)];
     let layout1 = create_layout_with_epoch(1, targets1);

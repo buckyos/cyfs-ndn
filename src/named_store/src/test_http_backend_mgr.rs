@@ -13,7 +13,7 @@ mod tests {
     use crate::backend::{ChunkWriteOutcome, NamedDataStoreBackend};
     use crate::http_backend::{HttpBackend, HttpBackendConfig};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
-    use crate::{NamedLocalConfig, NamedStore, NamedStoreMgr, StoreLayout, StoreTarget};
+    use crate::{NamedLocalConfig, NamedStore, NamedDataMgr, StoreLayout, StoreTarget};
 
     use bytes::Bytes;
     use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode};
@@ -41,7 +41,7 @@ mod tests {
     /// Start an HTTP server backed by a NamedStoreMgrHttpGateway.
     /// Returns `(base_url, JoinHandle)`.
     async fn start_http_server(
-        store_mgr: Arc<NamedStoreMgr>,
+        store_mgr: Arc<NamedDataMgr>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let gateway = Arc::new(NamedStoreMgrHttpGateway::new(store_mgr));
 
@@ -140,7 +140,7 @@ mod tests {
     ///
     /// Returns (NamedStoreMgr, server_join_handle).
     struct TestEnv {
-        mgr: Arc<NamedStoreMgr>,
+        mgr: Arc<NamedDataMgr>,
         _server_handle: tokio::task::JoinHandle<()>,
         _tmp_dir: tempfile::TempDir,
     }
@@ -163,7 +163,7 @@ mod tests {
             .unwrap();
             let store = Arc::new(tokio::sync::Mutex::new(store));
 
-            let mgr = NamedStoreMgr::new();
+            let mgr = NamedDataMgr::new();
             mgr.register_store(store).await;
 
             let layout = StoreLayout::new(
@@ -187,7 +187,7 @@ mod tests {
         let (server_url, server_handle) = start_http_server(remote_mgr).await;
 
         // -- Main NamedStoreMgr with 2 local + 1 remote --
-        let mgr = NamedStoreMgr::new();
+        let mgr = NamedDataMgr::new();
 
         let local1_dir = base.join("store-local-1");
         std::fs::create_dir_all(&local1_dir).unwrap();
@@ -248,7 +248,7 @@ mod tests {
     }
 
     /// Determine which store a given obj_id would route to.
-    async fn target_store_id(mgr: &NamedStoreMgr, obj_id: &ObjId) -> String {
+    async fn target_store_id(mgr: &NamedDataMgr, obj_id: &ObjId) -> String {
         let layout = mgr.current_layout().await.unwrap();
         layout
             .select_primary_target(obj_id)

@@ -1,4 +1,4 @@
-use crate::{chunk_list_reader::OpenChunkReader, NamedStoreMgr};
+use crate::{chunk_list_reader::OpenChunkReader, NamedDataMgr};
 use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, ChunkList};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -106,7 +106,7 @@ struct MergedChunkMeta {
 }
 
 pub struct DiffChunkListReader {
-    named_store_mgr: Arc<NamedStoreMgr>,
+    named_store_mgr: Arc<NamedDataMgr>,
     auto_cache: bool,
     local_mode: bool,
     open_chunk_reader: Option<OpenChunkReader>,
@@ -129,7 +129,7 @@ pub struct DiffChunkListReader {
 
 impl DiffChunkListReader {
     pub async fn new(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list: ChunkList,
         diff_chunk_list: DiffChunkList,
         seek_from: SeekFrom,
@@ -150,7 +150,7 @@ impl DiffChunkListReader {
     }
 
     pub async fn with_options(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list: ChunkList,
         diff_chunk_list: DiffChunkList,
         seek_from: SeekFrom,
@@ -218,7 +218,7 @@ impl DiffChunkListReader {
     }
 
     pub async fn from_writer_state(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list: ChunkList,
         writer_state: &DiffChunkListWriterState,
         seek_from: SeekFrom,
@@ -257,7 +257,7 @@ impl DiffChunkListReader {
     }
 
     pub async fn from_writer_state_file(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list: ChunkList,
         diff_file_path: impl AsRef<Path>,
         seek_from: SeekFrom,
@@ -636,7 +636,7 @@ struct PersistedDirtyChunks {
 }
 
 pub struct DiffChunkListWriter {
-    named_store_mgr: Arc<NamedStoreMgr>,
+    named_store_mgr: Arc<NamedDataMgr>,
     base_chunk_list_id: ObjId,
     base_chunk_ids: Vec<ChunkId>,
     base_chunk_sizes: Vec<u64>,
@@ -656,7 +656,7 @@ pub struct DiffChunkListWriter {
 
 impl DiffChunkListWriter {
     pub async fn new(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list_id: ObjId,
         base_chunk_list: ChunkList,
         diff_file_path: impl AsRef<Path>,
@@ -715,7 +715,7 @@ impl DiffChunkListWriter {
     }
 
     pub async fn open_from_state(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         base_chunk_list: ChunkList,
         state: DiffChunkListWriterState,
         open_chunk_reader: Option<OpenChunkReader>,
@@ -1335,7 +1335,7 @@ fn build_simple_chunk_list_from_ids(
 }
 
 async fn open_store_chunk_reader_with_fallback(
-    named_store_mgr: Arc<NamedStoreMgr>,
+    named_store_mgr: Arc<NamedDataMgr>,
     chunk_id: ChunkId,
     offset: u64,
     auto_cache: bool,
@@ -1543,7 +1543,7 @@ fn resolve_diff_chunk_sizes(
 }
 
 async fn resolve_chunk_sizes_for_list(
-    named_store_mgr: &Arc<NamedStoreMgr>,
+    named_store_mgr: &Arc<NamedDataMgr>,
     chunk_list: &ChunkList,
     local_mode: bool,
     fixed_chunk_size: Option<u64>,
@@ -1638,7 +1638,7 @@ fn resolve_fixed_chunk_sizes(
 }
 
 async fn ensure_chunks_available_in_local(
-    named_store_mgr: &Arc<NamedStoreMgr>,
+    named_store_mgr: &Arc<NamedDataMgr>,
     chunk_list: &ChunkList,
     expected_sizes: Option<&Vec<u64>>,
 ) -> NdnResult<Vec<u64>> {
@@ -1705,7 +1705,7 @@ mod tests {
         store_id: &str,
     ) -> (
         TempDir,
-        Arc<NamedStoreMgr>,
+        Arc<NamedDataMgr>,
         Arc<tokio::sync::Mutex<NamedLocalStore>>,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -1717,7 +1717,7 @@ mod tests {
             .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = Arc::new(NamedStoreMgr::new());
+        let store_mgr = Arc::new(NamedDataMgr::new());
         store_mgr.register_store(store.clone()).await;
         let layout = StoreLayout::new(1, vec![default_target(store_id)], 0, 0);
         store_mgr.add_layout(layout).await;

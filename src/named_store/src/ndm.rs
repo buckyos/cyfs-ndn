@@ -188,8 +188,9 @@ impl ResolveNextObjCache {
     }
 }
 
+//Named Data Manager (NDM)
 #[derive(Clone)]
-pub struct NamedStoreMgr {
+pub struct NamedDataMgr {
     /// Store layouts ordered by epoch (newest first)
     /// Maximum 3 versions: [current, previous, oldest]
     versions: Arc<RwLock<Vec<LayoutVersion>>>,
@@ -204,7 +205,7 @@ pub struct NamedStoreMgr {
     resolve_next_obj_cache: Arc<Mutex<ResolveNextObjCache>>,
 }
 
-impl NamedStoreMgr {
+impl NamedDataMgr {
     pub async fn get_store_mgr(store_config_path: &Path) -> NdnResult<Self> {
         let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
         if store_config.stores.len() < 1 {
@@ -1501,7 +1502,7 @@ impl NamedStoreMgr {
     }
 }
 
-impl Default for NamedStoreMgr {
+impl Default for NamedDataMgr {
     fn default() -> Self {
         Self::new()
     }

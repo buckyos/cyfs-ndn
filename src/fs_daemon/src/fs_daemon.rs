@@ -4,7 +4,7 @@ use fuser::{
 };
 use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
 use log::{debug, info, warn};
-use named_store::{NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
+use named_store::{NamedLocalConfig, NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
 use cyfs::{
     CommitPolicy, NamedFileMgr, NamedFileMgrRef, NfsFileWriter, OpenWriteFlag, PathKind,
     ReadOptions,
@@ -1257,7 +1257,7 @@ fn resolve_store_id(entry: &StoreConfigEntry, index: usize) -> String {
         .unwrap_or_else(|| format!("store-{}", index + 1))
 }
 
-fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<NamedStoreMgr>> {
+fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<NamedDataMgr>> {
     let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
     if store_config.stores.len() < 3 {
         return Err(NdnError::InvalidParam(format!(
@@ -1266,7 +1266,7 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
         )));
     }
 
-    let store_mgr = Arc::new(NamedStoreMgr::new());
+    let store_mgr = Arc::new(NamedDataMgr::new());
     let mut targets = Vec::with_capacity(store_config.stores.len());
     let mut total_capacity = 0u64;
     let mut total_used = 0u64;

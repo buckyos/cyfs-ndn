@@ -1,4 +1,4 @@
-use crate::NamedStoreMgr;
+use crate::NamedDataMgr;
 use log::warn;
 use ndn_lib::{ChunkId, ChunkReader, NdnError, NdnResult, ChunkList};
 use std::future::Future;
@@ -54,7 +54,7 @@ struct ChunkMeta {
 }
 
 pub struct ChunkListReader {
-    named_store_mgr: Arc<NamedStoreMgr>,
+    named_store_mgr: Arc<NamedDataMgr>,
     local_mode: bool,
     open_chunk_reader: Option<OpenChunkReader>,
 
@@ -76,7 +76,7 @@ pub type SimpleChunkListReader = ChunkListReader;
 
 impl ChunkListReader {
     pub async fn new(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         chunk_list: ChunkList,
         seek_from: SeekFrom,
     ) -> NdnResult<Self> {
@@ -87,7 +87,7 @@ impl ChunkListReader {
     }
 
     pub async fn with_options(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         chunk_list: ChunkList,
         seek_from: SeekFrom,
         options: ChunkListReaderOptions,
@@ -241,7 +241,7 @@ impl ChunkListReader {
     }
 
     async fn load_chunk_reader(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         chunk_id: ChunkId,
         offset: u64,
         local_mode: bool,
@@ -333,7 +333,7 @@ impl ChunkListReader {
     }
 
     async fn resolve_chunk_sizes(
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         chunk_list: &ChunkList,
         options: &ChunkListReaderOptions,
     ) -> NdnResult<Vec<u64>> {
@@ -375,7 +375,7 @@ impl ChunkListReader {
     }
 
     async fn ensure_chunks_available_in_local(
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         chunk_list: &ChunkList,
         expected_sizes: Option<&Vec<u64>>,
     ) -> NdnResult<Vec<u64>> {
@@ -570,7 +570,7 @@ mod tests {
         store_id: &str,
     ) -> (
         TempDir,
-        Arc<NamedStoreMgr>,
+        Arc<NamedDataMgr>,
         Arc<tokio::sync::Mutex<NamedLocalStore>>,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -582,7 +582,7 @@ mod tests {
             .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = Arc::new(NamedStoreMgr::new());
+        let store_mgr = Arc::new(NamedDataMgr::new());
         store_mgr.register_store(store.clone()).await;
         let layout = StoreLayout::new(1, vec![default_target(store_id)], 0, 0);
         store_mgr.add_layout(layout).await;

@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use named_store::{
     ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListWriter, DiffChunkListWriterState,
-    NamedStoreMgr,
+    NamedDataMgr,
 };
 use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use ndn_lib::{
@@ -185,7 +185,7 @@ pub struct LocalFileBufferService {
     size_used: RwLock<u64>,
     db: Arc<LocalFileBufferDB>,
     records: RwLock<HashMap<String, Arc<RwLock<FileBufferRecord>>>>,
-    named_store_mgr: RwLock<Option<Arc<NamedStoreMgr>>>,
+    named_store_mgr: RwLock<Option<Arc<NamedDataMgr>>>,
     fsmeta_client: RwLock<Option<Arc<FsMetaClient>>>,
 }
 
@@ -236,7 +236,7 @@ impl LocalFileBufferService {
         }
     }
 
-    pub fn with_named_store_mgr(mut self, named_store_mgr: Arc<NamedStoreMgr>) -> Self {
+    pub fn with_named_store_mgr(mut self, named_store_mgr: Arc<NamedDataMgr>) -> Self {
         self.named_store_mgr = RwLock::new(Some(named_store_mgr));
         self
     }
@@ -246,7 +246,7 @@ impl LocalFileBufferService {
         self
     }
 
-    pub fn set_named_store_mgr(&self, named_store_mgr: Arc<NamedStoreMgr>) -> NdnResult<()> {
+    pub fn set_named_store_mgr(&self, named_store_mgr: Arc<NamedDataMgr>) -> NdnResult<()> {
         let mut guard = self
             .named_store_mgr
             .write()
@@ -641,7 +641,7 @@ impl LocalFileBufferService {
         })
     }
 
-    fn get_named_store_mgr(&self) -> NdnResult<Option<Arc<NamedStoreMgr>>> {
+    fn get_named_store_mgr(&self) -> NdnResult<Option<Arc<NamedDataMgr>>> {
         let guard = self
             .named_store_mgr
             .read()
@@ -659,7 +659,7 @@ impl LocalFileBufferService {
 
     async fn put_chunks_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         segments: &[ChunkSegment],
     ) -> NdnResult<()> {
@@ -695,7 +695,7 @@ impl LocalFileBufferService {
 
     async fn put_overlay_dirty_chunks_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         dirty_segments: &[OverlayDirtyChunkSegment],
     ) -> NdnResult<()> {
@@ -740,7 +740,7 @@ impl LocalFileBufferService {
 
     async fn put_links_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         segments: &[ChunkSegment],
         qcid: &ChunkId,
@@ -768,7 +768,7 @@ impl LocalFileBufferService {
 
     async fn put_overlay_dirty_links_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         dirty_segments: &[OverlayDirtyChunkSegment],
         qcid: &ChunkId,
@@ -800,7 +800,7 @@ impl LocalFileBufferService {
 
     async fn put_objects_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         content_layout: &ContentLayout,
         file_obj_id: &ObjId,
         file_obj_str: &str,
