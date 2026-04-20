@@ -251,8 +251,8 @@ impl NdnClient {
         }
 
         let mut cyfs_resp_headers = get_cyfs_resp_headers(res.headers())?;
-        if cyfs_resp_headers.obj_size.is_none() {
-            cyfs_resp_headers.obj_size = res.content_length();
+        if cyfs_resp_headers.chunk_size.is_none() {
+            cyfs_resp_headers.chunk_size = res.content_length();
         }
 
         if let Some(expect) = expect_chunk_id {
@@ -318,7 +318,7 @@ impl NdnClient {
             copy_chunk(chunk_id, &mut remote_reader, &mut local_writer, None, None).await?;
         local_writer.flush().await?;
 
-        let size = resp_headers.obj_size.unwrap_or(copied);
+        let size = resp_headers.chunk_size.unwrap_or(copied);
         Ok(size)
     }
 

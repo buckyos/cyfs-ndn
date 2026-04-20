@@ -10,7 +10,6 @@ use reqwest::header::{self, HeaderMap};
 use reqwest::{Client, Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -23,8 +22,9 @@ use tokio_util::io::StreamReader;
 use ndn_lib::{
     caculate_qcid_from_file, copy_chunk, cyfs_get_obj_id_from_url, get_cyfs_resp_headers,
     verify_named_object_from_str, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkReader,
-    DirObject, FileObject, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId,
-    ProgressCallbackResult, ChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_FILE,
+    CyfsParent, DirObject, FileObject, NamedObject, NdnAction, NdnError, NdnProgressCallback,
+    NdnResult, ObjId, ProgressCallbackResult, ChunkList, StoreMode, OBJ_TYPE_CHUNK_LIST,
+    OBJ_TYPE_FILE,
 };
 
 #[derive(Clone)]
@@ -189,11 +189,15 @@ enum PullDescriptor {
 #[serde(default)]
 struct CyfsHeadEnvelope {
     obj_id: Option<String>,
-    obj_size: Option<u64>,
-    root_obj_id: Option<String>,
+    chunk_size: Option<u64>,
     path_obj: Option<String>,
-    mtree_path: Option<String>,
-    embed_objs: HashMap<String, String>,
+    /// Parent entries – each item is either `oid:<objid>` or `json:<base64url>`
+    /// following the CYFS Protocol `cyfs-parents-N` encoding.
+    #[serde(default)]
+    parents: Vec<String>,
+    /// Inner-path proof data.
+    #[serde(default)]
+    inner_proofs: Vec<Value>,
 }
 
 impl CyfsNdnClientBuilder {
@@ -761,8 +765,8 @@ impl CyfsResponseMeta {
         content_length: Option<u64>,
     ) -> NdnResult<Self> {
         let mut cyfs_headers = get_cyfs_resp_headers(headers)?;
-        if cyfs_headers.obj_size.is_none() {
-            cyfs_headers.obj_size = content_length;
+        if cyfs_headers.chunk_size.is_none() {
+            cyfs_headers.chunk_size = content_length;
         }
 
         let cyfs_head = parse_cyfs_head(headers)?;
@@ -1110,7 +1114,7 @@ impl CyfsNdnResponse {
         file_action: Option<NdnAction>,
     ) -> NdnResult<CyfsPullResult> {
         let effective_obj_id = self.meta.effective_obj_id();
-        let obj_size_hint = self.meta.cyfs_headers.obj_size;
+        let obj_size_hint = self.meta.cyfs_headers.chunk_size;
         let progress_callback = self.request.progress_callback.clone();
         let original_url = self.request.resolved_url.original_url.clone();
         let mut reader = self.reader();
@@ -1540,20 +1544,17 @@ fn merge_cyfs_head_into_headers(headers: &mut CYFSHttpRespHeaders, cyfs_head: Op
             if headers.obj_id.is_none() {
                 headers.obj_id = head_headers.obj_id.clone();
             }
-            if headers.obj_size.is_none() {
-                headers.obj_size = head_headers.obj_size;
+            if headers.chunk_size.is_none() {
+                headers.chunk_size = head_headers.chunk_size;
             }
             if headers.path_obj.is_none() {
                 headers.path_obj = head_headers.path_obj.clone();
             }
-            if headers.root_obj_id.is_none() {
-                headers.root_obj_id = head_headers.root_obj_id.clone();
+            if headers.parents.is_empty() {
+                headers.parents = head_headers.parents.clone();
             }
-            if headers.mtree_path.is_empty() {
-                headers.mtree_path = head_headers.mtree_path.clone();
-            }
-            if headers.embed_objs.is_none() {
-                headers.embed_objs = head_headers.embed_objs.clone();
+            if headers.inner_proofs.is_empty() {
+                headers.inner_proofs = head_headers.inner_proofs.clone();
             }
         }
         CyfsHead::FileObject { obj_id, .. }
@@ -1586,15 +1587,10 @@ fn parse_cyfs_head_value(raw: &str) -> NdnResult<CyfsHead> {
 
     if let Ok(envelope) = serde_json::from_value::<CyfsHeadEnvelope>(value.clone()) {
         if envelope.obj_id.is_some()
-            || envelope.obj_size.is_some()
-            || envelope.root_obj_id.is_some()
+            || envelope.chunk_size.is_some()
             || envelope.path_obj.is_some()
-            || envelope
-                .mtree_path
-                .as_ref()
-                .map(|v| !v.is_empty())
-                .unwrap_or(false)
-            || !envelope.embed_objs.is_empty()
+            || !envelope.parents.is_empty()
+            || !envelope.inner_proofs.is_empty()
         {
             return Ok(CyfsHead::RespHeaders(envelope.into_headers()?));
         }
@@ -1635,28 +1631,17 @@ fn parse_cyfs_head_value(raw: &str) -> NdnResult<CyfsHead> {
 impl CyfsHeadEnvelope {
     fn into_headers(self) -> NdnResult<CYFSHttpRespHeaders> {
         let obj_id = self.obj_id.as_ref().map(|v| ObjId::new(v)).transpose()?;
-        let root_obj_id = self
-            .root_obj_id
-            .as_ref()
-            .map(|v| ObjId::new(v))
-            .transpose()?;
-        let embed_objs = if self.embed_objs.is_empty() {
-            None
-        } else {
-            let mut mapped = HashMap::new();
-            for (key, value) in self.embed_objs {
-                mapped.insert(ObjId::new(key.as_str())?, value);
-            }
-            Some(mapped)
-        };
+        let mut parents = Vec::with_capacity(self.parents.len());
+        for raw in self.parents {
+            parents.push(CyfsParent::decode_header_value(&raw)?);
+        }
 
         Ok(CYFSHttpRespHeaders {
             obj_id,
-            obj_size: self.obj_size,
+            chunk_size: self.chunk_size,
             path_obj: self.path_obj,
-            root_obj_id,
-            mtree_path: self.mtree_path.unwrap_or_default(),
-            embed_objs,
+            parents,
+            inner_proofs: self.inner_proofs,
         })
     }
 }
