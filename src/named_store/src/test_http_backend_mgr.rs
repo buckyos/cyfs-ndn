@@ -11,9 +11,9 @@
 #[cfg(test)]
 mod tests {
     use crate::backend::{ChunkWriteOutcome, NamedDataStoreBackend};
-    use crate::http_backend::{NamedStoreHttpBackend, HttpBackendConfig};
+    use crate::http_backend::{HttpBackendConfig, NamedStoreHttpBackend};
     use crate::store_http_gateway::NamedStoreMgrHttpGateway;
-    use crate::{NamedLocalConfig, NamedStore, NamedDataMgr, StoreLayout, StoreTarget};
+    use crate::{NamedDataMgr, NamedLocalConfig, NamedStore, StoreLayout, StoreTarget};
 
     use bytes::Bytes;
     use cyfs_gateway_lib::{HttpServer, ServerError, ServerErrorCode};

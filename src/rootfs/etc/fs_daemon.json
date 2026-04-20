@@ -1,5 +1,6 @@
 {
   "instance_id": "default",
+  "current_device_did": "did:web:node.example.com",
   "fs_buffer_dir": "/opt/buckyos/local/fs_buffer/",
   "fs_meta_db_path": "/opt/buckyos/local/fs_meta/fs_meta.db",
   "fs_buffer_size_limit": 0

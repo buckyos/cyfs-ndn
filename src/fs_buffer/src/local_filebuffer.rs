@@ -6,15 +6,14 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use named_store::{
     ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListWriter, DiffChunkListWriterState,
     NamedDataMgr,
 };
-use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use ndn_lib::{
-    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, FileObject,
-    NamedObject, NdnError, NdnResult, ObjId, ChunkList, CHUNK_DEFAULT_SIZE,
-    MIN_QCID_FILE_SIZE,
+    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, ChunkList, FileObject,
+    NamedObject, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE, MIN_QCID_FILE_SIZE,
 };
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -684,9 +683,7 @@ impl LocalFileBufferService {
             file.read_exact(&mut buf)
                 .await
                 .map_err(|e| NdnError::IoError(format!("read chunk bytes failed: {}", e)))?;
-            named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf)
-                .await?;
+            named_store_mgr.put_chunk(&segment.chunk_id, &buf).await?;
             cursor += segment.size;
         }
 
@@ -729,9 +726,7 @@ impl LocalFileBufferService {
             file.read_exact(&mut buf).await.map_err(|e| {
                 NdnError::IoError(format!("read overlay dirty chunk bytes failed: {}", e))
             })?;
-            named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf)
-                .await?;
+            named_store_mgr.put_chunk(&segment.chunk_id, &buf).await?;
             cursor = cursor.saturating_add(segment.size);
         }
 
@@ -1594,9 +1589,7 @@ impl FileBufferService for LocalFileBufferService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{
-        ChunkHasher, ChunkType, FileObject, NamedObject, ChunkList, CHUNK_DEFAULT_SIZE,
-    };
+    use ndn_lib::{ChunkHasher, ChunkList, ChunkType, FileObject, NamedObject, CHUNK_DEFAULT_SIZE};
     use tempfile::tempdir;
 
     fn test_lease() -> WriteLease {

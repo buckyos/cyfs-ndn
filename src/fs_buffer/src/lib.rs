@@ -2,11 +2,11 @@ mod buffer_db;
 mod fb_service;
 mod local_filebuffer;
 
+pub use cyfs_lib::SessionId;
 pub use fb_service::{FileBufferService, NfsPath, WriteLease};
 pub use local_filebuffer::{
     FileBufferBaseReader, FileBufferDiffState, FileBufferRecord, LocalFileBufferService,
 };
-pub use cyfs_lib::SessionId;
 use ndn_lib::ChunkId;
 
 pub struct FileBufferId {

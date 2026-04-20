@@ -465,8 +465,8 @@ mod tests {
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
     use crate::{
         ActionObject, CanonValue, InclusionProof, MachineContent, MsgContent, MsgContentFormat,
-        MsgObjKind, MsgObject, ReceiptObj, PathObject, ReceiptStatus, RefItem, RefRole,
-        RefTarget, RelationObject, TopicThread, ACTION_TYPE_VIEWED,
+        MsgObjKind, MsgObject, PathObject, ReceiptObj, ReceiptStatus, RefItem, RefRole, RefTarget,
+        RelationObject, TopicThread, ACTION_TYPE_VIEWED,
     };
     use name_lib::DID;
     use serde::{Deserialize, Serialize};

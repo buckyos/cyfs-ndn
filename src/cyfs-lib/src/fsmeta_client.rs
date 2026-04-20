@@ -3,7 +3,7 @@
 /// ------------------------------
 use crate::{OpenWriteFlag, SessionId};
 use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::{NfsPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
+use ndn_lib::{NdnError, NdnResult, NfsPath, ObjId, OBJ_TYPE_DIR};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};

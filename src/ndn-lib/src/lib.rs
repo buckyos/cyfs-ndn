@@ -116,17 +116,16 @@ pub const OBJ_TYPE_INCLUSION_PROOF: &str = "cyinc"; // curator -> creator: conte
 pub const OBJ_TYPE_RELATION: &str = "cyrel";
 pub const OBJ_TYPE_ACTION: &str = "cyact";
 
-
 //pub const OBJ_TYPE_TRIE: &str = "cytrie"; // trie object map
 //pub const OBJ_TYPE_TRIE_SIMPLE: &str = "cytrie-s"; // simple trie object map
 //pub const OBJ_TYPE_OBJMAP: &str = "cymap-mtp"; // object map
 pub const OBJ_TYPE_OBJMAP: &str = "cymap"; // simple object map
-//pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
+                                           //pub const OBJ_TYPE_LIST: &str = "cylist-mtree"; // object list
 pub const OBJ_TYPE_LIST: &str = "cylist"; // simple object list
-//pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
+                                          //pub const OBJ_TYPE_CHUNK_LIST: &str = "cl"; // normal chunk list with variable size
 pub const OBJ_TYPE_CHUNK_LIST: &str = "clist"; // simple chunk list with mixhash chunk
-//pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list with fixed size
-//pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
+                                               //pub const OBJ_TYPE_CHUNK_LIST_FIX_SIZE: &str = "clist-fix"; // simple chunk list with fixed size
+                                               //pub const OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE: &str = "cl-sf"; // simple chunk list with fixed size
 pub const OBJ_TYPE_PACK: &str = "cypack"; // object set
 
 pub const RELATION_TYPE_SAME: &str = "same";

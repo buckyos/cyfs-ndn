@@ -1,5 +1,5 @@
 use crate::{chunk_list_reader::OpenChunkReader, NamedDataMgr};
-use ndn_lib::{ChunkHasher, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, ChunkList};
+use ndn_lib::{ChunkHasher, ChunkId, ChunkList, ChunkReader, NdnError, NdnResult, ObjId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -1594,10 +1594,7 @@ fn resolve_mix_chunk_sizes(chunk_list: &ChunkList) -> Option<Vec<u64>> {
     Some(sizes)
 }
 
-fn resolve_fixed_chunk_sizes(
-    chunk_list: &ChunkList,
-    fixed_chunk_size: u64,
-) -> NdnResult<Vec<u64>> {
+fn resolve_fixed_chunk_sizes(chunk_list: &ChunkList, fixed_chunk_size: u64) -> NdnResult<Vec<u64>> {
     if chunk_list.body.is_empty() {
         return Ok(Vec::new());
     }

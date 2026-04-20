@@ -2,13 +2,13 @@
 mod tests {
     use crate::fs_meta_service::FSMetaService;
     use buckyos_kit::init_logging;
-    use fs_buffer::{LocalFileBufferService, SessionId};
-    use krpc::{RPCContext, RPCErrors};
-    use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
     use cyfs::{
         ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
         NodeRecord, NodeState, OpenWriteFlag,
     };
+    use fs_buffer::{LocalFileBufferService, SessionId};
+    use krpc::{RPCContext, RPCErrors};
+    use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
     use ndn_lib::{DirObject, FileObject, NfsPath, ObjId};
     use std::sync::{Arc, Once};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -57,8 +57,8 @@ mod tests {
         StoreLayout::new(1, vec![target], 0, 0)
     }
 
-    async fn create_test_service_with_store(
-    ) -> (FSMetaService, TempDir, TempDir, Arc<NamedDataMgr>) {
+    async fn create_test_service_with_store() -> (FSMetaService, TempDir, TempDir, Arc<NamedDataMgr>)
+    {
         ensure_test_logging_once();
         let meta_tmp_dir = TempDir::new().unwrap();
         let store_tmp_dir = TempDir::new().unwrap();

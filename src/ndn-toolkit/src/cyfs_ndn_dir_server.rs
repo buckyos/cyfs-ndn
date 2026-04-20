@@ -32,13 +32,13 @@ use std::time::{Duration, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
+use named_store::{ChunkLocalInfo, NamedDataMgr};
 use ndn_lib::{
     apply_cyfs_resp_headers, build_named_object_by_json, caculate_qcid_from_file,
     calculate_file_chunk_id, named_obj_to_jwt, CYFSHttpRespHeaders, ChunkId, ChunkReader,
     ChunkType, CyfsParent, DirObject, FileObject, NdnError, NdnResult, ObjId, PathObject,
     OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
-use named_store::{ChunkLocalInfo, NamedDataMgr};
 
 const INNER_PATH_DELIMITER: &str = "/@/";
 
@@ -179,9 +179,8 @@ impl SidecarRecord {
     }
 
     fn write_to(&self, path: &Path) -> NdnResult<()> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            NdnError::Internal(format!("serialize sidecar failed: {}", e))
-        })?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| NdnError::Internal(format!("serialize sidecar failed: {}", e)))?;
         std::fs::write(path, bytes).map_err(|e| {
             NdnError::IoError(format!("write sidecar {} failed: {}", path.display(), e))
         })
@@ -306,8 +305,14 @@ impl NdnDirServer {
 
         // 4. R-Link: resolve against semantic root.
         let root = self.load_root_from_semantic(&root_segments).await?;
-        self.serve_resolved(root, inner_steps, head_only, resp_raw, range_header.as_deref())
-            .await
+        self.serve_resolved(
+            root,
+            inner_steps,
+            head_only,
+            resp_raw,
+            range_header.as_deref(),
+        )
+        .await
     }
 
     /// Normalize URL prefix comparison: both sides are matched as `/segment/`.
@@ -337,9 +342,8 @@ impl NdnDirServer {
             return Ok(RootState::Chunk(ChunkId::from_obj_id(obj_id)));
         }
         let obj_str = self.config.store_mgr.get_object(obj_id).await?;
-        let obj_json: serde_json::Value = serde_json::from_str(&obj_str).map_err(|e| {
-            NdnError::DecodeError(format!("parse store object {}: {}", obj_id, e))
-        })?;
+        let obj_json: serde_json::Value = serde_json::from_str(&obj_str)
+            .map_err(|e| NdnError::DecodeError(format!("parse store object {}: {}", obj_id, e)))?;
         Ok(RootState::NamedObj {
             obj_id: obj_id.clone(),
             obj_type: obj_id.obj_type.clone(),
@@ -356,9 +360,7 @@ impl NdnDirServer {
 
         // Directly requested sidecar: return the raw JSON so clients can
         // inspect metadata. Useful for debugging / template flows.
-        if fs_path.extension().and_then(|s| s.to_str()) == Some("cyobj")
-            && fs_path.is_file()
-        {
+        if fs_path.extension().and_then(|s| s.to_str()) == Some("cyobj") && fs_path.is_file() {
             return Ok(RootState::LocalObjFile(fs_path));
         }
 
@@ -444,9 +446,8 @@ impl NdnDirServer {
                         )
                         .await;
                 }
-                let (final_value, parents) = self
-                    .walk_inner_path(obj_type, obj_json, &steps)
-                    .await?;
+                let (final_value, parents) =
+                    self.walk_inner_path(obj_type, obj_json, &steps).await?;
                 self.serve_inner_path_final(
                     final_value,
                     parents,
@@ -492,12 +493,7 @@ impl NdnDirServer {
             cyfs_headers.obj_id = Some(obj_id.clone());
             cyfs_headers.path_obj = path_obj_jwt;
             return self
-                .build_chunklist_response(
-                    &obj_id,
-                    head_only,
-                    range_header,
-                    Some(cyfs_headers),
-                )
+                .build_chunklist_response(&obj_id, head_only, range_header, Some(cyfs_headers))
                 .await;
         }
 
@@ -575,10 +571,7 @@ impl NdnDirServer {
             }
             // Cross-segment boundary: must be an ObjectId.
             let next_id = ObjId::from_value(&result).map_err(|e| {
-                NdnError::InvalidParam(format!(
-                    "segment {} did not end with ObjectId: {}",
-                    i, e
-                ))
+                NdnError::InvalidParam(format!("segment {} did not end with ObjectId: {}", i, e))
             })?;
             let json_str = self.config.store_mgr.get_object(&next_id).await?;
             let next_json: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| {
@@ -618,10 +611,7 @@ impl NdnDirServer {
                 if let Ok(obj_id) = ObjId::from_value(&next) {
                     let json_str = self.config.store_mgr.get_object(&obj_id).await?;
                     cur = serde_json::from_str(&json_str).map_err(|e| {
-                        NdnError::DecodeError(format!(
-                            "parse object JSON mid-segment: {}",
-                            e
-                        ))
+                        NdnError::DecodeError(format!("parse object JSON mid-segment: {}", e))
                     })?;
                     continue;
                 }
@@ -643,9 +633,8 @@ impl NdnDirServer {
         if let Ok(obj_id) = ObjId::from_value(&final_value) {
             if resp_raw {
                 // Do not dereference — return the ObjectId as a JSON string.
-                let body = serde_json::to_string(&final_value).map_err(|e| {
-                    NdnError::Internal(format!("serialize final value: {}", e))
-                })?;
+                let body = serde_json::to_string(&final_value)
+                    .map_err(|e| NdnError::Internal(format!("serialize final value: {}", e)))?;
                 return serve_raw_bytes(
                     Bytes::from(body.into_bytes()),
                     "application/json; charset=utf-8",
@@ -654,14 +643,12 @@ impl NdnDirServer {
             }
             if obj_id.is_chunk() {
                 let chunk_id = ChunkId::from_obj_id(&obj_id);
-                let (_, total_size) =
-                    self.config.store_mgr.query_chunk_state(&chunk_id).await?;
+                let (_, total_size) = self.config.store_mgr.query_chunk_state(&chunk_id).await?;
                 let mut cyfs_headers = CYFSHttpRespHeaders::default();
                 cyfs_headers.obj_id = Some(chunk_id.to_obj_id());
                 cyfs_headers.chunk_size = Some(total_size);
                 cyfs_headers.path_obj = root_path_obj_jwt;
-                cyfs_headers.parents =
-                    parents.into_iter().map(CyfsParent::Json).collect();
+                cyfs_headers.parents = parents.into_iter().map(CyfsParent::Json).collect();
                 return self
                     .build_chunk_response(
                         &chunk_id,
@@ -674,27 +661,22 @@ impl NdnDirServer {
             }
             // NamedObject deref: body = its canonical JSON.
             let json_str = self.config.store_mgr.get_object(&obj_id).await?;
-            let obj_value: serde_json::Value =
-                serde_json::from_str(&json_str).map_err(|e| {
-                    NdnError::DecodeError(format!("parse final named object: {}", e))
-                })?;
-            let (_, canonical) =
-                build_named_object_by_json(obj_id.obj_type.as_str(), &obj_value);
+            let obj_value: serde_json::Value = serde_json::from_str(&json_str)
+                .map_err(|e| NdnError::DecodeError(format!("parse final named object: {}", e)))?;
+            let (_, canonical) = build_named_object_by_json(obj_id.obj_type.as_str(), &obj_value);
             let body_bytes = Bytes::from(canonical.into_bytes());
             let mut cyfs_headers = CYFSHttpRespHeaders::default();
             cyfs_headers.obj_id = Some(obj_id);
             cyfs_headers.path_obj = root_path_obj_jwt;
-            cyfs_headers.parents =
-                parents.into_iter().map(CyfsParent::Json).collect();
+            cyfs_headers.parents = parents.into_iter().map(CyfsParent::Json).collect();
             return build_named_object_response(body_bytes, cyfs_headers, head_only);
         }
 
         // Non-ObjectId final value: return the JSON value itself. There is no
         // object id at the leaf, so `cyfs-obj-id` is omitted; the parents
         // chain alone backs the verification of the surrounding path.
-        let body = serde_json::to_string(&final_value).map_err(|e| {
-            NdnError::Internal(format!("serialize final value: {}", e))
-        })?;
+        let body = serde_json::to_string(&final_value)
+            .map_err(|e| NdnError::Internal(format!("serialize final value: {}", e)))?;
         if resp_raw {
             return serve_raw_bytes(
                 Bytes::from(body.into_bytes()),
@@ -745,13 +727,11 @@ impl NdnDirServer {
                 })?;
                 if offset > 0 {
                     use tokio::io::AsyncSeekExt;
-                    file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| {
-                        NdnError::IoError(format!(
-                            "seek {} failed: {}",
-                            fs_path.display(),
-                            e
-                        ))
-                    })?;
+                    file.seek(std::io::SeekFrom::Start(offset))
+                        .await
+                        .map_err(|e| {
+                            NdnError::IoError(format!("seek {} failed: {}", fs_path.display(), e))
+                        })?;
                 }
                 let reader: ChunkReader = Box::pin(file);
                 (reader, total)
@@ -821,17 +801,15 @@ impl NdnDirServer {
         template: Option<&'async_recursion ObjectTemplate>,
         processed: &mut usize,
     ) -> NdnResult<()> {
-        let read = std::fs::read_dir(dir).map_err(|e| {
-            NdnError::IoError(format!("scan {} failed: {}", dir.display(), e))
-        })?;
+        let read = std::fs::read_dir(dir)
+            .map_err(|e| NdnError::IoError(format!("scan {} failed: {}", dir.display(), e)))?;
         for entry in read {
-            let entry = entry.map_err(|e| {
-                NdnError::IoError(format!("read_dir entry failed: {}", e))
-            })?;
+            let entry =
+                entry.map_err(|e| NdnError::IoError(format!("read_dir entry failed: {}", e)))?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|e| {
-                NdnError::IoError(format!("file_type failed: {}", e))
-            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| NdnError::IoError(format!("file_type failed: {}", e)))?;
             let name = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n.to_string(),
                 None => continue,
@@ -865,11 +843,7 @@ impl NdnDirServer {
                 match self.objectify_file(&path, template).await {
                     Ok(true) => *processed += 1,
                     Ok(false) => {}
-                    Err(e) => warn!(
-                        "ndn_dir_server: objectify {} failed: {}",
-                        path.display(),
-                        e
-                    ),
+                    Err(e) => warn!("ndn_dir_server: objectify {} failed: {}", path.display(), e),
                 }
             }
         }
@@ -937,9 +911,7 @@ impl NdnDirServer {
         // indicates a possible change.
         if sidecar_path.is_file() {
             if let Ok(existing) = SidecarRecord::read_from(&sidecar_path) {
-                if existing.source_size == Some(size)
-                    && existing.source_mtime == Some(mtime)
-                {
+                if existing.source_size == Some(size) && existing.source_mtime == Some(mtime) {
                     return Ok(false);
                 }
                 // mtime / size drifted — confirm via QCID before recomputing.
@@ -968,12 +940,10 @@ impl NdnDirServer {
             )));
         }
 
-        let mut file_obj =
-            FileObject::new(file_name.clone(), chunk_size, chunk_id.to_string());
+        let mut file_obj = FileObject::new(file_name.clone(), chunk_size, chunk_id.to_string());
         apply_template_to_file(&mut file_obj, template);
-        let file_json = serde_json::to_value(&file_obj).map_err(|e| {
-            NdnError::Internal(format!("serialize FileObject failed: {}", e))
-        })?;
+        let file_json = serde_json::to_value(&file_obj)
+            .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;
         let (file_obj_id, _) = build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
 
         // Register the chunk with the store according to mode. We do this
@@ -1048,10 +1018,8 @@ impl NdnDirServer {
 
         // Sidecar stores the canonical form so the JSON round-trips to the
         // same `dir_obj_id` and inner_path verification holds for R-Link.
-        let dir_obj_json: serde_json::Value =
-            serde_json::from_str(&dir_obj_str).map_err(|e| {
-                NdnError::Internal(format!("reparse canonical DirObject JSON: {}", e))
-            })?;
+        let dir_obj_json: serde_json::Value = serde_json::from_str(&dir_obj_str)
+            .map_err(|e| NdnError::Internal(format!("reparse canonical DirObject JSON: {}", e)))?;
 
         let path_obj_jwt = self.mint_path_jwt(dir_path, &dir_obj_id)?;
 
@@ -1103,13 +1071,12 @@ impl NdnDirServer {
             NdnError::IoError(format!("read_dir {} failed: {}", dir_path.display(), e))
         })?;
         for entry in read {
-            let entry = entry.map_err(|e| {
-                NdnError::IoError(format!("read_dir entry failed: {}", e))
-            })?;
+            let entry =
+                entry.map_err(|e| NdnError::IoError(format!("read_dir entry failed: {}", e)))?;
             let path = entry.path();
-            let file_type = entry.file_type().map_err(|e| {
-                NdnError::IoError(format!("file_type failed: {}", e))
-            })?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| NdnError::IoError(format!("file_type failed: {}", e)))?;
             let fname = match path.file_name().and_then(|s| s.to_str()) {
                 Some(n) => n.to_string(),
                 None => continue,
@@ -1122,17 +1089,13 @@ impl NdnDirServer {
             }
 
             if file_type.is_file() {
-                let (file_json, file_size) =
-                    self.build_inline_file_object(&path, template).await?;
+                let (file_json, file_size) = self.build_inline_file_object(&path, template).await?;
                 dir_obj.add_file(fname, file_json, file_size)?;
             } else if file_type.is_dir() {
                 let sub = self.build_dir_object_tree(&path, template).await?;
                 let sub_size = sub.total_size;
                 let (sub_id, sub_str) = sub.gen_obj_id()?;
-                self.config
-                    .store_mgr
-                    .put_object(&sub_id, &sub_str)
-                    .await?;
+                self.config.store_mgr.put_object(&sub_id, &sub_str).await?;
                 dir_obj.add_directory(fname, sub_id, sub_size)?;
             }
         }
@@ -1151,9 +1114,7 @@ impl NdnDirServer {
         let file_name = file_path
             .file_name()
             .and_then(|s| s.to_str())
-            .ok_or_else(|| {
-                NdnError::InvalidParam(format!("bad filename {}", file_path.display()))
-            })?
+            .ok_or_else(|| NdnError::InvalidParam(format!("bad filename {}", file_path.display())))?
             .to_string();
 
         let (chunk_id, chunk_size) =
@@ -1162,28 +1123,21 @@ impl NdnDirServer {
         self.register_chunk_in_store(file_path, &chunk_id, chunk_size)
             .await?;
 
-        let mut file_obj =
-            FileObject::new(file_name, chunk_size, chunk_id.to_string());
+        let mut file_obj = FileObject::new(file_name, chunk_size, chunk_id.to_string());
         apply_template_to_file(&mut file_obj, template);
-        let file_json = serde_json::to_value(&file_obj).map_err(|e| {
-            NdnError::Internal(format!("serialize FileObject failed: {}", e))
-        })?;
+        let file_json = serde_json::to_value(&file_obj)
+            .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;
         Ok((file_json, chunk_size))
     }
 
-    fn mint_path_jwt(
-        &self,
-        source_path: &Path,
-        target: &ObjId,
-    ) -> NdnResult<Option<String>> {
+    fn mint_path_jwt(&self, source_path: &Path, target: &ObjId) -> NdnResult<Option<String>> {
         let Some(key) = self.config.signing_key.as_ref() else {
             return Ok(None);
         };
         let semantic_path = self.semantic_path_for(source_path);
         let path_obj = PathObject::new(semantic_path, target.clone());
-        let path_json = serde_json::to_value(&path_obj).map_err(|e| {
-            NdnError::Internal(format!("serialize PathObject failed: {}", e))
-        })?;
+        let path_json = serde_json::to_value(&path_obj)
+            .map_err(|e| NdnError::Internal(format!("serialize PathObject failed: {}", e)))?;
         Ok(Some(named_obj_to_jwt(
             &path_json,
             key,
@@ -1290,7 +1244,11 @@ fn serve_raw_bytes(
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, content_type)
         .header(http::header::CONTENT_LENGTH, len);
-    let body = if head_only { empty_body() } else { full_body(body_bytes) };
+    let body = if head_only {
+        empty_body()
+    } else {
+        full_body(body_bytes)
+    };
     builder
         .body(body)
         .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)))
@@ -1307,7 +1265,11 @@ fn build_named_object_response(
         .header(http::header::CONTENT_TYPE, CONTENT_TYPE_CYFS_OBJECT)
         .header(http::header::CONTENT_LENGTH, len);
     apply_cyfs_headers(&mut builder, &cyfs_headers)?;
-    let body = if head_only { empty_body() } else { full_body(body_bytes) };
+    let body = if head_only {
+        empty_body()
+    } else {
+        full_body(body_bytes)
+    };
     builder
         .body(body)
         .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)))
@@ -1321,10 +1283,17 @@ fn build_json_value_response(
     let len = body_bytes.len();
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )
         .header(http::header::CONTENT_LENGTH, len);
     apply_cyfs_headers(&mut builder, &cyfs_headers)?;
-    let body = if head_only { empty_body() } else { full_body(body_bytes) };
+    let body = if head_only {
+        empty_body()
+    } else {
+        full_body(body_bytes)
+    };
     builder
         .body(body)
         .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)))
@@ -1385,22 +1354,14 @@ fn load_object_template(root: &Path) -> Option<ObjectTemplate> {
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
         Err(e) => {
-            warn!(
-                "ndn_dir_server: read {} failed: {}",
-                path.display(),
-                e
-            );
+            warn!("ndn_dir_server: read {} failed: {}", path.display(), e);
             return None;
         }
     };
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(v) => v.as_object().cloned(),
         Err(e) => {
-            warn!(
-                "ndn_dir_server: parse {} failed: {}",
-                path.display(),
-                e
-            );
+            warn!("ndn_dir_server: parse {} failed: {}", path.display(), e);
             None
         }
     }
@@ -1473,14 +1434,15 @@ fn compute_dir_signature(dir_path: &Path) -> NdnResult<String> {
 
     let mut entries: Vec<(String, u64, u64)> = Vec::new();
     let mut meta_bytes: Vec<u8> = Vec::new();
-    collect_dir_signature_entries(dir_path, dir_path, &mut entries, &mut meta_bytes)
-        .map_err(|e| {
+    collect_dir_signature_entries(dir_path, dir_path, &mut entries, &mut meta_bytes).map_err(
+        |e| {
             NdnError::IoError(format!(
                 "signature scan {} failed: {}",
                 dir_path.display(),
                 e
             ))
-        })?;
+        },
+    )?;
     entries.sort();
 
     let mut hasher = DefaultHasher::new();
@@ -1612,16 +1574,14 @@ fn apply_cyfs_headers(
 ) -> NdnResult<()> {
     let mut map: reqwest::header::HeaderMap = reqwest::header::HeaderMap::new();
     apply_cyfs_resp_headers(headers, &mut map)?;
-    let response_headers = builder.headers_mut().ok_or_else(|| {
-        NdnError::Internal("response builder has no headers".to_string())
-    })?;
+    let response_headers = builder
+        .headers_mut()
+        .ok_or_else(|| NdnError::Internal("response builder has no headers".to_string()))?;
     for (k, v) in map.iter() {
-        let name = http::header::HeaderName::from_bytes(k.as_ref()).map_err(|e| {
-            NdnError::Internal(format!("invalid header name {}: {}", k, e))
-        })?;
-        let value = HeaderValue::from_bytes(v.as_bytes()).map_err(|e| {
-            NdnError::Internal(format!("invalid header value: {}", e))
-        })?;
+        let name = http::header::HeaderName::from_bytes(k.as_ref())
+            .map_err(|e| NdnError::Internal(format!("invalid header name {}: {}", k, e)))?;
+        let value = HeaderValue::from_bytes(v.as_bytes())
+            .map_err(|e| NdnError::Internal(format!("invalid header value: {}", e)))?;
         response_headers.append(name, value);
     }
     Ok(())
@@ -1737,9 +1697,9 @@ async fn serve_local_file_bytes(
     head_only: bool,
     range_header: Option<&str>,
 ) -> NdnResult<Response<ServerBody>> {
-    let meta = tokio::fs::metadata(path).await.map_err(|e| {
-        NdnError::IoError(format!("stat {} failed: {}", path.display(), e))
-    })?;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| NdnError::IoError(format!("stat {} failed: {}", path.display(), e)))?;
     let total = meta.len();
     let offset = parse_range_offset(range_header).unwrap_or(0);
     if offset > total {
@@ -1769,14 +1729,14 @@ async fn serve_local_file_bytes(
             .map_err(|e| NdnError::Internal(format!("build response failed: {}", e)));
     }
 
-    let mut file = tokio::fs::File::open(path).await.map_err(|e| {
-        NdnError::IoError(format!("open {} failed: {}", path.display(), e))
-    })?;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| NdnError::IoError(format!("open {} failed: {}", path.display(), e)))?;
     if offset > 0 {
         use tokio::io::AsyncSeekExt;
-        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| {
-            NdnError::IoError(format!("seek {} failed: {}", path.display(), e))
-        })?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| NdnError::IoError(format!("seek {} failed: {}", path.display(), e)))?;
     }
     let reader: ChunkReader = Box::pin(file);
     let body = chunk_reader_to_body(reader, remaining);
@@ -1805,7 +1765,10 @@ fn build_error_response(status: StatusCode, message: &str) -> Response<ServerBod
     let body = serde_json::json!({ "error": message }).to_string();
     Response::builder()
         .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
+        .header(
+            http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )
         .body(full_body(Bytes::from(body)))
         .unwrap_or_else(|_| {
             Response::builder()
@@ -1835,8 +1798,7 @@ mod inner_path_tests {
 
     #[test]
     fn split_inner_path_with_root_two_steps_multi_field() {
-        let (root, steps) =
-            split_inner_path_with_root("/all_images/@/readme/@/content");
+        let (root, steps) = split_inner_path_with_root("/all_images/@/readme/@/content");
         assert_eq!(root, "/all_images");
         assert_eq!(
             steps,
@@ -1891,4 +1853,3 @@ mod inner_path_tests {
         assert!(!query_has_resp_raw(Some("")));
     }
 }
-

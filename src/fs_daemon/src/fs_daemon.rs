@@ -1,18 +1,19 @@
+use cyfs::{
+    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NfsFileWriter, OpenWriteFlag, PathKind,
+    ReadOptions,
+};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
-use log::{debug, info, warn};
-use named_store::{NamedLocalConfig, NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
-use cyfs::{
-    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NfsFileWriter, OpenWriteFlag, PathKind,
-    ReadOptions,
-};
-use ndn_lib::{NfsPath, NdnError, NdnResult};
+use log::{debug, info};
+use name_lib::DID;
+use named_store::NamedDataMgr;
+use ndn_lib::{NdnError, NdnResult, NfsPath};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,6 +101,7 @@ impl Default for StoreConfigEntry {
 struct FsDaemonServiceConfig {
     #[serde(alias = "instance", alias = "cyfs_instance_id")]
     instance_id: String,
+    current_device_did: Option<DID>,
     #[serde(alias = "buffer_dir", alias = "fs_buffer_path")]
     fs_buffer_dir: PathBuf,
     #[serde(alias = "meta_db_path", alias = "fs_meta_path")]
@@ -112,6 +114,7 @@ impl Default for FsDaemonServiceConfig {
     fn default() -> Self {
         Self {
             instance_id: "default".to_string(),
+            current_device_did: None,
             fs_buffer_dir: PathBuf::from("/opt/buckyos/var/fs_buffer"),
             fs_meta_db_path: PathBuf::from("/opt/buckyos/var/fs_meta/fs_meta.db"),
             fs_buffer_size_limit: 0,
@@ -1244,20 +1247,11 @@ fn read_json_config<T: DeserializeOwned>(path: &Path) -> NdnResult<T> {
         .map_err(|e| NdnError::InvalidData(format!("parse {} failed: {}", path.display(), e)))
 }
 
-fn resolve_store_id(entry: &StoreConfigEntry, index: usize) -> String {
-    if let Some(store_id) = entry.store_id.as_ref().filter(|v| !v.is_empty()) {
-        return store_id.clone();
-    }
-    entry
-        .path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| format!("store-{}", index + 1))
-}
-
-fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<NamedDataMgr>> {
+fn init_store_mgr(
+    runtime: &Runtime,
+    store_config_path: &Path,
+    current_device_did: &DID,
+) -> NdnResult<Arc<NamedDataMgr>> {
     let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
     if store_config.stores.len() < 3 {
         return Err(NdnError::InvalidParam(format!(
@@ -1266,84 +1260,11 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
         )));
     }
 
-    let store_mgr = Arc::new(NamedDataMgr::new());
-    let mut targets = Vec::with_capacity(store_config.stores.len());
-    let mut total_capacity = 0u64;
-    let mut total_used = 0u64;
-    let mut store_id_set = HashSet::new();
-
-    let config_dir = store_config_path.parent().unwrap_or_else(|| Path::new("."));
-
-    for (index, entry) in store_config.stores.iter().enumerate() {
-        if entry.path.as_os_str().is_empty() {
-            return Err(NdnError::InvalidParam(format!(
-                "store config {} has empty path at index {}",
-                store_config_path.display(),
-                index
-            )));
-        }
-
-        let store_path = if entry.path.is_absolute() {
-            entry.path.clone()
-        } else {
-            config_dir.join(&entry.path)
-        };
-
-        std::fs::create_dir_all(&store_path).map_err(|e| {
-            NdnError::IoError(format!(
-                "create store dir {} failed: {}",
-                store_path.display(),
-                e
-            ))
-        })?;
-
-        let store_id = resolve_store_id(entry, index);
-        let store_config = NamedLocalConfig {
-            read_only: entry.readonly,
-            ..Default::default()
-        };
-        let store = runtime.block_on(async {
-            NamedLocalStore::from_config(Some(store_id.clone()), store_path, store_config).await
-        })?;
-        let actual_store_id = store.store_id().to_string();
-        if actual_store_id != store_id {
-            warn!(
-                "store id mismatch, configured={}, actual={}, using actual",
-                store_id, actual_store_id
-            );
-        }
-        if !store_id_set.insert(actual_store_id.clone()) {
-            return Err(NdnError::InvalidParam(format!(
-                "duplicate store_id '{}' in {}",
-                actual_store_id,
-                store_config_path.display()
-            )));
-        }
-
-        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
-        runtime.block_on(async { store_mgr.register_store(store_ref).await });
-
-        total_capacity += entry.capacity.unwrap_or(0);
-        total_used += entry.used.unwrap_or(0);
-        targets.push(StoreTarget {
-            store_id: actual_store_id,
-            device_did: None,
-            capacity: entry.capacity,
-            used: entry.used,
-            readonly: entry.readonly,
-            enabled: entry.enabled,
-            weight: entry.weight,
-        });
-    }
-
-    let layout = StoreLayout::new(
-        store_config.epoch.max(1),
-        targets,
-        store_config.total_capacity.unwrap_or(total_capacity),
-        store_config.total_used.unwrap_or(total_used),
-    );
-    runtime.block_on(async { store_mgr.add_layout(layout).await });
-    Ok(store_mgr)
+    runtime
+        .block_on(async {
+            NamedDataMgr::get_store_mgr(store_config_path, current_device_did).await
+        })
+        .map(Arc::new)
 }
 
 pub fn init_named_mgr(
@@ -1352,10 +1273,16 @@ pub fn init_named_mgr(
     service_config_path: &Path,
 ) -> NdnResult<NamedFileMgrRef> {
     // 1. load store_layout config, construct store_layout + store_mgr
-    let store_mgr = init_store_mgr(runtime, store_config_path)?;
+    let service_config: FsDaemonServiceConfig = read_json_config(service_config_path)?;
+    let current_device_did = service_config.current_device_did.clone().ok_or_else(|| {
+        NdnError::InvalidParam(format!(
+            "service config {} must include current_device_did",
+            service_config_path.display()
+        ))
+    })?;
+    let store_mgr = init_store_mgr(runtime, store_config_path, &current_device_did)?;
 
     // 2. load fs_daemon service config, init fs_buffer and fs_meta service runner
-    let service_config: FsDaemonServiceConfig = read_json_config(service_config_path)?;
     std::fs::create_dir_all(&service_config.fs_buffer_dir).map_err(|e| {
         NdnError::IoError(format!(
             "create fs buffer dir {} failed: {}",

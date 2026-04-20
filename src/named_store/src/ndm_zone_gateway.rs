@@ -30,8 +30,8 @@ use serde::Deserialize;
 
 use crate::gc_types::{EdgeMsg, PinRequest};
 use crate::named_store::ObjectState;
-use crate::store_db::ChunkStoreState;
 use crate::ndm::NamedDataMgr;
+use crate::store_db::ChunkStoreState;
 
 // ======================== Constants ========================
 

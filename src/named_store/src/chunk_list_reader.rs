@@ -1,6 +1,6 @@
 use crate::NamedDataMgr;
 use log::warn;
-use ndn_lib::{ChunkId, ChunkReader, NdnError, NdnResult, ChunkList};
+use ndn_lib::{ChunkId, ChunkList, ChunkReader, NdnError, NdnResult};
 use std::future::Future;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -648,8 +648,7 @@ mod tests {
             store.put_chunk(&chunk_a_id, &chunk_a).await.unwrap();
         }
 
-        let chunk_list =
-            ChunkList::from_chunk_list(vec![chunk_a_id, missing_chunk_id]).unwrap();
+        let chunk_list = ChunkList::from_chunk_list(vec![chunk_a_id, missing_chunk_id]).unwrap();
         let options = ChunkListReaderOptions::default().with_local_mode(true);
 
         let err = ChunkListReader::with_options(store_mgr, chunk_list, SeekFrom::Start(0), options)
@@ -698,8 +697,7 @@ mod tests {
         ));
 
         let chunk_list =
-            ChunkList::from_chunk_list(vec![in_main_id.clone(), in_backup_id.clone()])
-                .unwrap();
+            ChunkList::from_chunk_list(vec![in_main_id.clone(), in_backup_id.clone()]).unwrap();
         let mut reader =
             ChunkListReader::with_options(store_mgr, chunk_list, SeekFrom::Start(0), options)
                 .await

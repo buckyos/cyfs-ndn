@@ -27,7 +27,7 @@ use crate::cyfs_ndn_client::{
     CyfsTransportResponse, PathObjectVerifier,
 };
 use crate::cyfs_ndn_dir_server::{NdnDirServer, NdnDirServerConfig, NdnDirServerMode};
-use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
+use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
 use ndn_lib::{
     build_named_object_by_json, cyfs_parse_url, ChunkHasher, ChunkId, ChunkList, ChunkType,
     FileObject, HashMethod, NamedObject, NdnError, ObjId, CYFS_CASCADES_MAX_LEN,
@@ -122,8 +122,11 @@ impl CyfsHttpTransport for InProcServerTransport {
     fn send(
         &self,
         request: CyfsTransportRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = ndn_lib::NdnResult<CyfsTransportResponse>> + Send + '_>>
-    {
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = ndn_lib::NdnResult<CyfsTransportResponse>> + Send + '_,
+        >,
+    > {
         let server = self.server.clone();
         Box::pin(async move {
             let parsed = Url::parse(&request.url)
@@ -369,11 +372,7 @@ fn can_02_explicit_null_differs_from_missing() {
 #[test]
 fn can_07_file_object_custom_meta_changes_id() {
     let chunk_id = mix256_from_bytes(&deterministic_bytes(128));
-    let base = FileObject::new(
-        "cyfs-head.bin".to_string(),
-        128,
-        chunk_id.to_string(),
-    );
+    let base = FileObject::new("cyfs-head.bin".to_string(), 128, chunk_id.to_string());
     let (base_id, _) = base.clone().gen_obj_id();
 
     let mut with_meta = base.clone();
@@ -482,7 +481,12 @@ async fn e2e_01_r_link_file_pull_via_server() {
 
     // The response must carry cyfs-obj-id for the underlying chunk and
     // cyfs-parents-0 inlining the FileObject.
-    let chunk_id = resp.meta().cyfs_headers.obj_id.clone().expect("cyfs-obj-id");
+    let chunk_id = resp
+        .meta()
+        .cyfs_headers
+        .obj_id
+        .clone()
+        .expect("cyfs-obj-id");
     assert!(chunk_id.is_chunk(), "final obj id must be a chunk");
     assert_eq!(resp.meta().cyfs_headers.parents.len(), 1);
 
@@ -551,10 +555,7 @@ async fn inner_05_chunk_url_rejects_inner_path() {
     store_mgr.put_chunk(&chunk_id, &chunk_bytes).await.unwrap();
     let _ = server;
 
-    let url = format!(
-        "http://local.test/ndn/{}/@/anything",
-        chunk_id.to_string()
-    );
+    let url = format!("http://local.test/ndn/{}/@/anything", chunk_id.to_string());
     let err = client.get(url).send().await.err().expect("should fail");
     // Server returns HTTP 400 -> client surfaces an error.
     match err {
@@ -624,7 +625,9 @@ impl CyfsHttpTransport for SyntheticTransport {
         &self,
         _request: CyfsTransportRequest,
     ) -> Pin<
-        Box<dyn std::future::Future<Output = ndn_lib::NdnResult<CyfsTransportResponse>> + Send + '_>,
+        Box<
+            dyn std::future::Future<Output = ndn_lib::NdnResult<CyfsTransportResponse>> + Send + '_,
+        >,
     > {
         let headers = self.headers.clone();
         let body = self.body.clone();
@@ -666,13 +669,10 @@ async fn inner_06_nonconsecutive_parents_are_truncated() {
     // Header set has cyfs-parents-0 AND cyfs-parents-2, but no cyfs-parents-1.
     // The spec says: the client walks 0, 1, ... stopping at the first gap.
     // So the only parent actually materialized is parent-0.
-    let parent0 = format!(
-        "json:{}",
-        {
-            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-            URL_SAFE_NO_PAD.encode(file_canonical.as_bytes())
-        }
-    );
+    let parent0 = format!("json:{}", {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        URL_SAFE_NO_PAD.encode(file_canonical.as_bytes())
+    });
     let parent2 = format!("oid:{}", file_obj_id.to_string());
     let headers = header_map_from_pairs(&[
         (CYFS_HEADER_OBJ_ID, &file_obj_id.to_string()),
@@ -692,10 +692,13 @@ async fn inner_06_nonconsecutive_parents_are_truncated() {
 
     // URL carries two inner_path steps but only one parent was parsed — the
     // verification chain must refuse to complete.
-    let url = format!(
-        "http://alice.example/root/@/step_a/@/step_b"
-    );
-    let resp = client.get(url).obj_id(file_obj_id.clone()).send().await.unwrap();
+    let url = format!("http://alice.example/root/@/step_a/@/step_b");
+    let resp = client
+        .get(url)
+        .obj_id(file_obj_id.clone())
+        .send()
+        .await
+        .unwrap();
     let err = resp.meta().verify_inner_path_chain().unwrap_err();
     assert!(
         matches!(err, NdnError::InvalidData(_)),
@@ -726,11 +729,7 @@ fn raw_01_client_raw_toggle_adds_query_parameter() {
 async fn server_get(
     server: &Arc<NdnDirServer>,
     path_and_query: &str,
-) -> (
-    http::StatusCode,
-    http::HeaderMap<HttpHeaderValue>,
-    Vec<u8>,
-) {
+) -> (http::StatusCode, http::HeaderMap<HttpHeaderValue>, Vec<u8>) {
     let req = HttpRequest::builder()
         .method("GET")
         .uri(path_and_query)
@@ -845,15 +844,12 @@ async fn clist_dir_03_file_object_content_chunklist_streams_content() {
     let (server, _, store_mgr) = make_server_client_pair(tmp.path()).await;
 
     let parts = vec![deterministic_bytes(2048), deterministic_bytes(512)];
-    let (list_id, list_canonical, expected) =
-        put_chunklist_with_parts(&store_mgr, &parts).await;
+    let (list_id, list_canonical, expected) = put_chunklist_with_parts(&store_mgr, &parts).await;
     let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
 
-    let file_obj =
-        FileObject::new("big.bin".to_string(), total, list_id.to_string());
+    let file_obj = FileObject::new("big.bin".to_string(), total, list_id.to_string());
     let file_json = serde_json::to_value(&file_obj).unwrap();
-    let (file_obj_id, file_canonical) =
-        build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
+    let (file_obj_id, file_canonical) = build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
     store_mgr
         .put_object(&file_obj_id, &file_canonical)
         .await
@@ -913,4 +909,3 @@ async fn clist_dir_03_file_object_content_chunklist_streams_content() {
 fn path_verifier_is_trait_object_compatible() {
     let _v: Arc<dyn PathObjectVerifier> = Arc::new(AcceptIfFreshVerifier::default());
 }
-

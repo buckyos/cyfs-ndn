@@ -42,11 +42,11 @@ PackageEnv 当前实现说明
   - 递归检查依赖 pkg 是否 ready
   - 不检查当前 pkg 自身内容
 
-- `install_pkg(pkg_id, install_deps, force_install)`
+ - `install_pkg(pkg_id, install_deps, force_install)`
   - 获取写锁
   - 读取 `PackageMeta`
   - 如需要先递归安装依赖
-  - 通过 `named_store_config_path` 构造 `NamedStoreMgr`
+  - 通过 `named_store_config_path + current_device_did` 构造 `NamedStoreMgr`
   - 安装前先检查 `FileObject.content` 引用的数据是否已全部在 store 中
   - 用 `open_reader` 打开包内容 reader，最终统一落到 `do_install_pkg_from_data`
 
@@ -68,7 +68,7 @@ PackageEnv 当前实现说明
 use async_trait::async_trait;
 use fs_extra::dir::*;
 use log::*;
-use name_lib::EncodedDocument;
+use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -105,6 +105,7 @@ pub struct PackageEnvConfig {
     pub parent: Option<PathBuf>, //parent package env work_dir
     pub ready_only: bool,        //read only env cann't install any new pkgs
     pub named_store_config_path: Option<String>, //如果指定了，则使用 named_store 配置文件路径作为默认 read chunk 的来源
+    pub current_device_did: Option<DID>,         //显式传给 NamedDataMgr，用于决定桶是本地还是远端
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     #[serde(default)]
     pub installed: HashSet<String>, //pkg_id列表，表示已经安装的pkg
@@ -146,6 +147,7 @@ impl Default for PackageEnvConfig {
             parent: None,
             ready_only: false,
             named_store_config_path: None,
+            current_device_did: None,
             prefix: Some(os_type.to_string()),
             installed: HashSet::new(),
         }
@@ -605,8 +607,14 @@ impl PackageEnv {
                     "named_store_config_path is required for package installation".to_owned(),
                 )
             })?;
+        let current_device_did = self.config.current_device_did.as_ref().ok_or_else(|| {
+            PkgError::InstallError(
+                pkg_id.clone(),
+                "current_device_did is required for package installation".to_owned(),
+            )
+        })?;
 
-        let store_mgr = NamedDataMgr::get_store_mgr(&store_config_path)
+        let store_mgr = NamedDataMgr::get_store_mgr(&store_config_path, current_device_did)
             .await
             .map_err(|e| {
                 PkgError::InstallError(
@@ -1042,8 +1050,8 @@ mod tests {
     use super::*;
     use buckyos_kit::*;
     use name_lib::DID;
-    use named_store::{NamedLocalStore, NamedDataMgr, StoreLayout, StoreTarget};
-    use ndn_lib::{FileObject, ObjId, ChunkList, StoreMode, CHUNK_DEFAULT_SIZE};
+    use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
+    use ndn_lib::{ChunkList, FileObject, ObjId, StoreMode, CHUNK_DEFAULT_SIZE};
     use ndn_toolkit::{cacl_file_object, CheckMode};
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -1167,6 +1175,8 @@ mod tests {
         let store_mgr = create_test_store_mgr(base_dir).await;
         let store_config_path = create_test_store_config(base_dir).await;
         env.config.named_store_config_path = Some(store_config_path.to_string_lossy().to_string());
+        env.config.current_device_did =
+            Some(DID::from_str("did:web:test-node.example.com").unwrap());
 
         let archive_path = create_test_pkg_archive(base_dir).await;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();

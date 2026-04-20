@@ -69,8 +69,7 @@ impl ChunkList {
         );
         let chunk_list_id_raw =
             ChunkId::mix_length_and_hash_result(self.total_size, &obj_id.obj_hash);
-        let result_id =
-            ObjId::new_by_raw(OBJ_TYPE_CHUNK_LIST.to_string(), chunk_list_id_raw);
+        let result_id = ObjId::new_by_raw(OBJ_TYPE_CHUNK_LIST.to_string(), chunk_list_id_raw);
         (result_id, obj_str)
     }
 

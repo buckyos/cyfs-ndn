@@ -39,7 +39,10 @@ impl CyfsParsedUrl {
         if self.inner_path_steps.is_empty() {
             None
         } else {
-            Some(format!("/{}", self.inner_path_steps.join(CYFS_INNER_PATH_DELIMITER)))
+            Some(format!(
+                "/{}",
+                self.inner_path_steps.join(CYFS_INNER_PATH_DELIMITER)
+            ))
         }
     }
 }
@@ -72,9 +75,7 @@ pub fn cyfs_parse_url(cyfs_url: &str) -> NdnResult<CyfsParsedUrl> {
         .map_err(|e| NdnError::InvalidId(format!("parse cyfs url failed:{}", e)))?;
 
     let host = url.host_str().map(|s| s.to_string());
-    let host_obj_id = host
-        .as_deref()
-        .and_then(|h| ObjId::from_hostname(h).ok());
+    let host_obj_id = host.as_deref().and_then(|h| ObjId::from_hostname(h).ok());
 
     // Split path by the literal "/@/" delimiter.
     let path = url.path();
@@ -95,9 +96,7 @@ pub fn cyfs_parse_url(cyfs_url: &str) -> NdnResult<CyfsParsedUrl> {
     }
 
     let query = url.query().map(|q| q.to_string());
-    let resp_raw = url
-        .query_pairs()
-        .any(|(k, v)| k == "resp" && v == "raw");
+    let resp_raw = url.query_pairs().any(|(k, v)| k == "resp" && v == "raw");
 
     Ok(CyfsParsedUrl {
         host,
@@ -177,11 +176,12 @@ impl CyfsParent {
             return Ok(CyfsParent::ObjId(id));
         }
         if let Some(rest) = raw.strip_prefix("json:") {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(rest.as_bytes())
-                .map_err(|e| NdnError::DecodeError(format!("decode cyfs-parents base64url failed: {}", e)))?;
-            let json = String::from_utf8(bytes)
-                .map_err(|e| NdnError::DecodeError(format!("decode cyfs-parents utf8 failed: {}", e)))?;
+            let bytes = URL_SAFE_NO_PAD.decode(rest.as_bytes()).map_err(|e| {
+                NdnError::DecodeError(format!("decode cyfs-parents base64url failed: {}", e))
+            })?;
+            let json = String::from_utf8(bytes).map_err(|e| {
+                NdnError::DecodeError(format!("decode cyfs-parents utf8 failed: {}", e))
+            })?;
             return Ok(CyfsParent::Json(json));
         }
         Err(NdnError::DecodeError(format!(
@@ -250,7 +250,10 @@ pub fn get_cyfs_resp_headers(headers: &HeaderMap) -> NdnResult<CYFSHttpRespHeade
         None => Vec::new(),
         Some(raw) => {
             let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-                NdnError::DecodeError(format!("parse {} json failed: {}", CYFS_HEADER_INNER_PROOF, e))
+                NdnError::DecodeError(format!(
+                    "parse {} json failed: {}",
+                    CYFS_HEADER_INNER_PROOF, e
+                ))
             })?;
             match value {
                 serde_json::Value::Array(arr) => arr,
@@ -288,7 +291,10 @@ pub fn apply_cyfs_resp_headers(
     }
     if !resp.inner_proofs.is_empty() {
         let raw = serde_json::to_string(&resp.inner_proofs).map_err(|e| {
-            NdnError::Internal(format!("serialize {} failed: {}", CYFS_HEADER_INNER_PROOF, e))
+            NdnError::Internal(format!(
+                "serialize {} failed: {}",
+                CYFS_HEADER_INNER_PROOF, e
+            ))
         })?;
         insert_header(headers, CYFS_HEADER_INNER_PROOF, &raw)?;
     }
@@ -382,10 +388,7 @@ pub fn get_cyfs_req_headers(headers: &HeaderMap) -> NdnResult<CYFSHttpReqHeaders
     })
 }
 
-pub fn apply_cyfs_req_headers(
-    req: &CYFSHttpReqHeaders,
-    headers: &mut HeaderMap,
-) -> NdnResult<()> {
+pub fn apply_cyfs_req_headers(req: &CYFSHttpReqHeaders, headers: &mut HeaderMap) -> NdnResult<()> {
     if let Some(user) = &req.original_user {
         insert_header(headers, CYFS_HEADER_ORIGINAL_USER, user)?;
     }
@@ -423,9 +426,9 @@ fn header_get_str(headers: &HeaderMap, name: &str) -> NdnResult<Option<String>> 
     match headers.get(name) {
         None => Ok(None),
         Some(v) => {
-            let s = v
-                .to_str()
-                .map_err(|e| NdnError::DecodeError(format!("decode header {} failed: {}", name, e)))?;
+            let s = v.to_str().map_err(|e| {
+                NdnError::DecodeError(format!("decode header {} failed: {}", name, e))
+            })?;
             Ok(Some(s.to_string()))
         }
     }
@@ -450,10 +453,8 @@ mod tests {
 
     #[test]
     fn test_parse_url_inner_path() {
-        let parsed = cyfs_parse_url(
-            "http://zone.example/all_images/@/readme/@/content?resp=raw",
-        )
-        .unwrap();
+        let parsed =
+            cyfs_parse_url("http://zone.example/all_images/@/readme/@/content?resp=raw").unwrap();
         assert_eq!(parsed.root_locator, "/all_images");
         assert_eq!(parsed.inner_path_steps, vec!["readme", "content"]);
         assert!(parsed.resp_raw);

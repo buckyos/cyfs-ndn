@@ -5,13 +5,14 @@ use crate::{
 };
 use name_lib::DID;
 use named_store::{
-    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedDataMgr, StoreLayout,
+    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedDataMgr, NamedLocalStore, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
-    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind, MsgObject,
-    NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, RefItem,
-    RefRole, RefTarget, ChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    ChunkHasher, ChunkId, ChunkList, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind,
+    MsgObject, NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId,
+    ProgressCallbackResult, RefItem, RefRole, RefTarget, SimpleMapItem, StoreMode,
+    CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
@@ -151,10 +152,7 @@ async fn build_chunk_list_from_file(
             .unwrap()
             .calc_mix_chunk_id_from_bytes(chunk_data)
             .unwrap();
-        store_mgr
-            .put_chunk(&chunk_id, chunk_data)
-            .await
-            .unwrap();
+        store_mgr.put_chunk(&chunk_id, chunk_data).await.unwrap();
         chunk_ids.push(chunk_id);
     }
 

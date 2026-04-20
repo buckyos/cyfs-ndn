@@ -23,9 +23,9 @@ use ndn_lib::{
     apply_cyfs_req_headers, build_named_object_by_json, caculate_qcid_from_file, copy_chunk,
     cyfs_parse_url, get_cyfs_resp_headers, verify_named_object_from_str, CYFSHttpReqHeaders,
     CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkList, ChunkReader, CyfsParent, CyfsParsedUrl,
-    FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId,
-    PathObject, ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN, OBJ_TYPE_CHUNK_LIST,
-    OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_PATH,
+    FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId, PathObject,
+    ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR,
+    OBJ_TYPE_FILE, OBJ_TYPE_PATH,
 };
 
 // =====================================================================
@@ -59,8 +59,9 @@ pub struct AcceptIfFreshVerifier;
 
 impl PathObjectVerifier for AcceptIfFreshVerifier {
     fn verify(&self, jwt: &str, _host: Option<&str>) -> NdnResult<VerifiedPathObject> {
-        let claims = decode_jwt_claim_without_verify(jwt)
-            .map_err(|e| NdnError::DecodeError(format!("decode cyfs-path-obj jwt failed: {}", e)))?;
+        let claims = decode_jwt_claim_without_verify(jwt).map_err(|e| {
+            NdnError::DecodeError(format!("decode cyfs-path-obj jwt failed: {}", e))
+        })?;
 
         let path_obj: PathObject = serde_json::from_value(claims).map_err(|e| {
             NdnError::InvalidData(format!("parse cyfs-path-obj jwt claims failed: {}", e))
@@ -477,7 +478,12 @@ impl CyfsNdnRequestBuilder {
     }
 
     pub async fn send(self) -> NdnResult<CyfsNdnResponse> {
-        if self.req_headers.cascades.as_ref().map(|v| v.len()).unwrap_or(0)
+        if self
+            .req_headers
+            .cascades
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0)
             > CYFS_CASCADES_MAX_LEN
         {
             return Err(NdnError::InvalidParam(format!(
@@ -974,10 +980,9 @@ fn resolve_inner_path_step(obj_json: &Value, step: &str) -> NdnResult<Value> {
                 .cloned()
                 .ok_or_else(|| NdnError::NotFound(format!("inner_path index {} not found", idx)))?
         } else {
-            current
-                .get(field)
-                .cloned()
-                .ok_or_else(|| NdnError::NotFound(format!("inner_path field '{}' not found", field)))?
+            current.get(field).cloned().ok_or_else(|| {
+                NdnError::NotFound(format!("inner_path field '{}' not found", field))
+            })?
         };
     }
     Ok(current)
@@ -1605,7 +1610,9 @@ impl CyfsNdnClient {
             )));
         }
 
-        let chunk_list_obj = self.fetch_verified_object_by_id(base, &content_obj_id).await?;
+        let chunk_list_obj = self
+            .fetch_verified_object_by_id(base, &content_obj_id)
+            .await?;
         let chunk_list = ChunkList::from_json_value(chunk_list_obj.obj_json)?;
         let chunklist_store = KnownObjectToStore {
             obj_id: chunk_list_obj.obj_id.clone(),

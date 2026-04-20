@@ -14,12 +14,12 @@ use fs_buffer::{FileBufferBaseReader, FileBufferDiffState, FileBufferRecord, Fil
 use log::{debug, info, warn};
 use named_store::{
     DiffChunkList, DiffChunkListReader, DiffChunkListWriter, DiffChunkListWriterOptions,
-    DiffChunkListWriterState, NamedLocalConfig, NamedLocalStore, NamedDataMgr, StoreLayout,
+    DiffChunkListWriterState, NamedDataMgr, NamedLocalConfig, NamedLocalStore, StoreLayout,
     StoreTarget as LayoutStoreTarget,
 };
 use ndn_lib::{
-    load_named_obj, ChunkId, DirObject, FileObject, NfsPath, NdnError, NdnResult, ObjId,
-    ChunkList, SimpleMapItem, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    load_named_obj, ChunkId, ChunkList, DirObject, FileObject, NdnError, NdnResult, NfsPath, ObjId,
+    SimpleMapItem, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 
 use crate::{
