@@ -1,10 +1,12 @@
 pub mod cyfs_ndn_client;
+pub mod cyfs_ndn_dir_server;
 pub mod tools;
 
 pub use named_store::{ChunkLocalInfo, ChunkStoreState};
 pub use ndn_lib::*;
 
 pub use cyfs_ndn_client::*;
+pub use cyfs_ndn_dir_server::*;
 pub use tools::*;
 
 #[cfg(test)]
