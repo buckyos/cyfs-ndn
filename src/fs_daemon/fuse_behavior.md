@@ -4,7 +4,7 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 
 ## Core Principles
 
-- The FUSE layer is a thin adapter over `NamedDataMgr` (NDM).
+- The FUSE layer is a thin adapter over `NamedFileMgr` (NDM).
 - Avoid direct use of `store_mgr` / `fs_buffer` from the FUSE request path.
 - Any data persistence or linking is managed by NDM semantics, not local filesystem semantics.
 
@@ -18,7 +18,7 @@ This document captures intended FUSE behavior for `fs_daemon`. It is a working d
 
 ### Lookup / Getattr
 
-- Map `lookup` and `getattr` to `NamedDataMgr::stat`.
+- Map `lookup` and `getattr` to `NamedFileMgr::stat`.
 - Use NDM inode ID when present.
 - TODO: Define UID/GID/permissions mapping rules (currently fixed 755/644).
 

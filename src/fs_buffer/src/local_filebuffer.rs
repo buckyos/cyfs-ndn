@@ -10,7 +10,7 @@ use named_store::{
     ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListWriter, DiffChunkListWriterState,
     NamedStoreMgr,
 };
-use ndm_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
+use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use ndn_lib::{
     caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, FileObject,
     NamedObject, NdnError, NdnResult, ObjId, ChunkList, CHUNK_DEFAULT_SIZE,

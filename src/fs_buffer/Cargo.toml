@@ -12,7 +12,7 @@ rusqlite = { workspace = true }
 fs2 = "*"
 once_cell = "*"
 ndn-lib = { path = "../ndn-lib" }
-ndm-lib = { path = "../ndm-lib" }
+cyfs-lib = { path = "../cyfs-lib" }
 named_store = { path = "../named_store" }
 async-trait = "0.1"
 

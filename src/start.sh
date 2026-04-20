@@ -13,7 +13,7 @@ OPT_ETC_DIR="${OPT_BASE_DIR}/etc"
 LOG_DIR="${OPT_BASE_DIR}/var/log/fs-daemon"
 LOG_FILE="${LOG_DIR}/fs_daemon.log"
 
-MOUNTPOINT="/opt/ndm"
+MOUNTPOINT="/opt/cyfs"
 REQUIRED_CONFIGS=("store_layout.json" "fs_daemon.json")
 
 echo "[1/7] cargo build -p fs_daemon"

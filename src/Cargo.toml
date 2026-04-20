@@ -4,10 +4,10 @@ resolver = "2"
 members = [
     "./package-lib",
     "./ndn-lib",
-    "./ndm-lib",
+    "./cyfs-lib",
     "./named_store",
     "./fs_buffer",
-    "./ndm",
+    "./cyfs",
     "./fs_meta",
     "./fs_daemon",
     "./ndn-toolkit"

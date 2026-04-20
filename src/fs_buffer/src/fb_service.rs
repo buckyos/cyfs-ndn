@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ndm_lib::SessionId;
+use cyfs_lib::SessionId;
 use ndn_lib::{ChunkId, NdnResult};
 
 use crate::local_filebuffer::FileBufferRecord;

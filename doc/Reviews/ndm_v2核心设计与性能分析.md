@@ -388,7 +388,7 @@ for fileObject in dir_object.get_children()
 2. 当设备断网的情况下，提供有限的可用性
 3. 设备在断网的情况下做的修改，在网络回复后可以继续同步。如果出现了冲突，有一定的自动解决能力
 
-这需要基于ndm的基础协议，实现一个更高级的客户端 -> NamedDataMgr Client Daemon
+这需要基于ndm的基础协议，实现一个更高级的客户端 -> NamedFileMgr Client Daemon
 
 结论：同步盘的两种模式
 NDMClient的强Cache模式:离线模式下只能读不能写

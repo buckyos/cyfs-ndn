@@ -64,7 +64,7 @@
 
 ### `ndm`
 
-`named_mgr.rs` 当前有两类危险点：
+`named_file_mgr.rs` 当前有两类危险点：
 
 1. 发布 / finalize 只做 `put_object`，不向底层声明“我还引用它”；
 2. `erase_obj_by_id` 直接删对象，没有检查 anchor / incoming / pin。
@@ -453,7 +453,7 @@ db.pin_internal(
 
 因此 P0 的结论是：
 
-- `named_mgr.rs::erase_obj_by_id` 不能再直接删 anchored / referenced 对象；
+- `named_file_mgr.rs::erase_obj_by_id` 不能再直接删 anchored / referenced 对象；
 - 对外可先禁用，或者只允许作用于 `eviction_class=0 && owned_bytes>0` 的纯 cache 行；
 - 用户要释放空间，P0 只支持“`fs_release` / unpin + 等收敛 + GC”。
 
@@ -508,8 +508,8 @@ db.pin_internal(
 | `src/named_store/src/store_mgr.rs` | 增加 sender / flusher / migration worker；暴露 `await_cascade_idle()` |
 | `src/ndn-lib/...` | `HasRefs` trait 与 `parse_obj_refs`；`SameAs` 返回 `[chunk_list_id]` |
 | `src/fs_meta/src/fs_meta_service.rs` | 删除 `obj_stat` 相关表与 handler；六个写路径接入 `fs_acquire` / `fs_release`，事务共享 |
-| `src/ndm-lib/src/fsmeta_client.rs` | 删除 `obj_stat_*` API；加入必要的 `fs_acquire/release` 客户端能力（若跨进程）；暴露 `fs_anchor_state` 读接口给 UI 层 |
-| `src/ndm/src/named_mgr.rs` | finalize 路径接 `fs_acquire`；`erase_obj_by_id` 在 P0 禁用或只允许纯 cache 对象；按需调用 `await_cascade_idle()` + `forced_gc_until()`；把 `fs_anchor_state` 的 `Pending`/`Materializing` 透给上层 UI |
+| `src/cyfs-lib/src/fsmeta_client.rs` | 删除 `obj_stat_*` API；加入必要的 `fs_acquire/release` 客户端能力（若跨进程）；暴露 `fs_anchor_state` 读接口给 UI 层 |
+| `src/cyfs/src/named_file_mgr.rs` | finalize 路径接 `fs_acquire`；`erase_obj_by_id` 在 P0 禁用或只允许纯 cache 对象；按需调用 `await_cascade_idle()` + `forced_gc_until()`；把 `fs_anchor_state` 的 `Pending`/`Materializing` 透给上层 UI |
 
 ---
 

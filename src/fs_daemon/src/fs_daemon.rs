@@ -5,11 +5,11 @@ use fuser::{
 use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
 use log::{debug, info, warn};
 use named_store::{NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-use ndm::{
-    CommitPolicy, NamedDataMgr, NamedDataMgrRef, NdmFileWriter, OpenWriteFlag, PathKind,
+use cyfs::{
+    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NdmFileWriter, OpenWriteFlag, PathKind,
     ReadOptions,
 };
-use ndn_lib::{NdmPath, NdnError, NdnResult};
+use ndn_lib::{NfsPath, NdnError, NdnResult};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -98,7 +98,7 @@ impl Default for StoreConfigEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct FsDaemonServiceConfig {
-    #[serde(alias = "instance", alias = "ndm_instance_id")]
+    #[serde(alias = "instance", alias = "cyfs_instance_id", alias = "ndm_instance_id")]
     instance_id: String,
     #[serde(alias = "buffer_dir", alias = "fs_buffer_path")]
     fs_buffer_dir: PathBuf,
@@ -130,12 +130,12 @@ impl FsMetaServiceRunner {
         }
     }
 
-    fn start_in_process(mut self) -> NdnResult<Arc<ndm::FsMetaClient>> {
+    fn start_in_process(mut self) -> NdnResult<Arc<cyfs::FsMetaClient>> {
         let service = self
             .service
             .take()
             .ok_or_else(|| NdnError::InvalidState("fs_meta runner already started".to_string()))?;
-        Ok(Arc::new(ndm::FsMetaClient::new_in_process(Box::new(
+        Ok(Arc::new(cyfs::FsMetaClient::new_in_process(Box::new(
             service,
         ))))
     }
@@ -318,7 +318,7 @@ impl HandleTable {
 
 pub struct FsDaemon {
     runtime: Runtime,
-    named_mgr: NamedDataMgrRef,
+    named_mgr: NamedFileMgrRef,
     inode_table: InodeTable,
     handle_table: HandleTable,
     xattrs: Mutex<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>,
@@ -326,7 +326,7 @@ pub struct FsDaemon {
 }
 
 impl FsDaemon {
-    pub fn new(runtime: Runtime, named_mgr: NamedDataMgrRef) -> Self {
+    pub fn new(runtime: Runtime, named_mgr: NamedFileMgrRef) -> Self {
         Self {
             runtime,
             named_mgr,
@@ -400,7 +400,7 @@ impl FsDaemon {
         Ok((inode, attr))
     }
 
-    fn ensure_exists(stat: &ndm::PathStat) -> Result<(), i32> {
+    fn ensure_exists(stat: &cyfs::PathStat) -> Result<(), i32> {
         if matches!(stat.kind, PathKind::NotFound) {
             return Err(ENOENT);
         }
@@ -417,7 +417,7 @@ impl FsDaemon {
             .runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                let session = mgr.start_list(&NdmPath::new(path.clone())).await?;
+                let session = mgr.start_list(&NfsPath::new(path.clone())).await?;
                 let list = mgr.list_next(session, 0).await?;
                 mgr.stop_list(session).await?;
                 Ok::<_, NdnError>(list)
@@ -449,16 +449,16 @@ impl FsDaemon {
         Ok(out)
     }
 
-    fn stat_path(&self, path: &str) -> Result<ndm::PathStat, i32> {
+    fn stat_path(&self, path: &str) -> Result<cyfs::PathStat, i32> {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.stat(&NdmPath::new(path.to_string())).await
+                mgr.stat(&NfsPath::new(path.to_string())).await
             })
             .map_err(map_ndn_err)
     }
 
-    fn resolve_attr_size(&self, path: &str, stat: &ndm::PathStat) -> u64 {
+    fn resolve_attr_size(&self, path: &str, stat: &cyfs::PathStat) -> u64 {
         if let Some(size) = stat.size {
             return size;
         }
@@ -470,7 +470,7 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 let (mut reader, _) = mgr
-                    .open_reader(&NdmPath::new(path.to_string()), ReadOptions::default())
+                    .open_reader(&NfsPath::new(path.to_string()), ReadOptions::default())
                     .await?;
                 let mut total = 0u64;
                 let mut buffer = [0u8; 8192];
@@ -486,7 +486,7 @@ impl FsDaemon {
             .unwrap_or(0)
     }
 
-    fn build_attr(&self, inode: u64, path: &str, stat: &ndm::PathStat) -> FileAttr {
+    fn build_attr(&self, inode: u64, path: &str, stat: &cyfs::PathStat) -> FileAttr {
         let size = self.resolve_attr_size(path, stat);
         let (kind, perm, nlink) = match stat.kind {
             PathKind::Dir => (FileType::Directory, 0o755, 2),
@@ -517,7 +517,7 @@ impl FsDaemon {
             .runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.open_file_writer(&NdmPath::new(path.to_string()), flag, None)
+                mgr.open_file_writer(&NfsPath::new(path.to_string()), flag, None)
                     .await
             })
             .map_err(map_ndn_err)?;
@@ -568,7 +568,7 @@ impl FsDaemon {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.create_dir(&NdmPath::new(path.clone())).await
+                mgr.create_dir(&NfsPath::new(path.clone())).await
             })
             .map_err(map_ndn_err)?;
         let stat = self.stat_path(&path)?;
@@ -581,7 +581,7 @@ impl FsDaemon {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.delete(&NdmPath::new(path.clone())).await
+                mgr.delete(&NfsPath::new(path.clone())).await
             })
             .map_err(map_ndn_err)?;
 
@@ -612,8 +612,8 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 mgr.move_path(
-                    &NdmPath::new(old_path.clone()),
-                    &NdmPath::new(new_path.clone()),
+                    &NfsPath::new(old_path.clone()),
+                    &NfsPath::new(new_path.clone()),
                 )
                 .await
             })
@@ -629,7 +629,7 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 let (mut reader, _) = mgr
-                    .open_reader(&NdmPath::new(path.clone()), ReadOptions::default())
+                    .open_reader(&NfsPath::new(path.clone()), ReadOptions::default())
                     .await?;
                 if offset > 0 {
                     let mut remaining = offset as u64;
@@ -1140,7 +1140,7 @@ impl Filesystem for FsDaemon {
                         let mgr = self.named_mgr.lock().await;
                         let (mut writer, inode_id) = mgr
                             .open_file_writer(
-                                &NdmPath::new(path),
+                                &NfsPath::new(path),
                                 OpenWriteFlag::CreateOrTruncate,
                                 Some(0),
                             )
@@ -1350,7 +1350,7 @@ pub fn init_named_mgr(
     runtime: &Runtime,
     store_config_path: &Path,
     service_config_path: &Path,
-) -> NdnResult<NamedDataMgrRef> {
+) -> NdnResult<NamedFileMgrRef> {
     // 1. load store_layout config, construct store_layout + store_mgr
     let store_mgr = init_store_mgr(runtime, store_config_path)?;
 
@@ -1394,7 +1394,7 @@ pub fn init_named_mgr(
     buffer_service.set_fsmeta_client(fs_meta_client.clone())?;
 
     // 3. construct named_mgr, register with default id (None -> "default")
-    let named_mgr = NamedDataMgr::with_layout_mgr(
+    let named_mgr = NamedFileMgr::with_layout_mgr(
         instance_id,
         fs_meta_client,
         buffer_service,
@@ -1403,11 +1403,11 @@ pub fn init_named_mgr(
         store_mgr,
     );
     runtime.block_on(async {
-        NamedDataMgr::register_named_data_mgr("default", named_mgr).await?;
-        NamedDataMgr::get_named_data_mgr_by_id(None)
+        NamedFileMgr::register_named_file_mgr("default", named_mgr).await?;
+        NamedFileMgr::get_named_file_mgr_by_id(None)
             .await
             .ok_or_else(|| {
-                NdnError::NotFound("default named data manager is not registered".to_string())
+                NdnError::NotFound("default named file manager is not registered".to_string())
             })
     })
 }

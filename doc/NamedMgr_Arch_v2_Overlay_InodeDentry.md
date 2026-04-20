@@ -1,4 +1,4 @@
-# NamedMgr / NamedDataMgr 架构设计说明（Overlay + Inode/Dentry 版）
+# NamedMgr / NamedFileMgr 架构设计说明（Overlay + Inode/Dentry 版）
 
 > 版本：v2（基于《named_mgr discuss.md》与《new discuss.md》的演进，并吸收你在对话中明确的选择）  
 > 日期：2026-02-03  
@@ -53,7 +53,7 @@
 
 ## 2. 主要组件总览（保持原风格）
 
-- **named_mgr / NamedDataMgr（NDM）**：对外“类 FS API”，负责：
+- **named_mgr / NamedFileMgr（NDM）**：对外“类 FS API”，负责：
   - path 解析、Overlay 合并、读写语义与 staged commit orchestration。
 - **fs_meta（service）**：强一致元数据域（单机 SQLite / 未来 klog+Raft），负责 inode/dentry/lease/mount_mode/rev。
 - **named_store**：对象与 chunk 的 CAS 存储（ObjId/ChunkId），提供 open_reader_by_id/get_object 等绕过 path 的访问。

@@ -2,13 +2,13 @@ use fs_buffer::{FileBufferService, SessionId};
 use krpc::{RPCContext, RPCErrors};
 use log::{debug, info, warn};
 use named_store::NamedStoreMgr;
-use ndm::{
+use cyfs::{
     ClientSessionId, DentryRecord, DentryTarget, FsMetaHandler, FsMetaListEntry,
-    FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, NdmInstanceId, NodeKind, NodeRecord,
+    FsMetaResolvePathItem, FsMetaResolvePathResp, IndexNodeId, NfsInstanceId, NodeKind, NodeRecord,
     NodeState, ObjStat, OpenFileReaderResp, OpenWriteFlag,
 };
 use ndn_lib::{
-    load_named_obj, ChunkId, DirObject, NdmPath, NdnError, NdnResult, ObjId, SimpleMapItem,
+    load_named_obj, ChunkId, DirObject, NfsPath, NdnError, NdnResult, ObjId, SimpleMapItem,
     OBJ_TYPE_DIR,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -267,7 +267,7 @@ pub struct FSMetaService {
     list_cache: Arc<Mutex<ListCache>>,
 
     /// Instance identifier for lease session naming (required for high-level file operations)
-    instance: Option<NdmInstanceId>,
+    instance: Option<NfsInstanceId>,
     /// File buffer service for managing write buffers (required for high-level file operations)
     fb_service: Option<Arc<dyn FileBufferService>>,
     /// Named store manager for resolving base DirObject children
@@ -325,7 +325,7 @@ impl FSMetaService {
     /// Set instance and buffer for high-level file operations (open_file_writer, etc.)
     pub fn with_buffer(
         mut self,
-        instance: NdmInstanceId,
+        instance: NfsInstanceId,
         buffer: Arc<dyn FileBufferService>,
     ) -> Self {
         self.instance = Some(instance);
@@ -829,7 +829,7 @@ impl FSMetaService {
             NODE_STATE_WORKING => {
                 let fb_handle: String = row.get(9).map_err(map_db_err)?;
                 let last_write_at: i64 = row.get(10).map_err(map_db_err)?;
-                Ok(NodeState::Working(ndm::FileWorkingState {
+                Ok(NodeState::Working(cyfs::FileWorkingState {
                     fb_handle,
                     last_write_at: last_write_at as u64,
                 }))
@@ -837,7 +837,7 @@ impl FSMetaService {
             NODE_STATE_COOLING => {
                 let fb_handle: String = row.get(9).map_err(map_db_err)?;
                 let closed_at: i64 = row.get(11).map_err(map_db_err)?;
-                Ok(NodeState::Cooling(ndm::FileCoolingState {
+                Ok(NodeState::Cooling(cyfs::FileCoolingState {
                     fb_handle,
                     closed_at: closed_at as u64,
                 }))
@@ -847,7 +847,7 @@ impl FSMetaService {
                 let qcid_blob: Vec<u8> = row.get(13).map_err(map_db_err)?;
                 let filebuffer_id: String = row.get(14).map_err(map_db_err)?;
                 let linked_at: i64 = row.get(15).map_err(map_db_err)?;
-                Ok(NodeState::Linked(ndm::FileLinkedState {
+                Ok(NodeState::Linked(cyfs::FileLinkedState {
                     obj_id: obj_id_from_blob(obj_blob)?,
                     qcid: obj_id_from_blob(qcid_blob)?,
                     filebuffer_id,
@@ -857,7 +857,7 @@ impl FSMetaService {
             NODE_STATE_FINALIZED => {
                 let obj_blob: Vec<u8> = row.get(16).map_err(map_db_err)?;
                 let finalized_at: i64 = row.get(17).map_err(map_db_err)?;
-                Ok(NodeState::Finalized(ndm::FinalizedObjState {
+                Ok(NodeState::Finalized(cyfs::FinalizedObjState {
                     obj_id: obj_id_from_blob(obj_blob)?,
                     finalized_at: finalized_at as u64,
                 }))
@@ -907,7 +907,7 @@ impl FSMetaService {
     /// Internal directory creation that doesn't recursively call ensure_dir_inode.
     /// Assumes parent directory already exists.
     #[allow(dead_code)]
-    async fn create_dir_internal(&self, path: &NdmPath) -> Result<(), RPCErrors> {
+    async fn create_dir_internal(&self, path: &NfsPath) -> Result<(), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
             .ok_or_else(|| RPCErrors::ReasonError("invalid path".to_string()))?;
@@ -995,19 +995,19 @@ impl FSMetaService {
     }
 
     #[allow(dead_code)]
-    fn join_child_path(parent: &NdmPath, name: &str) -> NdmPath {
+    fn join_child_path(parent: &NfsPath, name: &str) -> NfsPath {
         let parent_str = parent.as_str().trim_end_matches('/');
         if parent_str.is_empty() || parent_str == "/" {
-            NdmPath::new(format!("/{}", name))
+            NfsPath::new(format!("/{}", name))
         } else {
-            NdmPath::new(format!("{}/{}", parent_str, name))
+            NfsPath::new(format!("{}/{}", parent_str, name))
         }
     }
 
     #[allow(dead_code)]
     async fn resolve_symlink_child_as_obj(
         &self,
-        child_path: &NdmPath,
+        child_path: &NfsPath,
         ctx: RPCContext,
     ) -> Result<Option<ObjId>, RPCErrors> {
         let resolved = self
@@ -1050,7 +1050,7 @@ impl FSMetaService {
 
     //如果finalize_dir成功，则返回true,如果dir不满足finalzie条件，需要先finalzie child,返回false
     #[allow(dead_code)]
-    async fn try_finalize_dir(&self, dir_path: &NdmPath) -> Result<bool, RPCErrors> {
+    async fn try_finalize_dir(&self, dir_path: &NfsPath) -> Result<bool, RPCErrors> {
         /*
         finalize_dir是系统减少元数据的重要方法。
         检查children是不是都finalize了，如果都finalize了，可以立刻完成并返回true
@@ -1771,7 +1771,7 @@ impl FSMetaService {
     /// This method handles the case where the path passes through a DirObject:
     /// - When a dentry points to ObjId (DirObject) instead of IndexNodeId
     /// - It materializes the directory by creating inode with base_obj_id pointing to the DirObject
-    pub(crate) async fn ensure_dir_inode(&self, path: &NdmPath) -> Result<IndexNodeId, RPCErrors> {
+    pub(crate) async fn ensure_dir_inode(&self, path: &NfsPath) -> Result<IndexNodeId, RPCErrors> {
         if path.is_root() {
             return Ok(self.root_inode);
         }
@@ -2289,14 +2289,14 @@ impl Drop for FSMetaService {
 }
 
 #[async_trait::async_trait]
-impl ndm::FsMetaHandler for FSMetaService {
+impl cyfs::FsMetaHandler for FSMetaService {
     async fn handle_root_dir(&self, _ctx: RPCContext) -> Result<IndexNodeId, RPCErrors> {
         Ok(self.root_inode)
     }
 
     async fn handle_resolve_path_ex(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
         mut sym_count: u32,
         ctx: RPCContext,
     ) -> NdnResult<Option<FsMetaResolvePathResp>> {
@@ -4429,7 +4429,7 @@ impl ndm::FsMetaHandler for FSMetaService {
                 )
                 .await?;
 
-            let working_state = NodeState::Working(ndm::FileWorkingState {
+            let working_state = NodeState::Working(cyfs::FileWorkingState {
                 fb_handle: handle.clone(),
                 last_write_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -4493,7 +4493,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             file_id, fb.handle_id
         );
 
-        let working_state = NodeState::Working(ndm::FileWorkingState {
+        let working_state = NodeState::Working(cyfs::FileWorkingState {
             fb_handle: fb.handle_id.clone(),
             last_write_at: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -4581,7 +4581,7 @@ impl ndm::FsMetaHandler for FSMetaService {
             RPCErrors::ReasonError(format!("failed to close buffer: {}", e))
         })?;
 
-        let cooling_state = NodeState::Cooling(ndm::FileCoolingState {
+        let cooling_state = NodeState::Cooling(cyfs::FileCoolingState {
             fb_handle: fb_handle.clone(),
             closed_at: now,
         });
@@ -4614,7 +4614,7 @@ impl ndm::FsMetaHandler for FSMetaService {
     //return ObjectId + innerpath or file_buffer_handle_id
     async fn handle_open_file_reader(
         &self,
-        path: NdmPath,
+        path: NfsPath,
         ctx: RPCContext,
     ) -> Result<OpenFileReaderResp, RPCErrors> {
         if path.is_root() {

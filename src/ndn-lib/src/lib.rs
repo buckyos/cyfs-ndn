@@ -273,11 +273,11 @@ impl StoreMode {
     }
 }
 
-/// NDM path representation
+///Named File System path representation
 #[derive(Debug, Clone)]
-pub struct NdmPath(pub String);
+pub struct NfsPath(pub String);
 
-impl NdmPath {
+impl NfsPath {
     pub fn new(path: impl Into<String>) -> Self {
         Self(path.into())
     }
@@ -293,7 +293,7 @@ impl NdmPath {
     }
 
     /// Split path into parent and name components
-    pub fn split_parent_name(&self) -> Option<(NdmPath, String)> {
+    pub fn split_parent_name(&self) -> Option<(NfsPath, String)> {
         let path = self.0.trim_end_matches('/');
         if path.is_empty() || path == "/" {
             return None;
@@ -308,7 +308,7 @@ impl NdmPath {
         if name.is_empty() {
             None
         } else {
-            Some((NdmPath(parent), name))
+            Some((NfsPath(parent), name))
         }
     }
 
@@ -411,26 +411,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ndm_path_split() {
-        let path = NdmPath::new("/foo/bar/baz");
+    fn test_nfs_path_split() {
+        let path = NfsPath::new("/foo/bar/baz");
         let (parent, name) = path.split_parent_name().unwrap();
         assert_eq!(parent.as_str(), "/foo/bar");
         assert_eq!(name, "baz");
 
-        let root_child = NdmPath::new("/foo");
+        let root_child = NfsPath::new("/foo");
         let (parent, name) = root_child.split_parent_name().unwrap();
         assert_eq!(parent.as_str(), "/");
         assert_eq!(name, "foo");
 
-        let root = NdmPath::new("/");
+        let root = NfsPath::new("/");
         assert!(root.split_parent_name().is_none());
         assert!(root.is_root());
 
         assert_eq!(
-            NdmPath::new("/foo/bar/baz").components(),
+            NfsPath::new("/foo/bar/baz").components(),
             vec!["foo", "bar", "baz"]
         );
-        assert_eq!(NdmPath::new("/").components(), Vec::<&str>::new());
+        assert_eq!(NfsPath::new("/").components(), Vec::<&str>::new());
     }
 
     #[test]

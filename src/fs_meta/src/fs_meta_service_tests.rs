@@ -5,11 +5,11 @@ mod tests {
     use fs_buffer::{LocalFileBufferService, SessionId};
     use krpc::{RPCContext, RPCErrors};
     use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-    use ndm::{
+    use cyfs::{
         ClientSessionId, DentryTarget, FsMetaHandler, FsMetaResolvePathItem, IndexNodeId, NodeKind,
         NodeRecord, NodeState, OpenWriteFlag,
     };
-    use ndn_lib::{DirObject, FileObject, NdmPath, ObjId};
+    use ndn_lib::{DirObject, FileObject, NfsPath, ObjId};
     use std::sync::{Arc, Once};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
@@ -126,7 +126,7 @@ mod tests {
 
     async fn split_parent_name_with_ensure(
         svc: &FSMetaService,
-        path: &NdmPath,
+        path: &NfsPath,
     ) -> Result<(IndexNodeId, String), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
@@ -140,7 +140,7 @@ mod tests {
 
     async fn handle_create_dir_path(
         svc: &FSMetaService,
-        path: &NdmPath,
+        path: &NfsPath,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let (parent, name) = split_parent_name_with_ensure(svc, path).await?;
@@ -149,7 +149,7 @@ mod tests {
 
     async fn handle_set_file_path(
         svc: &FSMetaService,
-        path: &NdmPath,
+        path: &NfsPath,
         obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
@@ -159,7 +159,7 @@ mod tests {
 
     async fn handle_set_dir_path(
         svc: &FSMetaService,
-        path: &NdmPath,
+        path: &NfsPath,
         dir_obj_id: ObjId,
         ctx: RPCContext,
     ) -> Result<String, RPCErrors> {
@@ -169,8 +169,8 @@ mod tests {
 
     async fn handle_symlink_path(
         svc: &FSMetaService,
-        link_path: &NdmPath,
-        target: &NdmPath,
+        link_path: &NfsPath,
+        target: &NfsPath,
         ctx: RPCContext,
     ) -> Result<(), RPCErrors> {
         let (parent, name) = split_parent_name_with_ensure(svc, link_path).await?;
@@ -180,7 +180,7 @@ mod tests {
 
     async fn handle_open_file_writer_path(
         svc: &FSMetaService,
-        path: &NdmPath,
+        path: &NfsPath,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
         ctx: RPCContext,
@@ -211,7 +211,7 @@ mod tests {
             ref_by: None,
             read_only: false,
             base_obj_id: None,
-            state: NodeState::Working(ndm::FileWorkingState {
+            state: NodeState::Working(cyfs::FileWorkingState {
                 fb_handle: fb_handle.to_string(),
                 last_write_at: 1000,
             }),
@@ -391,7 +391,7 @@ mod tests {
             .unwrap();
 
         // Transition to Cooling
-        let new_state = NodeState::Cooling(ndm::FileCoolingState {
+        let new_state = NodeState::Cooling(cyfs::FileCoolingState {
             fb_handle: "fb-001".to_string(),
             closed_at: 2000,
         });
@@ -437,7 +437,7 @@ mod tests {
         let result = svc
             .handle_update_inode_state(
                 301,
-                NodeState::Cooling(ndm::FileCoolingState {
+                NodeState::Cooling(cyfs::FileCoolingState {
                     fb_handle: "fb-002".to_string(),
                     closed_at: 2000,
                 }),
@@ -627,8 +627,8 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/link_file"),
-            &NdmPath::new("/target_file"),
+            &NfsPath::new("/link_file"),
+            &NfsPath::new("/target_file"),
             ctx.clone(),
         )
         .await
@@ -645,7 +645,7 @@ mod tests {
         }
 
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/link_file"), 0, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/link_file"), 0, ctx)
             .await
             .unwrap()
             .unwrap();
@@ -679,8 +679,8 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/link_a"),
-            &NdmPath::new("/target_file_2"),
+            &NfsPath::new("/link_a"),
+            &NfsPath::new("/target_file_2"),
             ctx.clone(),
         )
         .await
@@ -688,8 +688,8 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/link_b"),
-            &NdmPath::new("/link_a"),
+            &NfsPath::new("/link_b"),
+            &NfsPath::new("/link_a"),
             ctx,
         )
         .await
@@ -714,8 +714,8 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/link_rel"),
-            &NdmPath::new("../a/b"),
+            &NfsPath::new("/link_rel"),
+            &NfsPath::new("../a/b"),
             ctx,
         )
         .await
@@ -739,15 +739,15 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/link_a"),
-            &NdmPath::new("/target_a"),
+            &NfsPath::new("/link_a"),
+            &NfsPath::new("/target_a"),
             ctx.clone(),
         )
         .await
         .unwrap();
 
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/link_a/sub/path"), 0, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/link_a/sub/path"), 0, ctx)
             .await
             .unwrap()
             .unwrap();
@@ -823,15 +823,15 @@ mod tests {
 
         handle_symlink_path(
             &svc,
-            &NdmPath::new("/a/x/l"),
-            &NdmPath::new("../y"),
+            &NfsPath::new("/a/x/l"),
+            &NfsPath::new("../y"),
             ctx.clone(),
         )
         .await
         .unwrap();
 
         let unresolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 0, ctx.clone())
+            .handle_resolve_path_ex(&NfsPath::new("/a/x/l/file"), 0, ctx.clone())
             .await
             .unwrap()
             .unwrap();
@@ -842,7 +842,7 @@ mod tests {
         assert_eq!(unresolved.inner_path, Some("/file".to_string()));
 
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/x/l/file"), 1, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/a/x/l/file"), 1, ctx)
             .await
             .unwrap()
             .unwrap();
@@ -1798,7 +1798,7 @@ mod tests {
             ref_by: None,
             read_only: false,
             base_obj_id: None,
-            state: NodeState::Linked(ndm::FileLinkedState {
+            state: NodeState::Linked(cyfs::FileLinkedState {
                 obj_id: obj_id.clone(),
                 qcid: qcid.clone(),
                 filebuffer_id: "fb-900".to_string(),
@@ -1837,7 +1837,7 @@ mod tests {
             ref_by: None,
             read_only: true,
             base_obj_id: None,
-            state: NodeState::Finalized(ndm::FinalizedObjState {
+            state: NodeState::Finalized(cyfs::FinalizedObjState {
                 obj_id: obj_id.clone(),
                 finalized_at: 6000,
             }),
@@ -1904,7 +1904,7 @@ mod tests {
             ref_by: None,
             read_only: false,
             base_obj_id: None,
-            state: NodeState::Working(ndm::FileWorkingState {
+            state: NodeState::Working(cyfs::FileWorkingState {
                 fb_handle: "fb-903".to_string(),
                 last_write_at: 1000,
             }),
@@ -2047,7 +2047,7 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
+            .handle_resolve_path_ex(&NfsPath::new("/a/b/c"), 0, ctx.clone())
             .await
             .unwrap()
             .unwrap();
@@ -2073,7 +2073,7 @@ mod tests {
         .unwrap();
 
         let resolved2 = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/a/b/c"), 0, ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());
@@ -2132,7 +2132,7 @@ mod tests {
 
         // Populate cache.
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx.clone())
+            .handle_resolve_path_ex(&NfsPath::new("/a/b/c"), 0, ctx.clone())
             .await
             .unwrap()
             .unwrap();
@@ -2161,7 +2161,7 @@ mod tests {
 
         // After commit, the cached /a/b/* entries must be invalidated.
         let resolved2 = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/b/c"), 0, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/a/b/c"), 0, ctx)
             .await
             .unwrap();
         assert!(resolved2.is_none());
@@ -2211,7 +2211,7 @@ mod tests {
         .await
         .unwrap();
 
-        handle_create_dir_path(&svc, &NdmPath::new("/a/b/c/new"), ctx.clone())
+        handle_create_dir_path(&svc, &NfsPath::new("/a/b/c/new"), ctx.clone())
             .await
             .unwrap();
 
@@ -2353,7 +2353,7 @@ mod tests {
         .unwrap();
 
         let resolved = svc
-            .handle_resolve_path_ex(&NdmPath::new("/a/leaf"), 0, ctx)
+            .handle_resolve_path_ex(&NfsPath::new("/a/leaf"), 0, ctx)
             .await
             .unwrap()
             .unwrap();
@@ -2400,7 +2400,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = handle_create_dir_path(&svc, &NdmPath::new("/a/leaf/new"), ctx)
+        let err = handle_create_dir_path(&svc, &NfsPath::new("/a/leaf/new"), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not a directory"));
@@ -2411,20 +2411,20 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
+        handle_create_dir_path(&svc, &NfsPath::new("/a"), ctx.clone())
             .await
             .unwrap();
 
         handle_set_file_path(
             &svc,
-            &NdmPath::new("/a/file"),
+            &NfsPath::new("/a/file"),
             create_obj_id(11),
             ctx.clone(),
         )
         .await
         .unwrap();
 
-        let err = handle_set_file_path(&svc, &NdmPath::new("/a/file"), create_obj_id(12), ctx)
+        let err = handle_set_file_path(&svc, &NfsPath::new("/a/file"), create_obj_id(12), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2435,19 +2435,19 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        handle_create_dir_path(&svc, &NdmPath::new("/a"), ctx.clone())
+        handle_create_dir_path(&svc, &NfsPath::new("/a"), ctx.clone())
             .await
             .unwrap();
 
         let dir1 = DirObject::new(Some("d1".to_string()));
         let (dir1_id, _) = dir1.gen_obj_id().unwrap();
-        handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir1_id, ctx.clone())
+        handle_set_dir_path(&svc, &NfsPath::new("/a/dir"), dir1_id, ctx.clone())
             .await
             .unwrap();
 
         let dir2 = DirObject::new(Some("d2".to_string()));
         let (dir2_id, _) = dir2.gen_obj_id().unwrap();
-        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/dir"), dir2_id, ctx)
+        let err = handle_set_dir_path(&svc, &NfsPath::new("/a/dir"), dir2_id, ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2488,7 +2488,7 @@ mod tests {
         .await
         .unwrap();
 
-        let err = handle_set_file_path(&svc, &NdmPath::new("/a/leaf"), create_obj_id(33), ctx)
+        let err = handle_set_file_path(&svc, &NfsPath::new("/a/leaf"), create_obj_id(33), ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2527,7 +2527,7 @@ mod tests {
 
         let dir_new = DirObject::new(Some("new".to_string()));
         let (dir_new_id, _) = dir_new.gen_obj_id().unwrap();
-        let err = handle_set_dir_path(&svc, &NdmPath::new("/a/sub"), dir_new_id, ctx)
+        let err = handle_set_dir_path(&svc, &NfsPath::new("/a/sub"), dir_new_id, ctx)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -2554,7 +2554,7 @@ mod tests {
 
         let err = handle_open_file_writer_path(
             &svc,
-            &NdmPath::new("/a"),
+            &NfsPath::new("/a"),
             OpenWriteFlag::CreateOrTruncate,
             None,
             ctx,
@@ -2602,7 +2602,7 @@ mod tests {
 
         let err = handle_open_file_writer_path(
             &svc,
-            &NdmPath::new("/a/leaf"),
+            &NfsPath::new("/a/leaf"),
             OpenWriteFlag::CreateExclusive,
             None,
             ctx,
@@ -2650,7 +2650,7 @@ mod tests {
 
         let err = handle_open_file_writer_path(
             &svc,
-            &NdmPath::new("/a/leaf"),
+            &NfsPath::new("/a/leaf"),
             OpenWriteFlag::ContinueWrite,
             None,
             ctx.clone(),
@@ -2669,7 +2669,7 @@ mod tests {
 
         let handle = handle_open_file_writer_path(
             &svc,
-            &NdmPath::new("/new_file"),
+            &NfsPath::new("/new_file"),
             OpenWriteFlag::CreateExclusive,
             None,
             ctx,
@@ -2742,14 +2742,14 @@ mod tests {
         let (svc, _tmp) = create_test_service();
         let ctx = dummy_ctx();
 
-        handle_create_dir_path(&svc, &NdmPath::new("/left"), ctx.clone())
+        handle_create_dir_path(&svc, &NfsPath::new("/left"), ctx.clone())
             .await
             .unwrap();
-        handle_create_dir_path(&svc, &NdmPath::new("/right"), ctx.clone())
+        handle_create_dir_path(&svc, &NfsPath::new("/right"), ctx.clone())
             .await
             .unwrap();
-        let left = svc.ensure_dir_inode(&NdmPath::new("/left")).await.unwrap();
-        let right = svc.ensure_dir_inode(&NdmPath::new("/right")).await.unwrap();
+        let left = svc.ensure_dir_inode(&NfsPath::new("/left")).await.unwrap();
+        let right = svc.ensure_dir_inode(&NfsPath::new("/right")).await.unwrap();
 
         let src_obj = create_obj_id(71);
         let dst_obj = create_obj_id(72);

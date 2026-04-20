@@ -1,13 +1,19 @@
 [package]
-name = "ndm-lib"
+name = "cyfs"
 version.workspace = true
 edition = "2021"
 publish = false
 
 [dependencies]
+log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 krpc = { workspace = true }
+name-lib = { workspace = true }
+lazy_static = { workspace = true }
 ndn-lib = { path = "../ndn-lib" }
+cyfs-lib = { path = "../cyfs-lib" }
+fs-buffer = { path = "../fs_buffer" }
+named_store = { path = "../named_store" }

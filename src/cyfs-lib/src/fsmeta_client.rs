@@ -3,7 +3,7 @@
 /// ------------------------------
 use crate::{OpenWriteFlag, SessionId};
 use krpc::{kRPC, RPCContext, RPCErrors, RPCHandler, RPCRequest, RPCResponse, RPCResult};
-use ndn_lib::{NdmPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
+use ndn_lib::{NfsPath, NdnError, NdnResult, ObjId, OBJ_TYPE_DIR};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, time::Duration};
@@ -819,16 +819,16 @@ impl FsMetaClient {
         }
     }
 
-    fn join_child_path(parent: &NdmPath, name: &str) -> NdmPath {
+    fn join_child_path(parent: &NfsPath, name: &str) -> NfsPath {
         let parent_str = parent.as_str().trim_end_matches('/');
         if parent_str.is_empty() || parent_str == "/" {
-            NdmPath::new(format!("/{}", name))
+            NfsPath::new(format!("/{}", name))
         } else {
-            NdmPath::new(format!("{}/{}", parent_str, name))
+            NfsPath::new(format!("{}/{}", parent_str, name))
         }
     }
 
-    fn is_descendant_path(path: &NdmPath, ancestor: &NdmPath) -> bool {
+    fn is_descendant_path(path: &NfsPath, ancestor: &NfsPath) -> bool {
         let path_str = path.as_str().trim_end_matches('/');
         let ancestor_str = ancestor.as_str().trim_end_matches('/');
         if ancestor_str.is_empty() {
@@ -846,7 +846,7 @@ impl FsMetaClient {
 
     async fn parent_and_name_for_path(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
     ) -> Result<(IndexNodeId, String), RPCErrors> {
         let (parent_path, name) = path
             .split_parent_name()
@@ -1155,7 +1155,7 @@ impl FsMetaClient {
         ))
     }
 
-    pub async fn ensure_dir_inode(&self, path: &NdmPath) -> Result<IndexNodeId, RPCErrors> {
+    pub async fn ensure_dir_inode(&self, path: &NfsPath) -> Result<IndexNodeId, RPCErrors> {
         if path.is_root() {
             return self.root_dir().await;
         }
@@ -1166,7 +1166,7 @@ impl FsMetaClient {
         }
 
         let mut current_id = self.root_dir().await?;
-        let mut current_path = NdmPath::new("/".to_string());
+        let mut current_path = NfsPath::new("/".to_string());
 
         for component in components {
             let child_path = Self::join_child_path(&current_path, &component);
@@ -1298,7 +1298,7 @@ impl FsMetaClient {
 
     pub async fn resolve_path_ex(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
         sym_count: u32,
     ) -> NdnResult<Option<FsMetaResolvePathResp>> {
         match self {
@@ -1929,7 +1929,7 @@ impl FsMetaClient {
 
     pub async fn open_file_writer(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
         flag: OpenWriteFlag,
         expected_size: Option<u64>,
     ) -> NdnResult<String> {
@@ -1981,7 +1981,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn open_file_reader(&self, path: &NdmPath) -> NdnResult<OpenFileReaderResp> {
+    pub async fn open_file_reader(&self, path: &NfsPath) -> NdnResult<OpenFileReaderResp> {
         match self {
             Self::InProcess(handler) => {
                 let ctx = RPCContext::default();
@@ -1996,7 +1996,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn set_file(&self, path: &NdmPath, obj_id: ObjId) -> NdnResult<()> {
+    pub async fn set_file(&self, path: &NfsPath, obj_id: ObjId) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (parent, name) = self
@@ -2016,7 +2016,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn set_dir(&self, path: &NdmPath, dir_obj_id: ObjId) -> NdnResult<()> {
+    pub async fn set_dir(&self, path: &NfsPath, dir_obj_id: ObjId) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (parent, name) = self
@@ -2036,7 +2036,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn delete(&self, path: &NdmPath) -> NdnResult<()> {
+    pub async fn delete(&self, path: &NfsPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (parent, name) = self
@@ -2055,7 +2055,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn move_path(&self, old_path: &NdmPath, new_path: &NdmPath) -> NdnResult<()> {
+    pub async fn move_path(&self, old_path: &NfsPath, new_path: &NfsPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (src_parent_path, src_name) = old_path
@@ -2091,7 +2091,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn symlink(&self, link_path: &NdmPath, target: &NdmPath) -> NdnResult<()> {
+    pub async fn symlink(&self, link_path: &NfsPath, target: &NfsPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (link_parent, link_name) = self
@@ -2110,7 +2110,7 @@ impl FsMetaClient {
         }
     }
 
-    pub async fn create_dir(&self, path: &NdmPath) -> NdnResult<()> {
+    pub async fn create_dir(&self, path: &NfsPath) -> NdnResult<()> {
         match self {
             Self::InProcess(handler) => {
                 let (parent, name) = self
@@ -2300,7 +2300,7 @@ pub trait FsMetaHandler: Send + Sync {
 
     async fn handle_resolve_path_ex(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
         sym_count: u32,
         ctx: RPCContext,
     ) -> NdnResult<Option<FsMetaResolvePathResp>>;
@@ -2371,7 +2371,7 @@ pub trait FsMetaHandler: Send + Sync {
     //return ObjectId + innerpath or file_buffer_handle_id
     async fn handle_open_file_reader(
         &self,
-        path: NdmPath,
+        path: NfsPath,
         ctx: RPCContext,
     ) -> Result<OpenFileReaderResp, RPCErrors>;
 }
@@ -2403,7 +2403,7 @@ impl<T: FsMetaHandler> RPCHandler for FsMetaServerHandler<T> {
             }
             "resolve_path_ex" => {
                 let req = FsMetaResolvePathExReq::from_json(req.params)?;
-                let path = NdmPath::new(req.path);
+                let path = NfsPath::new(req.path);
                 let result = self
                     .0
                     .handle_resolve_path_ex(&path, req.sym_count, ctx)
@@ -2678,7 +2678,7 @@ mod tests {
 
         async fn handle_resolve_path_ex(
             &self,
-            path: &NdmPath,
+            path: &NfsPath,
             sym_count: u32,
             _ctx: RPCContext,
         ) -> NdnResult<Option<FsMetaResolvePathResp>> {
@@ -3324,7 +3324,7 @@ mod tests {
 
         async fn handle_open_file_reader(
             &self,
-            _path: NdmPath,
+            _path: NfsPath,
             _ctx: RPCContext,
         ) -> Result<OpenFileReaderResp, RPCErrors> {
             Err(RPCErrors::ReasonError("not implemented".to_string()))
