@@ -992,6 +992,18 @@ impl NamedDataMgr {
         obj_id: &ObjId,
         inner_path: Option<String>,
     ) -> NdnResult<(ChunkReader, u64)> {
+        let (reader, total, _resolved) = self.open_reader_with_resolved(obj_id, inner_path).await?;
+        Ok((reader, total))
+    }
+
+    /// Same as [`open_reader`] but also returns the resolved terminal `ObjId`
+    /// (the chunk or chunklist that actually backs the reader) so callers
+    /// (e.g. NDM Proxy gateway) can surface it as protocol metadata.
+    pub async fn open_reader_with_resolved(
+        &self,
+        obj_id: &ObjId,
+        inner_path: Option<String>,
+    ) -> NdnResult<(ChunkReader, u64, ObjId)> {
         let mut current_obj_id = obj_id.clone();
         let mut current_path = Self::normalize_inner_path(inner_path);
         let mut current_obj_str: Option<String> = None;
@@ -1000,16 +1012,18 @@ impl NamedDataMgr {
             if current_path.is_none() {
                 if current_obj_id.is_chunk() {
                     let chunk_id = ChunkId::from_obj_id(&current_obj_id);
-                    return self.open_chunk_reader(&chunk_id, 0).await;
+                    let (reader, total) = self.open_chunk_reader(&chunk_id, 0).await?;
+                    return Ok((reader, total, current_obj_id));
                 }
 
                 if current_obj_id.is_chunk_list() {
-                    if let Some(obj_str) = current_obj_str.take() {
-                        return self
-                            .open_chunklist_reader_by_obj_str(obj_str.as_str(), 0)
-                            .await;
-                    }
-                    return self.open_chunklist_reader(&current_obj_id, 0).await;
+                    let (reader, total) = if let Some(obj_str) = current_obj_str.take() {
+                        self.open_chunklist_reader_by_obj_str(obj_str.as_str(), 0)
+                            .await?
+                    } else {
+                        self.open_chunklist_reader(&current_obj_id, 0).await?
+                    };
+                    return Ok((reader, total, current_obj_id));
                 }
 
                 if current_obj_id.is_file_object() {
@@ -1021,10 +1035,13 @@ impl NamedDataMgr {
                     let content_obj_id = ObjId::new(file_obj.content.as_str())?;
                     if content_obj_id.is_chunk() {
                         let chunk_id = ChunkId::from_obj_id(&content_obj_id);
-                        return self.open_chunk_reader(&chunk_id, 0).await;
+                        let (reader, total) = self.open_chunk_reader(&chunk_id, 0).await?;
+                        return Ok((reader, total, content_obj_id));
                     }
                     if content_obj_id.is_chunk_list() {
-                        return self.open_chunklist_reader(&content_obj_id, 0).await;
+                        let (reader, total) =
+                            self.open_chunklist_reader(&content_obj_id, 0).await?;
+                        return Ok((reader, total, content_obj_id));
                     }
                     return Err(NdnError::InvalidObjType(format!(
                         "file object content {} is not chunk or chunklist",

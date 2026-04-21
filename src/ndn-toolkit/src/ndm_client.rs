@@ -392,9 +392,7 @@ impl NdmClient {
                 }),
             )
             .await?;
-        let total = header_u64(&resp, H_TOTAL_SIZE)
-            .or_else(|| header_u64(&resp, H_CHUNK_SIZE))
-            .unwrap_or(0);
+        let total = require_total_size(&resp, "chunk/open")?;
         Ok((into_stream_reader(resp), total))
     }
 
@@ -413,7 +411,7 @@ impl NdmClient {
                 }),
             )
             .await?;
-        let total = header_u64(&resp, H_TOTAL_SIZE).unwrap_or(0);
+        let total = require_total_size(&resp, "chunklist/open")?;
         Ok((into_stream_reader(resp), total))
     }
 
@@ -425,7 +423,7 @@ impl NdmClient {
     ) -> NdnResult<(ChunkReader, u64)> {
         let body = build_obj_with_path(obj_id, inner_path);
         let resp = self.read_request("object/open", &body).await?;
-        let total = header_u64(&resp, H_TOTAL_SIZE).unwrap_or(0);
+        let total = require_total_size(&resp, "object/open")?;
         Ok((into_stream_reader(resp), total))
     }
 
@@ -509,11 +507,18 @@ impl NdmClient {
             .headers()
             .get(H_WRITE_OUTCOME)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("written");
-        Ok(match outcome {
-            "already_exists" => ChunkWriteOutcome::AlreadyExists,
-            _ => ChunkWriteOutcome::Written,
-        })
+            .ok_or_else(|| {
+                NdnError::InvalidData(format!(
+                    "missing {H_WRITE_OUTCOME} header in write response"
+                ))
+            })?;
+        match outcome {
+            "written" => Ok(ChunkWriteOutcome::Written),
+            "already_exists" => Ok(ChunkWriteOutcome::AlreadyExists),
+            other => Err(NdnError::InvalidData(format!(
+                "unknown {H_WRITE_OUTCOME} value: {other}"
+            ))),
+        }
     }
 
     /// 对应 `NamedDataMgr::put_chunk`. 便利方法：手里已有 `Vec<u8>` 时走同一写入接口。
@@ -648,13 +653,6 @@ fn take_str<'a>(value: &'a Value, field: &str) -> NdnResult<&'a str> {
         .ok_or_else(|| NdnError::InvalidData(format!("missing field '{field}' in response")))
 }
 
-fn header_u64(resp: &Response, name: &str) -> Option<u64> {
-    resp.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-}
-
 fn into_stream_reader(resp: Response) -> ChunkReader {
     let stream = resp
         .bytes_stream()
@@ -678,10 +676,21 @@ fn parse_object_state(v: &Value) -> NdnResult<ObjectState> {
 
 fn parse_chunk_store_state(v: &Value) -> NdnResult<(ChunkStoreState, u64)> {
     let state = take_str(v, "state")?;
-    let size = v
-        .get("chunk_size")
-        .and_then(|x| x.as_u64())
-        .unwrap_or(0);
+    let size_field = v.get("chunk_size");
+    let size = match size_field {
+        Some(x) => x.as_u64().ok_or_else(|| {
+            NdnError::InvalidData(format!("chunk_size must be u64, got {x}"))
+        })?,
+        None => {
+            // Only not_exist may legitimately omit chunk_size; other states carry it per protocol.
+            if state != "not_exist" {
+                return Err(NdnError::InvalidData(format!(
+                    "missing chunk_size in chunk state '{state}'"
+                )));
+            }
+            0
+        }
+    };
     let state = match state {
         "new" => ChunkStoreState::New,
         "completed" => ChunkStoreState::Completed,
@@ -706,6 +715,23 @@ fn parse_chunk_store_state(v: &Value) -> NdnResult<(ChunkStoreState, u64)> {
         }
     };
     Ok((state, size))
+}
+
+fn require_total_size(resp: &Response, route: &str) -> NdnResult<u64> {
+    match resp.headers().get(H_TOTAL_SIZE) {
+        None => Err(NdnError::InvalidData(format!(
+            "missing {H_TOTAL_SIZE} header on /read/{route}"
+        ))),
+        Some(v) => v
+            .to_str()
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                NdnError::InvalidData(format!(
+                    "invalid {H_TOTAL_SIZE} header on /read/{route}"
+                ))
+            }),
+    }
 }
 
 fn parse_local_info(v: &Value) -> NdnResult<ChunkLocalInfo> {
@@ -749,6 +775,7 @@ fn map_http_error(status: StatusCode, body: &str) -> NdnError {
             "permission_denied" => NdnError::PermissionDenied(message.to_string()),
             "already_exists" => NdnError::AlreadyExists(message.to_string()),
             "offset_too_large" => NdnError::OffsetTooLarge(message.to_string()),
+            "unsupported" => NdnError::Unsupported(message.to_string()),
             _ => NdnError::RemoteError(format!("HTTP {}: {}", status, message)),
         };
     }
@@ -757,6 +784,7 @@ fn map_http_error(status: StatusCode, body: &str) -> NdnError {
         StatusCode::BAD_REQUEST => NdnError::InvalidParam(body.to_string()),
         StatusCode::CONFLICT => NdnError::VerifyError(body.to_string()),
         StatusCode::FORBIDDEN => NdnError::PermissionDenied(body.to_string()),
+        StatusCode::METHOD_NOT_ALLOWED => NdnError::Unsupported(body.to_string()),
         StatusCode::RANGE_NOT_SATISFIABLE => NdnError::OffsetTooLarge(body.to_string()),
         _ => NdnError::RemoteError(format!("HTTP {}: {}", status, body)),
     }
@@ -829,9 +857,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_chunk_store_state_requires_size() {
+        // completed without chunk_size must fail
+        let v = serde_json::json!({ "state": "completed" });
+        assert!(matches!(
+            parse_chunk_store_state(&v),
+            Err(NdnError::InvalidData(_))
+        ));
+
+        // non-numeric chunk_size must fail
+        let v = serde_json::json!({ "state": "completed", "chunk_size": "1024" });
+        assert!(matches!(
+            parse_chunk_store_state(&v),
+            Err(NdnError::InvalidData(_))
+        ));
+
+        // not_exist may omit chunk_size
+        let v = serde_json::json!({ "state": "not_exist" });
+        let (st, sz) = parse_chunk_store_state(&v).unwrap();
+        assert_eq!(st, ChunkStoreState::NotExist);
+        assert_eq!(sz, 0);
+    }
+
+    #[test]
     fn test_map_http_error_json() {
         let body = r#"{"error":"not_found","message":"object missing"}"#;
         let err = map_http_error(StatusCode::NOT_FOUND, body);
         assert!(matches!(err, NdnError::NotFound(_)));
+    }
+
+    #[test]
+    fn test_map_http_error_unsupported() {
+        let body = r#"{"error":"unsupported","message":"method not allowed"}"#;
+        let err = map_http_error(StatusCode::METHOD_NOT_ALLOWED, body);
+        assert!(matches!(err, NdnError::Unsupported(_)));
+
+        // Status-based fallback: 405 with no JSON body.
+        let err = map_http_error(StatusCode::METHOD_NOT_ALLOWED, "not allowed");
+        assert!(matches!(err, NdnError::Unsupported(_)));
     }
 }

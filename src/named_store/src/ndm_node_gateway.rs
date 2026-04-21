@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cyfs_gateway_lib::{HttpServer, ServerError, ServerResult, StreamInfo};
+use cyfs_gateway_lib::{server_err, HttpServer, ServerError, ServerErrorCode, ServerResult, StreamInfo};
 use futures_util::StreamExt;
 use http::{Method, Response, StatusCode, Version};
 use http_body_util::combinators::BoxBody;
@@ -489,6 +489,14 @@ impl NamedDataMgrNodeGateway {
             "chunk/piece" => {
                 let r: ChunkPieceRequest = parse_json_body(req).await?;
                 let chunk_id = ChunkId::new(&r.chunk_id)?;
+                // 协议 §11.1 要求所有读接口返回 NDM-Total-Size，先取一次状态拿到逻辑总长度。
+                let (state, total_size) = self.store_mgr.query_chunk_state(&chunk_id).await?;
+                if matches!(state, ChunkStoreState::NotExist) {
+                    return Err(NdnError::NotFound(format!(
+                        "chunk {} not found",
+                        chunk_id.to_string()
+                    )));
+                }
                 let piece = self
                     .store_mgr
                     .get_chunk_piece(&chunk_id, r.offset, r.piece_size)
@@ -498,6 +506,7 @@ impl NamedDataMgrNodeGateway {
                     .status(StatusCode::OK)
                     .header("content-type", CONTENT_TYPE_OCTET)
                     .header("content-length", piece_len)
+                    .header(H_TOTAL_SIZE, total_size)
                     .header(H_READER_KIND, "chunk");
                 if r.offset > 0 {
                     builder = builder.header(H_OFFSET, r.offset);
@@ -540,15 +549,27 @@ impl NamedDataMgrNodeGateway {
                 let r: ObjIdWithInnerPathRequest = parse_json_body(req).await?;
                 let obj_id = parse_obj_id(&r.obj_id)?;
                 let inner_path = normalize_inner_path(r.inner_path);
-                let (reader, total_size) = self.store_mgr.open_reader(&obj_id, inner_path).await?;
+                // 协议 §11.6：NDM-Resolved-Object-ID 必须是最终落地 reader 的对象 ID
+                // （chunk 或 chunklist），而不是输入的入口 obj_id。
+                let (reader, total_size, resolved_obj_id) = self
+                    .store_mgr
+                    .open_reader_with_resolved(&obj_id, inner_path)
+                    .await?;
+                let kind = if resolved_obj_id.is_chunk() {
+                    "chunk"
+                } else if resolved_obj_id.is_chunk_list() {
+                    "chunklist"
+                } else {
+                    "object"
+                };
                 let body = chunk_reader_to_body(reader, total_size);
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", CONTENT_TYPE_OCTET)
                     .header("content-length", total_size)
                     .header(H_TOTAL_SIZE, total_size)
-                    .header(H_READER_KIND, "object")
-                    .header(H_RESOLVED_OBJ_ID, obj_id.to_string())
+                    .header(H_READER_KIND, kind)
+                    .header(H_RESOLVED_OBJ_ID, resolved_obj_id.to_string())
                     .body(body)
                     .map_err(|e| NdnError::Internal(format!("build response: {e}")))
             }
@@ -581,21 +602,36 @@ impl NamedDataMgrNodeGateway {
             ));
         }
 
-        // 协议要求 application/octet-stream
-        if let Some(ct) = req
+        // 协议 §12.1：Content-Type、Content-Length、NDM-Chunk-Size 都是必填，
+        // 且 Content-Length 必须与 chunk_size 一致。
+        let content_type = req
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-        {
-            if !ct.starts_with("application/octet-stream") {
-                return Err(NdnError::InvalidParam(format!(
-                    "write/chunk requires Content-Type: application/octet-stream, got: {}",
-                    ct
-                )));
-            }
+            .ok_or_else(|| {
+                NdnError::InvalidParam(
+                    "missing Content-Type header (required: application/octet-stream)".to_string(),
+                )
+            })?;
+        // 严格匹配：不接受 text/plain、multipart 等；允许后续可能的参数（如 charset）但主类型必须一致。
+        let main_type = content_type.split(';').next().unwrap_or("").trim();
+        if main_type != CONTENT_TYPE_OCTET {
+            return Err(NdnError::InvalidParam(format!(
+                "write/chunk requires Content-Type: {}, got: {}",
+                CONTENT_TYPE_OCTET, content_type
+            )));
         }
 
-        let chunk_size = parse_chunk_size_header(&req)?;
+        let content_length = parse_required_u64_header(&req, "content-length")?;
+        let ndm_chunk_size = parse_required_u64_header(&req, H_CHUNK_SIZE)?;
+
+        if content_length != ndm_chunk_size {
+            return Err(NdnError::InvalidParam(format!(
+                "Content-Length ({}) does not match {} ({})",
+                content_length, H_CHUNK_SIZE, ndm_chunk_size
+            )));
+        }
+        let chunk_size = ndm_chunk_size;
 
         // 若 chunk 已存在，短路返回 already_exists，避免重复读取请求体
         if self.store_mgr.have_chunk(&chunk_id).await {
@@ -850,26 +886,19 @@ fn no_content_response() -> Result<http::Response<BoxBody<Bytes, ServerError>>, 
         .map_err(|e| NdnError::Internal(format!("build response: {e}")))
 }
 
-fn parse_chunk_size_header(
+fn parse_required_u64_header(
     req: &http::Request<BoxBody<Bytes, ServerError>>,
+    name: &str,
 ) -> Result<u64, NdnError> {
-    if let Some(v) = req.headers().get(H_CHUNK_SIZE) {
-        return v
-            .to_str()
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| NdnError::InvalidParam(format!("invalid {H_CHUNK_SIZE}")));
-    }
-    if let Some(v) = req.headers().get("content-length") {
-        return v
-            .to_str()
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| NdnError::InvalidParam("invalid content-length".to_string()));
-    }
-    Err(NdnError::InvalidParam(format!(
-        "missing {H_CHUNK_SIZE} and content-length"
-    )))
+    let value = req
+        .headers()
+        .get(name)
+        .ok_or_else(|| NdnError::InvalidParam(format!("missing {} header", name)))?;
+    value
+        .to_str()
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| NdnError::InvalidParam(format!("invalid {} header value", name)))
 }
 
 // ======================== Stream adapters ========================
@@ -905,15 +934,39 @@ fn chunk_reader_to_channel(
             let to_read = std::cmp::min(STREAM_BUF_SIZE as u64, total - sent) as usize;
             let mut buf = vec![0u8; to_read];
             match reader.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    // 提前 EOF —— 实际读到的字节数小于声明的 total。
+                    // 不能当成成功结束流：下游会拿到一个 Content-Length 与实际 body 不一致的
+                    // 截断 200 OK。把它作为 body error 抛出，hyper 会中断响应连接。
+                    let err = server_err!(
+                        ServerErrorCode::IOError,
+                        "chunk reader unexpected EOF: sent={}, expected={}",
+                        sent,
+                        total
+                    );
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
                 Ok(n) => {
                     buf.truncate(n);
                     sent += n as u64;
                     if tx.send(Ok(Frame::data(Bytes::from(buf)))).await.is_err() {
-                        break;
+                        // 客户端主动断开：直接退出，不需要再报错。
+                        return;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    // 把底层 IO 错误透传给 body sink。如果发送也失败了说明客户端已经断开，
+                    // 这种情况下静默退出即可。
+                    let err = server_err!(
+                        ServerErrorCode::IOError,
+                        "chunk reader read failed at offset={}: {}",
+                        sent,
+                        e
+                    );
+                    let _ = tx.send(Err(err)).await;
+                    return;
+                }
             }
         }
     });
