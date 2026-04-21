@@ -39,7 +39,7 @@ name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "nam
 name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "main"}
 krpc = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC", branch = "main" }
 rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", branch = "main" }
-cyfs-gateway-lib = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs-gateway-lib", branch = "main" }
+cyfs-gateway-lib = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs-gateway-lib", branch = "beta2.2" }
 
 
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
