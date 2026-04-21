@@ -1,5 +1,4 @@
 //store layout从fsmeta下载后，完全保存在本地，select target操作不需要与fsmeta交互
-use name_lib::DID;
 use ndn_lib::ObjId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -7,7 +6,7 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone)]
 pub struct StoreTarget {
     pub store_id: String,
-    pub device_did: Option<DID>,
+    pub device_did: String,
     pub capacity: Option<u64>,
     pub used: Option<u64>,
     pub readonly: bool,
@@ -318,7 +317,7 @@ mod tests {
     ) -> StoreTarget {
         StoreTarget {
             store_id: store_id.to_string(),
-            device_did: None,
+            device_did: String::new(),
             capacity: Some(1000),
             used: Some(100),
             readonly,
@@ -666,7 +665,7 @@ mod tests {
         let targets1: Vec<StoreTarget> = (0..NUM_TARGETS_1)
             .map(|i| StoreTarget {
                 store_id: format!("store_{:05}", i),
-                device_did: None,
+                device_did: String::new(),
                 capacity: Some(1000),
                 used: Some(0),
                 readonly: false,
@@ -691,7 +690,7 @@ mod tests {
         let targets2: Vec<StoreTarget> = (0..NUM_TARGETS_2)
             .map(|i| StoreTarget {
                 store_id: format!("store_{:05}", i),
-                device_did: None,
+                device_did: String::new(),
                 capacity: Some(1000),
                 used: Some(0),
                 readonly: false,
@@ -972,7 +971,7 @@ mod tests {
         let targets1: Vec<StoreTarget> = (0..NUM_TARGETS_1)
             .map(|i| StoreTarget {
                 store_id: format!("store_{:03}", i),
-                device_did: None,
+                device_did: String::new(),
                 capacity: Some(1000),
                 used: Some(0),
                 readonly: false,
@@ -992,7 +991,7 @@ mod tests {
         let targets2: Vec<StoreTarget> = (0..NUM_TARGETS_2)
             .map(|i| StoreTarget {
                 store_id: format!("store_{:03}", i),
-                device_did: None,
+                device_did: String::new(),
                 capacity: Some(1000),
                 used: Some(0),
                 readonly: false,
@@ -1142,7 +1141,7 @@ mod tests {
         let targets: Vec<StoreTarget> = (0..NUM_TARGETS)
             .map(|i| StoreTarget {
                 store_id: format!("store_{:05}", i),
-                device_did: None,
+                device_did: String::new(),
                 capacity: Some(1000),
                 used: Some(0),
                 readonly: false,

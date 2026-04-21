@@ -20,7 +20,7 @@ cargo run -p fs_daemon -- /mnt/cyfs \
   --service-config /opt/buckyos/etc/fs_daemon.json
 ```
 
-`fs_daemon.json` 现在必须显式提供 `current_device_did`，用于 `NamedDataMgr` 在初始化时判断每个 bucket 应该走本地 backend 还是远端 HTTP backend。
+`fs_daemon.json` 现在通过 `http_backend_links` 显式提供远端链路表：key 是 `device_did`，value 是对应 HTTP backend 前缀；未出现在表里的 bucket 视为本地 backend。
 
 Mount note (one line):
 

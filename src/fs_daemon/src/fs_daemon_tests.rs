@@ -30,7 +30,7 @@ fn create_test_configs(tmp: &TempDir) -> (std::path::PathBuf, std::path::PathBuf
     let service_config = tmp.path().join("fs_daemon.json");
     let service_config_json = serde_json::json!({
         "instance_id": "test",
-        "current_device_did": "did:web:test-node.example.com",
+        "http_backend_links": {},
         "fs_buffer_dir": tmp.path().join("fs_buffer"),
         "fs_meta_db_path": tmp.path().join("fs_meta").join("fs_meta.db"),
         "fs_buffer_size_limit": 0

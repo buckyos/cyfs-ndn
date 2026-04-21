@@ -8,7 +8,7 @@ fn create_test_obj_id(obj_type: &str, hash_hex: &str) -> ObjId {
 fn create_test_target(store_id: &str, weight: u32, enabled: bool, readonly: bool) -> StoreTarget {
     StoreTarget {
         store_id: store_id.to_string(),
-        device_did: None,
+        device_did: String::new(),
         capacity: Some(1000),
         used: Some(100),
         readonly,

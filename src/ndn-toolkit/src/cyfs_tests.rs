@@ -58,7 +58,7 @@ async fn create_test_store_mgr(base_dir: &Path) -> Arc<NamedDataMgr> {
             1,
             vec![StoreTarget {
                 store_id,
-                device_did: None,
+                device_did: String::new(),
                 capacity: None,
                 used: None,
                 readonly: false,

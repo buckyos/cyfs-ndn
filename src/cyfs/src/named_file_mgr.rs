@@ -1669,7 +1669,7 @@ impl NamedFileMgr {
         if !targets.iter().any(|t| t.store_id == _new_target.store_id) {
             targets.push(LayoutStoreTarget {
                 store_id: _new_target.store_id.clone(),
-                device_did: None,
+                device_did: String::new(),
                 capacity: None,
                 used: None,
                 readonly: false,

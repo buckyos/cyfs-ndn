@@ -17,7 +17,6 @@ use crate::{
     SimpleChunkListReader, StoreLayout, StoreTarget,
 };
 use log::{info, warn};
-use name_lib::DID;
 use ndn_lib::{
     extract_objid_by_path, load_named_obj, load_named_object_from_obj_str, ChunkId, ChunkList,
     ChunkReader, DirObject, FileObject, NdnError, NdnResult, ObjId, SimpleMapItem,
@@ -58,14 +57,7 @@ struct StoreConfigEntry {
     store_id: Option<String>,
     #[serde(alias = "base_dir", alias = "root_path", alias = "store_path")]
     path: PathBuf,
-    device_did: Option<DID>,
-    #[serde(
-        alias = "gateway_base_url",
-        alias = "base_url",
-        alias = "http_base_url",
-        alias = "remote_base_url"
-    )]
-    gateway_base_url: Option<String>,
+    device_did: String,
     capacity: Option<u64>,
     used: Option<u64>,
     readonly: bool,
@@ -78,8 +70,7 @@ impl Default for StoreConfigEntry {
         Self {
             store_id: None,
             path: PathBuf::new(),
-            device_did: None,
-            gateway_base_url: None,
+            device_did: String::new(),
             capacity: None,
             used: None,
             readonly: false,
@@ -109,28 +100,35 @@ fn resolve_store_id(entry: &StoreConfigEntry, index: usize) -> String {
         .unwrap_or_else(|| format!("store-{}", index + 1))
 }
 
-fn should_use_local_backend(entry: &StoreConfigEntry, current_node: &DID) -> bool {
-    match entry.device_did.as_ref() {
-        Some(device_did) => device_did == current_node,
-        None => true,
-    }
+fn should_use_local_backend(
+    entry: &StoreConfigEntry,
+    http_backend_links: &HashMap<String, String>,
+) -> bool {
+    !http_backend_links.contains_key(&entry.device_did)
 }
 
-fn resolve_remote_store_base_url(entry: &StoreConfigEntry) -> NdnResult<String> {
-    if let Some(base_url) = entry
-        .gateway_base_url
-        .as_ref()
-        .map(|url| url.trim())
-        .filter(|url| !url.is_empty())
-    {
-        return Ok(base_url.to_string());
-    }
-
-    let device_did = entry.device_did.as_ref().ok_or_else(|| {
-        NdnError::InvalidParam("remote store requires device_did or gateway_base_url".to_string())
+fn resolve_remote_store_base_url(
+    entry: &StoreConfigEntry,
+    http_backend_links: &HashMap<String, String>,
+) -> NdnResult<String> {
+    let base_url = http_backend_links.get(&entry.device_did).ok_or_else(|| {
+        NdnError::InvalidParam(format!(
+            "remote store {} missing http backend prefix for device_did '{}'",
+            entry.store_id.clone().unwrap_or_default(),
+            entry.device_did
+        ))
     })?;
 
-    Ok(format!("http://{}/ndn", device_did.to_host_name()))
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return Err(NdnError::InvalidParam(format!(
+            "remote store {} has empty http backend prefix for device_did '{}'",
+            entry.store_id.clone().unwrap_or_default(),
+            entry.device_did
+        )));
+    }
+
+    Ok(base_url.to_string())
 }
 
 const DEFAULT_RESOLVE_NEXT_OBJ_CACHE_MAX_ENTRIES: usize = 10000;
@@ -244,7 +242,7 @@ pub struct NamedDataMgr {
 impl NamedDataMgr {
     pub async fn get_store_mgr(
         store_config_path: &Path,
-        current_device_did: &DID,
+        http_backend_links: &HashMap<String, String>,
     ) -> NdnResult<Self> {
         let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
         if store_config.stores.len() < 1 {
@@ -290,20 +288,17 @@ impl NamedDataMgr {
                 read_only: entry.readonly,
                 ..Default::default()
             };
-            let store = if should_use_local_backend(entry, current_device_did) {
+            let store = if should_use_local_backend(entry, http_backend_links) {
                 NamedStore::from_config(Some(store_id.clone()), store_path, config).await?
             } else {
-                let base_url = resolve_remote_store_base_url(entry)?;
+                let base_url = resolve_remote_store_base_url(entry, http_backend_links)?;
                 let backend = Arc::new(NamedStoreHttpBackend::new(HttpBackendConfig {
                     base_url: base_url.clone(),
                 })) as Arc<dyn NamedDataStoreBackend>;
 
                 info!(
-                    "store {} mapped to remote backend: current_node={:?}, device_did={:?}, base_url={}",
-                    store_id,
-                    current_device_did.to_string(),
-                    entry.device_did.as_ref().map(|did| did.to_string()),
-                    base_url
+                    "store {} mapped to remote backend: device_did={}, base_url={}",
+                    store_id, entry.device_did, base_url
                 );
 
                 NamedStore::from_config_with_backend(

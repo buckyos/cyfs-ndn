@@ -46,7 +46,7 @@ async fn main() {
         1,
         vec![StoreTarget {
             store_id: "test-store".to_string(),
-            device_did: None,
+            device_did: String::new(),
             weight: 1,
             capacity: Some(1_000_000_000),
             used: Some(0),

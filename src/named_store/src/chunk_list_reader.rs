@@ -557,7 +557,7 @@ mod tests {
     fn default_target(store_id: &str) -> StoreTarget {
         StoreTarget {
             store_id: store_id.to_string(),
-            device_did: None,
+            device_did: String::new(),
             capacity: Some(1024 * 1024 * 1024),
             used: Some(0),
             readonly: false,

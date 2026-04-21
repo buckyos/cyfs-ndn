@@ -170,7 +170,7 @@ mod tests {
                 1,
                 vec![StoreTarget {
                     store_id: "remote-backend".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -209,7 +209,7 @@ mod tests {
             vec![
                 StoreTarget {
                     store_id: "store-local-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -218,7 +218,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-local-2".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -227,7 +227,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-remote-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -514,7 +514,7 @@ mod tests {
             vec![
                 StoreTarget {
                     store_id: "store-local-2".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 2,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -523,7 +523,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-remote-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -532,7 +532,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-local-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -798,7 +798,7 @@ mod tests {
             vec![
                 StoreTarget {
                     store_id: "store-local-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 2,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -807,7 +807,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-local-2".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),
@@ -816,7 +816,7 @@ mod tests {
                 },
                 StoreTarget {
                     store_id: "store-remote-1".to_string(),
-                    device_did: None,
+                    device_did: String::new(),
                     weight: 1,
                     capacity: Some(1_000_000_000),
                     used: Some(0),

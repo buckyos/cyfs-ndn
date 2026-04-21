@@ -8,7 +8,6 @@ use fuser::{
 };
 use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
 use log::{debug, info};
-use name_lib::DID;
 use named_store::NamedDataMgr;
 use ndn_lib::{NdnError, NdnResult, NfsPath};
 use serde::de::DeserializeOwned;
@@ -101,7 +100,8 @@ impl Default for StoreConfigEntry {
 struct FsDaemonServiceConfig {
     #[serde(alias = "instance", alias = "cyfs_instance_id")]
     instance_id: String,
-    current_device_did: Option<DID>,
+    #[serde(default)]
+    http_backend_links: HashMap<String, String>,
     #[serde(alias = "buffer_dir", alias = "fs_buffer_path")]
     fs_buffer_dir: PathBuf,
     #[serde(alias = "meta_db_path", alias = "fs_meta_path")]
@@ -114,7 +114,7 @@ impl Default for FsDaemonServiceConfig {
     fn default() -> Self {
         Self {
             instance_id: "default".to_string(),
-            current_device_did: None,
+            http_backend_links: HashMap::new(),
             fs_buffer_dir: PathBuf::from("/opt/buckyos/var/fs_buffer"),
             fs_meta_db_path: PathBuf::from("/opt/buckyos/var/fs_meta/fs_meta.db"),
             fs_buffer_size_limit: 0,
@@ -1250,7 +1250,7 @@ fn read_json_config<T: DeserializeOwned>(path: &Path) -> NdnResult<T> {
 fn init_store_mgr(
     runtime: &Runtime,
     store_config_path: &Path,
-    current_device_did: &DID,
+    http_backend_links: &HashMap<String, String>,
 ) -> NdnResult<Arc<NamedDataMgr>> {
     let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
     if store_config.stores.len() < 3 {
@@ -1262,7 +1262,7 @@ fn init_store_mgr(
 
     runtime
         .block_on(async {
-            NamedDataMgr::get_store_mgr(store_config_path, current_device_did).await
+            NamedDataMgr::get_store_mgr(store_config_path, http_backend_links).await
         })
         .map(Arc::new)
 }
@@ -1274,13 +1274,11 @@ pub fn init_named_mgr(
 ) -> NdnResult<NamedFileMgrRef> {
     // 1. load store_layout config, construct store_layout + store_mgr
     let service_config: FsDaemonServiceConfig = read_json_config(service_config_path)?;
-    let current_device_did = service_config.current_device_did.clone().ok_or_else(|| {
-        NdnError::InvalidParam(format!(
-            "service config {} must include current_device_did",
-            service_config_path.display()
-        ))
-    })?;
-    let store_mgr = init_store_mgr(runtime, store_config_path, &current_device_did)?;
+    let store_mgr = init_store_mgr(
+        runtime,
+        store_config_path,
+        &service_config.http_backend_links,
+    )?;
 
     // 2. load fs_daemon service config, init fs_buffer and fs_meta service runner
     std::fs::create_dir_all(&service_config.fs_buffer_dir).map_err(|e| {

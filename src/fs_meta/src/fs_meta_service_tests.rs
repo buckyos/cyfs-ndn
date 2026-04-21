@@ -47,7 +47,7 @@ mod tests {
     fn build_test_layout(store_id: &str) -> StoreLayout {
         let target = StoreTarget {
             store_id: store_id.to_string(),
-            device_did: None,
+            device_did: String::new(),
             capacity: None,
             used: None,
             readonly: false,

@@ -1,6 +1,7 @@
 use super::*;
 use ndn_lib::ChunkHasher;
 use serde_json::json;
+use std::collections::HashMap;
 use tempfile::tempdir;
 
 fn calc_chunk_id(data: &[u8]) -> ChunkId {
@@ -11,11 +12,11 @@ fn calc_chunk_id(data: &[u8]) -> ChunkId {
 }
 
 #[tokio::test]
-async fn get_store_mgr_uses_local_backend_when_device_matches_current_node() {
+async fn get_store_mgr_uses_local_backend_when_device_is_not_in_link_map() {
     let temp_dir = tempdir().unwrap();
     let store_path = temp_dir.path().join("store-a");
     let config_path = temp_dir.path().join("store_layout.json");
-    let current_node = DID::new("web", "node-a.example.com");
+    let current_node = "did:web:node-a.example.com".to_string();
 
     std::fs::write(
         &config_path,
@@ -24,8 +25,7 @@ async fn get_store_mgr_uses_local_backend_when_device_matches_current_node() {
             "stores": [{
                 "store_id": "store-a",
                 "path": "store-a",
-                "device_did": current_node.to_string(),
-                "gateway_base_url": "http://127.0.0.1:9/ndn",
+                "device_did": current_node,
                 "weight": 1,
                 "enabled": true,
                 "readonly": false
@@ -35,7 +35,7 @@ async fn get_store_mgr_uses_local_backend_when_device_matches_current_node() {
     )
     .unwrap();
 
-    let mgr = NamedDataMgr::get_store_mgr(&config_path, &current_node)
+    let mgr = NamedDataMgr::get_store_mgr(&config_path, &HashMap::new())
         .await
         .unwrap();
 
@@ -55,11 +55,10 @@ async fn get_store_mgr_uses_local_backend_when_device_matches_current_node() {
 }
 
 #[tokio::test]
-async fn get_store_mgr_uses_http_backend_when_device_differs_from_current_node() {
+async fn get_store_mgr_uses_http_backend_when_device_is_in_link_map() {
     let temp_dir = tempdir().unwrap();
     let config_path = temp_dir.path().join("store_layout.json");
-    let current_node = DID::new("web", "node-a.example.com");
-    let remote_node = DID::new("web", "node-b.example.com");
+    let remote_node = "did:web:node-b.example.com".to_string();
 
     std::fs::write(
         &config_path,
@@ -68,8 +67,7 @@ async fn get_store_mgr_uses_http_backend_when_device_differs_from_current_node()
             "stores": [{
                 "store_id": "store-b",
                 "path": "store-b",
-                "device_did": remote_node.to_string(),
-                "gateway_base_url": "http://127.0.0.1:9/ndn",
+                "device_did": remote_node,
                 "weight": 1,
                 "enabled": true,
                 "readonly": false
@@ -79,9 +77,15 @@ async fn get_store_mgr_uses_http_backend_when_device_differs_from_current_node()
     )
     .unwrap();
 
-    let mgr = NamedDataMgr::get_store_mgr(&config_path, &current_node)
-        .await
-        .unwrap();
+    let mgr = NamedDataMgr::get_store_mgr(
+        &config_path,
+        &HashMap::from([(
+            "did:web:node-b.example.com".to_string(),
+            "http://127.0.0.1:9/ndn".to_string(),
+        )]),
+    )
+    .await
+    .unwrap();
 
     let data = b"remote backend path".to_vec();
     let chunk_id = calc_chunk_id(&data);
@@ -94,12 +98,16 @@ async fn get_store_mgr_uses_http_backend_when_device_differs_from_current_node()
 }
 
 #[test]
-fn remote_store_base_url_defaults_to_device_host_name() {
+fn remote_store_base_url_uses_link_map() {
     let entry = StoreConfigEntry {
-        device_did: Some(DID::new("bns", "store-node")),
+        device_did: "did:bns:store-node".to_string(),
         ..Default::default()
     };
 
-    let base_url = resolve_remote_store_base_url(&entry).unwrap();
+    let links = HashMap::from([(
+        "did:bns:store-node".to_string(),
+        "http://store-node.bns.did/ndn".to_string(),
+    )]);
+    let base_url = resolve_remote_store_base_url(&entry, &links).unwrap();
     assert_eq!(base_url, "http://store-node.bns.did/ndn");
 }
