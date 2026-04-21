@@ -16,3 +16,6 @@ mod test;
 
 #[cfg(test)]
 mod cyfs_tests;
+
+#[cfg(test)]
+mod ndm_tests;

@@ -48,3 +48,7 @@ buckyos-kit = { workspace = true }
 tempfile = { workspace = true }
 url = { workspace = true }
 base64 = "0.22"
+cyfs-gateway-lib = { workspace = true }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+

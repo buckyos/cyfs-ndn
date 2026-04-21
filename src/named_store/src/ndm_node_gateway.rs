@@ -842,13 +842,16 @@ async fn parse_json_body<T: serde::de::DeserializeOwned>(
     req: http::Request<BoxBody<Bytes, ServerError>>,
 ) -> Result<T, NdnError> {
     let body = collect_body(req).await?;
-    if body.is_empty() {
-        // 允许空 body（如 outbox_count 的 `{}`），这里把空 body 当作 `null` 处理
-        // —— 不过普通调用方都会发 JSON，所以这分支很少触发。
-        return serde_json::from_slice(b"{}")
-            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")));
-    }
-    serde_json::from_slice(&body).map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))
+    // 先解析为通用 Value：语法错误 → invalid_data（GEN-05）。
+    // 再从 Value 反序列化到目标结构：missing field / 类型错 → invalid_param（GEN-06）。
+    let value: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Object(Default::default())
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| NdnError::InvalidData(format!("invalid JSON: {e}")))?
+    };
+    serde_json::from_value(value)
+        .map_err(|e| NdnError::InvalidParam(format!("invalid request body: {e}")))
 }
 
 async fn collect_body(
