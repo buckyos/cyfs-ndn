@@ -417,13 +417,13 @@ impl Default for NdmZoneGatewayConfig {
 // ======================== Gateway ========================
 
 #[derive(Clone)]
-pub struct NamedStoreMgrZoneGateway {
+pub struct NamedDataMgrZoneGateway {
     store_mgr: Arc<NamedDataMgr>,
     state: Arc<RwLock<UploadStateManager>>,
     config: NdmZoneGatewayConfig,
 }
 
-impl NamedStoreMgrZoneGateway {
+impl NamedDataMgrZoneGateway {
     pub fn new(store_mgr: Arc<NamedDataMgr>, config: NdmZoneGatewayConfig) -> Self {
         let gw = Self {
             store_mgr,
@@ -451,7 +451,7 @@ impl NamedStoreMgrZoneGateway {
 }
 
 #[async_trait]
-impl HttpServer for NamedStoreMgrZoneGateway {
+impl HttpServer for NamedDataMgrZoneGateway {
     async fn serve_request(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
@@ -501,7 +501,7 @@ impl HttpServer for NamedStoreMgrZoneGateway {
 
 // ======================== Request Routing ========================
 
-impl NamedStoreMgrZoneGateway {
+impl NamedDataMgrZoneGateway {
     async fn route_request(
         &self,
         req: http::Request<BoxBody<Bytes, ServerError>>,
@@ -1474,7 +1474,7 @@ fn no_content_response() -> Result<http::Response<BoxBody<Bytes, ServerError>>, 
         .map_err(|e| NdnError::Internal(format!("build response: {e}")))
 }
 
-impl NamedStoreMgrZoneGateway {
+impl NamedDataMgrZoneGateway {
     async fn handle_store_rpc(
         &self,
         method_name: &str,

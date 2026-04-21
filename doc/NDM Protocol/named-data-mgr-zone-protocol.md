@@ -2,16 +2,21 @@
 
 ## 1. 文档定位
 
-本文以 `src/named_store/src/ndm_zone_gateway.rs` 的当前实现为准，整理 `NamedStoreMgrZoneGateway` 已经对外暴露的 HTTP 协议。
+本文以 `src/named_store/src/ndm_zone_gateway.rs` 的当前实现为准，整理 `NamedDataMgrZoneGateway` 已经对外暴露的 HTTP 协议。
 
-这份文档描述的是“当前可用协议”，不是目标需求稿。若与 `doc/ndm_gateway.md` 或 `doc/ndm_zone_gateway_structured_api.md` 有差异，以实现行为为准。
+这份文档描述的是“当前可用协议”，不是目标需求稿。若与历史拆分文档或旧需求稿有差异，以实现行为为准。
+
+从部署角色上看，这个 gateway 可以理解为：
+
+- 每个 Zone 内 Device 的 `NodeGateway` 上都有机会提供的一层 NDM 访问代理；
+- 典型调用链是 `Device/Agent -> NodeGateway -> NamedStoreMgr`；
+- 它同时承接浏览器友好的上传面和 Zone 内受信的结构化控制面。
 
 当前网关承载两类能力：
 
 - 基于 tus 1.0.0 风格的 chunk 上传协议；
-- `/ndm/v1/store/*` 下的一组结构化 Store 控制面 JSON API。
+- `/ndm/v1/store/*` 下的一组结构化 NDM/Store 控制面 JSON API。
 
-另外，`/cyfs/*` 与 `/ndn/*` 下载路径在本实现中仍是占位，尚未接入旧下载逻辑。
 
 这里的 upload session 是明确的 `per chunk session`：
 
@@ -23,7 +28,7 @@
 
 ### 2.1 监听与基础行为
 
-- 服务类型：`impl HttpServer for NamedStoreMgrZoneGateway`
+- 服务类型：`impl HttpServer for NamedDataMgrZoneGateway`
 - HTTP 版本：`HTTP/1.1`
 - 支持 `X-HTTP-Method-Override`，会优先用该 header 覆盖实际 method
 - 所有 JSON 响应均为 `content-type: application/json; charset=utf-8`
@@ -39,7 +44,7 @@
 | `/ndm/v1/uploads/{session_id}` | `HEAD` | 查询会话状态 |
 | `/ndm/v1/uploads/{session_id}` | `PATCH` | 追加 chunk 数据 |
 | `/ndm/v1/store/{method}` | `POST` | 结构化 Store JSON API |
-| `/cyfs/*` `/ndn/*` | 任意 | 当前返回未实现错误 |
+
 
 ### 2.3 默认配置
 
@@ -489,17 +494,53 @@ us_{unix_millis_hex}_{seq_hex}
 
 ## 6. `/ndm/v1/store/*` 结构化 Store API
 
-### 6.1 通用约定
+### 6.1 角色与边界
+
+`/ndm/v1/store/*` 这一组接口不是独立于 Zone Gateway 的另一份协议，而是本协议里“结构化控制面”的那一部分。它的定位是：
+
+- 作为 Zone 内 Device 的 `NodeGateway` 可能提供的 NDM 访问代理；
+- 给设备进程、Agent、后端 service 或受信 SDK 使用；
+- 通过小报文 JSON 暴露 `NamedStoreMgr` 的对象查询、路径解析、chunk 元数据、GC / pin / anchor 等控制面能力。
+
+这组接口默认应被视为 **Zone 内受信调用面**，不等价于公开浏览器上传面。特别是以下能力不应按匿名浏览器接口来理解：
+
+- `put_object`
+- `remove_object`
+- `remove_chunk`
+- `apply_edge`
+- `pin` / `unpin`
+- `forced_gc_until`
+- `fs_*`
+
+同时，它明确 **不覆盖 data-plane**：
+
+- `open_chunk_reader`
+- `open_chunklist_reader`
+- `open_reader`
+- `get_chunk_data`
+- `get_chunk_piece`
+- `put_chunk_by_reader`
+- `put_chunk`
+- `add_chunk_by_link_to_local_file`
+
+这些能力要么已经落在 tus 上传链路里，要么应继续放在未来的 `/cyfs/*`、`/ndn/*` 下载/数据面协议中，而不是塞进结构化 JSON RPC。
+
+### 6.2 通用约定
 
 - 统一路由：`POST /ndm/v1/store/{method}`
 - 请求体：JSON
+- 请求头通常为：
+  - `Content-Type: application/json`
+  - `Accept: application/json`
 - 成功响应：
   - 查询类通常返回 `200 OK + JSON`
   - 写操作通常返回 `204 No Content`
 - 非 `POST` 访问该前缀时返回 `405 unsupported`
 - 未知 `method` 返回 `404 not_found`
+- `obj_id` / `chunk_id` 统一使用字符串；`chunk_id` 在协议上仍按 `ObjId` 字符串传输
+- `inner_path` 的 `null`、空串和 `/` 会被规范化为 `None`
 
-### 6.2 对象接口
+### 6.3 对象接口
 
 | 方法 | 请求 JSON | 成功响应 |
 |---|---|---|
@@ -514,10 +555,9 @@ us_{unix_millis_hex}_{seq_hex}
 
 补充说明：
 
-- `open_object` / `is_object_stored` 中，`inner_path` 的 `null`、空串和 `/` 会被规范化为 `None`
 - `put_object` 与 `remove_object` 不接受 chunk ID；若传入 chunk ID，返回 `400 invalid_param`
 
-### 6.3 Chunk 元数据接口
+### 6.4 Chunk 元数据接口
 
 | 方法 | 请求 JSON | 成功响应 |
 |---|---|---|
@@ -535,7 +575,7 @@ us_{unix_millis_hex}_{seq_hex}
 - `local_link`
 - `same_as`
 
-### 6.4 GC / Anchor / Debug 接口
+### 6.5 GC / Anchor / Debug 接口
 
 | 方法 | 请求 JSON | 成功响应 |
 |---|---|---|
@@ -556,6 +596,45 @@ us_{unix_millis_hex}_{seq_hex}
 
 - `apply_edge` 与 `pin` 直接反序列化为内部类型 `EdgeMsg` / `PinRequest`
 - `debug_dump_expand_state` 的响应结构直接序列化内部 `ExpandDebug`，字段形状以后续代码为准
+
+### 6.6 `ndm.rs` 能力纳入范围
+
+下表给出 `NamedStoreMgr` 当前方法与协议暴露面的对应关系：
+
+| `ndm.rs` 方法 | 是否纳入 | API / 说明 |
+|---|---|---|
+| `get_object` | 是 | `POST /ndm/v1/store/get_object` |
+| `open_object` | 是 | `POST /ndm/v1/store/open_object` |
+| `get_dir_child` | 是 | `POST /ndm/v1/store/get_dir_child` |
+| `is_object_stored` | 是 | `POST /ndm/v1/store/is_object_stored` |
+| `is_object_exist` | 是 | `POST /ndm/v1/store/is_object_exist` |
+| `query_object_by_id` | 是 | `POST /ndm/v1/store/query_object_by_id` |
+| `put_object` | 是 | `POST /ndm/v1/store/put_object` |
+| `remove_object` | 是 | `POST /ndm/v1/store/remove_object` |
+| `have_chunk` | 是 | `POST /ndm/v1/store/have_chunk` |
+| `query_chunk_state` | 是 | `POST /ndm/v1/store/query_chunk_state` |
+| `remove_chunk` | 是 | `POST /ndm/v1/store/remove_chunk` |
+| `add_chunk_by_same_as` | 是 | `POST /ndm/v1/store/add_chunk_by_same_as` |
+| `apply_edge` | 是 | `POST /ndm/v1/store/apply_edge` |
+| `pin` | 是 | `POST /ndm/v1/store/pin` |
+| `unpin` | 是 | `POST /ndm/v1/store/unpin` |
+| `unpin_owner` | 是 | `POST /ndm/v1/store/unpin_owner` |
+| `fs_acquire` | 是 | `POST /ndm/v1/store/fs_acquire` |
+| `fs_release` | 是 | `POST /ndm/v1/store/fs_release` |
+| `fs_release_inode` | 是 | `POST /ndm/v1/store/fs_release_inode` |
+| `fs_anchor_state` | 是 | `POST /ndm/v1/store/fs_anchor_state` |
+| `forced_gc_until` | 是 | `POST /ndm/v1/store/forced_gc_until` |
+| `outbox_count` | 是 | `POST /ndm/v1/store/outbox_count` |
+| `debug_dump_expand_state` | 是 | `POST /ndm/v1/store/debug_dump_expand_state` |
+| `anchor_state` | 是 | `POST /ndm/v1/store/anchor_state` |
+| `open_chunk_reader` | 否 | 流式读取，属于 data-plane |
+| `open_chunklist_reader` | 否 | 流式读取，属于 data-plane |
+| `open_reader` | 否 | 流式读取，属于 data-plane |
+| `get_chunk_data` | 否 | 原始字节接口，不属于结构化控制面 |
+| `get_chunk_piece` | 否 | 原始字节接口，不属于结构化控制面 |
+| `put_chunk_by_reader` | 否 | 流式写入，继续走 tus / 上传协议 |
+| `put_chunk` | 否 | 原始二进制写入，不放进结构化 API |
+| `add_chunk_by_link_to_local_file` | 否 | 依赖服务端本地路径，不应远程暴露 |
 
 ## 7. 当前未实现项
 
@@ -594,7 +673,7 @@ CYFS get/download not yet implemented in zone gateway, coming in next iteration
 5. 再持续 `PATCH` 直到 `NDM-Chunk-Status=completed`
 6. 收集所有 chunk object id，交给上层对象组装逻辑
 
-这也是当前 `NamedStoreMgrZoneGateway` 实现已经稳定支持的最小闭环。
+这也是当前 `NamedDataMgrZoneGateway` 实现已经稳定支持的最小闭环。
 
 ## 9. 标准 tus-client 视角示例
 
@@ -850,4 +929,3 @@ function uploadOneChunk({
 3.2 client 在本地运行一个 `ndn_router`，准备处理来自 server 的 `get_obj` 和 `pull_chunk` 请求。  
 4. server 的 `dir download session` 创建成功，并持有一个 tunnel session 对象。  
 5. server 运行 `dir download logic`，基于该 tunnel 创建 `get_obj` 和 `pull_chunk`。
-

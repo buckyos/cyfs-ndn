@@ -64,7 +64,7 @@ async fn main() {
         cache_dir: cache_dir.clone(),
         ..Default::default()
     };
-    let gateway = Arc::new(NamedStoreMgrZoneGateway::new(mgr, config));
+    let gateway = Arc::new(NamedDataMgrZoneGateway::new(mgr, config));
 
     // ---------- HTTP server ----------
     let listener = TcpListener::bind("127.0.0.1:0")
