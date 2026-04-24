@@ -34,11 +34,11 @@ serde_json = "1"
 async-trait = "0.1"
 tempfile = "3"
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
-buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "main" }
-name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "main"}
-name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "main"}
-krpc = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC", branch = "main" }
-rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", branch = "main" }
+buckyos-kit = { git = "https://github.com/buckyos/buckyos-base.git", package = "buckyos-kit",branch = "beta2.2" }
+name-lib = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-lib" ,branch = "beta2.2"}
+name-client = { git = "https://github.com/buckyos/buckyos-base.git", package = "name-client" ,branch = "beta2.2"}
+krpc = { git = "https://github.com/buckyos/buckyos-base.git", package = "kRPC", branch = "beta2.2" }
+rbac = { git = "https://github.com/buckyos/buckyos-base.git", package = "rbac", branch = "beta2.2" }
 cyfs-gateway-lib = { git = "https://github.com/buckyos/cyfs-gateway.git", package = "cyfs-gateway-lib", branch = "beta2.2" }
 
 
