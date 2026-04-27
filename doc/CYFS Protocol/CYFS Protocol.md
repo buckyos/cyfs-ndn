@@ -2,13 +2,13 @@
 
 > `CYFS` 或 `cyfs://` 都是在说协议；单独说 `cyfs` 时，通常指基于 CYFS Protocol 定义的标准对象实现的 DFS。
 
-当前文档状态：0.9，最新草案，领先现有代码实现。
+当前文档状态：0.91 修订草案，领先现有代码实现。本版在 0.9 基础上补充 **No-Push 的精确定义**、**跨 Zone 小对象投递 `dispatch`**、**语义路径目录的两种形态** 与 **PathObject 的 sub-host DID 公钥扩展**。
 
 ## 设计哲学与边界
 
 在进入任何CYFS的设计之前，先说明 CYFS 协议的**定位**和**边界**——也就是 CYFS 做什么、不做什么、以及为什么把某些"看似相关"的能力推到了协议之外。
 
-很多在传统 P2P 或内容分发系统里被认为"理所当然应该包含"的模块——身份体系、支付结算、传输层连接、DHT、piece 级 P2P 交换、Tracker——在 CYFS 里都被有意识地移出了协议正文。它们要么由更下层的 tunnel 框架承担，要么由 W3C DID 等外部生态承担，要么由 CYFS 生态内的其他独立协议（NDM、BNS）承担。这一节解释这些设计边界的由来。
+很多在传统 P2P 或内容分发系统里被认为"理所当然应该包含"的模块——身份体系、支付结算、传输层连接、DHT、piece 级 P2P 交换、Tracker——在 CYFS 里都被有意识地移出了协议正文。它们要么由更下层的 tunnel 框架承担，要么由 W3C DID 等外部生态承担，要么由 CYFS 生态内的其他独立协议承担。这一节解释这些设计边界的由来。
 
 ### 定位：最小化的语义层协议
 
@@ -24,7 +24,7 @@ CYFS 的几条贯穿性原则：
 
 - **最小化扩展 HTTP**：协议只定义 `cyfs://` 必须扩展的那部分，其余继续复用 HTTP 生态。
 - **可信传输与中心化 CA 解绑**：让"HTTPS 证书的等价物"可以通过 DID 体系获得。
-- **Pull-first**：跨 Zone 之间不存在"我把内容推给你"的语义，所有跨 Zone 分发最终都落在"对方主动 Pull"上。
+- **No-Push / Pull-first**：站在 `Content Network` 的视角，内容不会、也不需要通过 Push 来发布。已发布内容的扩散、收录与消费，最终都应落在收录者或消费者主动 Pull 上；接收方拥有是否下载、何时下载、从谁下载的最终控制权。跨 Zone 可以存在小型 `NamedObject` 的投递，用于消息、评论、通知、索引变更等语义事件，但这类投递不等价于内容 Push、附件上传或把公共数据强行写入对方 Zone。
 - **源发现与内容校验解耦**：谁告诉我"某个源可能有数据"可以很宽松，这个源返回的数据是否可信必须严格。
 - **从真实用户场景反推传播过程**，而不是从协议抽象反推用户行为——这是 CYFS 和很多传统 P2P 协议最根本的视角差异。
 
@@ -115,6 +115,9 @@ CYFS 倾向于在协议里定义**逻辑广播 / 逻辑传播**，而不是**协
 | Tracker | 否 | 基于动作链的逻辑传播模型 + 收录者 |
 | 内容寻址与不可变对象 | **是** | CYFS |
 | 语义 URL 与 `PathObject` | **是** | CYFS |
+| 跨 Zone 小对象投递 `dispatch` | **是** | CYFS 语义资源层 |
+| 语义路径目录的强一致 / 尽力而为形态 | **是** | CYFS 语义资源层 |
+| 公共内容的 Push 发布 / 跨 Zone 附件上传 | 否 | 收录者与消费者主动 Pull；Zone 内数据搬运由本地实现承担 |
 | `FileObject` / `ChunkList` / `SameAs` | **是** | CYFS |
 | `inner_path` 与可验证字段寻址 | **是** | CYFS |
 | 购买证明的验证语义 | **是** | CYFS |
@@ -241,6 +244,21 @@ cyfs-path-obj: $path_jwt
 - 使用 BNS（智能合约）查询 `zoneid` 对应的可信公钥，适用于完全没有 HTTPS 证书，但客户端能读取智能合约状态的情况。
 
 服务提供者可以根据自己的实际情况，在兼容性和性能之间权衡选择。
+
+#### sub-host DID 的 PathObject 验证
+
+Zone 级根签名密钥安全等级高，不适合频繁用来签发路径到对象的绑定关系。为了支持更细粒度的日常签名，`cyfs://` URL 的 hostname 部分可以使用 **sub-host DID**。
+
+当 hostname 是一个 sub-host DID 时：
+
+1. 客户端通过标准 DID 解析流程获取该 sub-host DID 的 DID Document。
+2. DID Document 中允许用于 CYFS path binding 的公钥，自动加入该 hostname scope 下的 `PathObject` 可信公钥集。
+3. 客户端使用该公钥集验证 `cyfs-path-obj` 中的 JWT 签名。
+4. 这不会修改主 Zone 的可信公钥列表，也不要求主 Zone 根密钥参与日常 path binding 签发。
+
+这相当于在 Zone 内建立轻量化的密钥分级体系：根 Zone DID 持有最高权限的密钥，主要用于建立或撤销 sub-host DID 的授权；sub-host DID 持有自己 scope 内的日常签名密钥。
+
+本协议不引入 path 内的显式 DID 公钥前缀，例如 `/-ndn-did-/<did>/<rest>`。这类 magic prefix 与 sub-host DID 解决的是同一个问题，协议层只保留 hostname / DID Document 这一条路线。
 
 让内容的可信发布不依赖中心化 CA，也是 `cyfs://` 的另一个核心设计目标。
 
@@ -756,7 +774,7 @@ candidate_sources = [
 
 > 我只返回数据给 '满足于条件的用户'
 
-这里的认证描述的是 `cyfs://` 里的“君子协定”:协议只保证**诚实节点**会按约束传播和访问，并不在密码学上阻止恶意节点复制与转发。换句话说，这是一种**弱强制 + 基于声誉**的约束：配合 `cyfs-cascades`、`Reference` 等上下文信号，正常节点会选择遵守；恶意节点虽然技术上可以绕过，但也会因此失去后续收益分配、Curator 信用背书等上层好处。而且基于CYFS构建的Content Network的多源特性，一个节点拒绝返回数据给用户，通常不能100%保证用户无法得到数据。这个君子协定设计的目的是希望被大部分诚实节点遵守，提高”不道德节点“的作恶成本。严格的身份认证通常是写相关的，走的是 Zone 内的 NDM 相关协议，这里不展开讨论。落到 `cyfs://` 协议上，通常已经是跨 Zone 访问，此时至少偏向“半公开”场景，因为数据一旦到了公网，就没有 100% 可靠的方法阻止其继续传播。
+这里的认证描述的是 `cyfs://` 里的“君子协定”:协议只保证**诚实节点**会按约束传播和访问，并不在密码学上阻止恶意节点复制与转发。换句话说，这是一种**弱强制 + 基于声誉**的约束：配合 `cyfs-cascades`、`Reference` 等上下文信号，正常节点会选择遵守；恶意节点虽然技术上可以绕过，但也会因此失去后续收益分配、Curator 信用背书等上层好处。而且基于CYFS构建的Content Network的多源特性，一个节点拒绝返回数据给用户，通常不能100%保证用户无法得到数据。这个君子协定设计的目的是希望被大部分诚实节点遵守，提高”不道德节点“的作恶成本。严格的身份认证通常是写相关的，走的是 Zone 内部的本地实现，这里不展开讨论。落到 `cyfs://` 协议上，通常已经是跨 Zone 访问，此时至少偏向“半公开”场景，因为数据一旦到了公网，就没有 100% 可靠的方法阻止其继续传播。
 
 ```headers
 cyfs-original-user: $user-did
@@ -828,62 +846,228 @@ Reference:
 
 
 
-## 内容的发布与Zone 内上传
+## 内容的发布、No-Push 与 Zone 内上传
 
 CYFS 本身没有“上传公共数据”的统一协议设计，因为 CYFS 的定位是在互联网上高效可靠地获取公共数据，实现 `Content Network`。
 
-**No Push! `cyfs://` 是 `pull-first` 的协议。** 跨 Zone 之间**不存在**“我把内容推给你”的语义，所有跨 Zone 分发最终都落在“对方主动 Pull”上。
+本章重新精确定义 `No-Push / Pull-first`，并在此基础上补充跨 Zone 小对象投递 `dispatch` 与语义路径目录的两种形态。
 
-但在单个 Zone 内部，很多产品逻辑仍然会出现“传统的上传行为”——比如用户在手机上选择一张照片，用 MessageHub 给朋友发送消息，在消息真正发出前，需要先把照片从手机搬到 OOD 上。这是**Zone 内**的发布流程，不违反 pull-first 约束。关于Zone内的数据流转，参考NDM系列协议(Named Data Maanger Protocol)的设计
+### No-Push 的精确定义
 
-### Zone间的内容传播
+**No-Push 约束的是内容发布与消费，不是所有请求体写入。**
 
+一份内容能被某个消费者拿到，是因为该消费者，或代消费者工作的收录者，主动决定要拿，而不是因为发布者把它推过来。这是数据主权的体现：我的设备上存什么、向谁可见、何时可见，由我决定。
 
-Zone 间**没有上传的概念**。如果 `ZoneA` 给 `ZoneB` 发送一个带附件的 `MessageObject`，并不会有所谓“附件上传”的逻辑。
+因此，`No-Push / Pull-first` 主要约束的是 **NamedData / Chunk / FileObject content / 大对象 / 附件 / 已发布公共内容** 的传播方式。它不禁止“把一个 `NamedObject` 投递到 target Zone 控制的逻辑接收点”这类语义事件。投递是否接受、是否对外可见、何时可见，完全由 target Zone 决定。
 
-其核心流程如下：`ZoneA` 只是把“消息对象”和“附件引用”交给 `ZoneB`，真正的数据流动仍然发生在 `ZoneB` 后续主动发起的 Pull 中。
+### Zone 内上传
 
-也就是说，在跨 Zone 场景里要区分两件事：
+在单个 Zone 内部，很多产品逻辑仍然会出现“传统上传行为”。例如用户在手机上选择一张照片，用 MessageHub 给朋友发送消息，在消息真正发出前，需要先把照片从手机搬到 OOD 上。
 
-1. **消息到达**：`MessageObject` 本身是一个较小的 `NamedObject`，可以通过应用层 API 直接送达。
-2. **内容获取**：附件、引用对象、页面资源等较大的 `NamedData`，永远由接收方按需拉取。
+这是 **Zone 内** 的发布准备流程，不违反 `No-Push / Pull-first` 约束。Zone 内的数据流转、复制、缓存和设备协同不是 `cyfs://` 的跨 Zone 内容发布模型。
 
-因此，`sendmsg` 更像是在说：
+### Zone 间内容传播
 
-```text
-“我通知你：这里有一个对象，和一些你可以选择去 Pull 的引用。”
-```
+Zone 间 **没有上传公共内容** 的概念。如果 `ZoneA` 给 `ZoneB` 发送一个带附件的 `MessageObject`，并不会有所谓“附件上传”的逻辑。
 
-而不是：
+其核心流程如下：`ZoneA` 只是把一个较小的消息对象、对象引用或语义事件交给 `ZoneB`。真正的数据流动仍然发生在 `ZoneB` 后续主动发起的 Pull 中。
 
-```text
-“我已经把附件推送到了你的 Zone 里。”
-```
+也就是说，在跨 Zone 场景里要区分三件事：
 
-`ZoneB` 在收到消息后，通常会自己完成下面这些判断：
+1. **语义事件到达**：例如消息、评论、通知、索引更新等小型 `NamedObject` 到达目标处理逻辑。
+2. **引用传播**：这些小对象里可以携带 `ObjectId`、`FileObject`、`ChunkList`、语义 URL 或其它可 Pull 的引用。
+3. **内容获取**：附件、引用对象、页面资源、Chunk、FileObject content 等较大的 `NamedData` 永远由接收方按需 Pull。
 
-- 这个消息是否合法，发送者是否可信。
-- 自己是否真的需要附件。
-- 附件应该立刻下载、延迟下载，还是根本不下载。
-- 应该优先从 `ZoneA` 拉，还是先向本地 Cache、收录者或其它已知源查询更快的来源。
+只有在这些业务判断完成之后，接收方才会对 `MessageObject.ref_objs[i]` 或其它引用执行标准的 `open_reader_by_url` / `get_object_by_url`。一旦开始 Pull，后续流程就重新回到通用 CYFS 下载语义：验证 `PathObject`、验证 `NamedObject`、验证 `ChunkId`，必要时再走 `ChunkList`、`SameAs` 和多源调度。
 
-只有在这些业务判断完成之后，`ZoneB` 才会对 `MessageObject.ref_obj[i]` 执行标准的 `open_reader_by_url` / `get_object_by_url`。一旦开始 Pull，后续流程就重新回到本文前面介绍的通用 CYFS 下载语义：验证 `PathObject`、验证 `NamedObject`、验证 `ChunkId`，必要时再走 `ChunkList`、`SameAs` 和多源调度。
+### 跨 Zone 小对象投递：`dispatch`
 
-这个设计有两个重要好处：
-
-- 它保持了 `pull-first` 的统一语义。跨 Zone 的数据分发无需单独再设计一套“远程上传协议”。
-- 它让接收方始终拥有最终控制权。是否下载、何时下载、从谁下载，都由接收方决定，而不是由发送方强行推送。
-
-因此，跨 Zone 传播的本质不是“上传附件”，而是“发送一个可验证的引用，然后等待对方决定是否消费这个引用”。
+CYFS 定义一个标准写 verb：
 
 ```text
-ZoneA Call ZoneB.sendmsg(MessageObject) # sendmsg是一个app service API
-ZoneB.onmsg(MessageObject): # ZoneB自己的业务处理流程
-    业务逻辑判断
-    决定下载附件
-ZoneB.open_reader_by_url(MessageObject.ref_obj[0]) # ZoneB决定从ZoneA下载内容
+PUT cyfs://$target_zone_id/<sem_path>
+Content-Type: application/cyfs-named-object+json
+<body: NamedObject canonical JSON>
 ```
 
+语义是：
+
+> 我创建了一个 `NamedObject`，希望把它投递到你 NDN 路径 `<sem_path>` 对应的逻辑接收点。
+
+使用 `PUT` 而不是 `POST`，是因为 CYFS 对象是内容寻址、immutable 的。同一对象重复投递应该收敛到同一结果，这正是 `PUT` 的幂等语义。
+
+协议只定义下面几件事：
+
+1. body **MUST** 是 canonical JSON 形式的 `NamedObject`。
+2. body **MUST NOT** 直接携带 `NamedData` 或 Chunk 数据。如果 `NamedObject` 内部引用了大附件、`FileObject` 或 `ChunkList`，target Zone **MUST** 在自己后续主动 Pull。
+3. 如果 `<sem_path>` 上没有挂处理逻辑，target Zone **MUST** 返回明确失败，建议使用 `404` 并附带 `cyfs-dispatch-error: no-handler`。
+4. 是否接受、如何落地、ACL 如何判定、最终写到哪里，CYFS 协议不规定，由 target Zone 自行决定。
+
+#### ACL 与请求上下文
+
+ACL 不是 `dispatch` 的协议级问题。target Zone 的后端 service 可以使用 CYFS 已经定义的通用请求 header 自行判定：
+
+- `cyfs-original-user`：请求发起者 DID。
+- `cyfs-cascades`：上游动作链。
+- `cyfs-proofs`：各类行为证明。
+- `cyfs-access-code`：纯访问代码。
+
+具体策略，例如白名单、群成员资格、staking、声誉、邀请码、组合策略等，由 target Zone 的 service 决定。协议只定义请求语法，不定义权限模型。
+
+#### 路径结构推荐
+
+语义路径的对外组织建议遵循：
+
+```text
+<entity>[/<inner_logical_path>]
+```
+
+其中 `<entity>` 是接收方标识，可以是 DID、`ObjectId` 或其它可被生态理解的实体标识；`<inner_logical_path>` 表达“接收方的哪一部分”，例如 `inbox`、`comments`、`notifications`。
+
+示例：
+
+```text
+PUT cyfs://$ood/did:bns:my-group/inbox
+PUT cyfs://$ood/did:bns:my-group/sub/eng/inbox
+PUT cyfs://$ood/cyobj:article-xxx/comments
+PUT cyfs://$ood/did:bns:bob/inbox
+```
+
+这是 RESTful 推荐，不是协议硬约束。建议生态遵循这个隐喻，是因为它让读和写的路径形态同构：`GET .../inbox` 和 `PUT .../inbox` 操作的是同一个逻辑接收点。
+
+子群可以表达为父群 DID 下的命名子路径，而不一定拥有独立 DID。只有当子群有独立对外身份需求，例如独立支付绑定、独立被非父群成员订阅时，才需要使用独立 DID。这个判据由应用层自行决定。
+
+#### `/` 与 `/@/` 的分工
+
+`/` 是语义路径分隔符，用于表达 host Zone 的资源逻辑组织；`/@/` 是对象 `inner_path` 分隔符，只用于在 `NamedObject` 内部做字段寻址。
+
+完整 URL 结构是：
+
+```text
+cyfs://$zoneid/<sem_path>(/@/<inner_path_step>)*
+```
+
+`dispatch` 遵循同样规则，但 **不允许带 `inner_path` 段**：
+
+```text
+PUT cyfs://$zoneid/<sem_path>          # 合法
+PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
+```
+
+理由是 `NamedObject` 是 immutable 的，对它内部字段做“写”在语义上不存在；要更新只能投递一个新对象。
+
+### 语义路径目录的两种形态
+
+语义路径作为目录使用时，集合成员关系可以有不同可信级别。CYFS 明确支持两种合法形态。
+
+#### 为什么需要两种形态
+
+如果所有目录式语义路径都强制绑定到一个强一致容器对象，那么每写入一条消息都需要更新目录根对象。在大群 inbox、评论、通知这类写多读多路径上，这会把写入成本放大到不可接受。
+
+因此，协议必须允许 host Zone 根据场景选择目录可信级别：有些目录需要强一致、可封版、可多源验证；有些目录只需要低成本返回当前可见的 child 列表。
+
+#### 形态 A：强一致容器路径
+
+语义路径绑定到一个固定的 container `ObjectId`，例如 `clist`、`cymap-mtp` 等。这个形态已经由前文 `container_id/@/key` 机制支持。
+
+特征：
+
+- 整个目录的 `ObjectId` 是确定的，发布即封版。
+- `cyfs-path-obj` 把 path 绑定到该 container `ObjectId`，可密码学验证。
+- 多源拉取友好：同一个 container `ObjectId` 加 Range 可以从多个 Zone 并发拉取。
+- 写代价高：每次写入都要更新 container `ObjectId`。
+
+适用场景是版本敏感、需要精确多源校验、写少读多的目录，例如已封版的消息归档、版本化文档目录、被收录者维护的索引。
+
+#### 形态 B：尽力而为公共目录
+
+语义路径不绑定到任何固定的 container `ObjectId`。它是一个逻辑聚合点，host Zone 在响应时根据自己的实现聚合并返回当前 child 列表。
+
+特征：
+
+- 不承诺两次请求看到的列表完全一致。
+- 写入便宜，`dispatch` 一条新对象进来不需要重算父 `ObjectId`。
+- 协议只保证返回的每个 child item 自身有 `ObjectId`，可被独立校验。
+
+适用场景是高吞吐写入的 inbox、comments、notifications、log-tail。
+
+形态 B **不附带** `cyfs-path-obj`，因为没有固定 container `ObjectId` 可以绑定。客户端必须明确知道：拿到的列表是 host Zone 当前时刻的 best-effort 视图，不是密码学上不可篡改的承诺。**集合成员关系**是 best-effort 的；**集合成员本身**仍然是 verifiable 的。
+
+实现层建议：客户端 SDK 在使用形态 B 时 **SHOULD** 暴露明确 API 区分，例如 `list_loose()` 与 `list_verifiable()`，避免调用者无意识地拿到 best-effort 数据。
+
+#### 形态 B 请求语法
+
+通过 query 参数显式选择形态：
+
+```text
+GET cyfs://$ood/did:bns:my-group/inbox?list=loose
+GET cyfs://$ood/did:bns:my-group/inbox?list=loose&after=<ts>&limit=100
+```
+
+参数：
+
+- `list=loose`：明确请求形态 B。无 query 参数时，形态由 host 决定。
+- `before` / `after` / `limit`：标准翻页参数。
+- `before` / `after` 接受 `ObjectId` 或时间戳，由 host 在响应中声明自己使用了哪种锚点。
+
+形态 B 的响应 body **仅返回 child 的 `ObjectId` 数组**：
+
+```json
+[
+  "cyobj:msg-aaa...",
+  "cyobj:msg-bbb...",
+  "cyobj:msg-ccc..."
+]
+```
+
+客户端拿到 `ObjectId` 列表后，比对本地已持有集合，只对缺失的 `ObjectId` 再发起标准 `get_object_by_url` 拉取。
+
+协议不在形态 B 中支持“内联完整对象”的返回格式。应用层如果真的需要批量获取，可以单独发起 batch 请求作为应用扩展，不污染协议层。
+
+#### 形态 B 硬约束
+
+- 单次响应 **MUST** 不超过 **4096** 个 child。这个阈值与前文大容器阈值对齐，便于实现复用。
+- 客户端要看更多 child，必须使用翻页参数。
+- host **MUST** 在响应 header 中明确声明本次响应是否截断，建议使用 `cyfs-list-truncated: true|false`。
+
+形态选择由 host Zone 决策。客户端通过 `?list=` 参数声明期望形态；host 不支持时可以返回 `415 Unsupported Media Type`，也可以按自己默认形态降级，并通过响应 header 声明实际使用的形态，例如 `cyfs-list-mode: loose|strict`。
+
+| 形态 | path 是否绑定固定 ObjectId | cyfs-path-obj | 写代价 | 多源拉取 | 适用场景 |
+| --- | --- | --- | --- | --- | --- |
+| A 强一致容器 | 是 | 返回 | 高 | 完整支持 | 封版归档、版本化目录 |
+| B 尽力而为目录 | 否 | 不返回 | 低 | 仅成员级 | 高吞吐 inbox / comments |
+
+### MessageHub 示例
+
+Alice 给群发一条带图消息：
+
+```text
+PUT cyfs://$group_ood/did:bns:my-group/inbox
+Content-Type: application/cyfs-named-object+json
+cyfs-original-user: did:bns:alice
+cyfs-cascades: [...]
+<body: MessageObject canonical JSON>
+```
+
+`MessageObject` 是 KB 级对象，附件字段只引用 `FileObject` 的 `ObjectId`。group OOD 接受投递后，不会因为 dispatch 自动下载附件；附件由订阅者按需 Pull。
+
+Bob 拉群消息：
+
+```text
+GET cyfs://$group_ood/did:bns:my-group/inbox?list=loose&after=<last_seen_ts>&limit=4096
+```
+
+返回 `ObjectId` 数组。Bob 比对本地已持有集合，仅对缺失项调用标准 `get_object_by_url` 拉对应 `MessageObject`。看到附件引用后，按需 `open_reader_by_url` 拉图片 Chunk。
+
+子群和文章评论使用同一范式：
+
+```text
+PUT cyfs://$group_ood/did:bns:my-group/sub/eng/inbox
+GET cyfs://$group_ood/did:bns:my-group/sub/eng/inbox?list=loose&...
+
+PUT cyfs://$author_ood/cyobj:article-xxx/comments
+GET cyfs://$author_ood/cyobj:article-xxx/comments?list=loose&...
+```
 
 ## 附录：协议参考
 
@@ -972,6 +1156,8 @@ http://$objid.$zoneid/
 ```text
 http://$zone_id/readme.md
 http://$zone_id/all_images
+http://$zone_id/did:bns:group123/inbox
+http://$zone_id/did:bns:group123/objects/cyfile:abc/comments
 ```
 
 在此基础上，可以继续附加 `inner_path` 链。其 URL 形式统一写作：
@@ -1021,12 +1207,15 @@ http://$zone_id/$container_id/@/key/@/content
   小对象场景里通常直接给完整对象；大对象场景里也可以只给必要的 `ObjectId`，再配合 `cyfs-inner-proof` 验证。服务端 **SHOULD** 避免把过大的完整对象直接塞进 Header；当某个 parent object 过大时，应优先返回 `oid:` 形式，或切换到额外 proof / 二次获取的模式。
 - `cyfs-inner-proof`: `Array<json>`。用于证明 `$child_objid = resolve($parent_obj, inner_path)`；典型场景是大容器或 Merkle Tree 路径证明。
 - `cyfs-chunk-size`: `u64`。当返回的是 Chunk 或 Chunk Range 时，表示该 Chunk 的完整大小，不受 HTTP Range 影响。
+- `cyfs-dispatch-error`: `String`。dispatch 失败原因，例如 `no-handler`。
+- `cyfs-list-mode`: `String`。语义路径目录响应的实际形态，建议取值为 `strict` 或 `loose`。
+- `cyfs-list-truncated`: `Boolean`。语义路径目录响应是否被截断；形态 B 响应中必须明确声明。
 
 **CYFS ReqHeader扩展**
 
-- `cyfs-original-user`: `DID`。说明请求是由哪个用户 DID 发起的。
+- `cyfs-original-user`: `DID`。说明请求是由哪个用户 DID 发起的。该 Header 只是身份声明，不等价于签名；服务端应结合 tunnel 身份、请求签名或 `cyfs-proofs` 验证真实性。
 - `cyfs-cascades`: `json`，`ActionObject Array`。说明该请求是因为什么上游动作链被构造出来的，通常隐晦地表达了逻辑权限，最大长度为 `6`。
-- `cyfs-proofs`: `json`，`JWT Array`。用于携带各种行为证明，最常见的是购买证明（收据）；某些 P2P 流程还可能要求用户提供“下载证明”后才开始下载。
+- `cyfs-proofs`: `json`，`JWT Array`。用于携带各种行为证明，最常见的是购买证明（收据）；dispatch 场景中也可携带成员证明、邀请证明、请求签名或访问许可。
 - `cyfs-access-code`: `String` 或 `JWT`。纯粹的访问代码，一般自带过期时间。
 
 ### `get_object_by_url` 流程

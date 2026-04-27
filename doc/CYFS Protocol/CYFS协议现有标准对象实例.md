@@ -3,7 +3,7 @@
 本文档只统计当前仓库里已经有具体结构定义、编码逻辑，或者可以直接给出实例的 CYFS 标准对象。
 
 - 统一“编码后写文件，再从文件解码”的回环测试已经覆盖：
-  - `cyfile` / `cypath` / `cyinc` / `cyrel` / `cyact` / `cymsg` / `cymsgr` / `pkg`
+  - `cyfile` / `cypath` / `cyinc` / `cyrel` / `cyact` / `cymsg` / `cyrece` / `pkg`
 - 对应测试：
   - `src/ndn-lib/src/object.rs` 中的 `test_non_chunk_named_object_file_roundtrip`
   - `src/package-lib/src/meta.rs` 中的 `test_package_meta_file_roundtrip`
@@ -19,10 +19,12 @@
 | `cyrel` | `RelationObject` | 对象关系 | 是 |
 | `cyact` | `ActionObject` | 行为对象 | 是 |
 | `cymsg` | `MsgObject` | 消息对象 | 是 |
-| `cymsgr` | `MsgReceiptObj` | 消息回执对象 | 是 |
+| `cyrece` | `ReceiptObj` | 投递回执对象 | 是 |
 | `cymap` | `SimpleObjectMap` | 简单对象映射容器 | 否，作为容器组件使用 |
-| `clist` | `SimpleChunkList` | 简单 ChunkList | 否，属于 Chunk 相关对象 |
+| `clist` | `ChunkList` | 简单 ChunkList | 否，属于 Chunk 相关对象 |
 | `pkg` | `PackageMeta` | 包元数据对象 | 是 |
+
+说明：当前实现没有 `cymsgr` / `MsgReceiptObj`。旧文档或草案里出现的消息回执类型已经被当前 `cyrece` / `ReceiptObj` 取代。
 
 ## 2. 非 Chunk NamedObject 实际实例
 
@@ -37,7 +39,7 @@ cyfile:7d28f1f3c4f9405ea9812bd6db6d7d25986c8c678fc12f1de4cd6222852700ed:{"author
 ### 2.2 `cypath` / `PathObject`
 
 ```text
-cypath:a24ecb3ebd0e12b3e87d78ae33cf0e5aa7c8764e475531a74b963f11eef12ee6:{"exp":1700086600,"path":"/repo/apps/demo","target":"cyfile:1234567890abcdef","uptime":1700000200}
+cypath:b521d401720124f900410e86079ee5a0fee1a1959bce4f74e8240e7281d6adaf:{"exp":1700086600,"iat":1700000200,"path":"/repo/apps/demo","target":"cyfile:1234567890abcdef"}
 ```
 
 ### 2.3 `cyinc` / `InclusionProof`
@@ -64,10 +66,10 @@ cyact:3dcf493420e0d82f36e9c3ea4484c3cc29b5001694354d05b03199f14d88dcef:{"action"
 cymsg:179fa355bad0e0a154f3654b61fe4187d78561fea73bd83f79dff81d0f7a1676:{"content":{"content":"{\"status\":\"ok\"}","format":"application/json","machine":{"data":{"level":3,"urgent":true},"intent":"sync"},"refs":[{"label":"attachment","role":"input","target":{"obj_id":"cyfile:1234567890abcdef","type":"data_obj","uri_hint":"cyfs://hello.txt"}}],"title":"Hello"},"created_at_ms":1700000000000,"expires_at_ms":1700086400000,"from":"did:web:alice.example.com","kind":"chat","lang":"zh-CN","nonce":7,"priority":1,"proof":"proof-001","thread":{"correlation_id":"corr-001","reply_to":"cymsg:010203040506","topic":"release","tunnel_id":"tnl-001"},"to":["did:web:bob.example.com","did:web:carol.example.com"],"workspace":"did:web:workspace.example.com"}
 ```
 
-### 2.7 `cymsgr` / `MsgReceiptObj`
+### 2.7 `cyrece` / `ReceiptObj`
 
 ```text
-cymsgr:7b7e89c2c51b2000a10e8fcdbf8accd779d8995c25c1b4e1ba052cb5d9fd8814:{"at_ms":1700000100000,"group_id":"did:web:group.example.com","iss":"did:web:inbox.example.com","msg_id":"cymsg:010203040506","reader":"did:web:bob.example.com","reason":"delivered","status":"accepted"}
+cyrece:f7564f5b1ceed3ff854d5413034a67d51149a515ef8a46f3e8ff1d583d13ca72:{"channel":"group","iat":1700000100000,"iss":"did:web:inbox.example.com","obj_id":"cymsg:010203040506","reason":"delivered","status":"accepted"}
 ```
 
 ### 2.8 `pkg` / `PackageMeta`
@@ -133,7 +135,7 @@ pkg:368aa598c5e58c225c149f5e15a59cf548be23ddf6871456adad28519753727e:{"author":"
 }
 ```
 
-### 3.3 `clist` / `SimpleChunkList`
+### 3.3 `clist` / `ChunkList`
 
 ```json
 [
@@ -142,20 +144,25 @@ pkg:368aa598c5e58c225c149f5e15a59cf548be23ddf6871456adad28519753727e:{"author":"
 ]
 ```
 
-说明：`SimpleChunkList::gen_obj_id()` 不是普通 JSON 对象哈希，而是先对数组内容求 `clist` 基础哈希，再把总长度编码到 `ObjId` 中。
+说明：`ChunkList::gen_obj_id()` 不是普通 JSON 对象哈希，而是先对数组内容求 `clist` 基础哈希，再把总长度编码到 `ObjId` 中。
 
 ## 4. 当前只保留 ObjType，尚无独立实例结构的类型
 
-以下类型码已经在 `src/ndn-lib/src/lib.rs` 中保留，但当前仓库里没有稳定、可直接举例的独立结构定义，本文不强行给伪实例：
+以下类型码仍在 `src/ndn-lib/src/lib.rs` 中启用，但当前仓库里没有稳定、可直接举例的独立结构定义，本文不强行给伪实例：
 
 - `cypack`
+- `cylist`
+
+后续如果这些类型补齐了结构体和编码入口，应当把本文升级为“实例文档”，并同步补上对应的回环测试。
+
+## 5. 历史草案中已删除或未启用的类型
+
+以下类型名只在注释、旧文档或历史草案中出现，当前仓库没有启用对应 ObjType 常量，也没有稳定实现；不应在当前协议实例中继续使用：
+
 - `cytrie`
 - `cytrie-s`
 - `cymap-mtp`
-- `cylist`
 - `cylist-mtree`
 - `cl`
 - `clist-fix`
 - `cl-sf`
-
-后续如果这些类型补齐了结构体和编码入口，应当把本文升级为“实例文档”，并同步补上对应的回环测试。

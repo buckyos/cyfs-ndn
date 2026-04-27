@@ -1,49 +1,54 @@
 # CYFS 标准对象
 
-本文档描述 `cyfs-ndn` 中实现的 **CYFS 标准对象**（NamedObject/NamedData）以及 ObjId 的计算规则。
+本文档描述当前 `cyfs-ndn` 仓库已经实现的 **CYFS 标准对象**、`ObjId`/`ChunkId` 表示、对象 ID 计算规则，以及各对象的 JSON 形态。
 
-文风：标准协议参考（简洁、准确、全面）。
+
 
 ## 1. 术语与约定
 
-- **NamedObject**：可序列化为 JSON（或 JWT claims）的结构化对象，其标识为 `ObjId`。
-- **NamedData / Chunk**：二进制数据块，其标识为 `ChunkId`（也是 `ObjId` 的一种）。
-- **ObjType**：`ObjId` 的前缀字符串，表示对象类型（例如 `cyfile`、`cydir`、`clist`）。
-- **Canonical JSON（稳定编码）**：**CYFS 完全采用 [RFC 8785 (JSON Canonicalization Scheme, JCS)](https://datatracker.ietf.org/doc/html/rfc8785) 作为稳定 JSON 编码方案**。实现方通过 RFC 8785 的任何测试向量就能与 CYFS 互操作。
+- **NamedObject**：可序列化为 JSON 或 JWT claims 的结构化对象，其标识为 `ObjId`。
+- **NamedData / Chunk**：二进制数据块，其标识为 `ChunkId`，也是 `ObjId` 的一种。
+- **ObjType**：`ObjId` 的类型前缀，例如 `cyfile`、`cydir`、`clist`。
+- **Canonical JSON**：当前实现使用 `serde_jcs::to_string`，也就是 RFC 8785 JSON Canonicalization Scheme（JCS）风格的稳定 JSON 编码。
 
-本文使用“必须/应/可以”表示规范性要求。
+## 2. 当前实现的 ObjType
 
-## 1.1 本仓库已定义的标准 ObjType
+当前启用的 ObjType 常量定义在 `src/ndn-lib/src/lib.rs`：
 
-实现常量定义见 `src/ndn-lib/src/lib.rs`：
+| ObjType | Rust 类型/用途 | 状态 |
+| --- | --- | --- |
+| `cyfile` | `FileObject` | 已实现 |
+| `cydir` | `DirObject` | 已实现 |
+| `cypath` | `PathObject` | 已实现 |
+| `cyinc` | `InclusionProof` | 已实现 |
+| `cyact` | `ActionObject` | 已实现 |
+| `cyrel` | `RelationObject` | 已实现 |
+| `cymsg` | `MsgObject` | 已实现 |
+| `cyrece` | `ReceiptObj` | 已实现 |
+| `pkg` | `PackageMeta` | 已实现，位于 `package-lib` |
+| `cymap` | `SimpleObjectMap` | 已实现，主要作为容器组件使用 |
+| `cylist` | simple object list | 仅保留类型常量，当前没有独立结构实现 |
+| `clist` | `ChunkList` | 已实现，简单 ChunkId 数组 |
+| `cypack` | object set | 仅保留类型常量，当前没有独立结构实现 |
 
-| ObjType | 含义 |
-| --- | --- |
-| `cyfile` | FileObject |
-| `cydir` | DirObject |
-| `cypath` | PathObject |
-| `cyinc` | InclusionProof |
-| `cyact` | ActionObject |
-| `cyrel` | RelationObject |
-| `pkg` | PackageMeta（PkgMetaObject） |
-| `cymap` | SimpleObjectMap（simple） |
-| `cymap-mtp` | ObjectMap（Merkle Tree） *未稳定 |
-| `cytrie-s` | TrieObjectMap（simple） *未稳定 |
-| `cytrie` | TrieObjectMap（normal）*未稳定 |
-| `cylist` | ObjectArray（simple） |
-| `cylist-mtree` | ObjectArray（normal）*未稳定 |
-| `clist` | SimpleChunkList |
-| `clist-fix` | ChunkList（fixed-size）*未稳定 |
-| `cl` | ChunkList（variable-size）*未稳定 |
-| `cl-sf` | ChunkList（simple fixed-size）*未稳定 |
+历史草案中出现过 `cymap-mtp`、`cytrie`、`cytrie-s`、`cylist-mtree`、`cl`、`clist-fix`、`cl-sf` 等类型名。当前仓库没有启用这些 ObjType 常量，也没有对应稳定实现，本文不把它们列为已实现标准对象。
 
-## 2. ObjId 表示与解析
+## 3. ObjId 表示与解析
 
-实现（`src/ndn-lib/src/object.rs`）支持两种 ObjId 文本表示：
+`ObjId` 的结构为：
 
-1) **Hex 形式（推荐用于 JSON 字段）**
-
+```rust
+pub struct ObjId {
+    pub obj_type: String,
+    pub obj_hash: Vec<u8>,
+}
 ```
+
+当前实现支持两种文本表示。
+
+### 3.1 Hex 形式
+
+```text
 {obj_type}:{hex(obj_hash)}
 ```
 
@@ -51,44 +56,60 @@
 
 ```text
 sha256:0203040506
-cyrel:e0ad5f3b656a883de323e4c6e7999207ce3026d3fa5dcb47518d2caeb4d92aa0
+cyfile:7d28f1f3c4f9405ea9812bd6db6d7d25986c8c678fc12f1de4cd6222852700ed
 ```
 
-2) **Base32 形式（紧凑，用于 URL/Hostname 更友好）**
+规范：
 
-将字节串 `"{obj_type}:{obj_hash_bytes}"` 做 RFC 4648 base32 编码。规范（MUST）：
+- JSON 中表达 `ObjId`、`ChunkId` 字段时必须使用字符串。
+- 字符串形态应优先使用 hex 形式，便于人工检查与日志排查。
+- `ObjId::to_string()` 当前返回 hex 形式。
 
-- 使用 RFC 4648 标准 base32 字母表。
-- **不使用 padding**（去除尾部的 `=`）。
-- **统一使用小写字母**。解析端在解码前 MUST 先把输入整体转换为小写，以确保 `http://{base32_objid}.$zoneid/` 这种 hostname 形式（大小写不敏感）仍然能归一化回唯一的 ObjectId。
+### 3.2 Base32 形式
 
-示例（来自单元测试）：
+Base32 形式把字节串：
+
+```text
+obj_type UTF-8 bytes || ":" || obj_hash bytes
+```
+
+按 RFC 4648 base32 lower/no-padding 编码。
+
+示例：
 
 ```text
 sha256:0203040506  <->  onugcmrvgy5aeayeauda
 ```
 
-规范：
+规范与实现注意：
 
-- 实现必须同时接受以上两种表示。
-- 在 JSON 中表达 `ObjId/ChunkId` 字段时，应优先使用 Hex 形式（便于人工检查）。
-- 两种表示是字节级一一对应的；同一个 ObjectId 的 Hex 形式与 base32 形式 MUST 互相可逆。
+- `ObjId::to_base32()` 使用 RFC 4648 小写字母表，不带 padding。
+- `ObjId::new()` 在没有 `:` 的情况下按 base32 解析。
+- 当前实现的 base32 解码使用 lower/no-padding 字母表；协议实现应输出小写 base32。接收方如果要支持 hostname 场景，建议在调用解析前自行转小写。
+- `Display` 实现输出 base32；而 `ObjId::to_string()` 这个固有方法输出 hex 形式。协议文本和 JSON 字段应明确使用 hex 字符串。
 
-### 2.1 ObjId 的 JSON 编码形态
+### 3.3 字节表示
 
-本仓库目前同时存在两种 ObjId 的 JSON 编码形态（取决于具体对象定义）：
+`ObjId::to_bytes()` 与 `ObjId::from_bytes()` 使用同一字节格式：
 
-1) **字符串形态**（更接近协议/文本传输习惯）：
-
-为了稳定编码，应强制要求在json里引用objid必须使用此种格式
-
-```json
-"cyfile:513788..."
+```text
+obj_type UTF-8 bytes || ":" || obj_hash bytes
 ```
 
-2) **结构体形态**（直接序列化 `ObjId { obj_type, obj_hash }`）：
+`ChunkId` 的字节格式与 `ObjId` 相同，只是 `obj_type` 必须是已知 chunk type。
 
-注：即将放弃
+## 4. ObjId JSON 编码
+
+`ObjId` 和 `ChunkId` 的 serde 实现已经固定为字符串：
+
+```json
+{
+  "target": "cyfile:1234567890abcdef",
+  "chunk": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+}
+```
+
+结构体形态不再被当前 `ObjId` 反序列化接受：
 
 ```json
 {
@@ -97,107 +118,89 @@ sha256:0203040506  <->  onugcmrvgy5aeayeauda
 }
 ```
 
-注意：两种形态参与稳定编码与哈希计算时会得到不同结果；因此某个标准对象必须固定其采用的形态。
+规范：
 
+- 标准对象字段中的 ObjId/ChunkId 必须是字符串。
+- 使用结构体形态会导致当前实现反序列化失败，或者在其他 JSON 场景中产生不同的 canonical JSON 与 ObjId。
 
-## 3. ObjId 计算：标准 JSON NamedObject
+## 5. NamedObject 的 ObjId 计算
 
-### 3.1 计算公式
+### 5.1 JSON 对象
 
-> **CYFS 的稳定 JSON 编码完全兼容 [RFC 8785 (JSON Canonicalization Scheme, JCS)](https://datatracker.ietf.org/doc/html/rfc8785)。** 任何通过 RFC 8785 测试向量的实现都可以被 CYFS 协议直接采用；不同语言的实现只要都遵守 RFC 8785，就一定能算出相同的 `ObjId`。
+`NamedObject::gen_obj_id()` 的默认规则是：
 
-对“标准 JSON 对象”（非 Chunk、非容器派生特殊规则）使用以下规则（`build_named_object_by_json`）：
+1. 将对象序列化为 `serde_json::Value`。
+2. 用 `serde_jcs::to_string` 生成 canonical JSON 字符串 `S`。
+3. 计算 `sha256(S.as_bytes())` 得到 32 字节 `obj_hash`。
+4. 构造 `ObjId { obj_type, obj_hash }`。
+5. 对外文本通常表示为 `{obj_type}:{hex(obj_hash)}`。
 
-1. 将待计算对象表示为 JSON 值 `V`。
-2. 按 RFC 8785 对 `V` 做 canonicalization：
-   - **对象字段**按 key 的 UTF-16 code unit 顺序排序；**禁止重复 key**。
-   - **字符串**按 RFC 8259 转义规则最短表示；字符串内部文本应为 **NFC 归一化**的 Unicode。
-   - **数字**按 ECMAScript `Number.prototype.toString` 规则输出（整数无小数点、浮点数使用最短可回读表示、不输出多余零、不输出 `+` 号等）。
-   - **结构**紧凑输出，不插入任何空白字符。
-   - **禁止值**：`NaN`、`Infinity`、`-Infinity`、`undefined` 不允许出现在 canonical JSON 中，出现即视为非法对象。
-3. 将 canonical JSON 编码为 **UTF-8 字节串** `S`。
-4. 计算 `sha256(S)` 得到 `obj_hash`（32 字节）。
-5. `ObjId = "{obj_type}:" + hex(obj_hash)`（或其等价 base32 形式）。
-6. 某些“特殊对象”在上述结果基础上再追加长度/根哈希绑定（例如 `clist` 见 §5.4.1；`cymap-mtp` 见 §5.5）。
+实现函数：
 
-注意：当前实现固定使用 `sha256` 作为 NamedObject 的摘要算法（见 `build_obj_id`）。
+- `build_named_object_by_json(obj_type, json_value)`
+- `build_obj_id(obj_type, obj_json_str)`
+- `verify_named_object(obj_id, json_value)`
+- `verify_named_object_from_str(obj_id, obj_str)`
 
-编码注意事项：
+注意：
 
-- JSON 中字段的“缺省值”不等价于 `null`。如果某字段参与序列化，`null` 与“字段缺失”会产生不同的 ObjId。
-- 因此：对可选字段，应在缺省时省略字段（而不是显式写 `null`），以避免 ObjId 分叉。
-- `ObjId` 作为 JSON 字段值出现时 MUST 使用字符串形态（见 §2.1），不得使用结构体形态——否则 canonical JSON 序列化结果会不同，导致 ObjId 不可互操作。
+- 对象字段缺失、字段值为 `null`、字段值为默认值但被序列化出来，都会产生不同的 ObjId。
+- 当前很多结构通过 `skip_serializing_if` 省略空值或默认值；协议实现必须按实际 serde 形态对齐。
+- `serde_jcs::to_string` 失败时当前实现会退化为 `"{}"`。协议实现不应依赖这个容错路径，生成对象前应保证 JSON 可 canonicalize。
 
-### 3.2 JWT 形式的 NamedObject
+### 5.2 JWT 对象
 
-实现允许“对象数据”以 JWT 传输；其 ObjId 计算基于 **JWT claims（payload）**：
+对象数据可以用 JWT 传输。ObjId 计算基于 JWT claims，而不是 JWT header 或 signature：
 
-- 解码 JWT 得到 claims JSON。
-- 按 3.1 的稳定化与 `sha256` 规则计算 ObjId。
+1. `decode_jwt_claim_without_verify(jwt_str)` 得到 claims JSON。
+2. 按 5.1 的 JSON 规则计算 ObjId。
+
+实现函数：
+
+- `build_named_object_by_jwt(obj_type, jwt_str)`
+- `verify_named_object_from_jwt(obj_id, jwt_str)`
+- `load_named_object_from_obj_str(obj_str)`
 
 规范：
 
-- 如果对象以 JWT 传输，接收方在验证 ObjId 前必须先解码得到 claims。
-- ObjId 的计算不依赖 JWT header 与签名部分；签名验证属于更上层的信任/授权机制。
+- 接收方验证 ObjId 前必须先取得 JWT claims。
+- ObjId 验证不等价于签名验证。签名验证属于上层信任、授权或投递协议。
 
-## 4. Chunk（NamedData）与 ChunkId
+## 6. ChunkId
 
-ChunkId 是 `ObjId` 的一种：`obj_type` 为某种 hash/type，`obj_hash` 为哈希结果（部分类型包含长度编码）。
+`ChunkId` 是 `ObjId` 的一种。其 `obj_type` 是 chunk type，`obj_hash` 是 hash 结果，mix 类型在 hash 结果前编码数据长度。
 
-### 4.1 Chunk 类型字符串
+当前 `ChunkType::is_chunk_type()` 接受：
 
-实现（`src/ndn-lib/src/chunk/chunk.rs`）支持以下 `chunk_type`：
+| Chunk type | 基础算法 | 长度前缀 | Hash 状态 |
+| --- | --- | --- | --- |
+| `sha256` | SHA-256 | 否 | 已实现 |
+| `mix256` | SHA-256 | 是 | 已实现 |
+| `sha512` | SHA-512 | 否 | 已实现 |
+| `mix512` | SHA-512 | 是 | 已实现 |
+| `blake2s256` | BLAKE2s-256 | 否 | 已实现 |
+| `mixblake2s256` | BLAKE2s-256 | 是 | 已实现 |
+| `keccak256` | Keccak-256 | 否 | 已实现 |
+| `mixkeccak256` | Keccak-256 | 是 | 已实现 |
+| `qcid` | QCID | 是 | 类型已保留，hash 计算路径当前未实现 |
 
-- `sha256`
-- `mix256`
-- `sha512`
-- `mix512`
-- `qcid`
-- `blake2s256`
-- `mixblake2s256`
-- `keccak256`
-- `mixkeccak256`
+### 6.1 mix 长度编码
 
-其中 `mix*` 与 `qcid` 被视为“mix 模式”，其 `obj_hash` 前缀包含 **varint 编码的数据长度**。引入 mix 模式的动机是：调度器仅凭 ChunkId 字符串即可知道 Chunk 数据长度，无需先抓取 Chunk 本体。
-
-### 4.2 mix 长度编码
-
-对 `mix*` ChunkId（`mix256` / `mix512` / `mixblake2s256` / `mixkeccak256` / `qcid`）：
+对 `mix*` 和 `qcid` 类型：
 
 ```text
-obj_hash_bytes = varint(u64(data_length))  ||  raw_hash_bytes(base_algorithm)
+obj_hash = unsigned_varint(u64(data_length)) || raw_hash_bytes
 ```
 
 其中：
 
-- `varint` 采用 **无符号 LEB128** 编码（与 Protocol Buffers 的 `varint` 等价；单字节 7 位有效位 + 1 位续位）。
-- `base_algorithm` 是 mix 前缀对应的基础哈希：
-  - `mix256` → `sha256`（32 字节）
-  - `mix512` → `sha512`（64 字节）
-  - `mixblake2s256` → `blake2s256`（32 字节）
-  - `mixkeccak256` → `keccak256`（32 字节）
-  - `qcid` → 见实现中的 qcid 定义（按定长 mix 变体处理）
-- `raw_hash_bytes` 是对 Chunk 原始字节调用 `base_algorithm` 得到的**完整摘要**。
-- `data_length` 是该 Chunk 的**原始字节数**（与 `mix*` 的 Hash 基底无关）。
+- `unsigned_varint` 使用 `unsigned-varint` crate 的 u64 编码，即无符号 LEB128 风格编码。
+- `data_length` 是 chunk 原始字节长度。
+- `raw_hash_bytes` 是基础算法对 chunk 原始字节计算出的完整摘要。
 
-因此：
+`ChunkId::get_length()` 只对 mix 类型返回长度；非 mix 类型返回 `None`。
 
-- `ChunkId.get_length()` 可以从 `obj_hash_bytes` 解码得到 `data_length`。
-- `ChunkId.get_hash()`（实现内部逻辑）应跳过 varint 前缀，仅对后续 hash bytes 做比对/上层计算。
-
-示例：
-
-```text
-"mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
-        ^^^^^^  ^^^^^^^^...^^^^^^
-        varint  sha256 结果 (32 bytes)
-```
-
-解码 `80 c0 09` 得到 `data_length = 147456`（示意，非真实配比），其后 32 字节为 `sha256(chunk_bytes)`。
-
-### 4.3 ChunkId JSON 示例
-
-ChunkId 在 JSON 中以字符串表示：
+### 6.2 ChunkId JSON 示例
 
 ```json
 {
@@ -205,147 +208,20 @@ ChunkId 在 JSON 中以字符串表示：
 }
 ```
 
-## 5. 容器对象（Container Objects）
+## 7. ChunkList（ObjType: `clist`）
 
-容器对象用于组织大量子对象。按“可验证方式”分两类：
+实现：`src/ndn-lib/src/chunk/chunk_list.rs`
 
-1) **简单容器（Simple）**：对象数据中直接包含全部 children（或至少包含可推导 children ObjId 的信息）。
-2) **可证明容器（Proof-capable）**：ObjId 绑定一个树根（Merkle/MPT 等），子项可通过 proof 验证，无需传输整个容器。
+当前 `ChunkList` 是简单 ChunkId 数组：
 
-同一语义的容器通常存在 `simple` 与 `normal` 两种 ObjType。
-
-### 5.1 SimpleObjectMap（ObjType: `cymap`）
-
-实现：`src/ndn-lib/src/object_map/simple_object_map.rs`
-
-SimpleObjectMap 作为“可嵌入组件”使用（通常被 `DirObject` 等对象 `#[serde(flatten)]`）。
-
-#### 5.1.1 JSON 结构
-
-```json
-{
-  "body": {
-    "key": "<objid-string>",
-    "file1": {
-      "obj_type": "cyfile",
-      "body": {"name": "a.txt", "size": 3, "content": "mix256:..."}
-    },
-    "file2": {
-      "obj_type": "cyfile",
-      "jwt": "<jwt-string>"
-    }
-  }
+```rust
+pub struct ChunkList {
+    pub total_size: u64,
+    pub body: Vec<ChunkId>,
 }
 ```
 
-其中每个 value 是 `SimpleMapItem`：
-
-- 字符串：必须可解析为 `ObjId`（Hex 或 Base32）。
-- `{ "obj_type": "...", "body": <json> }`：内嵌对象（未容器化）。
-- `{ "obj_type": "...", "jwt": "..." }`：内嵌 JWT。
-
-#### 5.1.2 ObjId 计算规则（关键）
-
-对“真实对象”计算 ObjId 时，SimpleObjectMap 的 `body` 必须先被 **归一化**：
-
-- 对每个 item：
-  - 若是 ObjId 字符串：取其 ObjId。
-  - 若是内嵌 `body`：按 3.1 规则计算其 ObjId。
-  - 若是内嵌 `jwt`：按 3.2 规则计算其 ObjId。
-- 归一化后的 `body` 形态为：`{ key -> "{obj_type}:{hex(hash)}" }`（字符串值是 ObjId 的 hex 形式）。
-
-规范：
-
-- 内嵌 `body/jwt` 仅用于降低 RTT；不得影响上层对象的 ObjId计算。
-
-### 5.2 DirObject（ObjType: `cydir`）
-
-实现：`src/ndn-lib/src/dirobj.rs`
-
-DirObject 本质上是 `BaseContentObject + 目录统计字段 + SimpleObjectMap`。
-
-#### 5.2.1 JSON 示例（完整结构）
-
-（示例来自 `doc/demo_dir.json` 的结构化形式，做了裁剪）
-
-```json
-{
-  "name": "root",
-  "create_time": 1755329130,
-  "last_update_time": 1755329130,
-
-  "total_size": 1268095537,
-  "file_count": 74,
-  "file_size": 1261121897,
-
-  "body": {
-    "subdir": "cydir:0db931deec2d6842e42a8699e1824f4f187212057752f4f684c2ad78fb35e246",
-    "readme.txt": {
-      "obj_type": "cyfile",
-      "body": {
-        "name": "readme.txt",
-        "size": 123,
-        "content": "mix256:..."
-      }
-    }
-  }
-}
-```
-
-#### 5.2.2 ObjId 计算规则
-
-DirObject 的 ObjId 计算必须使用 5.1.2 的归一化规则：
-
-- `body` 中最终参与哈希的值是 **子项 ObjId 字符串**（而不是子项对象正文）。
-
-### 5.3 ObjectArray（ObjType: `cylist` / `cylist-mtree`）
-
-> 实现未稳定
-
-实现：`src/ndn-lib/src/object_array/object_array.rs`
-
-ObjectArray 用于按 index 存放 `ObjId` 列表，并支持基于 Merkle Tree 的单项/批量 proof。
-
-#### 5.3.1 Body JSON
-
-```json
-{
-  "root_hash": "<base32>",
-  "hash_method": "sha256",
-  "total_count": 1024
-}
-```
-
-#### 5.3.2 单项 Proof 的 JSON 编码
-
-> 实现未稳定
-
-实现提供 `ObjectArrayItemProofCodec`（`src/ndn-lib/src/object_array/proof.rs`），将 proof path 编码为 JSON 数组（每个节点的哈希值用 base64）：
-
-```json
-[
-  {"i": "0", "v": "AAECAwQ="},
-  {"i": "1", "v": "BQYHCAk="}
-]
-```
-
-规范：
-
-- `root_hash` 为 Merkle Tree 根哈希的 base32 字符串。
-- `hash_method` 取值见 `HashMethod`（实现当前用于 proof 的 hash 算法）。
-
-### 5.4 ChunkList
-
-ChunkList 用于表示“文件内容由多个 Chunk 组成”。本仓库存在两套实现：
-
-1) **SimpleChunkList（ObjType: `clist`）**：对象数据为 `ChunkId` 数组；ObjId 带总长度前缀（mix 风格）。
-2) **ChunkList（ObjType: `cl`/`clist`/`clist-fix`/`cl-sf`）**：基于 ObjectArray 的通用实现，ObjId 由 `ChunkListBody` 计算。
-
-#### 5.4.1 SimpleChunkList（ObjType: `clist`）
-
-实现：`src/ndn-lib/src/chunk/simple_chunk_list.rs`
-
-JSON（对象数据本体）为数组：
+对象数据本体是 JSON 数组，而不是带 `body` 字段的 JSON 对象：
 
 ```json
 [
@@ -354,363 +230,299 @@ JSON（对象数据本体）为数组：
 ]
 ```
 
-ObjId 精确算法（`obj_type = "clist"`）：
+### 7.1 构造约束
+
+`ChunkList::from_chunk_list()` 和 `append_chunk()` 要求每个 `ChunkId` 都能通过 `get_length()` 取得长度。因此当前 `clist` 的成员实际必须是 mix 类型 chunk id。普通 `sha256` chunk id 无法用于自动计算 `total_size`。
+
+### 7.2 ObjId 计算
+
+`ChunkList::gen_obj_id()` 的算法不同于普通 JSON NamedObject：
 
 ```text
-S         = RFC 8785 canonical JSON of the ChunkId array   // 形如 ["mix256:...", "mix256:..."]
-H         = sha256(S)                                       // 32 bytes
-obj_hash  = varint(u64(total_size)) || H                    // varint = unsigned LEB128
-ObjId     = "clist:" || hex(obj_hash)
+S        = JCS canonical JSON of Vec<ChunkId>
+H        = sha256(S)
+obj_hash = unsigned_varint(u64(total_size)) || H
+ObjId    = clist:hex(obj_hash)
 ```
 
-其中：
+其中 `total_size` 是所有 chunk 长度之和。
 
-- `total_size` 是 `ChunkList` 拼接还原出的**原始文件的字节总长度**（非 JSON 长度，非 Chunk 长度之和的可见部分——若最后一块被截短，`total_size` 即截短后的真实长度）。
-- 该算法与 §4.2 `mix*` ChunkId 的“长度前缀”思路一致：客户端仅凭 `clist:...` 即可得知目标文件大小。
+因此：
 
-因此 `clist` 的 `obj_hash` 并非纯 hash bytes；其前缀可解码出 `total_size`。
+- `clist` 的 `obj_hash` 不是单纯 hash，而是长度前缀加 hash。
+- 客户端可以仅凭 `clist` ObjId 解码出文件总大小。
 
-#### 5.4.2 ChunkListBody（通用 ChunkList）
+## 8. SimpleObjectMap（ObjType: `cymap`）
 
-实现：`src/ndn-lib/src/chunk/chunk_list.rs`
+实现：`src/ndn-lib/src/simple_object_map.rs`
 
-```json
-{
-  "object_array": {
-    "root_hash": "<base32>",
-    "hash_method": "sha256",
-    "total_count": 4096
-  },
-  "total_count": 4096,
-  "total_size": 123456789,
-  "fix_size": null
+`SimpleObjectMap` 是小规模 `key -> object` 容器，通常嵌入 `DirObject`。结构为：
+
+```rust
+pub struct SimpleObjectMap {
+    pub body: HashMap<String, SimpleMapItem>,
 }
 ```
 
-其中 `fix_size` 非空表示“定长 chunk list”。
+`SimpleMapItem` 有三种 JSON 形态：
 
-### 5.5 ObjectMap（ObjType: `cymap-mtp` / `cymap`）
+1. ObjId 字符串：
 
-实现：`src/ndn-lib/src/object_map/object_map.rs`
+```json
+"cyfile:7d28f1f3c4f9405ea9812bd6db6d7d25986c8c678fc12f1de4cd6222852700ed"
+```
 
-ObjectMap 是“key -> ObjId”的可证明映射，支持 Merkle Tree proof。
-
-#### 5.5.1 Body JSON（用于解析/传输）
+2. 内嵌 JSON 对象：
 
 ```json
 {
-  "root_hash": "<base32>",
-  "hash_method": "sha256",
-  "total_count": 123,
-  "content": null
+  "obj_type": "cyfile",
+  "body": {
+    "name": "readme.txt",
+    "create_time": 1700000000,
+    "last_update_time": 1700000000,
+    "size": 12,
+    "content": "mix256:..."
+  }
 }
 ```
 
-#### 5.5.2 ObjId 计算规则（重要：与普通 JSON 不同）
-
-ObjectMap 的 ObjId 只由以下三项决定（实现中称为 `ObjectMapBodyInner`）：
-
-- `root_hash`
-- `hash_method`
-- `total_count`
-
-即使 `content` 字段存在（内存模式），也不得影响 ObjId。
-
-### 5.6 TrieObjectMap（ObjType: `cytrie` / `cytrie-s`）
-
-实现：`src/ndn-lib/src/trie_object_map/object_map.rs`
-
-TrieObjectMap 使用 MPT（Merkle Patricia Trie）结构提供 `key -> ObjId` 与 proof。
-
-Body JSON：
+3. 内嵌 JWT：
 
 ```json
 {
-  "root_hash": "<base32>",
-  "hash_method": "sha256",
-  "total_count": 123
+  "obj_type": "cyfile",
+  "jwt": "<jwt-string>"
 }
 ```
 
-proof 编码：proof nodes 以 base64 字符串序列化成 JSON（见 `TrieObjectMapProofNodesCodec`）。
+### 8.1 ObjId 归一化规则
 
-JSON 示例（nodes 编码结果）：
+`SimpleObjectMap::gen_obj_id_with_real_obj(result_obj_type, real_obj)` 计算上层对象 ObjId 时，会先把 `body` 归一化为 `key -> ObjId hex 字符串`：
+
+- 如果 item 已经是 ObjId 字符串，直接使用该 ObjId。
+- 如果 item 是 `{ "obj_type": "...", "body": ... }`，按 JSON NamedObject 规则计算子对象 ObjId。
+- 如果 item 是 `{ "obj_type": "...", "jwt": ... }`，按 JWT claims 规则计算子对象 ObjId。
+
+归一化后的 `body` 形态类似：
 
 ```json
 {
-  "nodes": [
-    "AAECAwQ=",
-    "BQYHCAk="
-  ]
+  "body": {
+    "readme.txt": "cyfile:7d28f1f3c4f9405ea9812bd6db6d7d25986c8c678fc12f1de4cd6222852700ed"
+  }
 }
 ```
 
-## 6. BaseContentObject（抽象基类）
+规范：
+
+- 内嵌 `body`/`jwt` 是传输优化，用于减少额外抓取；它们不得直接参与上层对象 hash。
+- 上层对象 hash 只绑定归一化后的子对象 ObjId 字符串。
+
+## 9. BaseContentObject
 
 实现：`src/ndn-lib/src/base_content.rs`
 
-BaseContentObject 是一组通用内容元信息字段：
+`BaseContentObject` 是内容对象的通用元信息基类，本身不是独立 NamedObject。当前字段如下：
 
-- `did`: 可选 DID
-- `name`: 友好名称（文件名等）
-- `author`: 作者字符串
-- `owner`: DID
-- `create_time`, `last_update_time`: 时间戳（秒）
-- `copyright`: 可选
-- `tags`, `categories`: 标签/分类
-- `base_on`: 可选，表示基于另一个内容
-- `directory`, `references`: 扩展信息
-- `exp`: 可选过期时间
+```rust
+pub struct BaseContentObject {
+    pub did: Option<DID>,
+    pub name: String,
+    pub author: String,
+    pub owner: DID,
+    pub create_time: u64,
+    pub last_update_time: u64,
+    pub copyright: Option<String>,
+    pub tags: Vec<String>,
+    pub categories: Vec<String>,
+    pub base_on: Option<ObjId>,
+    pub directory: HashMap<String, Curator>,
+    pub references: HashMap<String, Reference>,
+    pub exp: u64,
+}
+```
 
-BaseContentObject 本身没有 ObjType；不能作为独立标准对象实体化。它通过 `#[serde(flatten)]` 被下述对象复用。
+序列化行为：
 
-## 7. FileObject（ObjType: `cyfile`）
+- `did`、`copyright`、`base_on` 为 `None` 时省略。
+- `name`、`author` 为空字符串时省略。
+- `owner` 为无效 DID 时省略。
+- `tags`、`categories`、`directory`、`references` 为空时省略。
+- `exp == 0` 时省略。
+- `create_time`、`last_update_time` 总是序列化，即使为 `0`。
+
+## 10. FileObject（ObjType: `cyfile`）
 
 实现：`src/ndn-lib/src/fileobj.rs`
 
-FileObject = `BaseContentObject` + 文件内容引用：
+`FileObject = BaseContentObject + size + content + flattened meta`：
 
-- `size`: 文件总大小（字节）
-- `content`: `ChunkId` 或 `ChunkListId`（即 ObjId 字符串）
-- 允许额外自定义字段：实现中通过 `meta: HashMap<String, Value>` 并 `flatten` 到顶层。
-
-### 7.1 JSON 示例（最小）
-
-```json
-{
-  "name": "readme.txt",
-  "create_time": 1755329130,
-  "last_update_time": 1755329130,
-  "size": 3813,
-  "content": "mix256:..."
+```rust
+pub struct FileObject {
+    pub content_obj: BaseContentObject,
+    pub size: u64,
+    pub content: String,
+    pub meta: HashMap<String, serde_json::Value>,
 }
 ```
-
-### 7.2 JSON 示例（带自定义字段）
-
-```json
-{
-  "name": "readme.txt",
-  "create_time": 1755329130,
-  "last_update_time": 1755329130,
-  "size": 3813,
-  "content": "clist:...",
-
-  "mime": "text/plain",
-  "sha1": "...",
-  "x-extra": {"k": "v"}
-}
-```
-
-## 8. PkgMetaObject / PackageMeta（ObjType: `pkg`）
-
-实现：`src/package-lib/src/meta.rs`
-
-PackageMeta 继承 FileObject（JSON 上通过 `flatten`）并增加版本语义：
-
-- `version`: 版本字符串（semver 兼容）
-- `version_tag`: 可选标签（如 `stable`/`beta`/`latest`）
-- `deps`: 依赖映射（`pkg_name -> version_req_str`）
-
-### 8.1 JSON 示例
-
-```json
-{
-  "name": "test-pkg",
-  "author": "author1",
-  "owner": "did:bns:buckyos.ai",
-  "create_time": 1767754917,
-  "last_update_time": 1767754917,
-  "exp": 1770346917,
-
-  "size": 123,
-  "content": "mix256:deadbeef",
-
-  "version": "1.0.0",
-  "version_tag": "stable",
-  "deps": {
-    "dep1": ">=1.0.0"
-  }
-}
-```
-
-### 8.2 AppDoc
-
-实际使用中，BuckyOS在PkgMetaObject上增加了更多约束，构造了可安装在BuckyOS上的AppDoc.
-- AppDoc是PkgMetaObject的特殊形式，所有的AppDoc都是合法的PkgMetaObject
-- AppDoc实现了BuckyOS的`App安装协议`
-- AppDoc目前支持3总类型的App: AppService(有docker),StaticWeb, Agent
-
-### 8.2.1 AppDoc 实例
-
-1. 标准的，基于docker的app
-
-```json
-{
-  "@schema": "buckyos.app.meta.v1",
-    "did":"did:bns:filebrowser.buckyos",
-    "name": "buckyos_filebrowser",
-    "version": "2.27.0",
-    "meta": {    
-         "show_name": "File Browser",
-        "icon_url": "https://example.com/icon.png",
-        "homepage_url": "https://example.com",
-        "support_url": "https://example.com/support","en": "A web-based file manager.", "zh": "一个基于 Web 的文件管理器。","license": "Apache-2.0" 
-    },
-    "pub_time": 1760000000,
-    "exp": 0,
-    "deps": {},
-    "tas": ["file", "web", "nas"],
-    "category": "app",
-
-    "author": "Filebrowser Team",
-    "owner": "did:bucky:authorxxxx",
-    "curators" ["did:bns:curator1","did:web:gitpot.ai"],
-
-    //付费应用填写，这个比较精细（站在对用户公开的角度来支持合适的细节），支持多种版本购买
-    "economics": {
-        "version" : "*", //购买的是所有版本， ^1.0 只购买1.0版本
-        "revenue_split": { "author": 0.8, "source": 0.15, "referrer": 0.05 },
-        "payment": { "usdb": {
-            "prices" : "1.99",
-            "contract" : "付款合约地址",// usdb有默认的付费合约地址，这里不应设置
-        } }
-    },
-
-// install主要是列出app希望申请的资源
-  "install": {
-    "selector_type": "single",
-    "install_config_tips": {
-      "data_mount_point": ["/data"],
-      "local_cache_mount_point": [],
-      "service_ports": { "www": 80 },
-      "container_param": null,
-      "custom_config": {}
-    },
-    "services": [
-      {
-        "name": "www",
-        "protocol": "tcp",
-        "container_port": 80,
-        "expose": {
-          "mode": "gateway_http",
-          "default_subdomain": "file",
-          "default_path_prefix": "/",
-          "tls": "optional"
-        }
-      }
-    ],
-    "mounts": [
-      { "kind": "data", "container_path": "/data", "persistence": "keep_on_uninstall" },
-      { "kind": "config", "container_path": "/config", "persistence": "delete_on_uninstall" },
-      { "kind": "cache", "container_path": "/cache", "persistence": "delete_on_uninstall" }
-    ],
-    "network": { "bind_default": "127.0.0.1", "allow_bind_public": true }
-  },
-  "permissions": {
-    "fs": {
-      "sandbox": true,
-      "home": {
-        "private": { "read": false, "write": false },
-        "public": { "read": true, "write": true },
-        "shared": { "read": true, "write": true }
-      }
-    },
-    "system": { "need_privileged": false, "devices": [], "capabilities": [] }
-  }
-}
-
-```
-
-2. Static web App
-
-该类型的app,pkg_list只有web
-
-```json
-{
-  "name": "buckyos_systest", 
-  "version": "0.5.1", 
-  "description": {
-    "detail": "BuckyOS System Test App"
-  },
-  "categories": ["web"],
-  "create_time": 1743008063,
-  "last_update_time": 1743008063,
-  "exp": 1837616063,
-  "tag": "latest",
-  "author": "did:web:buckyos.ai",
-  "owner": "did:web:buckyos.ai",
-  "show_name": "BuckyOS System Test",
-  "selector_type": "static",
-  "install_config_tips": {
-  },
-  "pkg_list": {
-    "web": {
-      "pkg_id": "nightly-linux-amd64.buckyos_systest#0.5.1"
-    }
-  }
-}     
-```
-
-3. Agent
-
-Agent类型的App，所有的提示词都包含在了meta中，pkg_list为空空
-
-## 9. PathObject（ObjType: `cypath`）
-
-实现：`src/ndn-lib/src/fileobj.rs`
-
-PathObject 用于表达“语义路径 -> 目标 ObjId”的可验证绑定（常以 JWT 传输并签名）。
 
 字段：
 
-- `path`: 不含域名的路径（例如 `/repo/readme.txt`）
-- `iat`: 绑定签发时间戳（与 JWT 的 `iat` 语义一致；取代早期草案中的 `uptime`）
-- `target`: 目标 `ObjId`
-- `exp`: 过期时间戳
+- `size`：文件总大小，`0` 时省略。
+- `content`：chunk id 或 `clist` id 字符串，空字符串时省略。
+- `meta`：额外自定义字段，flatten 到顶层。
 
-JSON 示例：
+示例：
 
 ```json
 {
-  "path": "/repo/pub_meta_index.db",
-  "iat": 1730000000,
-  "target": "cyfile:01020304",
-  "exp": 1820000000
+  "name": "hello.txt",
+  "author": "alice",
+  "create_time": 1700000000,
+  "last_update_time": 1700000120,
+  "size": 12,
+  "content": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5",
+  "mime": "text/plain"
 }
 ```
 
-## 10. InclusionProof（ObjType: `cyinc`）
+## 11. DirObject（ObjType: `cydir`）
+
+实现：`src/ndn-lib/src/dirobj.rs`
+
+`DirObject = BaseContentObject + meta + 目录统计字段 + SimpleObjectMap`：
+
+```rust
+pub struct DirObject {
+    pub content_obj: BaseContentObject,
+    pub meta: HashMap<String, serde_json::Value>,
+    pub total_size: u64,
+    pub file_count: u64,
+    pub file_size: u64,
+    pub object_map: SimpleObjectMap,
+}
+```
+
+JSON 形态：
+
+```json
+{
+  "name": "root",
+  "create_time": 1700000000,
+  "last_update_time": 1700000000,
+  "total_size": 12,
+  "file_count": 1,
+  "file_size": 12,
+  "body": {
+    "hello.txt": {
+      "obj_type": "cyfile",
+      "body": {
+        "name": "hello.txt",
+        "create_time": 1700000000,
+        "last_update_time": 1700000000,
+        "size": 12,
+        "content": "mix256:..."
+      }
+    }
+  }
+}
+```
+
+ObjId 计算：
+
+- `DirObject::gen_obj_id()` 不直接使用序列化出来的完整目录 JSON。
+- 它先构造包含基础字段和统计字段的 `real_obj`。
+- 再调用 `SimpleObjectMap::gen_obj_id_with_real_obj("cydir", real_obj)`。
+- 因此最终参与目录 hash 的 `body` 是 `key -> child ObjId 字符串`，不是内嵌子对象正文。
+
+## 12. PathObject（ObjType: `cypath`）
+
+实现：`src/ndn-lib/src/fileobj.rs`
+
+`PathObject` 表达“语义路径 -> 目标 ObjId”的可验证绑定，常以 JWT 传输并签名。
+
+```rust
+pub struct PathObject {
+    pub path: String,
+    pub iat: u64,
+    pub target: ObjId,
+    pub exp: u64,
+}
+```
+
+示例：
+
+```json
+{
+  "path": "/repo/apps/demo",
+  "iat": 1700000200,
+  "target": "cyfile:1234567890abcdef",
+  "exp": 1700086600
+}
+```
+
+注意：当前字段名是 `iat`，不是旧文档中的 `uptime`。
+
+## 13. InclusionProof（ObjType: `cyinc`）
 
 实现：`src/ndn-lib/src/base_content.rs`
 
-InclusionProof 表达“收录者对内容的收录证明”。实现建议将其 JSON 作为 JWT claims，并由收录者签名。
+`InclusionProof` 表达“收录者对内容的收录证明”。实现建议将 JSON 作为 JWT claims 并由收录者签名。
 
-JSON 示例：
-
-```json
-{
-  "content_id": "cyfile:1234",
-  "content_obj": {"name": "test_app"},
-
-  "curator": "did:web:gitpot.ai",
-  "editor": ["did:web:wcy.gitpot.ai"],
-  "meta": {"note": "reviewed"},
-  "rank": 1,
-  "collection": ["apps"],
-  "review_url": "https://gitpot.ai/reviews/apps/test_app",
-
-  "iat": 1730000000,
-  "exp": 1730000000
+```rust
+pub struct InclusionProof {
+    pub content_id: String,
+    pub content_obj: serde_json::Value,
+    pub curator: DID,
+    pub editor: Vec<String>,
+    pub meta: Option<serde_json::Value>,
+    pub rank: i64,
+    pub collection: Vec<String>,
+    pub review_url: Option<String>,
+    pub iat: u64,
+    pub exp: u64,
 }
 ```
 
-## 11. ActionObject（ObjType: `cyact`）
+示例：
+
+```json
+{
+  "content_id": "cyfile:1234567890abcdef",
+  "content_obj": {
+    "name": "hello.txt",
+    "size": 12,
+    "content": "mix256:..."
+  },
+  "curator": "did:web:curator.example.com",
+  "editor": ["did:web:editor.example.com"],
+  "meta": {"score": 9.6, "comment": "stable"},
+  "rank": 88,
+  "collection": ["docs", "featured"],
+  "review_url": "https://curator.example.com/review/hello.txt",
+  "iat": 1700000300,
+  "exp": 1703110300
+}
+```
+
+## 14. ActionObject（ObjType: `cyact`）
 
 实现：`src/ndn-lib/src/action_obj.rs`
 
-ActionObject 表达“某主体对某目标执行某动作”的事件。
-实现建议将其 JSON 作为 JWT claims，并由相关设备签名。
+`ActionObject` 表达“某主体对某目标执行某动作”的事件。
+
+```rust
+pub struct ActionObject {
+    pub subject: ObjId,
+    pub action: String,
+    pub target: ObjId,
+    pub base_on: Option<ObjId>,
+    pub details: Option<serde_json::Value>,
+    pub iat: u64,
+    pub exp: u64,
+}
+```
 
 已定义 action 常量：
 
@@ -722,100 +534,288 @@ ActionObject 表达“某主体对某目标执行某动作”的事件。
 - `unliked`
 - `purchased`
 
-JSON 示例：
+示例：
 
 ```json
 {
-  "subject": {"obj_type": "test", "obj_hash": [18, 52]},
-  "action": "download",
-  "target": {"obj_type": "cyfile", "obj_hash": [1, 2, 3, 4]},
-  "details": {"channel": "web"},
-  "iat": 1730000000,
-  "exp": 1730003600
+  "subject": "cyfile:aaaaaaaaaaaaaaaa",
+  "action": "viewed",
+  "target": "cymsg:bbbbbbbbbbbbbbbb",
+  "base_on": "cyact:cccccccccccccccc",
+  "details": {"device": "desktop", "source": "unit-test"},
+  "iat": 1700000500,
+  "exp": 1700086900
 }
 ```
 
-## 12. RelationObject（ObjType: `cyrel`）
+## 15. RelationObject（ObjType: `cyrel`）
 
 实现：`src/ndn-lib/src/relation_obj.rs`
 
-RelationObject 表达两个对象间的弱关系（观察/标注视角），可带自定义扩展字段（通过 `flatten` 到顶层）。
+`RelationObject` 表达两个对象之间的弱关系，可通过 flatten 的 `body` 携带扩展字段。
+
+```rust
+pub struct RelationObject {
+    pub source: ObjId,
+    pub relation: String,
+    pub target: ObjId,
+    pub body: HashMap<String, serde_json::Value>,
+    pub iat: Option<u64>,
+    pub exp: Option<u64>,
+}
+```
 
 已定义关系类型：
 
 - `same`
 - `part_of`
 
-### 12.1 JSON 示例：SameAs
+`same` 示例：
 
 ```json
 {
-  "source": {"obj_type": "test", "obj_hash": [18, 52]},
+  "source": "cyfile:1234567890abcdef",
   "relation": "same",
-  "target": {"obj_type": "test", "obj_hash": [18, 52]}
+  "target": "cyfile:fedcba0987654321"
 }
 ```
 
-### 12.2 JSON 示例：PartOf（带 range）
+`part_of` 示例：
 
 ```json
 {
-  "source": {"obj_type": "test", "obj_hash": [18, 52]},
+  "source": "cyfile:1234567890abcdef",
   "relation": "part_of",
-  "target": {"obj_type": "test", "obj_hash": [18, 52]},
-  "range": {"start": 0, "end": 100}
+  "target": "sha256:1122334455667788",
+  "range": {"start": 0, "end": 12},
+  "note": "excerpt",
+  "iat": 1700000400,
+  "exp": 1700086800
 }
 ```
 
-（实现中 `range` 位于 `body`/flatten 区域。）
+`range`、`note` 等字段位于 `body`/flatten 区域。
 
-### 12.3 ObjId 示例（来自单元测试，hex 形式）
+## 16. MsgObject（ObjType: `cymsg`）
 
-- `SameAs(test:1234 -> test:1234)` 的 ObjId：`cyrel:e0ad5f3b656a883de323e4c6e7999207ce3026d3fa5dcb47518d2caeb4d92aa0`
-- `PartOf(test:1234, range 0..100)` 的 ObjId：`cyrel:cf2ff05aaa9165e9c7fb2bc642cea5a02b730d9f0415f907fc9d4a6bad66bca9`
+实现：`src/ndn-lib/src/msgobj.rs`
 
-## 13. Rust 参考结构定义
-
-以下 Rust 定义与仓库实现保持一致（便于对照字段与序列化行为）。
+`MsgObject` 是不可变消息对象。
 
 ```rust
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+pub struct MsgObject {
+    pub from: DID,
+    pub to: Vec<DID>,
+    pub kind: MsgObjKind,
+    pub thread: TopicThread,
+    pub workspace: Option<DID>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub nonce: Option<u64>,
+    pub content: MsgContent,
+    pub proof: Option<String>,
+    pub meta: BTreeMap<String, serde_json::Value>,
+}
+```
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize, Hash)]
+`kind` 使用 snake_case 枚举：
+
+- `chat`
+- `group_msg`
+- `deliver`
+- `notify`
+- `event`
+- `operation`
+
+`MsgContent`：
+
+```rust
+pub struct MsgContent {
+    pub title: Option<String>,
+    pub format: Option<MsgContentFormat>,
+    pub content: String,
+    pub machine: Option<MachineContent>,
+    pub refs: Vec<RefItem>,
+}
+```
+
+`format` 是 MIME 字符串，例如 `text/plain`、`text/markdown`、`application/json`、`application/pdf`。未知 MIME 会以原字符串保留。
+
+引用对象 `RefItem` 支持：
+
+- `data_obj`：引用一个 `ObjId`，可带 `uri_hint`。
+- `service_did`：引用一个 DID 服务。
+
+示例：
+
+```json
+{
+  "from": "did:web:alice.example.com",
+  "to": ["did:web:bob.example.com", "did:web:carol.example.com"],
+  "kind": "chat",
+  "thread": {
+    "topic": "release",
+    "reply_to": "cymsg:010203040506",
+    "correlation_id": "corr-001",
+    "tunnel_id": "tnl-001"
+  },
+  "workspace": "did:web:workspace.example.com",
+  "created_at_ms": 1700000000000,
+  "expires_at_ms": 1700086400000,
+  "nonce": 7,
+  "content": {
+    "title": "Hello",
+    "format": "application/json",
+    "content": "{\"status\":\"ok\"}",
+    "machine": {
+      "intent": "sync",
+      "data": {
+        "level": 3,
+        "urgent": true
+      }
+    },
+    "refs": [
+      {
+        "role": "input",
+        "target": {
+          "type": "data_obj",
+          "obj_id": "cyfile:1234567890abcdef",
+          "uri_hint": "cyfs://hello.txt"
+        },
+        "label": "attachment"
+      }
+    ]
+  },
+  "proof": "proof-001",
+  "priority": 1,
+  "lang": "zh-CN"
+}
+```
+
+## 17. ReceiptObj（ObjType: `cyrece`）
+
+实现：`src/ndn-lib/src/msgobj.rs`
+
+`ReceiptObj` 是可选的不可变投递回执对象。
+
+```rust
+pub struct ReceiptObj {
+    pub obj_id: ObjId,
+    pub iss: DID,
+    pub channel: Option<String>,
+    pub iat: u64,
+    pub status: ReceiptStatus,
+    pub reason: Option<String>,
+}
+```
+
+`status` 使用 snake_case 枚举：
+
+- `accepted`
+- `rejected`
+- `quarantined`
+
+示例：
+
+```json
+{
+  "obj_id": "cymsg:010203040506",
+  "iss": "did:web:inbox.example.com",
+  "channel": "group",
+  "iat": 1700000100000,
+  "status": "accepted",
+  "reason": "delivered"
+}
+```
+
+注意：当前实现的 ObjType 是 `cyrece`。旧文档中的 `cymsgr`/`MsgReceiptObj` 不是当前代码里的命名。
+
+## 18. PackageMeta（ObjType: `pkg`）
+
+实现：`src/package-lib/src/meta.rs`
+
+`PackageMeta` flatten 继承 `FileObject`，并增加版本语义：
+
+```rust
+pub struct PackageMeta {
+    pub _base: FileObject,
+    pub version: String,
+    pub version_tag: Option<String>,
+    pub deps: HashMap<String, String>,
+}
+```
+
+字段：
+
+- `version`：版本字符串。
+- `version_tag`：可选标签，例如 `stable`、`beta`、`latest`。
+- `deps`：依赖映射，`pkg_name -> version_req_str`。
+
+示例：
+
+```json
+{
+  "name": "demo.pkg",
+  "author": "alice",
+  "owner": "did:bns:buckyos.ai",
+  "create_time": 1700000000,
+  "last_update_time": 1700000100,
+  "exp": 1700086400,
+  "size": 4096,
+  "content": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5",
+  "channel": "nightly",
+  "version": "1.2.3",
+  "version_tag": "stable",
+  "deps": {
+    "demo.dep": ">=0.9.0"
+  }
+}
+```
+
+`PackageMeta::from_str()` 通过 `name_lib::EncodedDocument` 读取 JSON/JWT 等编码文档，再反序列化为 `PackageMeta`。
+
+## 19. 当前可识别的标准对象子项遍历
+
+`KnownStandardObject::from_obj_data()` 当前只识别三类对象：
+
+- `cydir` -> `KnownStandardObject::Dir`
+- `cyfile` -> `KnownStandardObject::File`
+- `clist` -> `KnownStandardObject::ChunkList`
+
+`get_child_objs()` 的行为：
+
+- 对 `DirObject`：遍历目录 `body`，返回每个子项 ObjId；如果子项是内嵌对象/JWT，同时返回归一化后的子对象 JSON 字符串。
+- 对 `FileObject`：解析 `content` 为 ObjId 并返回。
+- 对 `ChunkList`：返回每个 `ChunkId` 对应的 ObjId。
+
+这说明当前实现把目录、文件、ChunkList 作为 NDN 递归拉取的核心可展开对象。
+
+## 20. Rust 参考结构
+
+以下定义摘取当前实现的协议关键字段，省略了部分 impl：
+
+```rust
 pub struct ObjId {
     pub obj_type: String,
     pub obj_hash: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileObject {
-    #[serde(flatten)]
     pub content_obj: BaseContentObject,
-    #[serde(default)]
     pub size: u64,
-    #[serde(default)]
     pub content: String,
-    #[serde(default)]
-    #[serde(flatten)]
     pub meta: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DirObject {
-    #[serde(flatten)]
     pub content_obj: BaseContentObject,
-    #[serde(default)]
-    #[serde(flatten)]
     pub meta: HashMap<String, serde_json::Value>,
     pub total_size: u64,
     pub file_count: u64,
     pub file_size: u64,
-    #[serde(flatten)]
     pub object_map: SimpleObjectMap,
 }
 
-#[derive(Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub struct PathObject {
     pub path: String,
     pub iat: u64,
@@ -823,32 +823,70 @@ pub struct PathObject {
     pub exp: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
 pub struct InclusionProof {
     pub content_id: String,
     pub content_obj: serde_json::Value,
-    pub curator: name_lib::DID,
+    pub curator: DID,
     pub editor: Vec<String>,
     pub meta: Option<serde_json::Value>,
     pub rank: i64,
-    #[serde(default)]
     pub collection: Vec<String>,
-    #[serde(default)]
     pub review_url: Option<String>,
     pub iat: u64,
     pub exp: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+pub struct ActionObject {
+    pub subject: ObjId,
+    pub action: String,
+    pub target: ObjId,
+    pub base_on: Option<ObjId>,
+    pub details: Option<serde_json::Value>,
+    pub iat: u64,
+    pub exp: u64,
+}
+
 pub struct RelationObject {
     pub source: ObjId,
     pub relation: String,
     pub target: ObjId,
-    #[serde(flatten)]
     pub body: HashMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub iat: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub exp: Option<u64>,
+}
+
+pub struct MsgObject {
+    pub from: DID,
+    pub to: Vec<DID>,
+    pub kind: MsgObjKind,
+    pub thread: TopicThread,
+    pub workspace: Option<DID>,
+    pub created_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub nonce: Option<u64>,
+    pub content: MsgContent,
+    pub proof: Option<String>,
+    pub meta: BTreeMap<String, serde_json::Value>,
+}
+
+pub struct ReceiptObj {
+    pub obj_id: ObjId,
+    pub iss: DID,
+    pub channel: Option<String>,
+    pub iat: u64,
+    pub status: ReceiptStatus,
+    pub reason: Option<String>,
+}
+
+pub struct ChunkList {
+    pub total_size: u64,
+    pub body: Vec<ChunkId>,
+}
+
+pub struct PackageMeta {
+    pub _base: FileObject,
+    pub version: String,
+    pub version_tag: Option<String>,
+    pub deps: HashMap<String, String>,
 }
 ```
