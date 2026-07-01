@@ -54,7 +54,7 @@ pub struct VerifiedPathObject {
 /// The default implementation [`NameClientPathVerifier`] uses
 /// `name_client::resolve_did` to fetch the verified `ZoneConfig`; that
 /// resolver handles caching, freshness, and BNS lookup internally.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait PathObjectVerifier: Send + Sync {
     async fn verify(
         &self,
@@ -77,7 +77,7 @@ pub trait PathObjectVerifier: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct NameClientPathVerifier;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl PathObjectVerifier for NameClientPathVerifier {
     async fn verify(
         &self,
@@ -184,7 +184,7 @@ impl PathObjectVerifier for NameClientPathVerifier {
 #[derive(Debug, Default, Clone)]
 pub struct InsecureFreshOnlyVerifier;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl PathObjectVerifier for InsecureFreshOnlyVerifier {
     async fn verify(
         &self,
