@@ -67,8 +67,8 @@ pub trait PathObjectVerifier: Send + Sync {
 /// Production verifier backed by `name_client::resolve_did`.
 ///
 /// Steps:
-/// 1. Map `requested_host` → `DID`, then `resolve_did(did, "zone")` to get the
-///    verified `ZoneConfig`.
+/// 1. Map `requested_host` → `DID`, then `resolve_did(did, DidDocType::Zone)` to
+///    get the verified `ZoneConfig`.
 /// 2. Pick `DecodingKey` via `ZoneConfig::get_auth_key(jwt.header.kid)`.
 /// 3. Check the kid is allowed in scope `key_scope::ZONE_PUBLISH` via
 ///    `DIDDocumentTrait::is_key_allowed_in_scope`.
@@ -95,7 +95,7 @@ impl PathObjectVerifier for NameClientPathVerifier {
         let zone_did = DID::from_str(host).map_err(|e| {
             NdnError::InvalidParam(format!("cannot derive zone DID from host {}: {}", host, e))
         })?;
-        let encoded = name_client::resolve_did(&zone_did, Some("zone"))
+        let encoded = name_client::resolve_did(&zone_did, Some(name_client::DidDocType::Zone))
             .await
             .map_err(|e| {
                 NdnError::PermissionDenied(format!(
@@ -113,10 +113,7 @@ impl PathObjectVerifier for NameClientPathVerifier {
         let kid_owned = header.kid.clone();
         let kid_ref = kid_owned.as_deref();
         let (decoding_key, _jwk) = zone_doc.get_auth_key(kid_ref).ok_or_else(|| {
-            NdnError::PermissionDenied(format!(
-                "no key for kid {:?} in zone {}",
-                kid_owned, host
-            ))
+            NdnError::PermissionDenied(format!("no key for kid {:?} in zone {}", kid_owned, host))
         })?;
 
         // 3. capability: kid must be allowed in zone:publish scope
