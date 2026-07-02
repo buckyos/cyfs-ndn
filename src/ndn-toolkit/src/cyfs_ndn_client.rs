@@ -52,7 +52,7 @@ pub struct VerifiedPathObject {
 /// to the request (`path`, `host`).
 ///
 /// The default implementation [`NameClientPathVerifier`] uses
-/// `name_client::resolve_did` to fetch the verified `ZoneConfig`; that
+/// `name_client::resolve_did` to fetch the verified `ZoneDocument`; that
 /// resolver handles caching, freshness, and BNS lookup internally.
 #[async_trait(?Send)]
 pub trait PathObjectVerifier: Send + Sync {
@@ -68,8 +68,8 @@ pub trait PathObjectVerifier: Send + Sync {
 ///
 /// Steps:
 /// 1. Map `requested_host` → `DID`, then `resolve_did(did, DidDocType::Zone)` to
-///    get the verified `ZoneConfig`.
-/// 2. Pick `DecodingKey` via `ZoneConfig::get_auth_key(jwt.header.kid)`.
+///    get the verified `ZoneDocument`.
+/// 2. Pick `DecodingKey` via `ZoneDocument::get_auth_key(jwt.header.kid)`.
 /// 3. Check the kid is allowed in scope `key_scope::ZONE_PUBLISH` via
 ///    `DIDDocumentTrait::is_key_allowed_in_scope`.
 /// 4. Verify JWT signature + `exp`, then check `claims.path == requested_path`
@@ -91,7 +91,7 @@ impl PathObjectVerifier for NameClientPathVerifier {
             )
         })?;
 
-        // 1. host -> DID -> verified ZoneConfig (resolve_did handles cache/freshness)
+        // 1. host -> DID -> verified ZoneDocument (resolve_did handles cache/freshness)
         let zone_did = DID::from_str(host).map_err(|e| {
             NdnError::InvalidParam(format!("cannot derive zone DID from host {}: {}", host, e))
         })?;
