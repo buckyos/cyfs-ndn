@@ -148,7 +148,9 @@ impl<'de> Deserialize<'de> for MsgContentFormat {
     }
 }
 
-/// Threading/correlation metadata.
+/// Threading/correlation metadata. Pure message semantics: transport
+/// information (which tunnel/hub carried the message) belongs to the delivery
+/// layer, never to the immutable message object.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicThread {
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -157,8 +159,6 @@ pub struct TopicThread {
     pub reply_to: Option<ObjId>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub correlation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub tunnel_id: Option<String>,
 }
 
 /// Canonical machine value for structured payload.
@@ -269,10 +269,7 @@ pub struct MsgObject {
 
 impl TopicThread {
     pub fn is_empty(&self) -> bool {
-        self.topic.is_none()
-            && self.reply_to.is_none()
-            && self.correlation_id.is_none()
-            && self.tunnel_id.is_none()
+        self.topic.is_none() && self.reply_to.is_none() && self.correlation_id.is_none()
     }
 }
 
@@ -554,7 +551,6 @@ mod tests {
                 topic: Some("dm-alice-bob".to_string()),
                 reply_to: Some(image_msg_id.clone()),
                 correlation_id: Some("reply-image-1".to_string()),
-                tunnel_id: None,
             },
             created_at_ms: 1735689622000,
             content: MsgContent {
@@ -611,7 +607,6 @@ mod tests {
                 topic: Some("dm-alice-bob".to_string()),
                 reply_to: Some(quoted_msg_id.clone()),
                 correlation_id: Some("quote-1".to_string()),
-                tunnel_id: None,
             },
             created_at_ms: 1735689630000,
             content: MsgContent {
@@ -662,7 +657,6 @@ mod tests {
             thread: TopicThread {
                 topic: Some("grp-release".to_string()),
                 correlation_id: None,
-                tunnel_id: Some("im/slack".to_string()),
                 reply_to: None,
             },
             workspace: Some(did_web("project.example.com")),

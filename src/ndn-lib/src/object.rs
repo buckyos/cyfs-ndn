@@ -864,7 +864,6 @@ mod tests {
                 topic: Some("release".to_string()),
                 reply_to: Some(ObjId::new("cymsg:010203040506").unwrap()),
                 correlation_id: Some("corr-001".to_string()),
-                tunnel_id: Some("tnl-001".to_string()),
             },
             workspace: Some(did_web("workspace.example.com")),
             created_at_ms: 1_700_000_000_000,
