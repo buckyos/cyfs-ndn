@@ -21,7 +21,7 @@ log = "0.4"
 # Pin to 1.x to avoid pulling both thiserror v1 and v2.
 thiserror = "*"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
 url = "2.5.8"
 http = "1.4.0"
 http-body-util = "0.1.3"
