@@ -35,6 +35,7 @@ JSON
 cat > "${SERVICE_CFG}" <<JSON
 {
   "instance_id": "fs-daemon-e2e",
+  "http_backend_links": {},
   "fs_buffer_dir": "${RUN_ROOT}/fs_buffer",
   "fs_meta_db_path": "${RUN_ROOT}/fs_meta/fs_meta.db",
   "fs_buffer_size_limit": 0

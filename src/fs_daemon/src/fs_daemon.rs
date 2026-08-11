@@ -1,18 +1,18 @@
+use cyfs::{
+    CommitPolicy, NamedFileMgr, NamedFileMgrRef, NfsFileWriter, OpenWriteFlag, PathKind,
+    ReadOptions,
+};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
 use libc::{EAGAIN, EBADF, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EPERM};
-use log::{debug, info, warn};
-use named_store::{NamedLocalConfig, NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-use ndm::{
-    CommitPolicy, NamedDataMgr, NamedDataMgrRef, NdmFileWriter, OpenWriteFlag, PathKind,
-    ReadOptions,
-};
-use ndn_lib::{NdmPath, NdnError, NdnResult};
+use log::{debug, info};
+use named_store::NamedDataMgr;
+use ndn_lib::{NdnError, NdnResult, NfsPath};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,8 +98,10 @@ impl Default for StoreConfigEntry {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 struct FsDaemonServiceConfig {
-    #[serde(alias = "instance", alias = "ndm_instance_id")]
+    #[serde(alias = "instance", alias = "cyfs_instance_id")]
     instance_id: String,
+    #[serde(default)]
+    http_backend_links: HashMap<String, String>,
     #[serde(alias = "buffer_dir", alias = "fs_buffer_path")]
     fs_buffer_dir: PathBuf,
     #[serde(alias = "meta_db_path", alias = "fs_meta_path")]
@@ -112,6 +114,7 @@ impl Default for FsDaemonServiceConfig {
     fn default() -> Self {
         Self {
             instance_id: "default".to_string(),
+            http_backend_links: HashMap::new(),
             fs_buffer_dir: PathBuf::from("/opt/buckyos/var/fs_buffer"),
             fs_meta_db_path: PathBuf::from("/opt/buckyos/var/fs_meta/fs_meta.db"),
             fs_buffer_size_limit: 0,
@@ -130,12 +133,12 @@ impl FsMetaServiceRunner {
         }
     }
 
-    fn start_in_process(mut self) -> NdnResult<Arc<ndm::FsMetaClient>> {
+    fn start_in_process(mut self) -> NdnResult<Arc<cyfs::FsMetaClient>> {
         let service = self
             .service
             .take()
             .ok_or_else(|| NdnError::InvalidState("fs_meta runner already started".to_string()))?;
-        Ok(Arc::new(ndm::FsMetaClient::new_in_process(Box::new(
+        Ok(Arc::new(cyfs::FsMetaClient::new_in_process(Box::new(
             service,
         ))))
     }
@@ -265,7 +268,7 @@ impl InodeTable {
 }
 
 struct OpenHandle {
-    writer: NdmFileWriter,
+    writer: NfsFileWriter,
     inode_id: u64,
 }
 
@@ -318,7 +321,7 @@ impl HandleTable {
 
 pub struct FsDaemon {
     runtime: Runtime,
-    named_mgr: NamedDataMgrRef,
+    named_mgr: NamedFileMgrRef,
     inode_table: InodeTable,
     handle_table: HandleTable,
     xattrs: Mutex<HashMap<u64, HashMap<Vec<u8>, Vec<u8>>>>,
@@ -326,7 +329,7 @@ pub struct FsDaemon {
 }
 
 impl FsDaemon {
-    pub fn new(runtime: Runtime, named_mgr: NamedDataMgrRef) -> Self {
+    pub fn new(runtime: Runtime, named_mgr: NamedFileMgrRef) -> Self {
         Self {
             runtime,
             named_mgr,
@@ -400,7 +403,7 @@ impl FsDaemon {
         Ok((inode, attr))
     }
 
-    fn ensure_exists(stat: &ndm::PathStat) -> Result<(), i32> {
+    fn ensure_exists(stat: &cyfs::PathStat) -> Result<(), i32> {
         if matches!(stat.kind, PathKind::NotFound) {
             return Err(ENOENT);
         }
@@ -417,7 +420,7 @@ impl FsDaemon {
             .runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                let session = mgr.start_list(&NdmPath::new(path.clone())).await?;
+                let session = mgr.start_list(&NfsPath::new(path.clone())).await?;
                 let list = mgr.list_next(session, 0).await?;
                 mgr.stop_list(session).await?;
                 Ok::<_, NdnError>(list)
@@ -449,16 +452,16 @@ impl FsDaemon {
         Ok(out)
     }
 
-    fn stat_path(&self, path: &str) -> Result<ndm::PathStat, i32> {
+    fn stat_path(&self, path: &str) -> Result<cyfs::PathStat, i32> {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.stat(&NdmPath::new(path.to_string())).await
+                mgr.stat(&NfsPath::new(path.to_string())).await
             })
             .map_err(map_ndn_err)
     }
 
-    fn resolve_attr_size(&self, path: &str, stat: &ndm::PathStat) -> u64 {
+    fn resolve_attr_size(&self, path: &str, stat: &cyfs::PathStat) -> u64 {
         if let Some(size) = stat.size {
             return size;
         }
@@ -470,7 +473,7 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 let (mut reader, _) = mgr
-                    .open_reader(&NdmPath::new(path.to_string()), ReadOptions::default())
+                    .open_reader(&NfsPath::new(path.to_string()), ReadOptions::default())
                     .await?;
                 let mut total = 0u64;
                 let mut buffer = [0u8; 8192];
@@ -486,7 +489,7 @@ impl FsDaemon {
             .unwrap_or(0)
     }
 
-    fn build_attr(&self, inode: u64, path: &str, stat: &ndm::PathStat) -> FileAttr {
+    fn build_attr(&self, inode: u64, path: &str, stat: &cyfs::PathStat) -> FileAttr {
         let size = self.resolve_attr_size(path, stat);
         let (kind, perm, nlink) = match stat.kind {
             PathKind::Dir => (FileType::Directory, 0o755, 2),
@@ -517,7 +520,7 @@ impl FsDaemon {
             .runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.open_file_writer(&NdmPath::new(path.to_string()), flag, None)
+                mgr.open_file_writer(&NfsPath::new(path.to_string()), flag, None)
                     .await
             })
             .map_err(map_ndn_err)?;
@@ -568,7 +571,7 @@ impl FsDaemon {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.create_dir(&NdmPath::new(path.clone())).await
+                mgr.create_dir(&NfsPath::new(path.clone())).await
             })
             .map_err(map_ndn_err)?;
         let stat = self.stat_path(&path)?;
@@ -581,7 +584,7 @@ impl FsDaemon {
         self.runtime
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
-                mgr.delete(&NdmPath::new(path.clone())).await
+                mgr.delete(&NfsPath::new(path.clone())).await
             })
             .map_err(map_ndn_err)?;
 
@@ -612,8 +615,8 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 mgr.move_path(
-                    &NdmPath::new(old_path.clone()),
-                    &NdmPath::new(new_path.clone()),
+                    &NfsPath::new(old_path.clone()),
+                    &NfsPath::new(new_path.clone()),
                 )
                 .await
             })
@@ -629,7 +632,7 @@ impl FsDaemon {
             .block_on(async {
                 let mgr = self.named_mgr.lock().await;
                 let (mut reader, _) = mgr
-                    .open_reader(&NdmPath::new(path.clone()), ReadOptions::default())
+                    .open_reader(&NfsPath::new(path.clone()), ReadOptions::default())
                     .await?;
                 if offset > 0 {
                     let mut remaining = offset as u64;
@@ -1140,7 +1143,7 @@ impl Filesystem for FsDaemon {
                         let mgr = self.named_mgr.lock().await;
                         let (mut writer, inode_id) = mgr
                             .open_file_writer(
-                                &NdmPath::new(path),
+                                &NfsPath::new(path),
                                 OpenWriteFlag::CreateOrTruncate,
                                 Some(0),
                             )
@@ -1244,20 +1247,11 @@ fn read_json_config<T: DeserializeOwned>(path: &Path) -> NdnResult<T> {
         .map_err(|e| NdnError::InvalidData(format!("parse {} failed: {}", path.display(), e)))
 }
 
-fn resolve_store_id(entry: &StoreConfigEntry, index: usize) -> String {
-    if let Some(store_id) = entry.store_id.as_ref().filter(|v| !v.is_empty()) {
-        return store_id.clone();
-    }
-    entry
-        .path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| format!("store-{}", index + 1))
-}
-
-fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<NamedStoreMgr>> {
+fn init_store_mgr(
+    runtime: &Runtime,
+    store_config_path: &Path,
+    http_backend_links: &HashMap<String, String>,
+) -> NdnResult<Arc<NamedDataMgr>> {
     let store_config: StoreLayoutConfigFile = read_json_config(store_config_path)?;
     if store_config.stores.len() < 3 {
         return Err(NdnError::InvalidParam(format!(
@@ -1266,96 +1260,27 @@ fn init_store_mgr(runtime: &Runtime, store_config_path: &Path) -> NdnResult<Arc<
         )));
     }
 
-    let store_mgr = Arc::new(NamedStoreMgr::new());
-    let mut targets = Vec::with_capacity(store_config.stores.len());
-    let mut total_capacity = 0u64;
-    let mut total_used = 0u64;
-    let mut store_id_set = HashSet::new();
-
-    let config_dir = store_config_path.parent().unwrap_or_else(|| Path::new("."));
-
-    for (index, entry) in store_config.stores.iter().enumerate() {
-        if entry.path.as_os_str().is_empty() {
-            return Err(NdnError::InvalidParam(format!(
-                "store config {} has empty path at index {}",
-                store_config_path.display(),
-                index
-            )));
-        }
-
-        let store_path = if entry.path.is_absolute() {
-            entry.path.clone()
-        } else {
-            config_dir.join(&entry.path)
-        };
-
-        std::fs::create_dir_all(&store_path).map_err(|e| {
-            NdnError::IoError(format!(
-                "create store dir {} failed: {}",
-                store_path.display(),
-                e
-            ))
-        })?;
-
-        let store_id = resolve_store_id(entry, index);
-        let store_config = NamedLocalConfig {
-            read_only: entry.readonly,
-            ..Default::default()
-        };
-        let store = runtime.block_on(async {
-            NamedLocalStore::from_config(Some(store_id.clone()), store_path, store_config).await
-        })?;
-        let actual_store_id = store.store_id().to_string();
-        if actual_store_id != store_id {
-            warn!(
-                "store id mismatch, configured={}, actual={}, using actual",
-                store_id, actual_store_id
-            );
-        }
-        if !store_id_set.insert(actual_store_id.clone()) {
-            return Err(NdnError::InvalidParam(format!(
-                "duplicate store_id '{}' in {}",
-                actual_store_id,
-                store_config_path.display()
-            )));
-        }
-
-        let store_ref = Arc::new(tokio::sync::Mutex::new(store));
-        runtime.block_on(async { store_mgr.register_store(store_ref).await });
-
-        total_capacity += entry.capacity.unwrap_or(0);
-        total_used += entry.used.unwrap_or(0);
-        targets.push(StoreTarget {
-            store_id: actual_store_id,
-            device_did: None,
-            capacity: entry.capacity,
-            used: entry.used,
-            readonly: entry.readonly,
-            enabled: entry.enabled,
-            weight: entry.weight,
-        });
-    }
-
-    let layout = StoreLayout::new(
-        store_config.epoch.max(1),
-        targets,
-        store_config.total_capacity.unwrap_or(total_capacity),
-        store_config.total_used.unwrap_or(total_used),
-    );
-    runtime.block_on(async { store_mgr.add_layout(layout).await });
-    Ok(store_mgr)
+    runtime
+        .block_on(async {
+            NamedDataMgr::get_store_mgr(store_config_path, http_backend_links).await
+        })
+        .map(Arc::new)
 }
 
 pub fn init_named_mgr(
     runtime: &Runtime,
     store_config_path: &Path,
     service_config_path: &Path,
-) -> NdnResult<NamedDataMgrRef> {
+) -> NdnResult<NamedFileMgrRef> {
     // 1. load store_layout config, construct store_layout + store_mgr
-    let store_mgr = init_store_mgr(runtime, store_config_path)?;
+    let service_config: FsDaemonServiceConfig = read_json_config(service_config_path)?;
+    let store_mgr = init_store_mgr(
+        runtime,
+        store_config_path,
+        &service_config.http_backend_links,
+    )?;
 
     // 2. load fs_daemon service config, init fs_buffer and fs_meta service runner
-    let service_config: FsDaemonServiceConfig = read_json_config(service_config_path)?;
     std::fs::create_dir_all(&service_config.fs_buffer_dir).map_err(|e| {
         NdnError::IoError(format!(
             "create fs buffer dir {} failed: {}",
@@ -1394,7 +1319,7 @@ pub fn init_named_mgr(
     buffer_service.set_fsmeta_client(fs_meta_client.clone())?;
 
     // 3. construct named_mgr, register with default id (None -> "default")
-    let named_mgr = NamedDataMgr::with_layout_mgr(
+    let named_mgr = NamedFileMgr::with_layout_mgr(
         instance_id,
         fs_meta_client,
         buffer_service,
@@ -1403,11 +1328,11 @@ pub fn init_named_mgr(
         store_mgr,
     );
     runtime.block_on(async {
-        NamedDataMgr::register_named_data_mgr("default", named_mgr).await?;
-        NamedDataMgr::get_named_data_mgr_by_id(None)
+        NamedFileMgr::register_named_file_mgr("default", named_mgr).await?;
+        NamedFileMgr::get_named_file_mgr_by_id(None)
             .await
             .ok_or_else(|| {
-                NdnError::NotFound("default named data manager is not registered".to_string())
+                NdnError::NotFound("default named file manager is not registered".to_string())
             })
     })
 }

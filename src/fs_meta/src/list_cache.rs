@@ -1,4 +1,4 @@
-use ndm::FsMetaListEntry;
+use cyfs::FsMetaListEntry;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 
@@ -82,7 +82,7 @@ impl ListCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndm::DentryTarget;
+    use cyfs::DentryTarget;
 
     fn sample_entry(name: &str) -> FsMetaListEntry {
         FsMetaListEntry {

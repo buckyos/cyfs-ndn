@@ -1,8 +1,8 @@
 FileSystem的守护进程，实现下面功能
 
-- 实现FUSE要求的接口，让系统可以将NDM提供的FileSystem抽象挂载到本地文件系统上
-- 在实现内部，主要是转调named_mgr的接口，尽量不直接使用store_mgr,绝对不使用fs_daemon和fs_buffer
-- named_mgr用单机模式初始化，包括其内部使用的fs_buffer,fs_meta（通过kRPC都支持进程内模式）。
+- 实现FUSE要求的接口，让系统可以将cyfs抽象挂载到本地文件系统上
+- 在实现内部，主要是转调named_file_mgr的接口，尽量不直接使用store_mgr,绝对不使用fs_daemon和fs_buffer
+- CYFS 在单机模式下初始化 named_file_mgr，包括其内部使用的fs_buffer,fs_meta（通过kRPC都支持进程内模式）。
 
 Usage:
 
@@ -15,20 +15,22 @@ cargo run -p fs_daemon -- <mountpoint> [--store-config <path>] [--service-config
 2) Example:
 
 ```bash
-cargo run -p fs_daemon -- /mnt/ndn \
+cargo run -p fs_daemon -- /mnt/cyfs \
   --store-config /opt/buckyos/etc/store_layout.json \
   --service-config /opt/buckyos/etc/fs_daemon.json
 ```
 
+`fs_daemon.json` 现在通过 `http_backend_links` 显式提供远端链路表：key 是 `device_did`，value 是对应 HTTP backend 前缀；未出现在表里的 bucket 视为本地 backend。
+
 Mount note (one line):
 
-- macOS: install macFUSE, then `mkdir -p /Volumes/ndn && cargo run -p fs_daemon -- /Volumes/ndn`.
-- Linux: install FUSE, then `mkdir -p /mnt/ndn && cargo run -p fs_daemon -- /mnt/ndn`.
+- macOS: install macFUSE, then `mkdir -p /Volumes/cyfs && cargo run -p fs_daemon -- /Volumes/cyfs`.
+- Linux: install FUSE, then `mkdir -p /mnt/cyfs && cargo run -p fs_daemon -- /mnt/cyfs`.
 
 Notes:
 
-- The daemon initializes `named_mgr` in single-machine mode (in-process fs_meta + fs_buffer + named_store).
-- FUSE operations route through `NamedDataMgr` APIs; the daemon avoids direct store_mgr usage in the request path.
+- The daemon initializes `named_file_mgr` in single-machine mode (in-process fs_meta + fs_buffer + named_store).
+- FUSE operations route through `NamedFileMgr` APIs; the daemon avoids direct store_mgr usage in the request path.
 
 Testing:
 

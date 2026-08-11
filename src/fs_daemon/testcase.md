@@ -4,8 +4,8 @@
 
 **目录与变量**
 
-* 挂载点：`$MNT`（例如 `/mnt/ndm`）
-* 每条用例在独立目录下跑，避免互相污染：`$T=$MNT/.ndm_test/<case_id>`
+* 挂载点：`$MNT`（例如 `/mnt/cyfs`）
+* 每条用例在独立目录下跑，避免互相污染：`$T=$MNT/.cyfs_test/<case_id>`
 * 每条用例结束清理：`rm -rf "$T"`（失败时可选择保留现场）
 
 **通用断言方式（bash）**
@@ -283,7 +283,7 @@
 ## C. 物化/状态机相关（Working/Cooling/Linked/Finalized 的坑）
 
 这些用例如果 **没有“手工物化/查询状态”的工具** 会变成“等待型、非确定性”
-如果有类似 `ndmctl finalize <path>`、`ndmctl inode_state <path>` 的调试接口，建议直接用它让测试确定性。
+如果有类似 `cyfsctl finalize <path>`、`cyfsctl inode_state <path>` 的调试接口，建议直接用它让测试确定性。
 
 ### C01 close 后很快 reopen 并写入（覆盖设计文档里提到的 CAS 竞态）
 
@@ -578,5 +578,4 @@
 * **只支持 symlink 不支持 hardlink** → F01 + E 组
 * **构建场景（小文件创建-删除）** → G01/G02
 * **深目录/Unicode（照片库）** → G04
-
 

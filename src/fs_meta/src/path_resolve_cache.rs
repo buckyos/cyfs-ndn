@@ -1,4 +1,4 @@
-use ndm::IndexNodeId;
+use cyfs::IndexNodeId;
 use ndn_lib::ObjId;
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -1,6 +1,6 @@
-use crate::NamedStoreMgr;
+use crate::NamedDataMgr;
 use log::warn;
-use ndn_lib::{ChunkId, ChunkReader, NdnError, NdnResult, SimpleChunkList};
+use ndn_lib::{ChunkId, ChunkList, ChunkReader, NdnError, NdnResult};
 use std::future::Future;
 use std::io::SeekFrom;
 use std::pin::Pin;
@@ -54,7 +54,7 @@ struct ChunkMeta {
 }
 
 pub struct ChunkListReader {
-    named_store_mgr: Arc<NamedStoreMgr>,
+    named_store_mgr: Arc<NamedDataMgr>,
     local_mode: bool,
     open_chunk_reader: Option<OpenChunkReader>,
 
@@ -76,8 +76,8 @@ pub type SimpleChunkListReader = ChunkListReader;
 
 impl ChunkListReader {
     pub async fn new(
-        named_store_mgr: Arc<NamedStoreMgr>,
-        chunk_list: SimpleChunkList,
+        named_store_mgr: Arc<NamedDataMgr>,
+        chunk_list: ChunkList,
         seek_from: SeekFrom,
     ) -> NdnResult<Self> {
         let options = ChunkListReaderOptions {
@@ -87,8 +87,8 @@ impl ChunkListReader {
     }
 
     pub async fn with_options(
-        named_store_mgr: Arc<NamedStoreMgr>,
-        chunk_list: SimpleChunkList,
+        named_store_mgr: Arc<NamedDataMgr>,
+        chunk_list: ChunkList,
         seek_from: SeekFrom,
         options: ChunkListReaderOptions,
     ) -> NdnResult<Self> {
@@ -241,7 +241,7 @@ impl ChunkListReader {
     }
 
     async fn load_chunk_reader(
-        named_store_mgr: Arc<NamedStoreMgr>,
+        named_store_mgr: Arc<NamedDataMgr>,
         chunk_id: ChunkId,
         offset: u64,
         local_mode: bool,
@@ -272,7 +272,7 @@ impl ChunkListReader {
         }
     }
 
-    fn resolve_mix_chunk_sizes(chunk_list: &SimpleChunkList) -> Option<Vec<u64>> {
+    fn resolve_mix_chunk_sizes(chunk_list: &ChunkList) -> Option<Vec<u64>> {
         let mut sizes = Vec::with_capacity(chunk_list.body.len());
         for chunk_id in chunk_list.body.iter() {
             let Some(chunk_size) = chunk_id.get_length() else {
@@ -284,7 +284,7 @@ impl ChunkListReader {
     }
 
     fn resolve_fixed_chunk_sizes(
-        chunk_list: &SimpleChunkList,
+        chunk_list: &ChunkList,
         fixed_chunk_size: u64,
     ) -> NdnResult<Vec<u64>> {
         if chunk_list.body.is_empty() {
@@ -333,8 +333,8 @@ impl ChunkListReader {
     }
 
     async fn resolve_chunk_sizes(
-        named_store_mgr: &Arc<NamedStoreMgr>,
-        chunk_list: &SimpleChunkList,
+        named_store_mgr: &Arc<NamedDataMgr>,
+        chunk_list: &ChunkList,
         options: &ChunkListReaderOptions,
     ) -> NdnResult<Vec<u64>> {
         if let Some(chunk_sizes) = options.chunk_sizes.clone() {
@@ -375,14 +375,14 @@ impl ChunkListReader {
     }
 
     async fn ensure_chunks_available_in_local(
-        named_store_mgr: &Arc<NamedStoreMgr>,
-        chunk_list: &SimpleChunkList,
+        named_store_mgr: &Arc<NamedDataMgr>,
+        chunk_list: &ChunkList,
         expected_sizes: Option<&Vec<u64>>,
     ) -> NdnResult<Vec<u64>> {
         let mut chunk_sizes = Vec::with_capacity(chunk_list.body.len());
 
         for (index, chunk_id) in chunk_list.body.iter().enumerate() {
-            let (state, chunk_size, _) = named_store_mgr.query_chunk_state(chunk_id).await?;
+            let (state, chunk_size) = named_store_mgr.query_chunk_state(chunk_id).await?;
             if !state.can_open_reader() {
                 return Err(NdnError::NotFound(format!(
                     "chunk {} missing in local NamedStoreMgr, state={}",
@@ -557,7 +557,7 @@ mod tests {
     fn default_target(store_id: &str) -> StoreTarget {
         StoreTarget {
             store_id: store_id.to_string(),
-            device_did: None,
+            device_did: String::new(),
             capacity: Some(1024 * 1024 * 1024),
             used: Some(0),
             readonly: false,
@@ -570,7 +570,7 @@ mod tests {
         store_id: &str,
     ) -> (
         TempDir,
-        Arc<NamedStoreMgr>,
+        Arc<NamedDataMgr>,
         Arc<tokio::sync::Mutex<NamedLocalStore>>,
     ) {
         let temp_dir = TempDir::new().unwrap();
@@ -582,7 +582,7 @@ mod tests {
             .unwrap();
         let store = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = Arc::new(NamedStoreMgr::new());
+        let store_mgr = Arc::new(NamedDataMgr::new());
         store_mgr.register_store(store.clone()).await;
         let layout = StoreLayout::new(1, vec![default_target(store_id)], 0, 0);
         store_mgr.add_layout(layout).await;
@@ -606,21 +606,12 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store
-                .put_chunk(&chunk_ids[0], &chunk_a, true)
-                .await
-                .unwrap();
-            store
-                .put_chunk(&chunk_ids[1], &chunk_b, true)
-                .await
-                .unwrap();
-            store
-                .put_chunk(&chunk_ids[2], &chunk_c, true)
-                .await
-                .unwrap();
+            store.put_chunk(&chunk_ids[0], &chunk_a).await.unwrap();
+            store.put_chunk(&chunk_ids[1], &chunk_b).await.unwrap();
+            store.put_chunk(&chunk_ids[2], &chunk_c).await.unwrap();
         }
 
-        let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids).unwrap();
+        let chunk_list = ChunkList::from_chunk_list(chunk_ids).unwrap();
         let mut reader = ChunkListReader::new(store_mgr, chunk_list, SeekFrom::Start(0))
             .await
             .unwrap();
@@ -654,11 +645,10 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
+            store.put_chunk(&chunk_a_id, &chunk_a).await.unwrap();
         }
 
-        let chunk_list =
-            SimpleChunkList::from_chunk_list(vec![chunk_a_id, missing_chunk_id]).unwrap();
+        let chunk_list = ChunkList::from_chunk_list(vec![chunk_a_id, missing_chunk_id]).unwrap();
         let options = ChunkListReaderOptions::default().with_local_mode(true);
 
         let err = ChunkListReader::with_options(store_mgr, chunk_list, SeekFrom::Start(0), options)
@@ -688,14 +678,11 @@ mod tests {
 
         {
             let store = main_store.lock().await;
-            store.put_chunk(&in_main_id, &in_main, true).await.unwrap();
+            store.put_chunk(&in_main_id, &in_main).await.unwrap();
         }
         {
             let store = backup_store.lock().await;
-            store
-                .put_chunk(&in_backup_id, &in_backup, true)
-                .await
-                .unwrap();
+            store.put_chunk(&in_backup_id, &in_backup).await.unwrap();
         }
 
         let fallback_store = backup_store.clone();
@@ -710,8 +697,7 @@ mod tests {
         ));
 
         let chunk_list =
-            SimpleChunkList::from_chunk_list(vec![in_main_id.clone(), in_backup_id.clone()])
-                .unwrap();
+            ChunkList::from_chunk_list(vec![in_main_id.clone(), in_backup_id.clone()]).unwrap();
         let mut reader =
             ChunkListReader::with_options(store_mgr, chunk_list, SeekFrom::Start(0), options)
                 .await
@@ -739,13 +725,13 @@ mod tests {
 
         {
             let store = store.lock().await;
-            store.put_chunk(&chunk_a_id, &chunk_a, true).await.unwrap();
-            store.put_chunk(&chunk_b_id, &chunk_b, true).await.unwrap();
-            store.put_chunk(&chunk_c_id, &chunk_c, true).await.unwrap();
+            store.put_chunk(&chunk_a_id, &chunk_a).await.unwrap();
+            store.put_chunk(&chunk_b_id, &chunk_b).await.unwrap();
+            store.put_chunk(&chunk_c_id, &chunk_c).await.unwrap();
         }
 
         let total_size = (chunk_a.len() + chunk_b.len() + chunk_c.len()) as u64;
-        let chunk_list = SimpleChunkList {
+        let chunk_list = ChunkList {
             total_size,
             body: vec![chunk_a_id, chunk_b_id, chunk_c_id],
         };

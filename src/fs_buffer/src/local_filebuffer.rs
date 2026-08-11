@@ -6,21 +6,20 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use named_store::{
     ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListWriter, DiffChunkListWriterState,
-    NamedStoreMgr,
+    NamedDataMgr,
 };
-use ndm_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use ndn_lib::{
-    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, FileObject,
-    NamedObject, NdnError, NdnResult, ObjId, SimpleChunkList, CHUNK_DEFAULT_SIZE,
-    MIN_QCID_FILE_SIZE,
+    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, ChunkList, FileObject,
+    NamedObject, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE, MIN_QCID_FILE_SIZE,
 };
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::buffer_db::LocalFileBufferDB;
-use crate::fb_service::{FileBufferService, NdmPath, WriteLease};
+use crate::fb_service::{FileBufferService, NfsPath, WriteLease};
 
 static HANDLE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -185,7 +184,7 @@ pub struct LocalFileBufferService {
     size_used: RwLock<u64>,
     db: Arc<LocalFileBufferDB>,
     records: RwLock<HashMap<String, Arc<RwLock<FileBufferRecord>>>>,
-    named_store_mgr: RwLock<Option<Arc<NamedStoreMgr>>>,
+    named_store_mgr: RwLock<Option<Arc<NamedDataMgr>>>,
     fsmeta_client: RwLock<Option<Arc<FsMetaClient>>>,
 }
 
@@ -236,7 +235,7 @@ impl LocalFileBufferService {
         }
     }
 
-    pub fn with_named_store_mgr(mut self, named_store_mgr: Arc<NamedStoreMgr>) -> Self {
+    pub fn with_named_store_mgr(mut self, named_store_mgr: Arc<NamedDataMgr>) -> Self {
         self.named_store_mgr = RwLock::new(Some(named_store_mgr));
         self
     }
@@ -246,7 +245,7 @@ impl LocalFileBufferService {
         self
     }
 
-    pub fn set_named_store_mgr(&self, named_store_mgr: Arc<NamedStoreMgr>) -> NdnResult<()> {
+    pub fn set_named_store_mgr(&self, named_store_mgr: Arc<NamedDataMgr>) -> NdnResult<()> {
         let mut guard = self
             .named_store_mgr
             .write()
@@ -397,7 +396,7 @@ impl LocalFileBufferService {
             ));
         }
 
-        let simple_chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let simple_chunk_list = ChunkList::from_chunk_list(chunk_ids)?;
         let (chunk_list_obj_id, chunk_list_obj_str) = simple_chunk_list.gen_obj_id();
         Ok(ContentLayout::ChunkList {
             segments,
@@ -409,9 +408,9 @@ impl LocalFileBufferService {
     fn simple_chunk_list_from_ids_with_sizes(
         chunk_ids: Vec<ChunkId>,
         chunk_sizes: &[u64],
-    ) -> NdnResult<SimpleChunkList> {
+    ) -> NdnResult<ChunkList> {
         let total_size: u64 = chunk_sizes.iter().sum();
-        match SimpleChunkList::from_chunk_list(chunk_ids.clone()) {
+        match ChunkList::from_chunk_list(chunk_ids.clone()) {
             Ok(list) => {
                 if list.total_size != total_size {
                     return Err(NdnError::InvalidData(format!(
@@ -421,7 +420,7 @@ impl LocalFileBufferService {
                 }
                 Ok(list)
             }
-            Err(_) => Ok(SimpleChunkList {
+            Err(_) => Ok(ChunkList {
                 total_size,
                 body: chunk_ids,
             }),
@@ -504,7 +503,7 @@ impl LocalFileBufferService {
 
     fn overlay_content_layout(
         &self,
-        merged_chunk_list: SimpleChunkList,
+        merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
     ) -> NdnResult<ContentLayout> {
         if merged_chunk_list.body.len() != merged_chunk_sizes.len() {
@@ -560,7 +559,7 @@ impl LocalFileBufferService {
         &self,
         file_inode_id: u64,
         diff_file_path: &PathBuf,
-        merged_chunk_list: SimpleChunkList,
+        merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
         existing_linked_at: Option<u64>,
     ) -> NdnResult<FinalizeData> {
@@ -641,7 +640,7 @@ impl LocalFileBufferService {
         })
     }
 
-    fn get_named_store_mgr(&self) -> NdnResult<Option<Arc<NamedStoreMgr>>> {
+    fn get_named_store_mgr(&self) -> NdnResult<Option<Arc<NamedDataMgr>>> {
         let guard = self
             .named_store_mgr
             .read()
@@ -659,7 +658,7 @@ impl LocalFileBufferService {
 
     async fn put_chunks_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         segments: &[ChunkSegment],
     ) -> NdnResult<()> {
@@ -684,9 +683,7 @@ impl LocalFileBufferService {
             file.read_exact(&mut buf)
                 .await
                 .map_err(|e| NdnError::IoError(format!("read chunk bytes failed: {}", e)))?;
-            named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf, true)
-                .await?;
+            named_store_mgr.put_chunk(&segment.chunk_id, &buf).await?;
             cursor += segment.size;
         }
 
@@ -695,7 +692,7 @@ impl LocalFileBufferService {
 
     async fn put_overlay_dirty_chunks_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         dirty_segments: &[OverlayDirtyChunkSegment],
     ) -> NdnResult<()> {
@@ -729,9 +726,7 @@ impl LocalFileBufferService {
             file.read_exact(&mut buf).await.map_err(|e| {
                 NdnError::IoError(format!("read overlay dirty chunk bytes failed: {}", e))
             })?;
-            named_store_mgr
-                .put_chunk(&segment.chunk_id, &buf, true)
-                .await?;
+            named_store_mgr.put_chunk(&segment.chunk_id, &buf).await?;
             cursor = cursor.saturating_add(segment.size);
         }
 
@@ -740,7 +735,7 @@ impl LocalFileBufferService {
 
     async fn put_links_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         segments: &[ChunkSegment],
         qcid: &ChunkId,
@@ -768,7 +763,7 @@ impl LocalFileBufferService {
 
     async fn put_overlay_dirty_links_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         dirty_segments: &[OverlayDirtyChunkSegment],
         qcid: &ChunkId,
@@ -800,7 +795,7 @@ impl LocalFileBufferService {
 
     async fn put_objects_to_store(
         &self,
-        named_store_mgr: &Arc<NamedStoreMgr>,
+        named_store_mgr: &Arc<NamedDataMgr>,
         content_layout: &ContentLayout,
         file_obj_id: &ObjId,
         file_obj_str: &str,
@@ -991,7 +986,7 @@ impl LocalFileBufferService {
 impl FileBufferService for LocalFileBufferService {
     async fn alloc_buffer(
         &self,
-        _path: &NdmPath,
+        _path: &NfsPath,
         file_inode_id: u64,
         base_chunk_list: Vec<ChunkId>,
         _lease: &WriteLease,
@@ -1594,9 +1589,7 @@ impl FileBufferService for LocalFileBufferService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{
-        ChunkHasher, ChunkType, FileObject, NamedObject, SimpleChunkList, CHUNK_DEFAULT_SIZE,
-    };
+    use ndn_lib::{ChunkHasher, ChunkList, ChunkType, FileObject, NamedObject, CHUNK_DEFAULT_SIZE};
     use tempfile::tempdir;
 
     fn test_lease() -> WriteLease {
@@ -1615,7 +1608,7 @@ mod tests {
         let service = LocalFileBufferService::new(base.clone(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/a.txt".to_string()),
+                &NfsPath("/a.txt".to_string()),
                 100,
                 vec![],
                 &test_lease(),
@@ -1653,7 +1646,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/b.txt".to_string()),
+                &NfsPath("/b.txt".to_string()),
                 101,
                 vec![],
                 &test_lease(),
@@ -1680,7 +1673,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/c.txt".to_string()),
+                &NfsPath("/c.txt".to_string()),
                 102,
                 vec![],
                 &test_lease(),
@@ -1701,7 +1694,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/d.txt".to_string()),
+                &NfsPath("/d.txt".to_string()),
                 103,
                 vec![],
                 &test_lease(),
@@ -1740,7 +1733,7 @@ mod tests {
         let dirty_chunk_bytes = b"diff-chunk";
         let fb = service
             .alloc_buffer(
-                &NdmPath("/e.txt".to_string()),
+                &NfsPath("/e.txt".to_string()),
                 104,
                 vec![base_chunk.clone()],
                 &test_lease(),
@@ -1793,7 +1786,7 @@ mod tests {
         let base_chunk = ChunkId::from_mix_hash_result(huge_size, &[0x11; 32], ChunkType::Mix256);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/overlay-linked.txt".to_string()),
+                &NfsPath("/overlay-linked.txt".to_string()),
                 107,
                 vec![base_chunk.clone()],
                 &test_lease(),
@@ -1827,7 +1820,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/big.txt".to_string()),
+                &NfsPath("/big.txt".to_string()),
                 105,
                 vec![],
                 &test_lease(),
@@ -1862,7 +1855,7 @@ mod tests {
             .unwrap()
             .calc_mix_chunk_id_from_bytes(&second)
             .unwrap();
-        let simple_chunk_list = SimpleChunkList::from_chunk_list(vec![chunk_1, chunk_2]).unwrap();
+        let simple_chunk_list = ChunkList::from_chunk_list(vec![chunk_1, chunk_2]).unwrap();
         let (content_obj_id, _) = simple_chunk_list.gen_obj_id();
         assert!(content_obj_id.is_chunk_list());
 
@@ -1881,7 +1874,7 @@ mod tests {
         let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
         let fb = service
             .alloc_buffer(
-                &NdmPath("/linked-big.txt".to_string()),
+                &NfsPath("/linked-big.txt".to_string()),
                 106,
                 vec![],
                 &test_lease(),

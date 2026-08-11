@@ -1,9 +1,7 @@
-use crate::{ChunkType, HashMethod, NdnError, NdnResult, OBJ_TYPE_TRIE};
+use crate::{ChunkType, HashMethod, NdnError, NdnResult};
 use crate::{
-    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_CHUNK_LIST_FIX_SIZE, OBJ_TYPE_CHUNK_LIST_SIMPLE,
-    OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_LIST,
-    OBJ_TYPE_LIST_SIMPLE, OBJ_TYPE_OBJMAP, OBJ_TYPE_OBJMAP_SIMPLE, OBJ_TYPE_PACK, OBJ_TYPE_PKG,
-    OBJ_TYPE_TRIE_SIMPLE,
+    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_LIST, OBJ_TYPE_OBJMAP,
+    OBJ_TYPE_PACK, OBJ_TYPE_PKG,
 };
 use buckyos_kit::get_by_json_path;
 use jsonwebtoken::{encode, DecodingKeyKind, EncodingKey};
@@ -12,10 +10,7 @@ use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializ
 use sha2::{Digest, Sha256};
 use std::fmt::Display;
 use std::str::FromStr;
-use std::{
-    collections::{BTreeMap, HashMap},
-    ops::Range,
-};
+use std::{collections::HashMap, ops::Range, path::Path};
 
 //objid link to a did::EncodedDocument
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -96,7 +91,7 @@ impl ObjId {
     }
 
     pub fn is_chunk_list(&self) -> bool {
-        self.obj_type == OBJ_TYPE_CHUNK_LIST_SIMPLE
+        self.obj_type == OBJ_TYPE_CHUNK_LIST
     }
 
     pub fn is_json(&self) -> bool {
@@ -121,13 +116,9 @@ impl ObjId {
     pub fn is_container(&self) -> bool {
         match self.obj_type.as_str() {
             OBJ_TYPE_DIR => true,
-            OBJ_TYPE_TRIE | OBJ_TYPE_TRIE_SIMPLE => true,
-            OBJ_TYPE_OBJMAP | OBJ_TYPE_OBJMAP_SIMPLE => true,
-            OBJ_TYPE_LIST | OBJ_TYPE_LIST_SIMPLE => true,
-            OBJ_TYPE_CHUNK_LIST
-            | OBJ_TYPE_CHUNK_LIST_SIMPLE
-            | OBJ_TYPE_CHUNK_LIST_FIX_SIZE
-            | OBJ_TYPE_CHUNK_LIST_SIMPLE_FIX_SIZE => true,
+            OBJ_TYPE_OBJMAP => true,
+            OBJ_TYPE_LIST => true,
+            OBJ_TYPE_CHUNK_LIST => true,
             _ => false,
         }
     }
@@ -135,11 +126,9 @@ impl ObjId {
     // Check if the object is a big container, which means it is collection and not in simple mode
     pub fn is_big_container(&self) -> bool {
         match self.obj_type.as_str() {
-            OBJ_TYPE_TRIE => true,
             OBJ_TYPE_OBJMAP => true,
             OBJ_TYPE_LIST => true,
             OBJ_TYPE_CHUNK_LIST => true,
-            OBJ_TYPE_CHUNK_LIST_FIX_SIZE => true,
             _ => false,
         }
     }
@@ -311,6 +300,19 @@ pub fn load_named_obj<T: DeserializeOwned>(obj_data_str: &str) -> NdnResult<T> {
     })
 }
 
+pub fn load_named_obj_from_file<T: DeserializeOwned, P: AsRef<Path>>(
+    obj_file_path: P,
+) -> NdnResult<T> {
+    let obj_data_str = std::fs::read_to_string(obj_file_path.as_ref()).map_err(|e| {
+        NdnError::IoError(format!(
+            "read named object file failed ({}): {}",
+            obj_file_path.as_ref().display(),
+            e
+        ))
+    })?;
+    load_named_obj(&obj_data_str)
+}
+
 //只验证objid,不会验证jwt.jwt通常需要读取特定对象的字段后才能决定怎么验证，无法自动化验证
 pub fn load_named_obj_and_verify<T: DeserializeOwned>(
     obj_id: &ObjId,
@@ -330,6 +332,20 @@ pub fn load_named_obj_and_verify<T: DeserializeOwned>(
             e
         ))
     })
+}
+
+pub fn load_named_obj_and_verify_from_file<T: DeserializeOwned, P: AsRef<Path>>(
+    obj_id: &ObjId,
+    obj_file_path: P,
+) -> NdnResult<T> {
+    let obj_data_str = std::fs::read_to_string(obj_file_path.as_ref()).map_err(|e| {
+        NdnError::IoError(format!(
+            "read named object file failed ({}): {}",
+            obj_file_path.as_ref().display(),
+            e
+        ))
+    })?;
+    load_named_obj_and_verify(obj_id, &obj_data_str)
 }
 
 pub fn extract_objid_by_path(obj_json: &serde_json::Value, path: &str) -> NdnResult<ObjId> {
@@ -356,27 +372,7 @@ pub fn build_named_object_by_json(
     obj_type: &str,
     json_value: &serde_json::Value,
 ) -> (ObjId, String) {
-    // 递归地处理 JSON 值，确保所有层级的对象都是有序的
-    fn stabilize_json(value: &serde_json::Value) -> serde_json::Value {
-        match value {
-            serde_json::Value::Object(map) => {
-                let ordered: BTreeMap<String, serde_json::Value> = map
-                    .iter()
-                    .map(|(k, v)| (k.clone(), stabilize_json(v)))
-                    .collect();
-                serde_json::Value::Object(serde_json::Map::from_iter(ordered))
-            }
-            serde_json::Value::Array(arr) => {
-                // 递归处理数组中的每个元素
-                serde_json::Value::Array(arr.iter().map(stabilize_json).collect())
-            }
-            // 其他类型直接克隆
-            _ => value.clone(),
-        }
-    }
-
-    let stable_value = stabilize_json(json_value);
-    let json_str = serde_json::to_string(&stable_value).unwrap_or_else(|_| "{}".to_string());
+    let json_str = serde_jcs::to_string(json_value).unwrap_or_else(|_| "{}".to_string());
     let obj_id = build_obj_id(obj_type, &json_str);
     (obj_id, json_str)
 }
@@ -420,7 +416,8 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
 }
 
 pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
-    if obj_str.find("{").is_some() {
+    let head = obj_str.trim_start();
+    if head.starts_with('{') || head.starts_with('[') {
         let obj_json = serde_json::from_str(obj_str).map_err(|e| {
             NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string()))
         })?;
@@ -466,8 +463,17 @@ pub fn named_obj_to_jwt(
 mod tests {
     use super::*;
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
+    use crate::{
+        ActionObject, CanonValue, InclusionProof, MachineContent, MsgContent, MsgContentFormat,
+        MsgObjKind, MsgObject, PathObject, ReceiptObj, ReceiptStatus, RefItem, RefRole, RefTarget,
+        RelationObject, TopicThread, ACTION_TYPE_VIEWED,
+    };
+    use name_lib::DID;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
+    use std::collections::{BTreeMap, HashMap};
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
     fn test_obj_id() {
@@ -643,6 +649,67 @@ mod tests {
         assert_eq!(verify_named_object(&obj_id, &json_value2), true);
     }
 
+    #[test]
+    fn test_build_obj_id_uses_jcs_number_canonicalization() {
+        let json_value = serde_json::from_str::<serde_json::Value>(r#"{"b":1.0,"a":1e0}"#).unwrap();
+        let (obj_id, json_str) = build_named_object_by_json("jobj", &json_value);
+
+        assert_eq!(json_str, r#"{"a":1,"b":1}"#);
+        assert_eq!(obj_id, build_obj_id("jobj", r#"{"a":1,"b":1}"#));
+    }
+
+    fn assert_jcs_fixture(case_name: &str, input_json: &str, expected_canonical_json: &str) {
+        let input_value = serde_json::from_str::<serde_json::Value>(input_json)
+            .unwrap_or_else(|e| panic!("failed to parse input fixture {case_name}: {e}"));
+        let expected_value = serde_json::from_str::<serde_json::Value>(expected_canonical_json)
+            .unwrap_or_else(|e| panic!("failed to parse expected fixture {case_name}: {e}"));
+
+        let (actual_obj_id, actual_json) = build_named_object_by_json("jobj", &input_value);
+        let (expected_obj_id, expected_json) = build_named_object_by_json("jobj", &expected_value);
+
+        assert_eq!(actual_json, expected_canonical_json, "fixture: {case_name}");
+        assert_eq!(
+            expected_json, expected_canonical_json,
+            "fixture: {case_name}"
+        );
+        assert_eq!(actual_obj_id, expected_obj_id, "fixture: {case_name}");
+    }
+
+    #[test]
+    fn test_rfc8785_fixture_cjk_text() {
+        let expected_text = format!(
+            "{}",
+            "\u{4e2d}\u{6587}\u{ff0c}\u{7e41}\u{9ad4}\u{ff0c}\u{304b}\u{306a}\u{ff0c}\u{d55c}\u{ae00}"
+        );
+        let expected_json = format!(r#"{{"message":"{}"}}"#, expected_text);
+
+        assert_jcs_fixture(
+            "cjk-text",
+            r#"{"message":"\u4e2d\u6587\uff0c\u7e41\u9ad4\uff0c\u304b\u306a\uff0c\ud55c\uae00"}"#,
+            &expected_json,
+        );
+    }
+
+    #[test]
+    fn test_rfc8785_fixture_utf16_key_sorting() {
+        let expected_json = format!(r#"{{"A":3,"{}":2,"{}":1}}"#, "\u{10000}", "\u{e000}");
+
+        assert_jcs_fixture(
+            "utf16-key-sorting",
+            r#"{"\ue000":1,"\ud800\udc00":2,"A":3}"#,
+            &expected_json,
+        );
+    }
+
+    #[test]
+    fn test_rfc8785_fixture_number_canonicalization() {
+        assert_jcs_fixture(
+            "number-canonicalization",
+            r#"{"unsafe_int":"18446744073709551615","safe_int":9007199254740991,"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001]}"#,
+            r#"{"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"safe_int":9007199254740991,"unsafe_int":"18446744073709551615"}"#,
+        );
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     struct TestNamedObject {
         name: String,
@@ -698,5 +765,171 @@ mod tests {
         let bad_obj_id = ObjId::new("jobj:123456").unwrap();
         let err = load_named_obj_and_verify::<TestNamedObject>(&bad_obj_id, &obj_str).unwrap_err();
         assert!(matches!(err, NdnError::InvalidId(_)));
+    }
+
+    fn did_web(host: &str) -> DID {
+        DID::new("web", host)
+    }
+
+    fn assert_named_object_file_roundtrip<T>(case_name: &str, obj: &T) -> serde_json::Value
+    where
+        T: NamedObject + DeserializeOwned,
+    {
+        let (obj_id, obj_str) = obj.gen_obj_id();
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join(format!("{}.json", case_name));
+        fs::write(&file_path, &obj_str).unwrap();
+
+        let decoded: T = load_named_obj_and_verify_from_file(&obj_id, &file_path).unwrap();
+        let decoded_json = serde_json::to_value(&decoded).unwrap();
+        let encoded_json: serde_json::Value = serde_json::from_str(&obj_str).unwrap();
+        assert_eq!(decoded_json, encoded_json);
+
+        json!({
+            "objid": obj_id.to_string(),
+            "objjson": encoded_json,
+        })
+    }
+
+    #[test]
+    fn test_non_chunk_named_object_file_roundtrip() {
+        let mut file_object = crate::FileObject::new(
+            "hello.txt".to_string(),
+            12,
+            "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+                .to_string(),
+        );
+        file_object.content_obj.create_time = 1_700_000_000;
+        file_object.content_obj.last_update_time = 1_700_000_120;
+        file_object.author = "alice".to_string();
+        file_object
+            .meta
+            .insert("mime".to_string(), json!("text/plain"));
+
+        let path_object = PathObject {
+            path: "/repo/apps/demo".to_string(),
+            iat: 1_700_000_200,
+            target: ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            exp: 1_700_086_600,
+            host: None,
+        };
+
+        let inclusion_content = json!({
+            "name": "hello.txt",
+            "size": 12,
+            "content": "mix256:80c00940db74383f24e9a59c3eaf03f301a24e8c21252055cc118a662405fe3bf175d5"
+        });
+        let mut inclusion_proof = InclusionProof::new(
+            ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            inclusion_content,
+            did_web("curator.example.com"),
+            88,
+            vec!["docs".to_string(), "featured".to_string()],
+        );
+        inclusion_proof.editor = vec!["did:web:editor.example.com".to_string()];
+        inclusion_proof.review_url =
+            Some("https://curator.example.com/review/hello.txt".to_string());
+        inclusion_proof.meta = Some(json!({"score": 9.6, "comment": "stable"}));
+        inclusion_proof.iat = 1_700_000_300;
+        inclusion_proof.exp = 1_703_110_300;
+
+        let mut relation_object = RelationObject::create_by_link_data(
+            ObjId::new("cyfile:1234567890abcdef").unwrap(),
+            crate::ObjectLinkData::PartOf(ObjId::new("sha256:1122334455667788").unwrap(), 0..12),
+        );
+        relation_object.iat = Some(1_700_000_400);
+        relation_object.exp = Some(1_700_086_800);
+        relation_object
+            .body
+            .insert("note".to_string(), json!("excerpt"));
+
+        let action_object = ActionObject {
+            subject: ObjId::new("cyfile:aaaaaaaaaaaaaaaa").unwrap(),
+            action: ACTION_TYPE_VIEWED.to_string(),
+            target: ObjId::new("cymsg:bbbbbbbbbbbbbbbb").unwrap(),
+            base_on: Some(ObjId::new("cyact:cccccccccccccccc").unwrap()),
+            details: Some(json!({"device": "desktop", "source": "unit-test"})),
+            iat: 1_700_000_500,
+            exp: 1_700_086_900,
+        };
+
+        let mut machine_data = BTreeMap::new();
+        machine_data.insert("level".to_string(), CanonValue::U64(3));
+        machine_data.insert("urgent".to_string(), CanonValue::Bool(true));
+        let msg_object = MsgObject {
+            from: did_web("alice.example.com"),
+            to: vec![did_web("bob.example.com"), did_web("carol.example.com")],
+            kind: MsgObjKind::Chat,
+            thread: TopicThread {
+                topic: Some("release".to_string()),
+                reply_to: Some(ObjId::new("cymsg:010203040506").unwrap()),
+                correlation_id: Some("corr-001".to_string()),
+            },
+            workspace: Some(did_web("workspace.example.com")),
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: Some(1_700_086_400_000),
+            nonce: Some(7),
+            content: MsgContent {
+                title: Some("Hello".to_string()),
+                format: Some(MsgContentFormat::ApplicationJson),
+                content: "{\"status\":\"ok\"}".to_string(),
+                machine: Some(MachineContent {
+                    intent: Some("sync".to_string()),
+                    data: machine_data,
+                }),
+                refs: vec![RefItem {
+                    role: RefRole::Input,
+                    target: RefTarget::DataObj {
+                        obj_id: ObjId::new("cyfile:1234567890abcdef").unwrap(),
+                        uri_hint: Some("cyfs://hello.txt".to_string()),
+                    },
+                    label: Some("attachment".to_string()),
+                }],
+            },
+            proof: Some("proof-001".to_string()),
+            meta: BTreeMap::from([
+                ("priority".to_string(), json!(1)),
+                ("lang".to_string(), json!("zh-CN")),
+            ]),
+        };
+
+        let msg_receipt = ReceiptObj {
+            obj_id: ObjId::new("cymsg:010203040506").unwrap(),
+            iss: did_web("inbox.example.com"),
+            channel: Some("group".to_string()),
+            iat: 1_700_000_100_000,
+            status: ReceiptStatus::Accepted,
+            reason: Some("delivered".to_string()),
+        };
+
+        let reports = vec![
+            assert_named_object_file_roundtrip("file_object", &file_object),
+            assert_named_object_file_roundtrip("path_object", &path_object),
+            assert_named_object_file_roundtrip("inclusion_proof", &inclusion_proof),
+            assert_named_object_file_roundtrip("relation_object", &relation_object),
+            assert_named_object_file_roundtrip("action_object", &action_object),
+            assert_named_object_file_roundtrip("msg_object", &msg_object),
+            assert_named_object_file_roundtrip("msg_receipt", &msg_receipt),
+        ];
+
+        assert_eq!(reports.len(), 7);
+        assert!(reports.iter().all(|report| report.get("objid").is_some()));
+        assert!(reports.iter().all(|report| report.get("objjson").is_some()));
+        println!("{}", serde_json::to_string_pretty(&reports).unwrap());
+    }
+
+    #[test]
+    fn test_load_named_obj_from_file() {
+        let obj = TestNamedObject {
+            name: "file-test".to_string(),
+            age: 20,
+        };
+        let temp_dir = tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_named_object.json");
+        fs::write(&file_path, serde_json::to_string(&obj).unwrap()).unwrap();
+
+        let decoded: TestNamedObject = load_named_obj_from_file(&file_path).unwrap();
+        assert_eq!(decoded.name, "file-test");
+        assert_eq!(decoded.age, 20);
     }
 }

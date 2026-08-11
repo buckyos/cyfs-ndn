@@ -5,13 +5,14 @@ use crate::{
 };
 use name_lib::DID;
 use named_store::{
-    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedLocalStore, NamedStoreMgr, StoreLayout,
+    ChunkListReader, ChunkLocalInfo, ChunkStoreState, NamedDataMgr, NamedLocalStore, StoreLayout,
     StoreTarget,
 };
 use ndn_lib::{
-    ChunkHasher, ChunkId, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind, MsgObject,
-    NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult,
-    RefItem, RefRole, RefTarget, SimpleChunkList, SimpleMapItem, StoreMode, CHUNK_DEFAULT_SIZE,
+    ChunkHasher, ChunkId, ChunkList, DirObject, FileObject, HashMethod, MsgContent, MsgObjKind,
+    MsgObject, NamedObject, NdnError, NdnProgressCallback, NdnResult, ObjId,
+    ProgressCallbackResult, RefItem, RefRole, RefTarget, SimpleMapItem, StoreMode,
+    CHUNK_DEFAULT_SIZE,
 };
 use std::io::SeekFrom;
 use std::path::Path;
@@ -58,21 +59,21 @@ fn did_web(host: &str) -> DID {
     DID::new("web", host)
 }
 
-async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
+async fn create_test_store_mgr(base_dir: &Path) -> NamedDataMgr {
     let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
         .await
         .unwrap();
     let store_id = store.store_id().to_string();
     let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-    let store_mgr = NamedStoreMgr::new();
+    let store_mgr = NamedDataMgr::new();
     store_mgr.register_store(store_ref).await;
     store_mgr
         .add_layout(StoreLayout::new(
             1,
             vec![StoreTarget {
                 store_id,
-                device_did: None,
+                device_did: String::new(),
                 capacity: None,
                 used: None,
                 readonly: false,
@@ -87,12 +88,12 @@ async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
     store_mgr
 }
 
-async fn create_test_named_mgr(base_dir: &Path) -> NamedStoreMgr {
+async fn create_test_named_mgr(base_dir: &Path) -> NamedDataMgr {
     create_test_store_mgr(base_dir).await
 }
 
-fn clone_chunk_list(chunk_list: &SimpleChunkList) -> SimpleChunkList {
-    SimpleChunkList::from_chunk_list(chunk_list.body.clone()).unwrap()
+fn clone_chunk_list(chunk_list: &ChunkList) -> ChunkList {
+    ChunkList::from_chunk_list(chunk_list.body.clone()).unwrap()
 }
 
 fn small_file_size() -> usize {
@@ -141,8 +142,8 @@ fn assert_dir_shape(dir_obj: &DirObject) {
 async fn build_chunk_list_from_file(
     file_path: &Path,
     chunk_size: usize,
-    store_mgr: &NamedStoreMgr,
-) -> SimpleChunkList {
+    store_mgr: &NamedDataMgr,
+) -> ChunkList {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
     let mut chunk_ids = Vec::new();
 
@@ -151,20 +152,17 @@ async fn build_chunk_list_from_file(
             .unwrap()
             .calc_mix_chunk_id_from_bytes(chunk_data)
             .unwrap();
-        store_mgr
-            .put_chunk(&chunk_id, chunk_data, true)
-            .await
-            .unwrap();
+        store_mgr.put_chunk(&chunk_id, chunk_data).await.unwrap();
         chunk_ids.push(chunk_id);
     }
 
-    SimpleChunkList::from_chunk_list(chunk_ids).unwrap()
+    ChunkList::from_chunk_list(chunk_ids).unwrap()
 }
 
 async fn assert_chunk_list_matches_file(
     file_path: &Path,
-    store_mgr: NamedStoreMgr,
-    chunk_list: &SimpleChunkList,
+    store_mgr: NamedDataMgr,
+    chunk_list: &ChunkList,
     offset: u64,
 ) {
     let file_bytes = tokio::fs::read(file_path).await.unwrap();
@@ -182,7 +180,7 @@ async fn assert_chunk_list_matches_file(
     assert_eq!(read_back, file_bytes[offset as usize..].to_vec());
 }
 
-async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expected: &str) {
+async fn assert_object_stored(store_mgr: &NamedDataMgr, obj_id: &ObjId, expected: &str) {
     let stored = store_mgr.get_object(obj_id).await.unwrap();
     match (
         serde_json::from_str::<serde_json::Value>(&stored),
@@ -193,8 +191,8 @@ async fn assert_object_stored(store_mgr: &NamedStoreMgr, obj_id: &ObjId, expecte
     }
 }
 
-async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, expected: &[u8]) {
-    let (state, size, _) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
+async fn assert_completed_chunk(store_mgr: &NamedDataMgr, chunk_id: &ChunkId, expected: &[u8]) {
+    let (state, size) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(state, ChunkStoreState::Completed);
     assert_eq!(size, expected.len() as u64);
 
@@ -205,13 +203,13 @@ async fn assert_completed_chunk(store_mgr: &NamedStoreMgr, chunk_id: &ChunkId, e
 }
 
 async fn assert_local_link_chunk(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     chunk_id: &ChunkId,
     expected_path: &Path,
     expected_range: Option<std::ops::Range<u64>>,
     expected: &[u8],
 ) {
-    let (state, size, _) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
+    let (state, size) = store_mgr.query_chunk_state(chunk_id).await.unwrap();
     assert_eq!(size, expected.len() as u64);
 
     match state {
@@ -236,7 +234,7 @@ async fn assert_local_link_chunk(
 }
 
 async fn assert_local_link_reader_fails_after_source_mutation(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     chunk_id: &ChunkId,
     source_path: &Path,
 ) {
@@ -280,7 +278,7 @@ async fn test_chunk_list_main() {
     assert_eq!(chunk_list.body.len(), file_size.div_ceil(chunk_size));
 
     let (chunk_list_id, chunk_list_str) = clone_chunk_list(&chunk_list).gen_obj_id();
-    let parsed_chunk_list = SimpleChunkList::from_json(&chunk_list_str).unwrap();
+    let parsed_chunk_list = ChunkList::from_json(&chunk_list_str).unwrap();
     assert_eq!(parsed_chunk_list.total_size, chunk_list.total_size);
     assert_eq!(parsed_chunk_list.body, chunk_list.body);
 
@@ -421,7 +419,7 @@ async fn test_check_file_object_content_ready() {
 
     let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
     let removed_chunk = chunk_list.body[0].clone();
     store_mgr.remove_chunk(&removed_chunk).await.unwrap();
 
@@ -459,7 +457,7 @@ async fn test_get_chunklist_from_known_named_object() {
 
     let chunklist_obj_id = ObjId::new(&file_obj.content).unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let expected_chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
 
     let chunk_ids = get_chunklist_from_known_named_object(
         &store_mgr,
@@ -530,7 +528,7 @@ async fn test_get_chunklist_from_msg_object_output_refs() {
     )
     .unwrap();
     let chunklist_json = store_mgr.get_object(&chunklist_obj_id).await.unwrap();
-    let expected_chunk_list = SimpleChunkList::from_json(chunklist_json.as_str()).unwrap();
+    let expected_chunk_list = ChunkList::from_json(chunklist_json.as_str()).unwrap();
 
     let msg_obj = MsgObject {
         from: did_web("alice.example.com"),
@@ -728,16 +726,12 @@ async fn test_cyfs_ndn_client_object_uses_cyfs_head() {
         chunk_id.to_string(),
     );
     let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
-    let head_str = serde_json::json!({
-        "obj_id": file_obj_id.to_string()
-    })
-    .to_string();
 
     let body = file_obj_str.clone();
-    let head = head_str.clone();
+    let obj_id_header = file_obj_id.to_string();
     let route = warp::path!("alias" / "fileobj").map(move || {
         warp::http::Response::builder()
-            .header("cyfs-head", head.clone())
+            .header("cyfs-obj-id", obj_id_header.clone())
             .body(body.clone())
             .unwrap()
     });
@@ -810,7 +804,7 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
         chunk_ids.push(chunk_id);
     }
 
-    let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids.clone()).unwrap();
+    let chunk_list = ChunkList::from_chunk_list(chunk_ids.clone()).unwrap();
     let (chunk_list_id, chunk_list_str) = clone_chunk_list(&chunk_list).gen_obj_id();
     let file_obj = FileObject::new(
         "largefile.bin".to_string(),
@@ -819,22 +813,30 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
     );
     let (file_obj_id, file_obj_str) = file_obj.clone().gen_obj_id();
 
-    let file_bytes_for_route = file_bytes.clone();
     let chunk_list_id_str = chunk_list_id.to_string();
     let chunk_list_str_for_route = chunk_list_str.clone();
     let file_obj_id_str = file_obj_id.to_string();
     let file_obj_str_for_route = file_obj_str.clone();
+    let chunk_map_for_route = chunk_map.clone();
     let route = warp::path!("largefile" / String).map(move |obj_id: String| {
         if obj_id == file_obj_id_str {
             return warp::http::Response::builder()
-                .header("cyfs-head", file_obj_str_for_route.clone())
-                .body(file_bytes_for_route.clone())
+                .header("cyfs-obj-id", file_obj_id_str.clone())
+                .body(file_obj_str_for_route.clone().into_bytes())
                 .unwrap();
         }
 
         if obj_id == chunk_list_id_str {
             return warp::http::Response::builder()
+                .header("cyfs-obj-id", chunk_list_id_str.clone())
                 .body(chunk_list_str_for_route.clone().into_bytes())
+                .unwrap();
+        }
+
+        if let Some(bytes) = chunk_map_for_route.get(&obj_id) {
+            return warp::http::Response::builder()
+                .header("cyfs-obj-id", obj_id.clone())
+                .body(bytes.clone())
                 .unwrap();
         }
 
@@ -852,8 +854,8 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
 
     let progress_log = Arc::new(Mutex::new(Vec::<String>::new()));
     let progress_log_for_cb = progress_log.clone();
-    let callback: Arc<Mutex<NdnProgressCallback>> = Arc::new(Mutex::new(Box::new(
-        move |inner_path, action| {
+    let callback: Arc<Mutex<NdnProgressCallback>> =
+        Arc::new(Mutex::new(Box::new(move |inner_path, action| {
             let progress_log = progress_log_for_cb.clone();
             Box::pin(async move {
                 progress_log
@@ -862,8 +864,7 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
                     .push(format!("{}|{}", inner_path, action.to_string()));
                 Ok(ProgressCallbackResult::Continue)
             })
-        },
-    )));
+        })));
 
     let client = CyfsNdnClient::builder()
         .transport(TestSchemeTransport::new())
@@ -891,8 +892,12 @@ async fn test_cyfs_ndn_client_pull_named_store_from_rtcp_url() {
         .unwrap();
 
     for chunk_id in chunk_ids.iter() {
-        assert_completed_chunk(&store_mgr, chunk_id, chunk_map.get(&chunk_id.to_string()).unwrap())
-            .await;
+        assert_completed_chunk(
+            &store_mgr,
+            chunk_id,
+            chunk_map.get(&chunk_id.to_string()).unwrap(),
+        )
+        .await;
     }
 
     let progress_log = progress_log.lock().await;

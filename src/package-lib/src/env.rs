@@ -46,7 +46,7 @@ PackageEnv 当前实现说明
   - 获取写锁
   - 读取 `PackageMeta`
   - 如需要先递归安装依赖
-  - 通过 `named_store_config_path` 构造 `NamedStoreMgr`
+  - 通过 `named_store_config_path + http_backend_links` 构造 `NamedStoreMgr`
   - 安装前先检查 `FileObject.content` 引用的数据是否已全部在 store 中
   - 用 `open_reader` 打开包内容 reader，最终统一落到 `do_install_pkg_from_data`
 
@@ -68,7 +68,7 @@ PackageEnv 当前实现说明
 use async_trait::async_trait;
 use fs_extra::dir::*;
 use log::*;
-use name_lib::EncodedDocument;
+use name_lib::{EncodedDocument, DID};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
@@ -82,7 +82,7 @@ use tokio::sync::{oneshot, Mutex as TokioMutex};
 use async_compression::tokio::bufread::GzipDecoder;
 use async_fd_lock::RwLockWriteGuard;
 use async_fd_lock::{LockRead, LockWrite};
-use named_store::NamedStoreMgr;
+use named_store::NamedDataMgr;
 use ndn_lib::*;
 use ndn_toolkit::{check_file_object_content_ready, collect_missing_chunks_for_file_object};
 use tokio::fs::File;
@@ -105,6 +105,8 @@ pub struct PackageEnvConfig {
     pub parent: Option<PathBuf>, //parent package env work_dir
     pub ready_only: bool,        //read only env cann't install any new pkgs
     pub named_store_config_path: Option<String>, //如果指定了，则使用 named_store 配置文件路径作为默认 read chunk 的来源
+    #[serde(default)]
+    pub http_backend_links: HashMap<String, String>, //device_did -> http backend前缀；未命中表示本地桶
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     #[serde(default)]
     pub installed: HashSet<String>, //pkg_id列表，表示已经安装的pkg
@@ -146,6 +148,7 @@ impl Default for PackageEnvConfig {
             parent: None,
             ready_only: false,
             named_store_config_path: None,
+            http_backend_links: HashMap::new(),
             prefix: Some(os_type.to_string()),
             installed: HashSet::new(),
         }
@@ -392,7 +395,7 @@ impl PackageEnv {
     pub async fn check_pkg_ready(
         meta_index_db: &PathBuf,
         pkg_id: &str,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
     ) -> PkgResult<()> {
         let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
@@ -429,7 +432,7 @@ impl PackageEnv {
     pub async fn check_deps_ready(
         meta_index_db: &PathBuf,
         pkg_id: &str,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
     ) -> PkgResult<()> {
         let meta_db = MetaIndexDb::new(meta_index_db.clone(), true)?;
@@ -457,7 +460,7 @@ impl PackageEnv {
     async fn check_deps_ready_impl(
         meta_index_db: &PathBuf,
         pkg_meta: &PackageMeta,
-        store_mgr: &NamedStoreMgr,
+        store_mgr: &NamedDataMgr,
         miss_chunk_list: &mut Vec<ChunkId>,
         visiting: &mut HashSet<String>,
     ) -> PkgResult<()> {
@@ -605,19 +608,19 @@ impl PackageEnv {
                     "named_store_config_path is required for package installation".to_owned(),
                 )
             })?;
-
-        let store_mgr = NamedStoreMgr::get_store_mgr(&store_config_path)
-            .await
-            .map_err(|e| {
-                PkgError::InstallError(
-                    pkg_id.clone(),
-                    format!(
-                        "Failed to open named store config {}: {}",
-                        store_config_path.display(),
-                        e
-                    ),
-                )
-            })?;
+        let store_mgr =
+            NamedDataMgr::get_store_mgr(&store_config_path, &self.config.http_backend_links)
+                .await
+                .map_err(|e| {
+                    PkgError::InstallError(
+                        pkg_id.clone(),
+                        format!(
+                            "Failed to open named store config {}: {}",
+                            store_config_path.display(),
+                            e
+                        ),
+                    )
+                })?;
 
         check_file_object_content_ready(&store_mgr, pkg_meta)
             .await
@@ -1042,8 +1045,8 @@ mod tests {
     use super::*;
     use buckyos_kit::*;
     use name_lib::DID;
-    use named_store::{NamedLocalStore, NamedStoreMgr, StoreLayout, StoreTarget};
-    use ndn_lib::{FileObject, ObjId, SimpleChunkList, StoreMode, CHUNK_DEFAULT_SIZE};
+    use named_store::{NamedDataMgr, NamedLocalStore, StoreLayout, StoreTarget};
+    use ndn_lib::{ChunkList, FileObject, ObjId, StoreMode, CHUNK_DEFAULT_SIZE};
     use ndn_toolkit::{cacl_file_object, CheckMode};
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -1088,21 +1091,21 @@ mod tests {
         pkg_dir
     }
 
-    async fn create_test_store_mgr(base_dir: &Path) -> NamedStoreMgr {
+    async fn create_test_store_mgr(base_dir: &Path) -> NamedDataMgr {
         let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
             .await
             .unwrap();
         let store_id = store.store_id().to_string();
         let store_ref = Arc::new(tokio::sync::Mutex::new(store));
 
-        let store_mgr = NamedStoreMgr::new();
+        let store_mgr = NamedDataMgr::new();
         store_mgr.register_store(store_ref).await;
         store_mgr
             .add_layout(StoreLayout::new(
                 1,
                 vec![StoreTarget {
                     store_id,
-                    device_did: None,
+                    device_did: String::new(),
                     capacity: None,
                     used: None,
                     readonly: false,
@@ -1167,6 +1170,7 @@ mod tests {
         let store_mgr = create_test_store_mgr(base_dir).await;
         let store_config_path = create_test_store_config(base_dir).await;
         env.config.named_store_config_path = Some(store_config_path.to_string_lossy().to_string());
+        env.config.http_backend_links = HashMap::new();
 
         let archive_path = create_test_pkg_archive(base_dir).await;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
@@ -1334,16 +1338,15 @@ mod tests {
         assert_eq!(media_info.full_path, friendly_path);
         assert!(matches!(media_info.media_type, MediaType::Dir));
 
-
-
         let pkg_meta =
             create_installable_test_pkg(&mut env, temp.path(), "test.pkg", "1.0.1").await;
         let (meta_obj_id, pkg_meta_str) = pkg_meta.gen_obj_id();
-        let get_result = env.get_pkg_meta(&format!("test.pkg#{}", meta_obj_id.to_string())).await;
+        let get_result = env
+            .get_pkg_meta(&format!("test.pkg#{}", meta_obj_id.to_string()))
+            .await;
         assert!(get_result.is_err());
         println!("get_result: {:?}", get_result);
 
-        
         let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
         let strict_path = env
             .get_pkg_strict_dir(&meta_obj_id.to_string(), &pkg_meta)
@@ -1544,7 +1547,7 @@ mod tests {
         pkg_meta.size = file_obj.size;
         pkg_meta.content = file_obj.content.clone();
 
-        let chunk_list = SimpleChunkList::from_json(
+        let chunk_list = ChunkList::from_json(
             store_mgr
                 .get_object(&ObjId::new(&pkg_meta.content).unwrap())
                 .await
@@ -1613,7 +1616,7 @@ mod tests {
         dep_meta.size = dep_file_obj.size;
         dep_meta.content = dep_file_obj.content.clone();
 
-        let chunk_list = SimpleChunkList::from_json(
+        let chunk_list = ChunkList::from_json(
             store_mgr
                 .get_object(&ObjId::new(&dep_meta.content).unwrap())
                 .await

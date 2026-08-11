@@ -1,16 +1,16 @@
 use log::{debug, info};
-use named_store::{ChunkLocalInfo, NamedStoreMgr};
+use named_store::{ChunkLocalInfo, NamedDataMgr};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use serde_json::Value;
 use tokio::sync::Mutex;
 
 use ndn_lib::{
-    caculate_qcid_from_file, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkType,
-    DirObject, FileObject, MsgObject, NamedObject, NdnAction, NdnError, NdnProgressCallback,
-    NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, SimpleChunkList, StoreMode,
+    caculate_qcid_from_file, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkList,
+    ChunkType, DirObject, FileObject, MsgObject, NamedObject, NdnAction, NdnError,
+    NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, StoreMode,
     CHUNK_DEFAULT_SIZE,
 };
 
@@ -94,7 +94,7 @@ async fn read_chunk_bytes(local_info: &ChunkLocalInfo, chunk_size: u64) -> NdnRe
 }
 
 pub async fn store_content_to_ndn_mgr_impl(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     content: ContentToStore,
     store_mode: StoreMode,
 ) -> NdnResult<()> {
@@ -106,7 +106,7 @@ pub async fn store_content_to_ndn_mgr_impl(
             }
             ContentToStore::Chunk(chunk_id, chunk_size, local_info) => {
                 let chunk_bytes = read_chunk_bytes(&local_info, chunk_size).await?;
-                store_mgr.put_chunk(&chunk_id, &chunk_bytes, true).await
+                store_mgr.put_chunk(&chunk_id, &chunk_bytes).await
             }
         },
         StoreMode::LocalFile(_, _, _) => match content {
@@ -123,7 +123,7 @@ pub async fn store_content_to_ndn_mgr_impl(
 }
 
 pub async fn store_content_to_ndn_mgr(
-    store_mgr: Option<&NamedStoreMgr>,
+    store_mgr: Option<&NamedDataMgr>,
     content: ContentToStore,
     store_mode: StoreMode,
 ) -> NdnResult<()> {
@@ -154,7 +154,7 @@ async fn call_ndn_callback(
 }
 
 pub async fn cacl_file_object(
-    store_mgr: Option<&NamedStoreMgr>,
+    store_mgr: Option<&NamedDataMgr>,
     local_file_path: &Path,
     fileobj_template: &FileObject,
     use_chunklist: bool,
@@ -285,7 +285,7 @@ pub async fn cacl_file_object(
     }
 
     if use_chunk_list_now {
-        let chunk_list = SimpleChunkList::from_chunk_list(chunk_ids)?;
+        let chunk_list = ChunkList::from_chunk_list(chunk_ids)?;
         let (chunk_list_id, chunk_list_str) = chunk_list.gen_obj_id();
         file_obj_result.content = chunk_list_id.to_string();
 
@@ -303,7 +303,7 @@ pub async fn cacl_file_object(
 }
 
 pub async fn collect_missing_chunks_for_file_object(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     file_obj: &FileObject,
 ) -> NdnResult<Vec<ChunkId>> {
     if file_obj.content.is_empty() {
@@ -322,7 +322,7 @@ pub async fn collect_missing_chunks_for_file_object(
 
     if content_obj_id.is_chunk_list() {
         let chunklist_json = store_mgr.get_object(&content_obj_id).await?;
-        let chunk_list = SimpleChunkList::from_json(chunklist_json.as_str())?;
+        let chunk_list = ChunkList::from_json(chunklist_json.as_str())?;
         let mut missing_chunks = Vec::new();
 
         for chunk_id in chunk_list.body.iter() {
@@ -341,7 +341,7 @@ pub async fn collect_missing_chunks_for_file_object(
 }
 
 pub async fn check_file_object_content_ready(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     file_obj: &FileObject,
 ) -> NdnResult<()> {
     if file_obj.content.is_empty() {
@@ -369,7 +369,7 @@ pub async fn check_file_object_content_ready(
 }
 
 pub async fn cacl_dir_object(
-    store_mgr: Option<&NamedStoreMgr>,
+    store_mgr: Option<&NamedDataMgr>,
     source_dir: &Path,
     file_obj_template: &FileObject,
     check_mode: &CheckMode,
@@ -508,7 +508,7 @@ pub async fn cacl_dir_object(
 
 pub async fn restore_file_object(
     _file_object: ObjId,
-    _store_mgr: Option<&NamedStoreMgr>,
+    _store_mgr: Option<&NamedDataMgr>,
     _target_file: &Path,
 ) -> NdnResult<()> {
     Err(NdnError::Unsupported(
@@ -518,7 +518,7 @@ pub async fn restore_file_object(
 
 pub async fn restore_dir_object(
     _dir_object: ObjId,
-    _store_mgr: Option<&NamedStoreMgr>,
+    _store_mgr: Option<&NamedDataMgr>,
     _target_dir: &Path,
 ) -> NdnResult<()> {
     Err(NdnError::Unsupported(
@@ -527,7 +527,7 @@ pub async fn restore_dir_object(
 }
 
 pub async fn put_local_file_as_chunk(
-    _store_mgr: Option<&NamedStoreMgr>,
+    _store_mgr: Option<&NamedDataMgr>,
     chunk_type: ChunkType,
     local_file_path: &PathBuf,
     _store_mode: StoreMode,
@@ -553,7 +553,7 @@ pub async fn put_local_file_as_chunk(
 }
 
 pub async fn pub_local_file_as_fileobj(
-    _store_mgr: Option<&NamedStoreMgr>,
+    _store_mgr: Option<&NamedDataMgr>,
     local_file_path: &PathBuf,
     _ndn_path: &str,
     fileobj_template: &mut FileObject,
@@ -573,8 +573,8 @@ pub async fn pub_local_file_as_fileobj(
 }
 
 pub async fn copy_file_from_ndn_mgr(
-    _source_store_mgr: &NamedStoreMgr,
-    _target_store_mgr: &NamedStoreMgr,
+    _source_store_mgr: &NamedDataMgr,
+    _target_store_mgr: &NamedDataMgr,
     _file_obj_id: &ObjId,
     _file_object: &FileObject,
     _pull_mode: StoreMode,
@@ -585,8 +585,8 @@ pub async fn copy_file_from_ndn_mgr(
 }
 
 pub async fn copy_dir_from_ndn_mgr(
-    _source_store_mgr: &NamedStoreMgr,
-    _target_store_mgr: &NamedStoreMgr,
+    _source_store_mgr: &NamedDataMgr,
+    _target_store_mgr: &NamedDataMgr,
     _dir_object_id: &ObjId,
     _pull_mode: StoreMode,
 ) -> NdnResult<()> {
@@ -596,9 +596,9 @@ pub async fn copy_dir_from_ndn_mgr(
 }
 
 async fn ensure_chunk_list_chunks_ready(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     owner_obj_id: &ObjId,
-    chunk_list: &SimpleChunkList,
+    chunk_list: &ChunkList,
 ) -> NdnResult<Vec<ChunkId>> {
     let mut missing_chunks = Vec::new();
     for chunk_id in chunk_list.body.iter() {
@@ -624,7 +624,7 @@ async fn ensure_chunk_list_chunks_ready(
 }
 
 async fn load_stored_object(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     obj_id: &ObjId,
     owner_obj_id: &ObjId,
 ) -> NdnResult<String> {
@@ -650,7 +650,7 @@ fn parse_known_object_json(obj_str: &str) -> NdnResult<Value> {
 
 #[async_recursion::async_recursion]
 async fn get_chunklist_from_known_named_object_impl(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     obj_id: &ObjId,
     obj_json: &Value,
     visited_obj_ids: &mut HashSet<ObjId>,
@@ -709,7 +709,7 @@ async fn get_chunklist_from_known_named_object_impl(
     }
 
     if obj_id.is_chunk_list() {
-        let chunk_list = SimpleChunkList::from_json_value(obj_json.clone())?;
+        let chunk_list = ChunkList::from_json_value(obj_json.clone())?;
         return ensure_chunk_list_chunks_ready(store_mgr, obj_id, &chunk_list).await;
     }
 
@@ -767,7 +767,7 @@ async fn get_chunklist_from_known_named_object_impl(
 }
 
 pub async fn get_chunklist_from_known_named_object(
-    store_mgr: &NamedStoreMgr,
+    store_mgr: &NamedDataMgr,
     obj_id: &ObjId,
     obj_json: &Value,
 ) -> NdnResult<Vec<ChunkId>> {

@@ -1,11 +1,11 @@
 use async_trait::async_trait;
-use ndm_lib::SessionId;
+use cyfs_lib::SessionId;
 use ndn_lib::{ChunkId, NdnResult};
 
 use crate::local_filebuffer::FileBufferRecord;
 
 #[derive(Debug, Clone)]
-pub struct NdmPath(pub String);
+pub struct NfsPath(pub String);
 
 #[derive(Debug, Clone)]
 pub struct WriteLease {
@@ -19,7 +19,7 @@ pub trait FileBufferService: Send + Sync {
     // 这个函数通常由 fs-meta service 调用
     async fn alloc_buffer(
         &self,
-        path: &NdmPath,
+        path: &NfsPath,
         file_inode_id: u64,
         base_chunk_list: Vec<ChunkId>,
         lease: &WriteLease,

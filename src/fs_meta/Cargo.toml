@@ -16,7 +16,7 @@ buckyos-kit = {workspace = true}
 ndn-lib = { path = "../ndn-lib" }
 fs-buffer = { path = "../fs_buffer" }
 named_store = { path = "../named_store" }
-ndm ={ path = "../ndm" }
+cyfs = { path = "../cyfs" }
 
 [dev-dependencies]
 tempfile = "3"
