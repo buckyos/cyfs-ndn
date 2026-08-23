@@ -30,23 +30,58 @@ use crate::package_id::*;
 use chrono::Utc;
 use log::*;
 use ndn_lib::ObjId;
-use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Result as SqliteResult};
 use semver::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Debug)]
 pub struct MetaIndexDb {
     pub db_path: PathBuf,
+    access: MetaIndexDbAccess,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetaIndexDbAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 impl MetaIndexDb {
-    pub fn new(db_path: PathBuf, ready_only: bool) -> PkgResult<Self> {
-        // 初始化时可以检查数据库文件是否可访问，并创建必要的表和索引
-        let conn = Self::create_connection(&db_path)?;
+    /// Open a deployed metadata index without ever creating or modifying it.
+    pub fn open_existing_readonly(path: impl AsRef<Path>) -> PkgResult<Self> {
+        let db_path = path.as_ref().to_path_buf();
+        if !db_path.is_file() {
+            return Err(PkgError::MetaDbError(format!(
+                "metadata DB does not exist: {}",
+                db_path.display()
+            )));
+        }
 
+        let db = Self {
+            db_path,
+            access: MetaIndexDbAccess::ReadOnly,
+        };
+        let conn = db.open_connection()?;
+        db.validate_existing_schema(&conn)?;
+        Ok(db)
+    }
+
+    /// Create an index when needed and open it for install/update operations.
+    pub fn create_or_open(path: impl AsRef<Path>) -> PkgResult<Self> {
+        let db = Self {
+            db_path: path.as_ref().to_path_buf(),
+            access: MetaIndexDbAccess::ReadWrite,
+        };
+        let conn = db.open_connection()?;
+        db.initialize_schema(&conn)?;
+        db.validate_existing_schema(&conn)?;
+        Ok(db)
+    }
+
+    fn initialize_schema(&self, conn: &Connection) -> PkgResult<()> {
         // 创建 pkg_metas 表
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pkg_metas (
@@ -106,21 +141,112 @@ impl MetaIndexDb {
         )
         .map_err(|e| PkgError::SqlError(e.to_string()))?;
 
-        // 完成初始化后关闭连接
-        drop(conn);
-
-        Ok(MetaIndexDb { db_path })
+        Ok(())
     }
 
-    // 创建数据库连接的辅助方法
-    fn create_connection(db_path: &PathBuf) -> PkgResult<Connection> {
-        Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
-                | rusqlite::OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-        )
-        .map_err(|e| PkgError::SqlError(e.to_string()))
+    fn validate_existing_schema(&self, conn: &Connection) -> PkgResult<()> {
+        let integrity: String = conn
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .map_err(|e| {
+                PkgError::MetaDbError(format!(
+                    "metadata DB {} is corrupt or unreadable: {}",
+                    self.db_path.display(),
+                    e
+                ))
+            })?;
+        if integrity != "ok" {
+            return Err(PkgError::MetaDbError(format!(
+                "metadata DB {} failed integrity check: {}",
+                self.db_path.display(),
+                integrity
+            )));
+        }
+
+        const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
+            (
+                "pkg_metas",
+                &[
+                    "metaobjid",
+                    "pkg_meta",
+                    "author",
+                    "author_pk",
+                    "update_time",
+                ],
+            ),
+            (
+                "pkg_versions",
+                &[
+                    "pkg_name",
+                    "author",
+                    "version",
+                    "version_int",
+                    "metaobjid",
+                    "tag",
+                    "update_time",
+                ],
+            ),
+            (
+                "author_info",
+                &["author_name", "author_owner_config", "author_zone_config"],
+            ),
+        ];
+
+        for (table, required_columns) in REQUIRED_SCHEMA {
+            let sql = format!("PRAGMA table_info({table})");
+            let mut stmt = conn.prepare(&sql).map_err(|e| {
+                PkgError::MetaDbError(format!(
+                    "metadata DB {} has incompatible schema: {}",
+                    self.db_path.display(),
+                    e
+                ))
+            })?;
+            let columns = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| PkgError::MetaDbError(e.to_string()))?
+                .collect::<Result<HashSet<_>, _>>()
+                .map_err(|e| PkgError::MetaDbError(e.to_string()))?;
+
+            if columns.is_empty()
+                || required_columns
+                    .iter()
+                    .any(|column| !columns.contains(*column))
+            {
+                return Err(PkgError::MetaDbError(format!(
+                    "metadata DB {} has incompatible schema for table {}",
+                    self.db_path.display(),
+                    table
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn open_connection(&self) -> PkgResult<Connection> {
+        let flags = match self.access {
+            MetaIndexDbAccess::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+            MetaIndexDbAccess::ReadWrite => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+            }
+        } | OpenFlags::SQLITE_OPEN_FULL_MUTEX;
+
+        Connection::open_with_flags(&self.db_path, flags).map_err(|e| {
+            PkgError::MetaDbError(format!(
+                "failed to open metadata DB {}: {}",
+                self.db_path.display(),
+                e
+            ))
+        })
+    }
+
+    fn open_write_connection(&self) -> PkgResult<Connection> {
+        if self.access != MetaIndexDbAccess::ReadWrite {
+            return Err(PkgError::AccessDeniedError(format!(
+                "metadata DB is read-only: {}",
+                self.db_path.display()
+            )));
+        }
+        self.open_connection()
     }
 
     pub fn cacl_pkg_deps_metas(
@@ -218,7 +344,7 @@ impl MetaIndexDb {
         package_id: &PackageId,
         metaobjid: &str,
     ) -> PkgResult<Option<(String, PackageMeta)>> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_connection()?;
         for candidate in Self::metaobjid_candidates(metaobjid) {
             let pkg_meta_str = conn
                 .query_row(
@@ -328,7 +454,7 @@ impl MetaIndexDb {
         version: &Version,
         tag: Option<String>,
     ) -> PkgResult<Option<(String, PackageMeta)>> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_connection()?;
         // 构建查询条件
         let mut query = String::from(
             "SELECT pv.metaobjid, pm.pkg_meta FROM pkg_versions pv 
@@ -394,7 +520,7 @@ impl MetaIndexDb {
         version_req: &VersionReq,
         tag: Option<String>,
     ) -> PkgResult<Option<(String, PackageMeta)>> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_connection()?;
 
         // 尝试获取版本范围
         let version_exp = VersionExp {
@@ -519,7 +645,7 @@ impl MetaIndexDb {
         &self,
         pkg_name: &str,
     ) -> PkgResult<Vec<(String, String, Option<String>)>> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_connection()?;
 
         let mut stmt = conn.prepare(
             "SELECT version, metaobjid, tag FROM pkg_versions WHERE pkg_name = ? ORDER BY update_time DESC"
@@ -595,7 +721,7 @@ impl MetaIndexDb {
         &self,
         author_name: &str,
     ) -> PkgResult<Option<(String, Option<String>, Option<String>)>> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_connection()?;
 
         conn.query_row(
             "SELECT author_name, author_owner_config, author_zone_config FROM author_info WHERE author_name = ?",
@@ -612,7 +738,7 @@ impl MetaIndexDb {
         author: &str,
         author_pk: Option<String>,
     ) -> PkgResult<()> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_write_connection()?;
 
         let current_time = chrono::Utc::now().timestamp();
         let author_pk = author_pk.unwrap_or_else(|| "".to_string());
@@ -629,7 +755,7 @@ impl MetaIndexDb {
         &self,
         pkg_meta_map: &HashMap<String, PackageMetaNode>,
     ) -> PkgResult<()> {
-        let mut conn: Connection = Self::create_connection(&self.db_path)?;
+        let mut conn: Connection = self.open_write_connection()?;
         // 开始事务
         let tx = conn
             .transaction()
@@ -688,7 +814,7 @@ impl MetaIndexDb {
         metaobjid: &str,
         tag: Option<&str>,
     ) -> PkgResult<()> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_write_connection()?;
         let version_exp = VersionExp::from_str(version)?;
         if !version_exp.is_version() {
             error!(
@@ -739,7 +865,7 @@ impl MetaIndexDb {
         author_owner_config: Option<&str>,
         author_zone_config: Option<&str>,
     ) -> PkgResult<()> {
-        let conn = Self::create_connection(&self.db_path)?;
+        let conn = self.open_write_connection()?;
         // 检查作者信息是否已存在
         let exists = conn
             .query_row(
@@ -775,9 +901,9 @@ impl MetaIndexDb {
 
     //将另一个meta_index_db中的全部记录插入当前db
     pub async fn merge_meta_index_db(&self, other_db_path: &PathBuf) -> PkgResult<()> {
-        let other_db = MetaIndexDb::new(other_db_path.clone(), true)?;
-        let mut conn = Self::create_connection(&self.db_path)?;
-        let mut other_conn = Self::create_connection(&PathBuf::from(other_db_path))?;
+        let other_db = MetaIndexDb::open_existing_readonly(other_db_path)?;
+        let mut conn = self.open_write_connection()?;
+        let mut other_conn = other_db.open_connection()?;
 
         // 开始事务
         let tx = conn
@@ -877,11 +1003,36 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn test_open_existing_readonly_does_not_create_missing_db() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("missing.db");
+
+        assert!(matches!(
+            MetaIndexDb::open_existing_readonly(&db_path).unwrap_err(),
+            PkgError::MetaDbError(_)
+        ));
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn test_open_existing_readonly_rejects_writes() {
+        let temp_dir = tempdir().unwrap();
+        let db_path = temp_dir.path().join("readonly.db");
+        MetaIndexDb::create_or_open(&db_path).unwrap();
+        let readonly = MetaIndexDb::open_existing_readonly(&db_path).unwrap();
+
+        assert!(matches!(
+            readonly.add_pkg_meta("id", "{}", "author", None),
+            Err(PkgError::AccessDeniedError(_))
+        ));
+    }
+
+    #[test]
     fn test_meta_db() -> PkgResult<()> {
         let temp_dir = tempdir().unwrap();
         let db_path = temp_dir.path().join("test_meta.db");
 
-        let meta_db = MetaIndexDb::new(db_path, false)?;
+        let meta_db = MetaIndexDb::create_or_open(db_path)?;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
         let mut test_pkg_meta =
             PackageMeta::new("test-pkg", "1.0.1", "author1", &owner, Some("stable"));
@@ -944,7 +1095,7 @@ mod tests {
         let db_path = temp_dir.path().join("test_versions.db");
         info!("db_path:{}", db_path.to_string_lossy());
 
-        let meta_db = MetaIndexDb::new(db_path, false)?;
+        let meta_db = MetaIndexDb::create_or_open(db_path)?;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
         let mut test_pkg_meta1 =
             PackageMeta::new("test-pkg", "1.0.0", "author1", &owner, Some("stable"));

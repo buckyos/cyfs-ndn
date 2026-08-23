@@ -38,6 +38,8 @@ pub enum PkgError {
     JsonError(#[from] serde_json::Error),
     #[error("Sql Error: {0}")]
     SqlError(String),
+    #[error("Metadata DB error: {0}")]
+    MetaDbError(String),
     #[error("Access denied: {0}")]
     AccessDeniedError(String),
     #[error("Lock Error: {0}")]
