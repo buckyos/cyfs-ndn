@@ -255,7 +255,7 @@ impl MetaIndexDb {
         deps: &mut HashMap<String, PackageMeta>,
     ) -> PkgResult<()> {
         let mut visiting = HashSet::new();
-        visiting.insert(pkg_meta.get_package_id().to_string());
+        visiting.insert(pkg_meta.try_get_package_id()?.to_string());
         self.cacl_pkg_deps_metas_impl(pkg_meta, deps, &mut visiting)
     }
 
@@ -270,7 +270,7 @@ impl MetaIndexDb {
             let pkg_result = self.get_pkg_meta(&dep_id)?;
             if pkg_result.is_some() {
                 let (meta_obj_id, dep_meta) = pkg_result.unwrap();
-                let dep_pkg_id = dep_meta.get_package_id().to_string();
+                let dep_pkg_id = dep_meta.try_get_package_id()?.to_string();
                 if visiting.contains(&dep_pkg_id) {
                     return Err(PkgError::LoadError(
                         dep_pkg_id,
@@ -422,7 +422,7 @@ impl MetaIndexDb {
         let pkg_meta = self.get_pkg_meta(&latest_version)?;
         if pkg_meta.is_some() {
             let (_, pkg_meta) = pkg_meta.unwrap();
-            let latest_pkg_id = pkg_meta.get_package_id();
+            let latest_pkg_id = pkg_meta.try_get_package_id()?;
             debug!(
                 "pkg_id {} latest_pkg_id {}",
                 pkg_id.to_string(),
@@ -435,7 +435,7 @@ impl MetaIndexDb {
             let pkg_meta = self.get_pkg_meta(&latest_version)?;
             if pkg_meta.is_some() {
                 let (_, pkg_meta) = pkg_meta.unwrap();
-                let latest_pkg_id = pkg_meta.get_package_id();
+                let latest_pkg_id = pkg_meta.try_get_package_id()?;
                 debug!(
                     "pkg_name {} 's latest_pkg_id {}",
                     pkg_name,
@@ -1087,6 +1087,8 @@ mod tests {
 
     #[test]
     fn test_version_db_operations() -> PkgResult<()> {
+        const META2_ID: &str =
+            "pkg:0202020202020202020202020202020202020202020202020202020202020202";
         unsafe {
             std::env::set_var("BUCKY_LOG", "debug");
         }
@@ -1112,7 +1114,7 @@ mod tests {
         let mut test_pkg_meta2 = PackageMeta::new("test-pkg", "1.1.0", "author1", &owner, None);
         let test_pkg_meta_str2 = serde_json::to_string(&test_pkg_meta2).unwrap();
         meta_db.add_pkg_meta(
-            "meta2",
+            META2_ID,
             &test_pkg_meta_str2,
             "author1",
             Some("pk1".to_string()),
@@ -1166,7 +1168,7 @@ mod tests {
 
         // 设置包版本
         meta_db.set_pkg_version("test-pkg", "author1", "1.0.0", "meta1", Some("stable"))?;
-        meta_db.set_pkg_version("test-pkg", "author1", "1.1.0", "meta2", Some("stable"))?;
+        meta_db.set_pkg_version("test-pkg", "author1", "1.1.0", META2_ID, Some("stable"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "1.2.0", "meta3", Some("beta"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "2.0.0", "meta4", Some("alpha"))?;
         meta_db.set_pkg_version("test-pkg", "author1", "0.9.0", "meta5", Some("old"))?;
@@ -1194,7 +1196,7 @@ mod tests {
         let v1 = meta_db.get_pkg_meta("test-pkg#1.1.0:stable")?;
         assert!(v1.is_some());
         let (metaobjid, pkg_meta) = v1.unwrap();
-        assert_eq!(metaobjid, "meta2");
+        assert_eq!(metaobjid, META2_ID);
         //assert_eq!(pkg_meta, r#"{"name":"test-pkg","version":"1.1.0"}"#);
 
         // 测试获取版本范围
@@ -1214,20 +1216,16 @@ mod tests {
         let (metaobjid, pkg_meta) = beta_version.unwrap();
         assert_eq!(metaobjid, "meta3");
 
-        let exact_by_objid = meta_db.get_pkg_meta("test-pkg#meta2")?;
+        let exact_by_objid = meta_db.get_pkg_meta(&format!("test-pkg#{}", META2_ID))?;
         assert!(exact_by_objid.is_some());
         let (metaobjid, pkg_meta) = exact_by_objid.unwrap();
-        assert_eq!(metaobjid, "meta2");
+        assert_eq!(metaobjid, META2_ID);
         assert_eq!(pkg_meta.version, "1.1.0");
 
-        let exact_by_version_and_objid = meta_db.get_pkg_meta("test-pkg#1.1.0#meta2")?;
-        assert!(exact_by_version_and_objid.is_some());
-        let (metaobjid, pkg_meta) = exact_by_version_and_objid.unwrap();
-        assert_eq!(metaobjid, "meta2");
-        assert_eq!(pkg_meta.version, "1.1.0");
-
-        let mismatch = meta_db.get_pkg_meta("test-pkg#2.0.0#meta2")?;
-        assert!(mismatch.is_none());
+        assert!(matches!(
+            meta_db.get_pkg_meta(&format!("test-pkg#1.1.0#{}", META2_ID)),
+            Err(PkgError::ParseError(_, _))
+        ));
 
         Ok(())
     }

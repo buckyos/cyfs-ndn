@@ -1,8 +1,8 @@
-# PackageId 命名与解析规则（草案）
+# PackageId 命名与解析规则
 
-状态：Draft，待 Review，尚未完全实现。
+状态：Implemented。
 
-本文定义 `package-lib` 对 `PackageId`、平台前缀和 `unique_name` 的统一语义。除“当前实现差异”一节外，文中的“必须”“不得”和“应该”描述的是目标规则，不代表当前代码已经满足。
+本文定义 `package-lib` 对 `PackageId`、平台前缀和 `unique_name` 的统一语义。文中的“必须”“不得”和“应该”均为解析器、索引、安装器和加载器共同遵循的规范。
 
 ## 1. 设计目标
 
@@ -14,13 +14,12 @@
 
 ## 2. 基本结构
 
-一个完整的 `PackageId` 由包名以及可选的版本选择器、对象 ID 组成：
+一个完整的 `PackageId` 由包名以及可选的选择条件组成。选择条件只能是版本选择器或精确对象 ID 之一，二者互斥：
 
 ```text
 PackageId = PackageName
           | PackageName "#" VersionSelector
           | PackageName "#" ObjectId
-          | PackageName "#" VersionSelector "#" ObjectId
 ```
 
 其中：
@@ -39,7 +38,6 @@ filebrowser.buckyos.ai#1.2.3
 nightly-windows-amd64.filebrowser.buckyos.ai#1.2.3
 filebrowser.buckyos.ai#:latest
 filebrowser.buckyos.ai#pkg:<hex-hash>
-filebrowser.buckyos.ai#1.2.3#pkg:<hex-hash>
 ```
 
 `#` 是 `PackageId` 各部分的分隔符，不属于 `PackageName`。
@@ -157,7 +155,29 @@ x86_64  -> amd64
 
 ### 4.1 语义
 
-`UniqueName` 是跨平台稳定的逻辑包名。平台构建变体必须共享同一个 `UniqueName`：
+`UniqueName` 是跨平台稳定的逻辑包名，也就是不带 `PackagePrefix` 的 `PackageName`：
+
+```text
+PackageName = UniqueName
+            | PackagePrefix "." UniqueName
+```
+
+因此：
+
+- 无 prefix 时，`PackageName` 与 `UniqueName` 是同一个字符串。
+- 有 prefix 时，`UniqueName` 是去掉已校验 prefix 后的剩余部分。
+- 合法的 `UniqueName` 再按 `PackageName` 解析，结果一定没有 prefix。
+- `UniqueName` 的第一个 label 不得具有三段 `-` 分隔外形 `{x}-{y}-{z}`。该外形属于 prefix 保留空间，无论后面是否还有 `.`、无论三段是否已注册。
+
+```text
+my-cool-app              # 非法：第一段是三段外形
+my-cool-app.module       # 非法：第一段是三段外形
+nightly-linux-amd64      # 非法：第一段是三段外形，且缺少 UniqueName
+nightly-freebsd-amd64.x  # 非法：第一段是三段外形，OS 未注册也不能当 UniqueName
+```
+
+平台构建变体必须共享同一个 `UniqueName`：
+
 
 ```text
 nightly-linux-amd64.filebrowser.buckyos.ai
@@ -337,11 +357,10 @@ filebrowser#1.2.3:A    # tag 含大写字母
 
 ## 6. 精确 ObjectId
 
-精确对象 ID 可以代替版本选择器，或者放在第二个 `#` 后用于同时校验版本和对象：
+精确对象 ID 与版本选择器互斥：有 `ObjectId` 时不再携带版本选择器，有版本选择器时不再携带 `ObjectId`。
 
 ```text
 PackageName#ObjectId
-PackageName#VersionSelector#ObjectId
 ```
 
 规范形式必须是可被 `ObjId::new()` 解析、且对象类型为 `pkg` 的类型化 ID：
@@ -354,7 +373,6 @@ pkg:<lowercase-hex-hash>
 
 ```text
 filebrowser#pkg:bcc479e2547e3ce5c6805ec12cffdb460e2f5856dda3ec600e27f0de570e248a
-filebrowser#1.2.3#pkg:bcc479e2547e3ce5c6805ec12cffdb460e2f5856dda3ec600e27f0de570e248a
 ```
 
 要求如下：
@@ -366,11 +384,12 @@ filebrowser#1.2.3#pkg:bcc479e2547e3ce5c6805ec12cffdb460e2f5856dda3ec600e27f0de57
 - 不再将“任意 ASCII 字母数字串”直接当作精确对象 ID，因为它会与版本表达式产生歧义。
 - 紧凑 Base32 ObjId 如需兼容，可以在输入边界解析，但必须立即规范化，不能作为 `PackageId::to_string()` 的输出。
 
-`PackageId` 最多允许两个 `#`。下面的形式非法：
+`PackageId` 最多允许一个 `#`。版本选择器和对象 ID 不能同时出现。下面的形式非法：
 
 ```text
 filebrowser##pkg:abcd
-filebrowser#1.2.3#pkg:abcd#extra
+filebrowser#1.2.3#pkg:abcd
+filebrowser#>=1.2.0#pkg:abcd
 ```
 
 ## 7. 规范化和比较
@@ -417,7 +436,7 @@ load("filebrowser.buckyos.ai#1.2.3")
 
 只有第一个候选明确返回“未找到包或未找到匹配版本”时，才能尝试通用包。元数据损坏、签名失败、对象哈希不匹配、权限错误或 I/O 错误不得触发静默回退，以免掩盖安全和数据一致性问题。
 
-严格模式和开发模式可以使用不同存储目录，但必须共享上述名称解析与候选顺序，不能让相同 `PackageId` 在两种模式中具有不同的命名语义。
+MetaDb 模式和目录模式可以使用不同存储目录，但必须共享上述名称解析与候选顺序，不能让相同 `PackageId` 在两种模式中具有不同的命名语义。
 
 ## 9. 安装目录与友好名称
 
@@ -450,21 +469,20 @@ name.starts_with(current_prefix)
 {work_dir}/pkgs/{canonical_package_name}/{object_id_filename}
 ```
 
-## 10. 当前实现差异
+## 10. 实现状态与兼容边界
 
-当前代码尚未实施本规范，主要差异如下：
+`package-lib` 已实施以下规则：
 
-| 项目 | 当前行为 | 本草案目标行为 |
-| --- | --- | --- |
-| Prefix 判断 | `name` 包含任意 `.` 即认为已有 prefix | 严格解析 `{channel}-{os}-{arch}` |
-| `unique_name` | 无条件删除第一个 `.` 之前的部分 | 只删除验证通过的 prefix |
-| 友好目录 | 部分代码使用最后一个 `.` 后的 label | 使用完整 `unique_name` |
-| 无 prefix 加载 | 严格查询会加 prefix；裸名称主要作为开发目录回退 | 平台候选未找到后查询通用包元数据与内容 |
-| 包名字符 | 基本没有校验，空名称和危险路径字符可能进入后续逻辑 | 使用本文 ASCII、长度及路径安全规则 |
-| 精确 ObjectId | 任意 ASCII 字母数字串可能被识别为 ObjId | 要求合法、类型化的 `pkg:<hash>` |
-| 默认 prefix | `nightly` 硬编码，OS/arch 在构建脚本中映射 | 使用相同结构，但统一经过 prefix 类型校验 |
+- `PackagePrefix` 和 `PackageName` 负责严格解析、注册值校验及规范序列化。
+- `PackageId::parse()` 校验完整输入，并保证版本选择器和精确 ObjectId 互斥。
+- `PackageId::load_candidates()` 统一生成平台变体和通用包候选。
+- MetaDb 与目录加载共用同一候选顺序；只有“未找到”允许继续查询通用候选或 parent env，损坏数据及其他错误不会触发静默回退。
+- 安装目录使用已校验的规范 `PackageName`，友好路径使用完整 `unique_name`。
+- 默认构建 prefix 对 OS/arch 执行注册表映射；环境配置中的自定义 prefix 也必须通过同一解析器。
 
-因此，在基础库完成改造前，调用者不能假定本文所有规则已经生效。
+为减少现有调用者的源码迁移成本，`PackageId` 暂时保留公开的 `name: String`、`version_exp: Option<VersionExp>` 和 `objid: Option<String>` 字段。外部输入必须通过 `PackageId::parse()` 构造；直接写字段无法获得本规范的合法性与互斥性保证。
+
+底层 metadata DB 查找和对象目录仍可识别历史 Base32 ObjId，以读取旧数据；该兼容只存在于存储边界，`PackageId::parse()` 和 `PackageId::to_string()` 不接受或输出这种形式。
 
 ## 11. 兼容性与迁移
 
@@ -474,8 +492,9 @@ name.starts_with(current_prefix)
 2. 找出“包含 `.` 但第一个 label 不是合法 prefix”的名称；新规则会将它们识别为无 prefix 的 `UniqueName`。
 3. 找出包含大写字母、Unicode、路径字符、空 label 或 Windows 保留名称的包。
 4. 找出依赖裸字母数字 ObjId 的 `PackageId`，转换为类型化 `pkg:<hash>`。
-5. 迁移期间如需 legacy fallback，必须记录明确的弃用日志；不得让 legacy 结果覆盖新规则的精确匹配结果。
-6. 发布方、索引服务和加载端必须在同一兼容窗口内升级，避免同一个字符串在不同节点上产生不同解释。
+5. 找出 `name#Version#ObjectId`，根据调用意图改为版本选择或精确 ObjectId 选择之一。
+6. 迁移期间如需 legacy fallback，必须记录明确的弃用日志；不得让 legacy 结果覆盖新规则的精确匹配结果。
+7. 发布方、索引服务和加载端必须在同一兼容窗口内升级，避免同一个字符串在不同节点上产生不同解释。
 
 ## 12. 必需测试用例
 
@@ -502,7 +521,7 @@ name.starts_with(current_prefix)
 | `filebrowser#` | 非法；空选择器 |
 | `filebrowser#abc123` | 非法；不再把任意字母数字串当作 ObjId |
 | `filebrowser#pkg:<valid-hash>` | 合法；精确包对象 |
-| `filebrowser#1.2.3#pkg:<valid-hash>` | 合法；同时约束版本和对象 |
+| `filebrowser#1.2.3#pkg:<valid-hash>` | 非法；版本选择器与 ObjectId 互斥 |
 
 加载测试还必须验证：
 
@@ -510,12 +529,12 @@ name.starts_with(current_prefix)
 - 无 prefix 的请求先查询当前平台名称，再查询通用名称。
 - `filebrowser.buckyos.ai` 不会被误认为 prefix 为 `filebrowser`。
 - 平台候选发生校验错误时不会静默回退到通用包。
-- 严格模式和开发模式得到相同的候选包名顺序。
+- MetaDb 模式和目录模式得到相同的候选包名顺序。
 - 安装后的友好路径保留完整 `unique_name`。
 
-## 13. 建议的基础类型
+## 13. 基础类型与统一接口
 
-实现时建议让解析结果成为唯一事实来源，而不是在各调用点重复处理字符串：
+命名结构由以下基础类型表示：
 
 ```rust
 struct PackagePrefix {
@@ -530,13 +549,14 @@ struct PackageName {
 }
 
 struct PackageId {
-    name: PackageName,
+    // 为源码兼容暂时保留字符串字段；parse() 使用 PackageName 校验它。
+    name: String,
     version_exp: Option<VersionExp>,
-    objid: Option<ObjId>,
+    objid: Option<String>,
 }
 ```
 
-至少应提供以下统一接口：
+统一接口包括：
 
 ```text
 PackagePrefix::parse()
@@ -544,21 +564,23 @@ PackageName::parse()
 PackageName::unique_name()
 PackageName::with_prefix()
 PackageName::without_prefix()
+PackageName::is_with_prefix()
 PackageId::parse()
 PackageId::load_candidates(current_prefix)
 ```
 
 元数据索引、依赖解析、安装和加载只能使用这些接口，不应再次通过 `find('.')`、`split('.')` 或 `starts_with()` 推断命名结构。
 
-## 14. Review 时需要确认的决定
+## 14. 已确认的规范决定
 
-以下规则会影响兼容性，实现前需要明确确认：
+以下兼容性决定已经纳入解析器和测试：
 
-1. 包名是否统一限制为 ASCII 小写，并对非规范输入直接报错，而不是自动转小写。
-2. 是否接受每个 label 最长 63 字符、完整 `PackageName` 最长 255 字节的限制。
-3. 是否将 `x-y-z.name` 形式的首个 label 全部保留给 prefix；这会使 `my-cool-app.module` 非法。
-4. Apple 平台的规范 OS 名称是否继续使用现有的 `apple`，而不是更常见的 `macos`。
-5. 无 prefix 请求是否统一采用“当前平台变体优先、平台无关通用包其次”的查询顺序。
-6. 显式 prefix 请求是否禁止自动回退到通用包。
-7. 精确对象是否只接受类型化 `pkg:<hash>`，并淘汰裸字母数字 ObjId。
-8. `unique_name` 是否允许任意数量的 `.` 分段，并在友好目录和 DID 相关逻辑中完整保留。
+1. 包名统一限制为 ASCII 小写；非规范输入直接报错，不自动转小写。
+2. 每个 label 最长 63 字符，完整 `PackageName` 最长 255 字节。
+3. `x-y-z.name` 形式的首个 label 全部保留给 prefix，因此 `my-cool-app.module` 非法。
+4. Apple 平台的规范 OS 名称使用 `apple`；构建脚本将 Cargo 的 `macos` 目标映射为 `apple`。
+5. 无 prefix 请求采用“当前平台变体优先、平台无关通用包其次”的查询顺序。
+6. 显式 prefix 请求禁止自动回退到通用包。
+7. 精确对象只接受类型化 `pkg:<hash>`，不接受裸字母数字 ObjId。
+8. `unique_name` 允许任意数量的 `.` 分段，并在友好目录和 DID 相关逻辑中完整保留。
+9. 版本选择器与精确 ObjectId 互斥，不支持 `name#Version#ObjectId`。

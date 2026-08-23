@@ -3,10 +3,314 @@ use name_lib::DID;
 use ndn_lib::ObjId;
 use semver::*;
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use version_compare::Cmp;
 
 use log::info;
+
+const MAX_CHANNEL_LEN: usize = 32;
+const MAX_NAME_LABEL_LEN: usize = 63;
+const MAX_PACKAGE_NAME_LEN: usize = 255;
+const MAX_TAG_LEN: usize = 63;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageOs {
+    Linux,
+    Windows,
+    Apple,
+}
+
+impl PackageOs {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linux => "linux",
+            Self::Windows => "windows",
+            Self::Apple => "apple",
+        }
+    }
+}
+
+impl FromStr for PackageOs {
+    type Err = PkgError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "linux" => Ok(Self::Linux),
+            "windows" => Ok(Self::Windows),
+            "apple" => Ok(Self::Apple),
+            _ => Err(PkgError::ParseError(
+                value.to_owned(),
+                "unregistered package OS".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Display for PackageOs {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageArch {
+    Amd64,
+    Aarch64,
+}
+
+impl PackageArch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Aarch64 => "aarch64",
+        }
+    }
+}
+
+impl FromStr for PackageArch {
+    type Err = PkgError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "amd64" => Ok(Self::Amd64),
+            "aarch64" => Ok(Self::Aarch64),
+            _ => Err(PkgError::ParseError(
+                value.to_owned(),
+                "unregistered package architecture".to_owned(),
+            )),
+        }
+    }
+}
+
+impl Display for PackageArch {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePrefix {
+    pub channel: String,
+    pub os: PackageOs,
+    pub arch: PackageArch,
+}
+
+impl PackagePrefix {
+    pub fn new(channel: &str, os: PackageOs, arch: PackageArch) -> PkgResult<Self> {
+        validate_channel(channel)?;
+        Ok(Self {
+            channel: channel.to_owned(),
+            os,
+            arch,
+        })
+    }
+
+    pub fn parse(value: &str) -> PkgResult<Self> {
+        let parts = value.split('-').collect::<Vec<_>>();
+        if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+            return Err(PkgError::ParseError(
+                value.to_owned(),
+                "package prefix must be {channel}-{os}-{arch}".to_owned(),
+            ));
+        }
+
+        Self::new(
+            parts[0],
+            PackageOs::from_str(parts[1])?,
+            PackageArch::from_str(parts[2])?,
+        )
+    }
+}
+
+impl FromStr for PackagePrefix {
+    type Err = PkgError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Display for PackagePrefix {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}-{}-{}", self.channel, self.os, self.arch)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageName {
+    pub prefix: Option<PackagePrefix>,
+    pub unique_name: String,
+}
+
+impl PackageName {
+    pub fn parse(value: &str) -> PkgResult<Self> {
+        if value.is_empty() {
+            return Err(PkgError::ParseError(
+                value.to_owned(),
+                "package name cannot be empty".to_owned(),
+            ));
+        }
+        if !value.is_ascii() || value.len() > MAX_PACKAGE_NAME_LEN {
+            return Err(PkgError::ParseError(
+                value.to_owned(),
+                format!(
+                    "package name must be ASCII and at most {} bytes",
+                    MAX_PACKAGE_NAME_LEN
+                ),
+            ));
+        }
+
+        let (first_label, remainder) = match value.split_once('.') {
+            Some((first, remainder)) => (first, Some(remainder)),
+            None => (value, None),
+        };
+
+        if has_prefix_shape(first_label) {
+            let prefix = PackagePrefix::parse(first_label)?;
+            let unique_name = remainder.ok_or_else(|| {
+                PkgError::ParseError(
+                    value.to_owned(),
+                    "a package prefix must be followed by a unique name".to_owned(),
+                )
+            })?;
+            validate_unique_name(unique_name)?;
+            return Ok(Self {
+                prefix: Some(prefix),
+                unique_name: unique_name.to_owned(),
+            });
+        }
+
+        validate_unique_name(value)?;
+        Ok(Self {
+            prefix: None,
+            unique_name: value.to_owned(),
+        })
+    }
+
+    pub fn unique_name(&self) -> &str {
+        &self.unique_name
+    }
+
+    pub fn with_prefix(&self, prefix: &PackagePrefix) -> PkgResult<Self> {
+        Self::parse(&format!("{}.{}", prefix, self.unique_name))
+    }
+
+    pub fn without_prefix(&self) -> Self {
+        Self {
+            prefix: None,
+            unique_name: self.unique_name.clone(),
+        }
+    }
+
+    pub fn is_with_prefix(&self) -> bool {
+        self.prefix.is_some()
+    }
+}
+
+impl FromStr for PackageName {
+    type Err = PkgError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl Display for PackageName {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(prefix) = &self.prefix {
+            write!(formatter, "{}.{}", prefix, self.unique_name)
+        } else {
+            formatter.write_str(&self.unique_name)
+        }
+    }
+}
+
+fn validate_channel(channel: &str) -> PkgResult<()> {
+    let valid = !channel.is_empty()
+        && channel.len() <= MAX_CHANNEL_LEN
+        && channel.as_bytes()[0].is_ascii_lowercase()
+        && channel
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if valid {
+        Ok(())
+    } else {
+        Err(PkgError::ParseError(
+            channel.to_owned(),
+            "channel must match [a-z][a-z0-9_]{0,31}".to_owned(),
+        ))
+    }
+}
+
+fn has_prefix_shape(label: &str) -> bool {
+    let mut parts = label.split('-');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(first), Some(second), Some(third), None)
+            if !first.is_empty() && !second.is_empty() && !third.is_empty()
+    )
+}
+
+fn validate_unique_name(unique_name: &str) -> PkgResult<()> {
+    if unique_name.is_empty() || !unique_name.is_ascii() {
+        return Err(PkgError::ParseError(
+            unique_name.to_owned(),
+            "unique name must be non-empty ASCII".to_owned(),
+        ));
+    }
+
+    let labels = unique_name.split('.').collect::<Vec<_>>();
+    if labels.iter().any(|label| label.is_empty()) {
+        return Err(PkgError::ParseError(
+            unique_name.to_owned(),
+            "unique name cannot contain empty labels".to_owned(),
+        ));
+    }
+    if has_prefix_shape(labels[0]) {
+        return Err(PkgError::ParseError(
+            unique_name.to_owned(),
+            "the first unique-name label is reserved for package prefixes".to_owned(),
+        ));
+    }
+
+    for label in labels {
+        validate_name_label(label)?;
+    }
+    Ok(())
+}
+
+fn validate_name_label(label: &str) -> PkgResult<()> {
+    let bytes = label.as_bytes();
+    let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= MAX_NAME_LABEL_LEN
+        && is_alphanumeric(bytes[0])
+        && is_alphanumeric(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-' || *byte == b'_'
+        });
+    if !valid {
+        return Err(PkgError::ParseError(
+            label.to_owned(),
+            "name label must match [a-z0-9](?:[a-z0-9_-]*[a-z0-9])? and be at most 63 bytes"
+                .to_owned(),
+        ));
+    }
+
+    let is_windows_reserved = matches!(label, "con" | "prn" | "aux" | "nul")
+        || (label.len() == 4
+            && matches!(&label[..3], "com" | "lpt")
+            && matches!(label.as_bytes()[3], b'1'..=b'9'));
+    if is_windows_reserved {
+        return Err(PkgError::ParseError(
+            label.to_owned(),
+            "name label is a Windows reserved device name".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VersionExpType {
@@ -69,7 +373,17 @@ impl FromStr for VersionExp {
     type Err = PkgError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.split(":").collect::<Vec<&str>>();
+        if !s.is_ascii()
+            || s.bytes()
+                .any(|byte| byte.is_ascii_whitespace() && byte != b' ')
+        {
+            return Err(PkgError::ParseError(
+                s.to_owned(),
+                "version expression only permits ASCII spaces".to_owned(),
+            ));
+        }
+
+        let parts = s.split(':').collect::<Vec<&str>>();
         match parts.len() {
             1 => {
                 let version_exp = VersionExpType::from_str(parts[0])?;
@@ -79,6 +393,7 @@ impl FromStr for VersionExp {
                 });
             }
             2 => {
+                validate_tag(parts[1])?;
                 let tag = parts[1].to_string();
                 let version_exp = VersionExpType::from_str(parts[0])?;
                 return Ok(VersionExp {
@@ -93,6 +408,28 @@ impl FromStr for VersionExp {
                 ));
             }
         }
+    }
+}
+
+fn validate_tag(tag: &str) -> PkgResult<()> {
+    let bytes = tag.as_bytes();
+    let is_alphanumeric = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= MAX_TAG_LEN
+        && is_alphanumeric(bytes[0])
+        && is_alphanumeric(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(*byte, b'.' | b'_' | b'-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(PkgError::ParseError(
+            tag.to_owned(),
+            "tag must be 1-63 lowercase ASCII name characters".to_owned(),
+        ))
     }
 }
 
@@ -278,15 +615,11 @@ impl VersionExp {
     }
 }
 
-/*
-pkg_id由两部分组成，包名和版本号或者sha256值。例如：
-pkg_name : pkg_name在整个Index中是唯一的，一般默认用pkg_author.module_name 来表示。只用Pkg_name使用的是默认版本
-pkd_name#0.1.5 : 指定版本
-pkg_name#:latest : 指定latest版本
-pkg_name#>0.1.4,<=0.1.6:stable : 指定范围版本里的,有stable tag的版本
-pkg_name#$objid : 指定一个精确版本
-pkg_name#0.1.5#$objid : 语义更强的指定一个精确版本，在加载的时候会对版本号进行验证
- */
+/// A canonical package name plus either a version expression or an exact package ObjId.
+///
+/// The public string fields are retained for API compatibility. `parse` is the only supported
+/// constructor for external input and guarantees that `version_exp` and `objid` are mutually
+/// exclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageId {
     pub name: String,
@@ -318,30 +651,37 @@ impl ToString for PackageId {
 }
 
 impl PackageId {
-    //todo
     pub fn get_author_from_unique_name(unique_name: &str) -> Option<String> {
-        if let Some(pos) = unique_name.find('-') {
-            let author = &unique_name[0..pos];
-            return Some(author.to_string());
-        } else {
+        let package_name = PackageName::parse(unique_name).ok()?;
+        if package_name.is_with_prefix() {
             return None;
         }
+        let parts = unique_name.split('_').collect::<Vec<_>>();
+        (parts.len() == 2).then(|| parts[0].to_owned())
     }
 
-    pub fn unique_name_to_did(unique_name: &str) -> DID {
-        let parts = unique_name.split('_').collect::<Vec<&str>>();
-        if parts.len() == 2 {
-            //did:bns:module_name.author
-            let did_str = format!("did:bns:{}.{}", parts[1], parts[0]);
-            return DID::from_str(&did_str).unwrap();
-        } else {
-            let did_str = format!("did:bns:{}", unique_name);
-            return DID::from_str(&did_str).unwrap();
+    pub fn unique_name_to_did(unique_name: &str) -> PkgResult<DID> {
+        let package_name = PackageName::parse(unique_name)?;
+        if package_name.is_with_prefix() {
+            return Err(PkgError::ParseError(
+                unique_name.to_owned(),
+                "DID conversion requires a unique name without a package prefix".to_owned(),
+            ));
         }
+
+        let parts = unique_name.split('_').collect::<Vec<&str>>();
+        let did_str = if parts.len() == 2 {
+            //did:bns:module_name.author
+            format!("did:bns:{}.{}", parts[1], parts[0])
+        } else {
+            format!("did:bns:{}", unique_name)
+        };
+        DID::from_str(&did_str)
+            .map_err(|error| PkgError::ParseError(unique_name.to_owned(), error.to_string()))
     }
 
-    pub fn to_did(&self) -> DID {
-        let unique_name = self.get_unique_name();
+    pub fn to_did(&self) -> PkgResult<DID> {
+        let unique_name = self.get_unique_name()?;
         Self::unique_name_to_did(&unique_name)
     }
 
@@ -356,17 +696,9 @@ impl PackageId {
         if parts.len() == 2 {
             let author = parts[1];
             let module_name = parts[0];
-            return Ok(PackageId {
-                name: format!("{}_{}", author, module_name),
-                version_exp: None,
-                objid: None,
-            });
+            return PackageId::parse(&format!("{}_{}", author, module_name));
         } else {
-            return Ok(PackageId {
-                name: did.id.to_string(),
-                version_exp: None,
-                objid: None,
-            });
+            return PackageId::parse(&did.id);
         }
     }
 
@@ -376,108 +708,120 @@ impl PackageId {
             return pkg_id.to_string();
         }
         let the_pkg_id = the_pkg_id.unwrap();
-        the_pkg_id.get_unique_name()
+        the_pkg_id
+            .get_unique_name()
+            .unwrap_or_else(|_| pkg_id.to_owned())
     }
 
     pub fn get_pkgid_with_objid(pkg_id: &str, pkg_obj_id: Option<ObjId>) -> PkgResult<String> {
-        let the_pkg_id = PackageId::parse(pkg_id);
+        let mut the_pkg_id = PackageId::parse(pkg_id)?;
         let Some(pkg_obj_id) = pkg_obj_id else {
-            if let Ok(mut the_pkg_id) = the_pkg_id {
-                the_pkg_id.version_exp = None;
-                return Ok(the_pkg_id.to_string());
-            }
-            return Ok(pkg_id.to_string());
-        };
-        let normalized_objid = pkg_obj_id.to_string();
-
-        if let Ok(mut the_pkg_id) = the_pkg_id {
-            if let Some(existing_objid) = the_pkg_id.objid.as_deref() {
-                let same_objid = ObjId::new(existing_objid)
-                    .map(|existing| existing == pkg_obj_id)
-                    .unwrap_or_else(|_| existing_objid == normalized_objid);
-                if !same_objid {
-                    return Err(PkgError::ParseError(
-                        pkg_id.to_string(),
-                        format!(
-                            "pkg obj id mismatch: existing {} != provided {}",
-                            existing_objid, normalized_objid
-                        ),
-                    ));
-                }
-                the_pkg_id.version_exp = None;
-                the_pkg_id.objid = Some(normalized_objid);
-                return Ok(the_pkg_id.to_string());
-            }
             the_pkg_id.version_exp = None;
-            the_pkg_id.objid = Some(normalized_objid);
             return Ok(the_pkg_id.to_string());
-        }
+        };
+        let normalized_objid = normalize_package_objid(&pkg_obj_id.to_string())?;
 
-        if pkg_id.is_empty() {
-            return Ok(format!("#{}", normalized_objid));
-        }
-
-        Ok(format!("{}#{}", pkg_id, normalized_objid))
-    }
-
-    pub fn get_unique_name(&self) -> String {
-        //after . and before #
-        let mut result = self.name.clone();
-        if let Some(pos) = result.find('.') {
-            result = result[pos + 1..].to_string();
-        }
-        result
-    }
-
-    pub fn parse(pkg_id: &str) -> PkgResult<PackageId> {
-        let parts = pkg_id.split('#').collect::<Vec<&str>>();
-        match parts.len() {
-            1 => {
-                return Ok(PackageId {
-                    name: parts[0].to_string(),
-                    version_exp: None,
-                    objid: None,
-                });
-            }
-            2 => {
-                let name = parts[0].to_string();
-                let version_part = parts[1].to_string();
-                let is_raw_exact_id = !version_part.is_empty()
-                    && version_part.chars().all(|c| c.is_ascii_alphanumeric());
-                if ObjId::new(&version_part).is_ok() || is_raw_exact_id {
-                    return Ok(PackageId {
-                        name: name,
-                        version_exp: None,
-                        objid: Some(version_part),
-                    });
-                }
-
-                let version_exp = VersionExp::from_str(&version_part)?;
-                return Ok(PackageId {
-                    name: name,
-                    version_exp: Some(version_exp),
-                    objid: None,
-                });
-            }
-            3 => {
-                let name = parts[0].to_string();
-                let version_part = parts[1].to_string();
-                let objid_part = parts[2].to_string();
-                let version_exp = VersionExp::from_str(&version_part)?;
-                return Ok(PackageId {
-                    name: name,
-                    version_exp: Some(version_exp),
-                    objid: Some(objid_part),
-                });
-            }
-            _ => {
+        if let Some(existing_objid) = the_pkg_id.objid.as_deref() {
+            if existing_objid != normalized_objid {
                 return Err(PkgError::ParseError(
                     pkg_id.to_string(),
-                    "Invalid package id".to_string(),
+                    format!(
+                        "pkg obj id mismatch: existing {} != provided {}",
+                        existing_objid, normalized_objid
+                    ),
                 ));
             }
         }
+        the_pkg_id.version_exp = None;
+        the_pkg_id.objid = Some(normalized_objid);
+        Ok(the_pkg_id.to_string())
     }
+
+    pub fn get_unique_name(&self) -> PkgResult<String> {
+        Ok(PackageName::parse(&self.name)?.unique_name)
+    }
+
+    pub fn package_name(&self) -> PkgResult<PackageName> {
+        PackageName::parse(&self.name)
+    }
+
+    pub fn is_with_prefix(&self) -> PkgResult<bool> {
+        Ok(self.package_name()?.is_with_prefix())
+    }
+
+    pub fn load_candidates(&self, current_prefix: &PackagePrefix) -> PkgResult<Vec<Self>> {
+        let package_name = self.package_name()?;
+        if package_name.is_with_prefix() {
+            return Ok(vec![self.clone()]);
+        }
+
+        let mut prefixed = self.clone();
+        prefixed.name = package_name.with_prefix(current_prefix)?.to_string();
+        Ok(vec![prefixed, self.clone()])
+    }
+
+    pub fn parse(pkg_id: &str) -> PkgResult<PackageId> {
+        if pkg_id.matches('#').count() > 1 {
+            return Err(PkgError::ParseError(
+                pkg_id.to_owned(),
+                "package id permits at most one selector".to_owned(),
+            ));
+        }
+
+        let (name, selector) = match pkg_id.split_once('#') {
+            Some((name, selector)) => (name, Some(selector)),
+            None => (pkg_id, None),
+        };
+        let package_name = PackageName::parse(name)?;
+
+        let Some(selector) = selector else {
+            return Ok(PackageId {
+                name: package_name.to_string(),
+                version_exp: None,
+                objid: None,
+            });
+        };
+        if selector.is_empty() {
+            return Err(PkgError::ParseError(
+                pkg_id.to_owned(),
+                "package selector cannot be empty".to_owned(),
+            ));
+        }
+
+        if selector.starts_with("pkg:") {
+            return Ok(PackageId {
+                name: package_name.to_string(),
+                version_exp: None,
+                objid: Some(normalize_package_objid(selector)?),
+            });
+        }
+
+        let version_exp = VersionExp::from_str(selector)?;
+        Ok(PackageId {
+            name: package_name.to_string(),
+            version_exp: Some(version_exp),
+            objid: None,
+        })
+    }
+}
+
+fn normalize_package_objid(value: &str) -> PkgResult<String> {
+    let objid = ObjId::new(value)
+        .map_err(|error| PkgError::ParseError(value.to_owned(), error.to_string()))?;
+    let normalized = objid.to_string();
+    if objid.obj_type != "pkg"
+        || objid.obj_hash.is_empty()
+        || normalized != value
+        || !value[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(PkgError::ParseError(
+            value.to_owned(),
+            "exact package ObjId must use canonical pkg:<lowercase-hex-hash> form".to_owned(),
+        ));
+    }
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -504,9 +848,13 @@ mod tests {
         let pkg_id = "buckyos-dev_filebrowser";
         let result = PackageId::parse(pkg_id).unwrap();
         assert_eq!(&result.name, "buckyos-dev_filebrowser");
+        assert_eq!(
+            PackageId::get_author_from_unique_name(&result.name).as_deref(),
+            Some("buckyos-dev")
+        );
         let pkg_id2 = result.to_string();
         assert_eq!(pkg_id, pkg_id2);
-        let did = result.to_did();
+        let did = result.to_did().unwrap();
         assert_eq!(did.method, "bns");
         assert_eq!(did.id, "filebrowser.buckyos-dev");
 
@@ -532,11 +880,11 @@ mod tests {
             "0.4.0".to_string()
         );
         assert_eq!(result.version_exp.as_ref().unwrap().tag, None);
-        let app_name = result.get_unique_name();
+        let app_name = result.get_unique_name().unwrap();
         assert_eq!(app_name, "buckyos_filebrowser".to_string());
 
-        let did1 = result.to_did();
-        let did = PackageId::unique_name_to_did("buckyos_filebrowser");
+        let did1 = result.to_did().unwrap();
+        let did = PackageId::unique_name_to_did("buckyos_filebrowser").unwrap();
         let host_name = did.to_host_name();
         assert_eq!(host_name, "filebrowser.buckyos.bns.did");
         assert_eq!(did1, did);
@@ -546,6 +894,11 @@ mod tests {
         assert_eq!(pkg_id.name, "buckyos_filebrowser");
         assert_eq!(pkg_id.version_exp, None);
         assert_eq!(pkg_id.objid, None);
+
+        let dotted = PackageId::parse("filebrowser.buckyos.ai").unwrap();
+        let dotted_did = dotted.to_did().unwrap();
+        assert_eq!(dotted_did.to_string(), "did:bns:filebrowser.buckyos.ai");
+        assert_eq!(PackageId::from_did(&dotted_did).unwrap(), dotted);
 
         let pkg_id = format!("a#{}", VALID_OBJID_1);
         let result = PackageId::parse(&pkg_id).unwrap();
@@ -610,11 +963,11 @@ mod tests {
                 .unwrap(),
             format!("a#{}", VALID_OBJID_1)
         );
-        assert_eq!(
-            PackageId::get_pkgid_with_objid(&format!("a#1.0.0#{}", VALID_OBJID_1), Some(objid_1()))
-                .unwrap(),
-            format!("a#{}", VALID_OBJID_1)
-        );
+        assert!(PackageId::get_pkgid_with_objid(
+            &format!("a#1.0.0#{}", VALID_OBJID_1),
+            Some(objid_1())
+        )
+        .is_err());
         assert!(
             PackageId::get_pkgid_with_objid(&format!("a#{}", VALID_OBJID_1), Some(objid_2()))
                 .is_err()
@@ -624,6 +977,90 @@ mod tests {
             Some(objid_2())
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_package_prefix_and_name_rules() {
+        let prefix = PackagePrefix::parse("nightly-linux-amd64").unwrap();
+        assert_eq!(prefix.channel, "nightly");
+        assert_eq!(prefix.os, PackageOs::Linux);
+        assert_eq!(prefix.arch, PackageArch::Amd64);
+        assert_eq!(prefix.to_string(), "nightly-linux-amd64");
+
+        let generic = PackageName::parse("filebrowser.buckyos.ai").unwrap();
+        assert!(!generic.is_with_prefix());
+        assert_eq!(generic.unique_name(), "filebrowser.buckyos.ai");
+        let platform = generic.with_prefix(&prefix).unwrap();
+        assert!(platform.is_with_prefix());
+        assert_eq!(platform.unique_name(), "filebrowser.buckyos.ai");
+        assert_eq!(
+            platform.to_string(),
+            "nightly-linux-amd64.filebrowser.buckyos.ai"
+        );
+        assert_eq!(platform.without_prefix(), generic);
+
+        let max_channel = format!("a{}-linux-amd64", "1".repeat(31));
+        assert!(PackagePrefix::parse(&max_channel).is_ok());
+        assert!(PackagePrefix::parse(&format!("a{}-linux-amd64", "1".repeat(32))).is_err());
+
+        let max_label = "a".repeat(63);
+        let max_name = std::iter::repeat(max_label.as_str())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(".");
+        assert_eq!(max_name.len(), 255);
+        assert!(PackageName::parse(&max_name).is_ok());
+        assert!(PackageName::parse(&"a".repeat(64)).is_err());
+
+        for invalid in [
+            "nightly-macos-x86_64.filebrowser",
+            "nightly-freebsd-amd64.filebrowser",
+            "nightly-linux-riscv64.filebrowser",
+            "my-cool-app.module",
+            "nightly-linux-amd64",
+            ".filebrowser",
+            "filebrowser.",
+            "filebrowser..ai",
+            "FileBrowser",
+            "file/browser",
+            "con.tools",
+            "tools.com1",
+            "tools.lpt9",
+            "-filebrowser",
+            "filebrowser_",
+        ] {
+            assert!(PackageName::parse(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn test_package_id_strict_selectors_and_candidates() {
+        let prefix = PackagePrefix::parse("nightly-windows-amd64").unwrap();
+        let request = PackageId::parse("filebrowser.buckyos.ai#1.2.3").unwrap();
+        let candidates = request.load_candidates(&prefix).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].to_string(),
+            "nightly-windows-amd64.filebrowser.buckyos.ai#1.2.3"
+        );
+        assert_eq!(candidates[1].to_string(), "filebrowser.buckyos.ai#1.2.3");
+
+        let exact = PackageId::parse(&format!("filebrowser#{}", VALID_OBJID_1)).unwrap();
+        assert_eq!(exact.objid.as_deref(), Some(VALID_OBJID_1));
+        for invalid in [
+            "filebrowser#",
+            "filebrowser#abc123",
+            "filebrowser#1.2.3:Stable",
+            "filebrowser#1.2.3#pkg:bcc4",
+            "filebrowser#sha256:bcc4",
+            "filebrowser#pkg:BCC4",
+        ] {
+            assert!(PackageId::parse(invalid).is_err(), "accepted {invalid}");
+        }
+
+        let explicit =
+            PackageId::parse("nightly-windows-amd64.filebrowser.buckyos.ai#:latest").unwrap();
+        assert_eq!(explicit.load_candidates(&prefix).unwrap(), vec![explicit]);
     }
 
     #[test]

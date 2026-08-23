@@ -77,7 +77,7 @@ impl PackageMeta {
         Ok(meta)
     }
 
-    pub fn get_package_id(&self) -> PackageId {
+    pub fn try_get_package_id(&self) -> PkgResult<PackageId> {
         if self.version_tag.is_some() {
             let package_id_str = format!(
                 "{}#{}:{}",
@@ -85,11 +85,16 @@ impl PackageMeta {
                 self.version,
                 self.version_tag.as_ref().unwrap()
             );
-            PackageId::parse(&package_id_str).unwrap()
+            PackageId::parse(&package_id_str)
         } else {
             let package_id_str = format!("{}#{}", self._base.content_obj.name, self.version);
-            PackageId::parse(&package_id_str).unwrap()
+            PackageId::parse(&package_id_str)
         }
+    }
+
+    pub fn get_package_id(&self) -> PackageId {
+        self.try_get_package_id()
+            .expect("PackageMeta must contain a valid package name, version, and tag")
     }
 }
 
