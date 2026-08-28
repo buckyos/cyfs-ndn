@@ -158,7 +158,7 @@ impl Hasher for Sha256Hasher {
     }
 
     fn update_from_bytes(&mut self, bytes: &[u8]) -> NdnResult<()> {
-        self.hasher.update(bytes);
+        Digest::update(&mut self.hasher, bytes);
         self.pos += bytes.len() as u64;
         Ok(())
     }
@@ -218,7 +218,7 @@ impl Hasher for Sha512Hasher {
     }
 
     fn update_from_bytes(&mut self, bytes: &[u8]) -> NdnResult<()> {
-        self.hasher.update(bytes);
+        Digest::update(&mut self.hasher, bytes);
         self.pos += bytes.len() as u64;
         Ok(())
     }
@@ -246,12 +246,12 @@ impl HashHelper {
         match hash_method {
             HashMethod::Sha256 => {
                 let mut hasher = Sha256::new();
-                hasher.update(data);
+                Digest::update(&mut hasher, data);
                 hasher.finalize().to_vec()
             }
             HashMethod::Sha512 => {
                 let mut hasher = sha2::Sha512::new();
-                hasher.update(data);
+                Digest::update(&mut hasher, data);
                 hasher.finalize().to_vec()
             }
             HashMethod::Blake2s256 => {
@@ -275,7 +275,7 @@ impl HashHelper {
             HashMethod::Sha256 => {
                 let mut hasher = sha2::Sha256::new();
                 for item in data {
-                    hasher.update(item);
+                    Digest::update(&mut hasher, item);
                 }
 
                 hasher.finalize().to_vec()
@@ -283,7 +283,7 @@ impl HashHelper {
             HashMethod::Sha512 => {
                 let mut hasher = sha2::Sha512::new();
                 for item in data {
-                    hasher.update(item);
+                    Digest::update(&mut hasher, item);
                 }
 
                 hasher.finalize().to_vec()
@@ -314,14 +314,14 @@ impl HashHelper {
         match hash_method {
             HashMethod::Sha256 => {
                 let mut hasher = sha2::Sha256::new();
-                hasher.update(left);
-                hasher.update(right);
+                Digest::update(&mut hasher, left);
+                Digest::update(&mut hasher, right);
                 hasher.finalize().to_vec()
             }
             HashMethod::Sha512 => {
                 let mut hasher = sha2::Sha512::new();
-                hasher.update(left);
-                hasher.update(right);
+                Digest::update(&mut hasher, left);
+                Digest::update(&mut hasher, right);
                 hasher.finalize().to_vec()
             }
             HashMethod::Blake2s256 => {
