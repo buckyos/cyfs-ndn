@@ -2,7 +2,7 @@
 
 > 文档状态：Draft / 非 normative（尚未实现）
 > 版本：v0
-> 日期：2026-08-31
+> 日期：2026-09-01
 > 定位：定义 **NamedFileSystem 对外的网络协议**。此前 `NamedFileMgr(NDM)` 是一个进程内编排层，
 > FUSE 与 WebUI 各自以不同方式接入；本文把这层"协议化"，使 FUSE / 浏览器 / SDK / 跨 Zone 客户端
 > 成为同一份协议的不同客户端。
@@ -44,7 +44,7 @@ AI 派生元数据、多维权限（含"能否进 AI 管线"）。这五条假�
 | 上传 | `PUT`，无查重、断点靠非标准 Range PUT | `probe(hash)` 秒传 → tus 续传 → `commit`；天然去重 |
 | 下载 | `GET`，只能信 TLS + 服务器 | Range GET + mtree path proof，可多源并发、可走 CDN |
 | 复制 / 快照 | `COPY` 复制字节，大目录不可用 | `bind_ref` / `publish_dir`：O(1) 建引用或快照；绑定与目标身份分离 |
-| 并发 | `LOCK` 独占写锁（实现普遍形同虚设） | file lease（fencing seq）+ dir `rev` CAS + 主动 recall |
+| 并发 | `LOCK` 独占写锁（实现普遍形同虚设） | file lease（fencing seq）+ Container `revision` CAS + 主动 recall |
 | 变更通知 | 无（轮询） | `watch` SSE：`container_changed(ref,revision)` / `meta_changed` / `lease_recall` |
 | 聚合视图 | 无；用 `BIND` 会造成"文件被复制"的错觉 | `View` / `Collection` 是一等 Container，可被 DFS Entry 引用；成员仍携带真实 `canonical_path` |
 | 搜索 | DASL（RFC 5323），几乎无人实现，无法表达语义召回 | `search` 一等 op，返回 `match_source` + `explain` + 统一游标 |
@@ -143,8 +143,8 @@ NFSP 对客户端暴露的是统一的可导航 Node 模型，而不是三套互
     "ordered": true
   },
   "locations": [
-    {"url":"collection://reading-list", "binding":"direct"},
-    {"url":"dfs://home/Lists/Reading%20List", "binding":"reference"}
+    {"url":"collection://reading-list", "via":"direct"},
+    {"url":"dfs://home/Lists/Reading%20List", "via":"reference"}
   ]
 }
 ```
@@ -152,6 +152,8 @@ NFSP 对客户端暴露的是统一的可导航 Node 模型，而不是三套互
 `capabilities` 是服务端在当前主体、当前入口下计算的有效能力；客户端据此裁剪交互，不能仅凭 `kind`
 硬编码权限。`locations[]` 是定位入口而非资源身份：同一个 View / Collection 可以没有 DFS 绑定、
 也可以被多个实体目录引用，但其 `LiveRef` 始终不变。
+`LiveRef.gen` 只在 node_id 被回收复用或身份被替换时变化；Container 内容变更只改变 opaque
+`revision`，不得通过修改 gen 让所有持有者无谓变成 STALE。
 
 每个 Container 的可见内容都是 Entry：
 
@@ -161,7 +163,7 @@ NFSP 对客户端暴露的是统一的可导航 Node 模型，而不是三套互
   "name": "北海道之行",
   "binding": "native" | "member" | "reference" | "derived",
   "target": {
-    "ref": {"type":"live", "node_id":"view-20", "gen":17},
+    "ref": {"type":"live", "node_id":"view-20", "gen":1},
     "kind": "view",
     "attrs": { /* want 掩码请求到的属性 */ }
   },
@@ -224,7 +226,7 @@ FUSE 适配器可自行选择"同步拉完再返回"或"返回 EAGAIN + 后台�
 
 ```
 base    : name, kind, size, mtime, ctime, flags
-ident   : obj_id, inode_id, gen, etag
+ident   : obj_id, node_id, gen, etag
 frozen  : frozen(bool), base_obj_id, need_pull
 access  : access_urls[]              // §3.6
 meta    : meta_digest, meta_summary  // 轻量摘要，完整 meta 走 get_meta
@@ -252,7 +254,7 @@ File Browser 的列表视图靠这一个字段就能画出全部角标。
     "at": 1756600000
   },
   "confidence": 0.86,              // 可选，AI 产出必填
-  "anchor": "obj:sha256:...",      // 锚在内容上；可变文件则为 "inode:1234"
+  "anchor": "obj:sha256:...",      // 锚在内容上；可变 Node 则为 "live:node-1234"
   "links": [                        // 可点击关联项（PRD 9.6 硬需求）
     { "rel": "topic", "ref": "view:topic/2026-hokkaido", "label": "北海道之行" },
     { "rel": "place", "ref": "view:place/sapporo",       "label": "札幌" },
@@ -282,7 +284,7 @@ PRD 9.4 有一条强约束：**Topic 不能让用户觉得文件被复制了**�
 
 ```jsonc
 {
-  "ref": {"type":"live", "node_id":"view-20", "gen":17},
+  "ref": {"type":"live", "node_id":"view-20", "gen":1},
   "kind": "view",
   "view_id": "topic/2026-hokkaido",
   "origin": "auto" | "manual" | "merged",
@@ -316,7 +318,7 @@ Collection 是 `kind:collection` 的可变 Container，由用户或 AI 显式管
 
 ```jsonc
 {
-  "ref": {"type":"live", "node_id":"collection-30", "gen":42},
+  "ref": {"type":"live", "node_id":"collection-30", "gen":1},
   "kind": "collection",
   "collection_id": "reading-list",
   "title": "Reading List",
@@ -334,7 +336,7 @@ Collection 是 `kind:collection` 的可变 Container，由用户或 AI 显式管
     },
     {
       "entry_ref":"ce_18", "name":"papers", "binding":"member",
-      "target": {"ref":{"type":"live", "node_id":"collection-group-8", "gen":42}, "kind":"group"},
+      "target": {"ref":{"type":"live", "node_id":"collection-group-8", "gen":1}, "kind":"group"},
       "context":{"type":"collection", "order_index":1}
     }
   ]
@@ -517,11 +519,11 @@ Live 结果统一返回 `LiveRef`，无论 locator 来自 DFS、View URI 还是 
 { "at":{"uri":"collection://reading-list"}, "want":["base","ident","policy"] }
 →
 { "kind":"collection", "state":"live",
-  "ref":{"type":"live", "node_id":"collection-30", "gen":42},
+  "ref":{"type":"live", "node_id":"collection-30", "gen":1},
   "revision":"collection-42",
   "capabilities":{"list":true, "accepts_content":false,
                   "accepts_references":true, "remove_semantics":"unlink", "ordered":true},
-  "locations":[{"url":"collection://reading-list","binding":"direct"}] }
+  "locations":[{"url":"collection://reading-list","via":"direct"}] }
 ```
 
 路径/URI 只负责首次得到 Ref。后续 `stat`、`list`、watch、Meta、绑定等操作必须传 Ref；
@@ -550,7 +552,7 @@ NFSP 必须定死：**默认跟随（`sym_limit=40`），`follow_symlink:false` 
       "target":{"ref":{...}, "kind":"file",
                 "attrs":{"size":..., "mtime":..., "flags":["frozen"], "thumb":{...}}} },
     { "entry_ref":"de_02", "name":"北海道之行", "binding":"reference",
-      "target":{"ref":{"type":"live", "node_id":"view-20", "gen":17}, "kind":"view"} }
+      "target":{"ref":{"type":"live", "node_id":"view-20", "gen":1}, "kind":"view"} }
   ],
   "next_cursor": "c_8f21...", "base_obj_id": "sha256:...",
   "mount_mode": "overlay", "truncated": false, "conflicts": [],
@@ -608,7 +610,7 @@ NFSP 改为**无状态游标**：服务端不记忆列举会话，标签页关�
 | `commit_file` | 把 `obj_id` 或 `fb_handle` 绑到路径，释放租约 |
 | `bind_ref` | 在 Container 中创建 `binding:reference` Entry，目标可以是 LiveRef 或 ObjRef；用于 DFS 引用 View / Collection / 文件，O(1) |
 | `unlink` | 按 `entry_ref` 删除 Entry；对 reference 只解除引用，不删除目标 |
-| `move` | 换绑定，O(1)，跨目录双 rev CAS |
+| `move` | 换 native Binding，O(1)，跨目录双 revision CAS |
 | `delete` | 销毁 native 目标；不得用于 reference Entry，必须显式区分于 `unlink` |
 | `publish_dir` | 目录快照 → 新 `DirObjId`（分享 / 备份 / 冻结） |
 | `set_read_only` | 切换挂载模式 |
@@ -622,7 +624,7 @@ WebDAV 锁是悲观的、有超时的、且实现质量普遍很差；NFSP 对 C
 bind_ref {
   "parent_ref":{"type":"live", "node_id":"dir-100", "gen":4},
   "name":"北海道之行",
-  "target_ref":{"type":"live", "node_id":"view-20", "gen":17},
+  "target_ref":{"type":"live", "node_id":"view-20", "gen":1},
   "expected_revision":"dir-981"
 }
 → {"entry_ref":"de_02", "revision":"dir-982"}
@@ -660,7 +662,7 @@ bind_ref {
 
 ```jsonc
 open_view { "view_id":"topic/2026-hokkaido", "group_by": null }
-→ { "ref":{"type":"live", "node_id":"view-20", "gen":17},
+→ { "ref":{"type":"live", "node_id":"view-20", "gen":1},
     "kind":"view", "revision":"view-17", "capabilities":{...} }
 
 view_patch { "ref":{...}, "expected_revision":"view-17",
@@ -683,11 +685,11 @@ create_collection { "title":"Reading List" }
     "kind":"collection", "revision":"collection-1" }
 
 open_collection { "collection_id":"reading-list" }
-→ { "ref":{"type":"live", "node_id":"collection-30", "gen":42},
+→ { "ref":{"type":"live", "node_id":"collection-30", "gen":1},
     "kind":"collection", "revision":"collection-42", "capabilities":{...} }
 
 collection_patch {
-  "ref":{"type":"live", "node_id":"collection-30", "gen":42},
+  "ref":{"type":"live", "node_id":"collection-30", "gen":1},
   "expected_revision":"collection-42",
   "ops":[
     {"add_ref":{"target_ref":{...}, "position":0}},
@@ -1017,7 +1019,7 @@ ObjectId → 逻辑路径的反查。** 对象平面的任何组件都不得维�
 |---|---:|---|---|
 | `NOT_FOUND` | 404 | 确实不存在 | 显示不存在 |
 | `NEED_PULL` | 409 | 对象未在本地，附 `obj_id` + `hints[]` | **显示"离线/拉取中"第三态**，或自行从 hints 拉取 |
-| `REV_MISMATCH` | 409 | 目录 rev CAS 失败 | 重新 `list` 后重试 |
+| `REV_MISMATCH` | 409 | Container revision CAS 失败 | 重新 `list` 后重试 |
 | `TARGET_MISMATCH` | 409 | dentry target CAS 失败 | 同上 |
 | `LEASE_CONFLICT` | 423 | 他人持有写租约 | 显示"文件正被编辑" + 持有者信息 |
 | `SEQ_OUT_OF_WINDOW` | 409 | 重放窗口外 | 重新 resolve |
@@ -1180,7 +1182,7 @@ POST /nfs/v1/batch
 | D7 | 管线权限粒度 | 目录级 + 文件级覆盖 |
 | D8 | "知道 ObjId 即可读"是否开 Zone 级开关 | 待定，默认关；无论开关，`context` 正向鉴权路径不变（§7.3.1） |
 | D9 | 隐私目录是否生成缩略图 | 待定，倾向于跟随 `ai.process` 维度 |
-| D10 | `list` 游标在并发变更下的语义 | 不重置，返回 `rev_changed` 由客户端决策 |
+| D10 | `list` 游标在并发变更下的语义 | 不重置，返回 `revision_changed` 由客户端决策 |
 | D11 | watch 断线重连是否保证不丢事件 | 否，提供 `resync` 事件即可 |
 | D12 | 数据面鉴权的宽窄（裸 ObjId 请求的默认裁决档位） | 待仔细设计（§7.3.1 档位表 L0–L2）。v0 现状为 L0（不鉴权），`context` 鼓励携带、先落审计；宽了与隐私直觉冲突，窄了伤害 Frozen 的多源分发价值（G2），需与用户心智模型对齐 |
 | D13 | DFS native entry 与 filedb virtual binding 被旁路写成同名时如何呈现 | 协议返回 `conflicts[]` + `NAMESPACE_CONFLICT`，不得静默覆盖或改绑；具体修复 UI 待产品定案 |
@@ -1193,7 +1195,8 @@ POST /nfs/v1/batch
 
 - **WebDAV**：`MOVE` 在同一 collection 内通常是元数据操作，但跨 collection、跨存储后端时
   规范允许服务器复制字节。客户端无法预知代价，也无法取消。属性（dead property）是否跟随由实现决定。
-- **NFSP**：`move` 永远是 O(1) 的换绑定（Ops_v3 §3.5，按 inode_id 升序锁行 + 双 rev CAS）。
+- **NFSP**：实体 DFS 内 `move` 永远是 O(1) 的换 native Binding（Ops_v3 §3.5，
+  fs_meta 内按 inode_id 升序锁行 + 双 revision CAS）。
   meta 锚定在 ObjId 上，不存在"属性跟不跟随"的问题。AI 分析结果一次都不需要重算。
 
 ### A.2 "把一个目录分享给外部"
