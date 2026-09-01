@@ -19,7 +19,9 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWri
 pub const CHUNK_DEFAULT_SIZE: u64 = 1024 * 1024 * 32;
 pub const CALC_HASH_PIECE_SIZE: u64 = 1024 * 1024 * 4;
 pub const QCID_HASH_PIECE_SIZE: u64 = 4096;
-pub const MIN_QCID_FILE_SIZE: u64 = QCID_HASH_PIECE_SIZE * 3;
+/// Files smaller than this value are hashed in full for QCID. Files at or
+/// above the threshold use the canonical head/center/tail sampling scheme.
+pub const QCID_SAMPLE_THRESHOLD: u64 = QCID_HASH_PIECE_SIZE * 3;
 pub const MAX_CHUNK_SIZE: u64 = 1024 * 1024 * 1024 * 2;
 pub const COPY_CHUNK_BUFFER_SIZE: usize = CALC_HASH_PIECE_SIZE as usize;
 

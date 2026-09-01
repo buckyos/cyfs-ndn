@@ -5,10 +5,10 @@ use crate::lru_hot_table::LruHotTable;
 use crate::store_db::{ChunkItem, ChunkLocalInfo, ChunkStoreState, NamedLocalStoreDB};
 use log::{debug, warn};
 use ndn_lib::{
-    caculate_qcid_from_file, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
+    calc_quick_hash, ChunkId, ChunkReader, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -286,9 +286,22 @@ impl NamedStore {
         local_info: &ChunkLocalInfo,
         offset: u64,
     ) -> NdnResult<(ChunkReader, u64)> {
-        self.verify_local_link(chunk_id, local_info).await?;
-
         let chunk_real_path = PathBuf::from(&local_info.path);
+        let mut file = tokio::fs::File::open(&chunk_real_path).await.map_err(|e| {
+            warn!(
+                "open_local_link_reader: open file failed! {}",
+                e.to_string()
+            );
+            NdnError::IoError(e.to_string())
+        })?;
+        let metadata = file.metadata().await.map_err(|e| {
+            warn!("open_local_link_reader: stat failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        let recalculated_qcid = self
+            .verify_local_link(chunk_id, local_info, &mut file, &metadata)
+            .await?;
+
         let mut real_offset = 0u64;
         let mut limit_len = chunk_item.chunk_size;
 
@@ -309,14 +322,7 @@ impl NamedStore {
         }
 
         real_offset += offset;
-        let mut file = tokio::fs::File::open(&chunk_real_path).await.map_err(|e| {
-            warn!(
-                "open_local_link_reader: open file failed! {}",
-                e.to_string()
-            );
-            NdnError::IoError(e.to_string())
-        })?;
-        if real_offset > 0 {
+        if real_offset > 0 || recalculated_qcid {
             file.seek(SeekFrom::Start(real_offset)).await.map_err(|e| {
                 warn!(
                     "open_local_link_reader: seek file failed! {}",
@@ -346,6 +352,21 @@ impl NamedStore {
         chunk_local_info: &ChunkLocalInfo,
     ) -> NdnResult<()> {
         self.ensure_writable()?;
+        let qcid = ChunkId::new(&chunk_local_info.qcid)
+            .map_err(|e| NdnError::InvalidParam(format!("invalid local link qcid: {}", e)))?;
+        if qcid.chunk_type != ndn_lib::ChunkType::QCID {
+            return Err(NdnError::InvalidParam(format!(
+                "local link fingerprint must be qcid, got {}",
+                qcid.chunk_type.to_string()
+            )));
+        }
+        if qcid.get_length() != Some(chunk_local_info.source_file_size) {
+            return Err(NdnError::InvalidParam(format!(
+                "local link source size mismatch: qcid={:?} metadata={}",
+                qcid.get_length(),
+                chunk_local_info.source_file_size
+            )));
+        }
         if let Some(range) = &chunk_local_info.range {
             let range_len = range.end.saturating_sub(range.start);
             if range_len != chunk_size {
@@ -354,6 +375,17 @@ impl NamedStore {
                     chunk_size, range_len
                 )));
             }
+            if range.end > chunk_local_info.source_file_size {
+                return Err(NdnError::InvalidParam(format!(
+                    "range end {} exceeds source file size {}",
+                    range.end, chunk_local_info.source_file_size
+                )));
+            }
+        } else if chunk_size != chunk_local_info.source_file_size {
+            return Err(NdnError::InvalidParam(format!(
+                "whole-file link size mismatch: chunk={} source={}",
+                chunk_size, chunk_local_info.source_file_size
+            )));
         }
         let chunk_item = ChunkItem::new_local_file(chunk_id, chunk_size, chunk_local_info);
         self.db.set_chunk_item(&chunk_item)
@@ -621,19 +653,19 @@ impl NamedStore {
         }
     }
 
-    async fn verify_local_link(&self, chunk_id: &ChunkId, info: &ChunkLocalInfo) -> NdnResult<()> {
+    async fn verify_local_link(
+        &self,
+        chunk_id: &ChunkId,
+        info: &ChunkLocalInfo,
+        file: &mut tokio::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> NdnResult<bool> {
         if info.qcid.is_empty() {
             return Err(NdnError::InvalidLink(format!(
                 "local link missing qcid for {}",
                 chunk_id.to_string()
             )));
         }
-
-        let path = Path::new(&info.path);
-        let metadata = fs::metadata(path).await.map_err(|e| {
-            warn!("verify_local_link: stat failed! {}", e.to_string());
-            NdnError::IoError(e.to_string())
-        })?;
 
         if let Some(range) = &info.range {
             let file_len = metadata.len();
@@ -645,7 +677,27 @@ impl NamedStore {
             }
         }
 
-        let qcid = caculate_qcid_from_file(path).await?;
+        if info.matches_metadata(metadata) {
+            return Ok(false);
+        }
+
+        let qcid = calc_quick_hash(file, Some(metadata.len())).await?;
+        let after = file.metadata().await.map_err(|e| {
+            warn!(
+                "verify_local_link: stat after qcid failed! {}",
+                e.to_string()
+            );
+            NdnError::IoError(e.to_string())
+        })?;
+        if metadata.len() != after.len()
+            || ChunkLocalInfo::modified_time_ns(metadata)
+                != ChunkLocalInfo::modified_time_ns(&after)
+        {
+            return Err(NdnError::InvalidLink(format!(
+                "local link changed while verifying {}",
+                chunk_id.to_string()
+            )));
+        }
         if qcid.to_string() != info.qcid {
             return Err(NdnError::VerifyError(format!(
                 "qcid mismatch for {}",
@@ -653,7 +705,7 @@ impl NamedStore {
             )));
         }
 
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -670,8 +722,7 @@ fn current_unix_ts() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{ChunkHasher, MIN_QCID_FILE_SIZE};
-    use serde_json::json;
+    use ndn_lib::{calculate_qcid_from_file_with_metadata, ChunkHasher};
     use tempfile::TempDir;
 
     fn calc_chunk_id(data: &[u8]) -> ChunkId {
@@ -707,26 +758,20 @@ mod tests {
             .await
             .unwrap();
 
-        let data = vec![0x5Au8; MIN_QCID_FILE_SIZE as usize + 1024];
+        let data = vec![0x5Au8; 1024];
         let file_path = temp_dir.path().join("external.bin");
         fs::write(&file_path, &data).await.unwrap();
 
         let chunk_id = calc_chunk_id(&data);
-        let qcid = caculate_qcid_from_file(&file_path).await.unwrap();
-        let meta = fs::metadata(&file_path).await.unwrap();
-        let mtime = meta
-            .modified()
-            .unwrap()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let info = ChunkLocalInfo {
-            path: file_path.to_string_lossy().to_string(),
-            qcid: qcid.to_string(),
-            last_modify_time: mtime,
-            range: None,
-        };
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(&file_path)
+            .await
+            .unwrap();
+        let info = ChunkLocalInfo::new(
+            file_path.to_string_lossy().to_string(),
+            qcid.to_string(),
+            &metadata,
+            None,
+        );
 
         store
             .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
@@ -741,18 +786,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_link_qcid_fallback_resets_reader_position() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let data = b"small local link fallback".to_vec();
+        let file_path = temp_dir.path().join("external-fallback.bin");
+        fs::write(&file_path, &data).await.unwrap();
+        let chunk_id = calc_chunk_id(&data);
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(&file_path)
+            .await
+            .unwrap();
+        let info = ChunkLocalInfo {
+            path: file_path.to_string_lossy().to_string(),
+            qcid: qcid.to_string(),
+            source_file_size: metadata.len(),
+            last_modify_time_ns: 0,
+            range: None,
+        };
+
+        store
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
+            .await
+            .unwrap();
+        let (mut reader, _) = store.open_chunk_reader(&chunk_id, 0).await.unwrap();
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).await.unwrap();
+        assert_eq!(read_back, data);
+    }
+
+    #[tokio::test]
     async fn test_local_link_qcid_mismatch() {
         let temp_dir = TempDir::new().unwrap();
         let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
-        let data = vec![0xAAu8; MIN_QCID_FILE_SIZE as usize + 2048];
+        let data = vec![0xAAu8; 2048];
         let file_path = temp_dir.path().join("external.bin");
         fs::write(&file_path, &data).await.unwrap();
 
         let chunk_id = calc_chunk_id(&data);
-        let qcid = caculate_qcid_from_file(&file_path).await.unwrap();
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(&file_path)
+            .await
+            .unwrap();
 
         let new_data = vec![0xBBu8; data.len()];
         fs::write(&file_path, &new_data).await.unwrap();
@@ -760,7 +839,8 @@ mod tests {
         let info = ChunkLocalInfo {
             path: file_path.to_string_lossy().to_string(),
             qcid: qcid.to_string(),
-            last_modify_time: 0,
+            source_file_size: metadata.len(),
+            last_modify_time_ns: 0,
             range: None,
         };
 
@@ -781,13 +861,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_local_link_missing_qcid() {
+    async fn test_local_link_missing_qcid_is_rejected_on_add() {
         let temp_dir = TempDir::new().unwrap();
         let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
             .await
             .unwrap();
 
-        let data = vec![0x33u8; MIN_QCID_FILE_SIZE as usize + 1024];
+        let data = vec![0x33u8; 1024];
         let file_path = temp_dir.path().join("external.bin");
         fs::write(&file_path, &data).await.unwrap();
 
@@ -795,24 +875,16 @@ mod tests {
         let info = ChunkLocalInfo {
             path: file_path.to_string_lossy().to_string(),
             qcid: String::new(),
-            last_modify_time: 0,
+            source_file_size: data.len() as u64,
+            last_modify_time_ns: 0,
             range: None,
         };
 
-        store
+        let err = store
             .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
             .await
-            .unwrap();
-
-        let err = store
-            .open_chunk_reader(&chunk_id, 0)
-            .await
-            .err()
-            .expect("expected invalid link error");
-        match err {
-            NdnError::InvalidLink(_) => {}
-            other => panic!("unexpected error: {:?}", other),
-        }
+            .unwrap_err();
+        assert!(matches!(err, NdnError::InvalidParam(_)));
     }
 
     #[tokio::test]

@@ -1517,7 +1517,7 @@ CYFS 客户端 **SHOULD** 实现一个轻量的后台任务：定期（如每天
 
 #### 特殊的ObjId
 - `mix256`:在ObjId中编码了Chunk长度的sha256,是系统中用的最多的chunkId类型。
-- `qcid`:快速全文Hash,取文件的5片数据进行mix256。这通常用于一些非严格场景的文件秒传和LocalLink模式的改变发现。
+- `qcid`：快速文件 Hash，用于候选查重和 LocalLink 改变检测。设片长 `P = 4096`：文件长度小于 `3P` 时计算全文 SHA-256；否则依次 Hash 头片 `[0, P)`、居中片 `[(L-P)/2, (L-P)/2+P)` 和尾片 `[L-P, L)`。最终 `obj_hash_bytes = varint(L) || SHA256(上述字节)`。恰好 `3P` 时三片无重叠地覆盖全文。
 - `clist` chunklist， 其ObjId用和mix256一致的方法在id中编码了长度信息，其长度是整个chunklist所有的chunk的大小的总和
 
 ### 含有 ObjId 和 inner_path 的 URL

@@ -182,7 +182,7 @@ obj_type UTF-8 bytes || ":" || obj_hash bytes
 | `mixblake2s256` | BLAKE2s-256 | 是 | 已实现 |
 | `keccak256` | Keccak-256 | 否 | 已实现 |
 | `mixkeccak256` | Keccak-256 | 是 | 已实现 |
-| `qcid` | QCID | 是 | 类型已保留，hash 计算路径当前未实现 |
+| `qcid` | SHA-256（全文或三片采样） | 是 | 已实现 |
 
 ### 6.1 mix 长度编码
 
@@ -200,7 +200,28 @@ obj_hash = unsigned_varint(u64(data_length)) || raw_hash_bytes
 
 `ChunkId::get_length()` 只对 mix 类型返回长度；非 mix 类型返回 `None`。
 
-### 6.2 ChunkId JSON 示例
+### 6.2 QCID 计算
+
+设文件长度为 `L`，固定片长 `P = 4096`：
+
+- `L < 3P`：`raw_hash_bytes = SHA256(file[0..L])`。
+- `L >= 3P`：`raw_hash_bytes = SHA256(head || center || tail)`，其中：
+  - `head = file[0..P]`
+  - `center_start = floor((L-P)/2)`
+  - `center = file[center_start..center_start+P]`
+  - `tail = file[L-P..L]`
+
+最终按 mix 长度编码生成：
+
+```text
+QCID.obj_hash = unsigned_varint(L) || raw_hash_bytes
+```
+
+所有大小的文件都可以计算 QCID。恰好 `L = 3P` 时，三片按顺序完整覆盖文件，结果等价于全文 SHA-256。
+
+QCID 对大文件只采样部分内容，因此只能用于快速候选匹配或修改检测，不能代替完整内容 Hash 做严格完整性证明。
+
+### 6.3 ChunkId JSON 示例
 
 ```json
 {

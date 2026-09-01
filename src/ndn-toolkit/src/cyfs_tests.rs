@@ -467,11 +467,10 @@ async fn e2e_01_r_link_file_pull_via_server() {
     let tmp = TempDir::new().unwrap();
     let (server, client, store_mgr) = make_server_client_pair(tmp.path()).await;
 
-    // Drop a small file into semantic_root and objectify.
+    // Drop a small file into semantic_root and objectify. Small files use a
+    // full-file QCID and are valid LocalLink targets.
     let root = server.config().semantic_root.clone();
-    // File must be ≥ MIN_QCID_FILE_SIZE (12 KiB) because LocalLink mode
-    // registers chunks with a QCID fingerprint.
-    let file_bytes = deterministic_bytes(16 * 1024 + 117);
+    let file_bytes = deterministic_bytes(4096 + 117);
     let file_path = root.join("readme.bin");
     tokio::fs::write(&file_path, &file_bytes).await.unwrap();
     let processed = server.scan_and_objectify().await.unwrap();

@@ -160,7 +160,7 @@
 
 其中：
 
-- `local_link` 会返回 `local_info.qcid`、`local_info.last_modify_time`，若有 range 还会返回 `local_info.range.start/end`
+- `local_link` 会返回 `local_info.qcid`、完整 backing file 的 `local_info.source_file_size`、纳秒级 Unix 时间戳 `local_info.last_modify_time_ns`；若有 range 还会返回 `local_info.range.start/end`
 - `same_as` 会返回 `same_as`
 
 #### 非 chunk 对象命中

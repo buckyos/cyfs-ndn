@@ -216,13 +216,18 @@ async fn assert_local_link_chunk(
         ChunkStoreState::LocalLink(ChunkLocalInfo {
             path,
             qcid,
-            last_modify_time,
+            source_file_size,
+            last_modify_time_ns,
             range,
         }) => {
             assert_eq!(path, expected_path.to_string_lossy().to_string());
             assert_eq!(range, expected_range);
             assert!(!qcid.is_empty());
-            assert!(last_modify_time > 0);
+            assert_eq!(
+                source_file_size,
+                std::fs::metadata(expected_path).unwrap().len()
+            );
+            assert!(last_modify_time_ns > 0);
         }
         other => panic!("expect LocalLink, got {:?}", other),
     }

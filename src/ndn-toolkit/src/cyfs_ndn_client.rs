@@ -22,12 +22,12 @@ use tokio::sync::Mutex;
 use tokio_util::io::StreamReader;
 
 use ndn_lib::{
-    apply_cyfs_req_headers, build_named_object_by_json, caculate_qcid_from_file, copy_chunk,
-    cyfs_parse_url, get_cyfs_resp_headers, verify_named_object_from_str, CYFSHttpReqHeaders,
-    CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkList, ChunkReader, CyfsParent, CyfsParsedUrl,
-    FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId, PathObject,
-    ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR,
-    OBJ_TYPE_FILE, OBJ_TYPE_PATH,
+    apply_cyfs_req_headers, build_named_object_by_json, calculate_qcid_from_file_with_metadata,
+    copy_chunk, cyfs_parse_url, get_cyfs_resp_headers, verify_named_object_from_str,
+    CYFSHttpReqHeaders, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkList, ChunkReader,
+    CyfsParent, CyfsParsedUrl, FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult,
+    ObjId, PathObject, ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN,
+    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_PATH,
 };
 
 // =====================================================================
@@ -1580,19 +1580,15 @@ impl CyfsNdnResponse {
                     let store_mgr = target_store_mgr.as_ref().ok_or_else(|| {
                         NdnError::NotFound("named store mgr is required".to_string())
                     })?;
-                    let qcid = caculate_qcid_from_file(path).await?;
-                    let last_modify_time = file_last_modify_time(path).await?;
+                    let (qcid, metadata) = calculate_qcid_from_file_with_metadata(path).await?;
+                    let local_info = ChunkLocalInfo::new(
+                        path.to_string_lossy().to_string(),
+                        qcid.to_string(),
+                        &metadata,
+                        Some(range.start..range.start + total_size),
+                    );
                     store_mgr
-                        .add_chunk_by_link_to_local_file(
-                            &chunk_id,
-                            total_size,
-                            &ChunkLocalInfo {
-                                path: path.to_string_lossy().to_string(),
-                                qcid: qcid.to_string(),
-                                last_modify_time,
-                                range: Some(range.start..range.start + total_size),
-                            },
-                        )
+                        .add_chunk_by_link_to_local_file(&chunk_id, total_size, &local_info)
                         .await?;
                 }
 
@@ -1971,17 +1967,6 @@ async fn open_local_writer_if_needed(
     Ok(None)
 }
 
-async fn file_last_modify_time(path: &Path) -> NdnResult<u64> {
-    let meta = tokio::fs::metadata(path).await?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default();
-    Ok(modified)
-}
-
 async fn finalize_local_links(
     pull_mode: &StoreMode,
     store_mgr: Option<&NamedDataMgr>,
@@ -1999,24 +1984,24 @@ async fn finalize_local_links(
         NdnError::InvalidParam("local file path is required for local-link pull".to_string())
     })?;
 
-    let qcid = caculate_qcid_from_file(local_path).await?;
-    let last_modify_time = file_last_modify_time(local_path).await?;
+    let (qcid, metadata) = calculate_qcid_from_file_with_metadata(local_path).await?;
     let start_offset = match pull_mode {
         StoreMode::LocalFile(_, range, _) => range.start,
         _ => 0,
     };
 
     for link in links.iter() {
+        let local_info = ChunkLocalInfo::new(
+            local_path.to_string_lossy().to_string(),
+            qcid.to_string(),
+            &metadata,
+            Some(start_offset + link.range.start..start_offset + link.range.end),
+        );
         store_mgr
             .add_chunk_by_link_to_local_file(
                 &link.chunk_id,
                 link.range.end - link.range.start,
-                &ChunkLocalInfo {
-                    path: local_path.to_string_lossy().to_string(),
-                    qcid: qcid.to_string(),
-                    last_modify_time,
-                    range: Some(start_offset + link.range.start..start_offset + link.range.end),
-                },
+                &local_info,
             )
             .await?;
     }

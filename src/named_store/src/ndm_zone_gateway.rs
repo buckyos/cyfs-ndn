@@ -1448,7 +1448,8 @@ fn chunk_store_state_to_json(state: ChunkStoreState, chunk_size: u64) -> serde_j
                 "chunk_size": chunk_size,
                 "local_info": {
                     "qcid": info.qcid,
-                    "last_modify_time": info.last_modify_time,
+                    "source_file_size": info.source_file_size,
+                    "last_modify_time_ns": info.last_modify_time_ns,
                 },
             });
             if let Some(range) = info.range {

@@ -39,9 +39,9 @@ use tokio::sync::mpsc;
 use named_store::{ChunkLocalInfo, NamedDataMgr};
 use ndn_lib::{
     apply_cyfs_resp_headers, build_named_object_by_json, caculate_qcid_from_file,
-    calculate_file_chunk_id, named_obj_to_jwt, CYFSHttpRespHeaders, ChunkId, ChunkReader,
-    ChunkType, CyfsParent, DirObject, FileObject, NdnError, NdnResult, ObjId, PathObject,
-    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    calculate_file_chunk_id, calculate_qcid_from_file_with_metadata, named_obj_to_jwt,
+    CYFSHttpRespHeaders, ChunkId, ChunkReader, ChunkType, CyfsParent, DirObject, FileObject,
+    NdnError, NdnResult, ObjId, PathObject, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 
 const INNER_PATH_DELIMITER: &str = "/@/";
@@ -1215,28 +1215,16 @@ impl NdnDirServer {
 
         match self.config.mode {
             NdnDirServerMode::LocalLink => {
-                let qcid = caculate_qcid_from_file(file_path).await?;
-                let meta = tokio::fs::metadata(file_path).await.map_err(|e| {
-                    NdnError::IoError(format!("stat {} failed: {}", file_path.display(), e))
-                })?;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
+                let (qcid, metadata) = calculate_qcid_from_file_with_metadata(file_path).await?;
+                let local_info = ChunkLocalInfo::new(
+                    file_path.to_string_lossy().to_string(),
+                    qcid.to_string(),
+                    &metadata,
+                    None,
+                );
                 self.config
                     .store_mgr
-                    .add_chunk_by_link_to_local_file(
-                        chunk_id,
-                        chunk_size,
-                        &ChunkLocalInfo {
-                            path: file_path.to_string_lossy().to_string(),
-                            qcid: qcid.to_string(),
-                            last_modify_time: mtime,
-                            range: None,
-                        },
-                    )
+                    .add_chunk_by_link_to_local_file(chunk_id, chunk_size, &local_info)
                     .await?;
             }
             NdnDirServerMode::InStore => {

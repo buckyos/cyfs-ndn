@@ -15,7 +15,7 @@ fn unix_timestamp() -> u64 {
 }
 
 // ────────────────────────────────────────────────────────────────
-// ChunkLocalInfo / ChunkStoreState (unchanged public API)
+// ChunkLocalInfo / ChunkStoreState
 // ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -23,7 +23,10 @@ pub struct ChunkLocalInfo {
     #[serde(skip_serializing, default)]
     pub path: String,
     pub qcid: String,
-    pub last_modify_time: u64,
+    /// Size of the complete backing file, not the linked range/chunk size.
+    pub source_file_size: u64,
+    /// Backing file modification time as nanoseconds since Unix epoch.
+    pub last_modify_time_ns: u64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub range: Option<Range<u64>>,
 }
@@ -33,13 +36,44 @@ impl Default for ChunkLocalInfo {
         Self {
             path: String::new(),
             qcid: String::new(),
-            last_modify_time: 0,
+            source_file_size: 0,
+            last_modify_time_ns: 0,
             range: None,
         }
     }
 }
 
 impl ChunkLocalInfo {
+    pub fn modified_time_ns(metadata: &std::fs::Metadata) -> u64 {
+        metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0)
+    }
+
+    pub fn new(
+        path: String,
+        qcid: String,
+        metadata: &std::fs::Metadata,
+        range: Option<Range<u64>>,
+    ) -> Self {
+        Self {
+            path,
+            qcid,
+            source_file_size: metadata.len(),
+            last_modify_time_ns: Self::modified_time_ns(metadata),
+            range,
+        }
+    }
+
+    pub fn matches_metadata(&self, metadata: &std::fs::Metadata) -> bool {
+        self.last_modify_time_ns != 0
+            && self.source_file_size == metadata.len()
+            && self.last_modify_time_ns == Self::modified_time_ns(metadata)
+    }
+
     pub fn create_by_info_str(path: String, info_str: &str) -> NdnResult<Self> {
         let mut local_info: ChunkLocalInfo =
             serde_json::from_str(info_str).map_err(|e| NdnError::InvalidParam(e.to_string()))?;

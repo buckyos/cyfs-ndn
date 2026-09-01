@@ -8,12 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use cyfs_lib::{FileLinkedState, FinalizedObjState, FsMetaClient, NodeState};
 use named_store::{
-    ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListWriter, DiffChunkListWriterState,
-    NamedDataMgr,
+    ChunkLocalInfo, DiffChunkListDirtyChunk, DiffChunkListReader, DiffChunkListWriter,
+    DiffChunkListWriterState, NamedDataMgr,
 };
 use ndn_lib::{
-    caculate_qcid_from_file, calculate_file_chunk_id, ChunkHasher, ChunkId, ChunkList, FileObject,
-    NamedObject, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE, MIN_QCID_FILE_SIZE,
+    caculate_qcid_from_file, calc_quick_hash, calculate_file_chunk_id,
+    calculate_qcid_from_file_with_metadata, ChunkHasher, ChunkId, ChunkList, FileObject,
+    NamedObject, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
 };
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -160,7 +161,7 @@ struct FinalizeData {
     content_layout: ContentLayout,
     file_obj_id: ObjId,
     file_obj_str: String,
-    qcid: ChunkId,
+    logical_qcid: Option<ChunkId>,
     linked_at: u64,
 }
 
@@ -545,22 +546,13 @@ impl LocalFileBufferService {
         })
     }
 
-    fn qcid_from_content_layout(content_layout: &ContentLayout) -> NdnResult<ChunkId> {
-        match content_layout {
-            ContentLayout::Single { segment } => Ok(segment.chunk_id.clone()),
-            ContentLayout::ChunkList { segments, .. } => segments
-                .first()
-                .map(|s| s.chunk_id.clone())
-                .ok_or_else(|| NdnError::InvalidData("empty chunk list for qcid".to_string())),
-        }
-    }
-
     fn build_overlay_finalize_data(
         &self,
         file_inode_id: u64,
         diff_file_path: &PathBuf,
         merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
+        logical_qcid: Option<ChunkId>,
         existing_linked_at: Option<u64>,
     ) -> NdnResult<FinalizeData> {
         let content_layout = self.overlay_content_layout(merged_chunk_list, merged_chunk_sizes)?;
@@ -572,14 +564,6 @@ impl LocalFileBufferService {
             content_obj_id.to_string(),
         );
         let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
-        let qcid = Self::qcid_from_content_layout(&content_layout)?;
-
-        if file_size >= MIN_QCID_FILE_SIZE {
-            log::warn!(
-                "overlay finalize uses first chunk as qcid fallback, inode={}",
-                file_inode_id
-            );
-        }
 
         Ok(FinalizeData {
             file_inode_id,
@@ -588,7 +572,7 @@ impl LocalFileBufferService {
             content_layout,
             file_obj_id,
             file_obj_str,
-            qcid,
+            logical_qcid,
             linked_at: existing_linked_at.unwrap_or_else(Self::now_unix_secs),
         })
     }
@@ -613,6 +597,27 @@ impl LocalFileBufferService {
             .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
             .clone();
         let writer_state = self.overlay_writer_state(fb, &base_chunk_ids, &diff_state)?;
+        let logical_qcid = if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+            let base_chunk_list = Self::simple_chunk_list_from_ids_with_sizes(
+                base_chunk_ids.clone(),
+                &writer_state.base_chunk_sizes,
+            )?;
+            let mut reader = DiffChunkListReader::from_writer_state(
+                named_store_mgr,
+                base_chunk_list,
+                &writer_state,
+                std::io::SeekFrom::Start(0),
+                None,
+            )
+            .await?;
+            Some(calc_quick_hash(&mut reader, Some(writer_state.total_size)).await?)
+        } else {
+            log::warn!(
+                "overlay logical qcid unavailable without named_store_mgr, inode={}",
+                fb.file_inode_id
+            );
+            None
+        };
         let merged_state = DiffChunkListWriter::rebuild_merged_state_from_writer_state(
             &base_chunk_ids,
             &writer_state,
@@ -623,6 +628,7 @@ impl LocalFileBufferService {
             &fb.diff_file_path,
             merged_state.merged_chunk_list,
             &merged_state.merged_chunk_sizes,
+            logical_qcid,
             existing_linked_at,
         )?;
         let dirty_segments = merged_state
@@ -738,21 +744,21 @@ impl LocalFileBufferService {
         named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         segments: &[ChunkSegment],
-        qcid: &ChunkId,
     ) -> NdnResult<()> {
         let local_path = diff_file_path.to_string_lossy().to_string();
-        let now = Self::now_unix_secs();
+        let (backing_qcid, metadata) =
+            calculate_qcid_from_file_with_metadata(diff_file_path).await?;
 
         for segment in segments {
-            let local_info = ChunkLocalInfo {
-                path: local_path.clone(),
-                qcid: qcid.to_string(),
-                last_modify_time: now,
-                range: Some(Range {
+            let local_info = ChunkLocalInfo::new(
+                local_path.clone(),
+                backing_qcid.to_string(),
+                &metadata,
+                Some(Range {
                     start: segment.offset,
                     end: segment.offset + segment.size,
                 }),
-            };
+            );
             named_store_mgr
                 .add_chunk_by_link_to_local_file(&segment.chunk_id, segment.size, &local_info)
                 .await?;
@@ -766,25 +772,25 @@ impl LocalFileBufferService {
         named_store_mgr: &Arc<NamedDataMgr>,
         diff_file_path: &PathBuf,
         dirty_segments: &[OverlayDirtyChunkSegment],
-        qcid: &ChunkId,
     ) -> NdnResult<()> {
         if dirty_segments.is_empty() {
             return Ok(());
         }
 
         let local_path = diff_file_path.to_string_lossy().to_string();
-        let now = Self::now_unix_secs();
+        let (backing_qcid, metadata) =
+            calculate_qcid_from_file_with_metadata(diff_file_path).await?;
 
         for segment in dirty_segments {
-            let local_info = ChunkLocalInfo {
-                path: local_path.clone(),
-                qcid: qcid.to_string(),
-                last_modify_time: now,
-                range: Some(Range {
+            let local_info = ChunkLocalInfo::new(
+                local_path.clone(),
+                backing_qcid.to_string(),
+                &metadata,
+                Some(Range {
                     start: segment.diff_file_offset,
                     end: segment.diff_file_offset + segment.size,
                 }),
-            };
+            );
             named_store_mgr
                 .add_chunk_by_link_to_local_file(&segment.chunk_id, segment.size, &local_info)
                 .await?;
@@ -837,19 +843,7 @@ impl LocalFileBufferService {
             content_obj_id.to_string(),
         );
         let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
-        let qcid = if file_size >= MIN_QCID_FILE_SIZE {
-            caculate_qcid_from_file(diff_file_path).await?
-        } else {
-            match &content_layout {
-                ContentLayout::Single { segment } => segment.chunk_id.clone(),
-                ContentLayout::ChunkList { segments, .. } => segments
-                    .first()
-                    .map(|s| s.chunk_id.clone())
-                    .ok_or_else(|| {
-                        NdnError::InvalidData("empty chunk list for qcid fallback".to_string())
-                    })?,
-            }
-        };
+        let logical_qcid = Some(caculate_qcid_from_file(diff_file_path).await?);
 
         Ok(FinalizeData {
             file_inode_id,
@@ -858,7 +852,7 @@ impl LocalFileBufferService {
             content_layout,
             file_obj_id,
             file_obj_str,
-            qcid,
+            logical_qcid,
             linked_at: existing_linked_at.unwrap_or_else(Self::now_unix_secs),
         })
     }
@@ -867,13 +861,19 @@ impl LocalFileBufferService {
         &self,
         file_inode_id: u64,
         file_obj_id: ObjId,
-        qcid: ChunkId,
+        logical_qcid: Option<ChunkId>,
         fb_handle: String,
         linked_at: u64,
     ) -> NdnResult<()> {
         let Some(client) = self.get_fsmeta_client()? else {
             return Ok(());
         };
+        let qcid = logical_qcid.ok_or_else(|| {
+            NdnError::InvalidState(format!(
+                "logical qcid is required for linked inode {}",
+                file_inode_id
+            ))
+        })?;
 
         let old_state = client
             .get_inode(file_inode_id, None)
@@ -946,7 +946,7 @@ impl LocalFileBufferService {
                     NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
                 })?;
                 state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
-                state.linked_qcid = Some(finalize_data.qcid.clone());
+                state.linked_qcid = finalize_data.logical_qcid.clone();
                 state.linked_at = Some(finalize_data.linked_at);
                 state.finalized_at = Some(Self::now_unix_secs());
             }
@@ -1302,7 +1302,11 @@ impl FileBufferService for LocalFileBufferService {
                     file_size
                 );
                 let finalized_obj_id = finalize_data.file_obj_id.clone();
-                let finalized_qcid = finalize_data.qcid.clone();
+                let finalized_qcid = finalize_data
+                    .logical_qcid
+                    .as_ref()
+                    .map(ChunkId::to_string)
+                    .unwrap_or_else(|| "unavailable".to_string());
 
                 if let Some(named_store_mgr) = self.get_named_store_mgr()? {
                     if let Some(context) = &overlay_context {
@@ -1337,7 +1341,7 @@ impl FileBufferService for LocalFileBufferService {
                     fb.handle_id,
                     fb.file_inode_id,
                     finalized_obj_id,
-                    finalized_qcid.to_string(),
+                    finalized_qcid,
                     file_size
                 );
                 return Ok(true);
@@ -1354,18 +1358,12 @@ impl FileBufferService for LocalFileBufferService {
                         &named_store_mgr,
                         &fb.diff_file_path,
                         &context.dirty_segments,
-                        &finalize_data.qcid,
                     )
                     .await?;
                 } else {
                     let segments = finalize_data.content_layout.segments();
-                    self.put_links_to_store(
-                        &named_store_mgr,
-                        &fb.diff_file_path,
-                        &segments,
-                        &finalize_data.qcid,
-                    )
-                    .await?;
+                    self.put_links_to_store(&named_store_mgr, &fb.diff_file_path, &segments)
+                        .await?;
                 }
                 self.put_objects_to_store(
                     &named_store_mgr,
@@ -1386,18 +1384,22 @@ impl FileBufferService for LocalFileBufferService {
                     NdnError::InvalidState("filebuffer diff_state poisoned".to_string())
                 })?;
                 state.linked_obj_id = Some(finalize_data.file_obj_id.clone());
-                state.linked_qcid = Some(finalize_data.qcid.clone());
+                state.linked_qcid = finalize_data.logical_qcid.clone();
                 state.linked_at = Some(finalize_data.linked_at);
                 state.finalized_at = None;
             }
             self.persist_meta(fb).await?;
 
             let linked_obj_id = finalize_data.file_obj_id.clone();
-            let linked_qcid = finalize_data.qcid.clone();
+            let linked_qcid = finalize_data
+                .logical_qcid
+                .as_ref()
+                .map(ChunkId::to_string)
+                .unwrap_or_else(|| "unavailable".to_string());
             self.update_fsmeta_linked_state(
                 fb.file_inode_id,
                 finalize_data.file_obj_id,
-                finalize_data.qcid,
+                finalize_data.logical_qcid,
                 fb.handle_id.clone(),
                 finalize_data.linked_at,
             )
@@ -1407,7 +1409,7 @@ impl FileBufferService for LocalFileBufferService {
                 fb.handle_id,
                 fb.file_inode_id,
                 linked_obj_id,
-                linked_qcid.to_string(),
+                linked_qcid,
                 file_size
             );
 
@@ -1504,18 +1506,27 @@ impl FileBufferService for LocalFileBufferService {
                 }
             }
             if let Some(existing_qcid) = state.linked_qcid {
-                if existing_qcid != finalize_data.qcid {
+                if finalize_data.logical_qcid.as_ref() != Some(&existing_qcid) {
+                    let recalculated_qcid = finalize_data
+                        .logical_qcid
+                        .as_ref()
+                        .map(ChunkId::to_string)
+                        .unwrap_or_else(|| "unavailable".to_string());
                     log::warn!(
                         "finalize recalculated qcid differs from linked state, handle={}, old={}, new={}",
                         fb_id,
                         existing_qcid.to_string(),
-                        finalize_data.qcid.to_string()
+                        recalculated_qcid
                     );
                 }
             }
 
             let finalized_obj_id = finalize_data.file_obj_id.clone();
-            let finalized_qcid = finalize_data.qcid.clone();
+            let finalized_qcid = finalize_data
+                .logical_qcid
+                .as_ref()
+                .map(ChunkId::to_string)
+                .unwrap_or_else(|| "unavailable".to_string());
             let finalized_file_size = finalize_data.file_size;
             self.do_finalize(&arc_record, finalize_data).await?;
             log::info!(
@@ -1523,7 +1534,7 @@ impl FileBufferService for LocalFileBufferService {
                 fb_id,
                 snapshot.file_inode_id,
                 finalized_obj_id,
-                finalized_qcid.to_string(),
+                finalized_qcid,
                 finalized_file_size
             );
 
@@ -1589,7 +1600,11 @@ impl FileBufferService for LocalFileBufferService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndn_lib::{ChunkHasher, ChunkList, ChunkType, FileObject, NamedObject, CHUNK_DEFAULT_SIZE};
+    use named_store::{NamedLocalStore, StoreLayout, StoreTarget};
+    use ndn_lib::{
+        calc_quick_hash_by_buffer, ChunkHasher, ChunkList, ChunkType, FileObject, NamedObject,
+        CHUNK_DEFAULT_SIZE,
+    };
     use tempfile::tempdir;
 
     fn test_lease() -> WriteLease {
@@ -1598,6 +1613,34 @@ mod tests {
             session_seq: 1,
             expires_at: 0,
         }
+    }
+
+    async fn create_test_store_mgr(base_dir: &std::path::Path) -> Arc<NamedDataMgr> {
+        let store = NamedLocalStore::get_named_store_by_path(base_dir.join("named_store"))
+            .await
+            .unwrap();
+        let store_id = store.store_id().to_string();
+        let store_mgr = NamedDataMgr::new();
+        store_mgr
+            .register_store(Arc::new(tokio::sync::Mutex::new(store)))
+            .await;
+        store_mgr
+            .add_layout(StoreLayout::new(
+                1,
+                vec![StoreTarget {
+                    store_id,
+                    device_did: String::new(),
+                    capacity: None,
+                    used: None,
+                    readonly: false,
+                    enabled: true,
+                    weight: 1,
+                }],
+                0,
+                0,
+            ))
+            .await;
+        Arc::new(store_mgr)
     }
 
     #[tokio::test]
@@ -1725,10 +1768,17 @@ mod tests {
     #[tokio::test]
     async fn test_cacl_name_supports_overlay_mode_with_dirty_diff() {
         let dir = tempdir().unwrap();
-        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0);
+        let store_mgr = create_test_store_mgr(dir.path()).await;
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0)
+            .with_named_store_mgr(store_mgr.clone());
+        let base_chunk_bytes = b"base-chunk";
         let base_chunk = ChunkHasher::new(None)
             .unwrap()
-            .calc_mix_chunk_id_from_bytes(b"base-chunk")
+            .calc_mix_chunk_id_from_bytes(base_chunk_bytes)
+            .unwrap();
+        store_mgr
+            .put_chunk(&base_chunk, base_chunk_bytes)
+            .await
             .unwrap();
         let dirty_chunk_bytes = b"diff-chunk";
         let fb = service
@@ -1776,6 +1826,10 @@ mod tests {
         );
         let (expected_file_obj_id, _) = file_obj.gen_obj_id();
         assert_eq!(state.linked_obj_id.unwrap(), expected_file_obj_id);
+        assert_eq!(
+            state.linked_qcid.unwrap(),
+            calc_quick_hash_by_buffer(dirty_chunk_bytes).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1801,7 +1855,9 @@ mod tests {
         let linked = service.get_buffer(&fb.handle_id).await.unwrap();
         let linked_state = linked.diff_state.read().unwrap().clone();
         assert!(linked_state.linked_obj_id.is_some());
-        assert!(linked_state.linked_qcid.is_some());
+        // The synthetic base chunk is not present in a NamedDataMgr, so the
+        // logical overlay bytes cannot be sampled for a canonical QCID.
+        assert!(linked_state.linked_qcid.is_none());
         assert!(linked_state.linked_at.is_some());
         assert!(linked_state.finalized_at.is_none());
         assert!(linked.diff_file_path.exists());

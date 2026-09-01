@@ -2,7 +2,7 @@ use super::chunk::{
     ChunkId, ChunkType, CALC_HASH_PIECE_SIZE, COPY_CHUNK_BUFFER_SIZE, QCID_HASH_PIECE_SIZE,
 };
 use crate::hash::DEFAULT_HASH_METHOD;
-use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult, MIN_QCID_FILE_SIZE};
+use crate::{HashHelper, HashMethod, Hasher, NdnError, NdnResult, QCID_SAMPLE_THRESHOLD};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::str::FromStr;
@@ -203,8 +203,28 @@ impl ChunkHasher {
     }
 }
 
-//TODO: this function require a seekable reader
-//quick hash is only for qcid
+fn finalize_qcid(length: u64, hasher: Sha256) -> ChunkId {
+    let hash_result = hasher.finalize();
+    ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID)
+}
+
+fn qcid_sample_offsets(length: u64) -> Option<[u64; 3]> {
+    if length < QCID_SAMPLE_THRESHOLD {
+        None
+    } else {
+        Some([
+            0,
+            (length - QCID_HASH_PIECE_SIZE) / 2,
+            length - QCID_HASH_PIECE_SIZE,
+        ])
+    }
+}
+
+/// Calculate the canonical QCID of a seekable reader.
+///
+/// Files smaller than 12 KiB are hashed in full. Larger files hash three
+/// 4 KiB pieces at the head, centered midpoint, and tail. All offsets are
+/// absolute from the beginning of the reader.
 pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
     reader: &mut T,
     length: Option<u64>,
@@ -223,64 +243,51 @@ pub async fn calc_quick_hash<T: AsyncRead + AsyncSeek + Unpin>(
         length
     };
 
-    if length < MIN_QCID_FILE_SIZE {
-        return Err(NdnError::Internal(format!(
-            "quick hash error: item size is too small"
-        )));
+    let mut hasher = Sha256::new();
+    if let Some(offsets) = qcid_sample_offsets(length) {
+        let mut piece = [0u8; QCID_HASH_PIECE_SIZE as usize];
+        for offset in offsets {
+            reader.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+                warn!("calc_quick_hash: seek file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+            reader.read_exact(&mut piece).await.map_err(|e| {
+                warn!("calc_quick_hash: read file failed! {}", e.to_string());
+                NdnError::IoError(e.to_string())
+            })?;
+            hasher.update(&piece);
+        }
+    } else {
+        reader.seek(SeekFrom::Start(0)).await.map_err(|e| {
+            warn!("calc_quick_hash: seek file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        let mut buffer = vec![0u8; length as usize];
+        reader.read_exact(&mut buffer).await.map_err(|e| {
+            warn!("calc_quick_hash: read file failed! {}", e.to_string());
+            NdnError::IoError(e.to_string())
+        })?;
+        hasher.update(&buffer);
     }
 
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; QCID_HASH_PIECE_SIZE as usize];
-    let mut offset = 0;
-    reader.read_exact(&mut buffer).await.map_err(|e| {
-        warn!("calc_quick_hash: read file failed! {}", e.to_string());
-        NdnError::IoError(e.to_string())
-    })?;
-    hasher.update(&buffer);
-    offset = length / 2;
-    reader.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-        warn!("calc_quick_hash: seek file failed! {}", e.to_string());
-        NdnError::IoError(e.to_string())
-    })?;
-    reader.read_exact(&mut buffer).await.map_err(|e| {
-        warn!("calc_quick_hash: read file failed! {}", e.to_string());
-        NdnError::IoError(e.to_string())
-    })?;
-    hasher.update(&buffer);
-    let hash_result = hasher.finalize();
-
-    let result_chunk_id = ChunkId::from_mix_hash_result(length, &hash_result, ChunkType::QCID);
-
-    Ok(result_chunk_id)
+    Ok(finalize_qcid(length, hasher))
 }
 
-pub async fn calc_quick_hash_by_buffer(
-    buffer_begin: &[u8],
-    buffer_mid: &[u8],
-    buffer_end: &[u8],
-    length: u64,
-) -> NdnResult<ChunkId> {
+/// Calculate the canonical QCID of an in-memory file.
+pub fn calc_quick_hash_by_buffer(buffer: &[u8]) -> NdnResult<ChunkId> {
+    let length = buffer.len() as u64;
     let mut hasher = Sha256::new();
-    let limit_size = QCID_HASH_PIECE_SIZE as usize;
-    if buffer_begin.len() != limit_size
-        || buffer_mid.len() != limit_size
-        || buffer_end.len() != limit_size
-    {
-        return Err(NdnError::Internal(format!(
-            "cacl quick hash buffer part length must be 4096"
-        )));
+    if let Some(offsets) = qcid_sample_offsets(length) {
+        let piece_size = QCID_HASH_PIECE_SIZE as usize;
+        for offset in offsets {
+            let start = offset as usize;
+            hasher.update(&buffer[start..start + piece_size]);
+        }
+    } else {
+        hasher.update(buffer);
     }
 
-    hasher.update(buffer_begin);
-    hasher.update(buffer_mid);
-    hasher.update(buffer_end);
-    let hash_result = hasher.finalize();
-
-    Ok(ChunkId::from_mix_hash_result(
-        length,
-        &hash_result,
-        ChunkType::QCID,
-    ))
+    Ok(finalize_qcid(length, hasher))
 }
 
 pub async fn calculate_file_chunk_id(
@@ -308,16 +315,46 @@ pub async fn calculate_file_chunk_id(
     }
 }
 
-pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<ChunkId> {
+fn same_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
+/// Calculate a file QCID and return the stable metadata snapshot used for it.
+pub async fn calculate_qcid_from_file_with_metadata(
+    file_path: &Path,
+) -> NdnResult<(ChunkId, std::fs::Metadata)> {
     let mut file_reader = tokio::fs::File::open(file_path).await.map_err(|err| {
         warn!(
-            "caculate_qcid_from_file: open file failed! {}",
+            "calculate_qcid_from_file_with_metadata: open file failed! {}",
             err.to_string()
         );
         NdnError::IoError(err.to_string())
     })?;
-    let qcid = calc_quick_hash(&mut file_reader, None).await?;
-    return Ok(qcid);
+    let before = file_reader
+        .metadata()
+        .await
+        .map_err(|err| NdnError::IoError(err.to_string()))?;
+    let qcid = calc_quick_hash(&mut file_reader, Some(before.len())).await?;
+    let after = file_reader
+        .metadata()
+        .await
+        .map_err(|err| NdnError::IoError(err.to_string()))?;
+    let path_after = tokio::fs::metadata(file_path)
+        .await
+        .map_err(|err| NdnError::IoError(err.to_string()))?;
+
+    if !same_file_metadata(&before, &after) || !same_file_metadata(&after, &path_after) {
+        return Err(NdnError::InvalidData(format!(
+            "file changed while calculating qcid: {}",
+            file_path.display()
+        )));
+    }
+
+    Ok((qcid, after))
+}
+
+pub async fn caculate_qcid_from_file(file_path: &Path) -> NdnResult<ChunkId> {
+    Ok(calculate_qcid_from_file_with_metadata(file_path).await?.0)
 }
 
 pub async fn copy_chunk<R, W>(
@@ -387,6 +424,69 @@ where
 mod tests {
     use super::*;
     use rand::Rng;
+    use std::io::Cursor;
+
+    fn qcid_test_data(length: usize) -> Vec<u8> {
+        (0..length).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn test_qcid_canonical_vectors_and_reader_buffer_consistency() {
+        let vectors = [
+            (
+                0usize,
+                "qcid:00e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                1,
+                "qcid:016e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+            ),
+            (
+                4095,
+                "qcid:ff1f45de2924756389e3ccab98bdaacbef8a81cdeb651b59f916a6d6385b4f7b999d",
+            ),
+            (
+                4096,
+                "qcid:8020d67c656e01756650d77717b0839985a056ec28ffe174601d690fc407a2ceffca",
+            ),
+            (
+                12287,
+                "qcid:ff5f78ac95e2a27d63518fe831893f210699f7d6d6091071e6d5adccaaa476caf39c",
+            ),
+            (
+                12288,
+                "qcid:80602ffe74f47a7bb7350e913f6b9259080cbe3cee97b2d313d5e2fe2942108d98e9",
+            ),
+            (
+                12289,
+                "qcid:8160e526e1336f9c56d5012c520783dba4c96852a49a515a988447b940253faa28f1",
+            ),
+        ];
+
+        for (length, expected) in vectors {
+            let data = qcid_test_data(length);
+            let buffer_qcid = calc_quick_hash_by_buffer(&data).unwrap();
+            assert_eq!(buffer_qcid.to_string(), expected, "length={length}");
+
+            let mut reader = Cursor::new(data);
+            let reader_qcid = calc_quick_hash(&mut reader, None).await.unwrap();
+            assert_eq!(reader_qcid, buffer_qcid, "length={length}");
+        }
+    }
+
+    #[test]
+    fn test_qcid_large_file_samples_head_center_and_tail() {
+        let length = QCID_SAMPLE_THRESHOLD as usize + 101;
+        let data = vec![0u8; length];
+        let original = calc_quick_hash_by_buffer(&data).unwrap();
+        let center_start = (length - QCID_HASH_PIECE_SIZE as usize) / 2;
+
+        for changed_offset in [0, center_start, length - 1] {
+            let mut changed = data.clone();
+            changed[changed_offset] = 1;
+            assert_ne!(calc_quick_hash_by_buffer(&changed).unwrap(), original);
+        }
+    }
 
     #[test]
     fn test_chunk_hasher_save_state() {

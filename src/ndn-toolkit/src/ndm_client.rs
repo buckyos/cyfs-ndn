@@ -736,8 +736,12 @@ fn require_total_size(resp: &Response, route: &str) -> NdnResult<u64> {
 
 fn parse_local_info(v: &Value) -> NdnResult<ChunkLocalInfo> {
     let qcid = take_string(v, "qcid")?;
-    let last_modify_time = v
-        .get("last_modify_time")
+    let source_file_size = v
+        .get("source_file_size")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(0);
+    let last_modify_time_ns = v
+        .get("last_modify_time_ns")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
     let range = v
@@ -749,7 +753,8 @@ fn parse_local_info(v: &Value) -> NdnResult<ChunkLocalInfo> {
     Ok(ChunkLocalInfo {
         path: String::new(),
         qcid,
-        last_modify_time,
+        source_file_size,
+        last_modify_time_ns,
         range,
     })
 }

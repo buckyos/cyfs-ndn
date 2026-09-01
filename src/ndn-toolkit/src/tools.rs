@@ -8,10 +8,10 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 
 use ndn_lib::{
-    caculate_qcid_from_file, load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkList,
-    ChunkType, DirObject, FileObject, MsgObject, NamedObject, NdnAction, NdnError,
-    NdnProgressCallback, NdnResult, ObjId, ProgressCallbackResult, RefRole, RefTarget, StoreMode,
-    CHUNK_DEFAULT_SIZE,
+    caculate_qcid_from_file, calculate_qcid_from_file_with_metadata,
+    load_named_object_from_obj_str, ChunkHasher, ChunkId, ChunkList, ChunkType, DirObject,
+    FileObject, MsgObject, NamedObject, NdnAction, NdnError, NdnProgressCallback, NdnResult, ObjId,
+    ProgressCallbackResult, RefRole, RefTarget, StoreMode, CHUNK_DEFAULT_SIZE,
 };
 
 #[derive(PartialEq)]
@@ -181,14 +181,18 @@ pub async fn cacl_file_object(
         .unwrap_or_default();
 
     let mut qcid_string = String::new();
+    let mut link_file_meta = None;
     if check_mode.is_support_quick_check() {
         if let Ok(qcid) = caculate_qcid_from_file(local_file_path).await {
             qcid_string = qcid.to_string();
         }
     }
-    if qcid_string.is_empty() && matches!(store_mode, StoreMode::LocalFile(_, _, _)) {
-        qcid_string = caculate_qcid_from_file(local_file_path).await?.to_string();
+    if matches!(store_mode, StoreMode::LocalFile(_, _, _)) {
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(local_file_path).await?;
+        qcid_string = qcid.to_string();
+        link_file_meta = Some(metadata);
     }
+    let local_info_metadata = link_file_meta.as_ref().unwrap_or(&file_meta);
 
     let use_chunk_list_now = use_chunklist && file_size > CHUNK_DEFAULT_SIZE;
     let mut chunk_ids = Vec::new();
@@ -200,12 +204,12 @@ pub async fn cacl_file_object(
         let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(0, &hash_result, hash_method)?;
         chunk_ids.push(chunk_id.clone());
 
-        let local_info = ChunkLocalInfo {
-            path: local_file_path.to_string_lossy().to_string(),
-            qcid: qcid_string.clone(),
-            last_modify_time: file_last_modify_time,
-            range: Some(0..0),
-        };
+        let local_info = ChunkLocalInfo::new(
+            local_file_path.to_string_lossy().to_string(),
+            qcid_string.clone(),
+            local_info_metadata,
+            Some(0..0),
+        );
         let content = ContentToStore::from_local_file(chunk_id.clone(), 0, local_info);
         store_content_to_ndn_mgr(store_mgr, content, store_mode.clone()).await?;
 
@@ -250,12 +254,12 @@ pub async fn cacl_file_object(
             );
 
             let range = Some(read_pos..read_pos + chunk_size);
-            let local_info = ChunkLocalInfo {
-                path: local_file_path.to_string_lossy().to_string(),
-                qcid: qcid_string.clone(),
-                last_modify_time: file_last_modify_time,
-                range: range.clone(),
-            };
+            let local_info = ChunkLocalInfo::new(
+                local_file_path.to_string_lossy().to_string(),
+                qcid_string.clone(),
+                local_info_metadata,
+                range.clone(),
+            );
             let content = ContentToStore::from_local_file(chunk_id.clone(), chunk_size, local_info);
             store_content_to_ndn_mgr(store_mgr, content, store_mode.clone()).await?;
 
