@@ -13,6 +13,11 @@
 
 非目标：
 - **不**设计任何对象级权限/签名校验机制（这一层由调用方在更高层添加，例如 CYFS Head/JWT）。
+- **不**提供、也**永不**提供 ObjectId → 逻辑路径的反查接口或反向索引。store 层不理解命名空间；
+  上层鉴权所需的路径上下文由客户端在请求中正向携带（NFSP 数据面的 `context` 参数，
+  见 [NamedFileSystem_Protocol_v0.md](../NamedFileSystem_Protocol_v0.md) §7.3.1）。
+  这是 NFSP 安全模型的结构性依赖：反查能力一旦存在，"一个 ObjId 被多条路径引用、
+  各路径策略不同"时的鉴权语义即不可判定，且反查本身构成隐私泄露面。
 - **不**设计断点续传、分片并发上传、CDN 协商等复杂上传策略。
 - **不**保留 `local_store.rs` 中 `LocalLink`（`add_chunk_by_link_to_local_file`）相关的本机文件别名功能 —— 这是文件系统专属的优化手段，不进入网络协议层；本地实现仍可在 store 内部走 fast path。
 
