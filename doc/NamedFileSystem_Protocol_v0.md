@@ -144,7 +144,7 @@ NFSP 对客户端暴露的是统一的可导航 Node 模型，而不是三套互
   },
   "locations": [
     {"url":"collection://reading-list", "via":"direct"},
-    {"url":"dfs://home/Lists/Reading%20List", "via":"reference"}
+    {"url":"cyfs:///home/Lists/Reading%20List", "via":"reference"}
   ]
 }
 ```
@@ -297,7 +297,7 @@ PRD 9.4 有一条强约束：**Topic 不能让用户觉得文件被复制了**�
       "members": [
         { "entry_ref":"ve_member_1", "binding":"derived",
           "target":{"ref":{"type":"live", "node_id":"file-99", "gen":2}, "kind":"file"},
-          "canonical_path": "dfs://home/photos/2026/07/IMG_0912.HEIC",
+          "canonical_path": "cyfs:///home/photos/2026/07/IMG_0912.HEIC",
           "provenance": { "why": "同一 IM 会话内接收", "matched_by": "story.im", "score": 0.91 } }
       ] }
   ]
@@ -331,7 +331,7 @@ Collection 是 `kind:collection` 的可变 Container，由用户或 AI 显式管
     {
       "entry_ref":"ce_17", "name":"report.pdf", "binding":"reference",
       "target": {"ref":{"type":"live", "node_id":"file-10", "gen":2}, "kind":"file"},
-      "canonical_path":"dfs://home/Documents/report.pdf",
+      "canonical_path":"cyfs:///home/Documents/report.pdf",
       "context":{"type":"collection", "order_index":0}
     },
     {
@@ -357,10 +357,10 @@ PRD 9.2 明确要求：`public` 目录下的文件要同时显示存储路径和
 
 ```jsonc
 "access_urls": [
-  { "kind": "fs",     "url": "dfs://home/public/report.pdf", "primary": true },
+  { "kind": "fs",     "url": "cyfs:///home/public/report.pdf", "primary": true },
   { "kind": "cyfs",   "url": "cyfs://o/$zoneid/sha256:abcd...", "immutable": true },
   { "kind": "public", "url": "https://alice.buckyos.io/public/report.pdf" },
-  { "kind": "pinned", "url": "https://alice.buckyos.io/ndn/sha256:abcd...?context=dfs://home/public/report.pdf", "immutable": true },
+  { "kind": "pinned", "url": "https://alice.buckyos.io/ndn/sha256:abcd...?context=cyfs:///home/public/report.pdf", "immutable": true },
   { "kind": "signed", "url": "https://alice.buckyos.io/s/eyJhb...", "expires_at": 1756699999,
     "cap_id": "cap_7f3a", "revocable": true }
 ]
@@ -717,7 +717,7 @@ collection_patch {
   "want": ["base","ident","thumb","access"] }
 →
 { "hits": [
-    { "ref": {...}, "canonical_path": "dfs://home/photos/2026/IMG_0912.HEIC",
+    { "ref": {...}, "canonical_path": "cyfs:///home/photos/2026/IMG_0912.HEIC",
       "match_source": "semantic",              // name | dirname | fulltext | semantic | meta
       "score": 0.83,
       "explain": { "matcher": "ai.vision.v1",
@@ -769,8 +769,8 @@ get_policy { "at": {"realm":"dfs","path":"/home/private/medical"} }
     "ai.external":    "deny"         // 即使允许 ai.process，也禁止出网模型
   },
   "inherited_from": {
-    "index.semantic": "dfs://home/private",
-    "ai.external":    "dfs://"        // zone 默认策略
+    "index.semantic": "cyfs:///home/private",
+    "ai.external":    "cyfs:///"        // zone 默认策略
   },
   "triggers": [                        // PRD 9.8：让用户看到这里挂了什么
     { "app_id":"kb-indexer", "on":"on_new_file_upload", "state":"suppressed",
@@ -818,7 +818,7 @@ data: {"ref":{"type":"live","node_id":"file-5678","gen":2},
        "reason":"conflicting_writer","grace_ms":3000}
 
 event: policy_changed
-data: {"path":"dfs://home/private","dims":["index.semantic"]}
+data: {"path":"cyfs:///home/private","dims":["index.semantic"]}
 ```
 
 这是 File Browser 从"能用"到"好用"的分水岭：
@@ -932,8 +932,8 @@ URL 本身不携带"这份内容在命名空间里位于何处、受哪条 polic
 为此，数据面请求**鼓励携带**（SHOULD）`context` 参数——通常就是该对象在 DFS 里的原始路径：
 
 ```
-GET /ndn/{obj_id}?context=dfs://home/photos/2026/cover.jpg
-GET /nfs/v1/repr/{obj_id}/thumb256?context=dfs://home/photos/2026/cover.jpg
+GET /ndn/{obj_id}?context=cyfs:///home/photos/2026/cover.jpg
+GET /nfs/v1/repr/{obj_id}/thumb256?context=cyfs:///home/photos/2026/cover.jpg
 ```
 
 - `context` 是客户端对"我从哪个逻辑路径得到这个 ObjId"的**声明**。
