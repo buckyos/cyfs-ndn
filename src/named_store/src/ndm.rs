@@ -927,6 +927,14 @@ impl NamedDataMgr {
                     continue;
                 }
                 Err(e) => {
+                    if let Ok((ChunkStoreState::SameAs(_), size)) =
+                        store_guard.query_chunk_state(chunk_id).await
+                    {
+                        drop(store_guard);
+                        drop(stores);
+                        drop(versions);
+                        return self.open_same_as_reader(chunk_id, size, offset).await;
+                    }
                     last_error = Some(e);
                     continue;
                 }
@@ -939,6 +947,67 @@ impl NamedDataMgr {
                 chunk_id.to_string()
             ))
         }))
+    }
+
+    async fn open_same_as_reader(
+        &self,
+        chunk_id: &ChunkId,
+        size: u64,
+        offset: u64,
+    ) -> NdnResult<(ChunkReader, u64)> {
+        if offset > size {
+            return Err(NdnError::OffsetTooLarge(chunk_id.to_string()));
+        }
+        let mut pending = vec![(chunk_id.clone(), Vec::<ChunkId>::new())];
+        let mut chunks = Vec::new();
+        while let Some((current, mut ancestors)) = pending.pop() {
+            if ancestors.contains(&current) || ancestors.len() >= 64 {
+                return Err(NdnError::InvalidData(
+                    "cyclic or excessive SameAs nesting".to_string(),
+                ));
+            }
+            let (state, stored_size) = self.query_chunk_state(&current).await?;
+            if let ChunkStoreState::SameAs(target) = state {
+                if !target.is_chunk_list() {
+                    return Err(NdnError::InvalidObjType(
+                        "SameAs target must be a ChunkList".to_string(),
+                    ));
+                }
+                let body = self.get_object(&target).await?;
+                let list = ChunkList::from_json(&body)?;
+                if list.total_size != stored_size
+                    || current
+                        .get_length()
+                        .is_some_and(|length| length != stored_size)
+                {
+                    return Err(NdnError::InvalidData(
+                        "SameAs chunk size differs from ChunkList".to_string(),
+                    ));
+                }
+                ancestors.push(current);
+                pending.extend(
+                    list.body
+                        .into_iter()
+                        .rev()
+                        .map(|child| (child, ancestors.clone())),
+                );
+            } else {
+                chunks.push(current);
+            }
+        }
+        let list = ChunkList::from_chunk_list(chunks)?;
+        if list.total_size != size {
+            return Err(NdnError::InvalidData(
+                "resolved SameAs size differs from chunk".to_string(),
+            ));
+        }
+        let reader = SimpleChunkListReader::new(
+            Arc::new(self.clone()),
+            list,
+            std::io::SeekFrom::Start(offset),
+        )
+        .await?;
+        Ok((Box::pin(reader), size))
     }
 
     /// Open chunklist reader by chunklist object id.

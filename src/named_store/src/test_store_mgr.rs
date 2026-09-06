@@ -290,3 +290,112 @@ async fn test_store_layout_mgr_replace_same_epoch() {
     let current = mgr.current_layout().await.unwrap();
     assert_eq!(current.targets.len(), 2);
 }
+
+#[tokio::test]
+async fn same_as_reader_preserves_order_offsets_and_rejects_cycles() {
+    use ndn_lib::{ChunkType, NamedObject};
+    use tokio::io::AsyncReadExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let store = NamedStore::get_named_store_by_path(root.path().to_path_buf())
+        .await
+        .unwrap();
+    let store_id = store.store_id().to_string();
+    let mgr = NamedDataMgr::new();
+    mgr.register_store(Arc::new(Mutex::new(store))).await;
+    mgr.add_layout(create_layout_with_epoch(
+        1,
+        vec![create_test_target(&store_id, 1, true, false)],
+    ))
+    .await;
+    let first = b"first chunk";
+    let second = b"second chunk";
+    let first_id = {
+        let hash = ndn_lib::ChunkHasher::new(None).unwrap();
+        ChunkId::from_mix_hash_result(
+            first.len() as u64,
+            &hash.calc_from_bytes(first),
+            ChunkType::Mix256,
+        )
+    };
+    let second_id = {
+        let hash = ndn_lib::ChunkHasher::new(None).unwrap();
+        ChunkId::from_mix_hash_result(
+            second.len() as u64,
+            &hash.calc_from_bytes(second),
+            ChunkType::Mix256,
+        )
+    };
+    mgr.put_chunk(&first_id, first).await.unwrap();
+    mgr.put_chunk(&second_id, second).await.unwrap();
+    let bytes = [first.as_slice(), second.as_slice()].concat();
+    let parent = ChunkId::from_mix_hash_result(bytes.len() as u64, &[3; 32], ChunkType::Mix256);
+    let (list_id, body) = ChunkList::from_chunk_list(vec![first_id.clone(), second_id.clone()])
+        .unwrap()
+        .gen_obj_id();
+    mgr.put_object(&list_id, &body).await.unwrap();
+    mgr.add_chunk_by_same_as(&parent, bytes.len() as u64, &list_id)
+        .await
+        .unwrap();
+    for offset in [
+        0,
+        first.len() as u64 - 1,
+        first.len() as u64,
+        bytes.len() as u64,
+    ] {
+        let (mut reader, total) = mgr.open_chunk_reader(&parent, offset).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(total, bytes.len() as u64);
+        assert_eq!(actual, bytes[offset as usize..]);
+    }
+    assert!(matches!(
+        mgr.open_chunk_reader(&parent, bytes.len() as u64 + 1).await,
+        Err(NdnError::OffsetTooLarge(_))
+    ));
+    let mut file = FileObject::default();
+    file.content = parent.to_string();
+    file.size = bytes.len() as u64;
+    let (file_id, file_body) = file.gen_obj_id();
+    mgr.put_object(&file_id, &file_body).await.unwrap();
+    let (mut reader, _) = mgr.open_reader(&file_id, None).await.unwrap();
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, bytes);
+
+    let nested = ChunkId::from_mix_hash_result(
+        (bytes.len() + first.len()) as u64,
+        &[4; 32],
+        ChunkType::Mix256,
+    );
+    let (nested_id, body) = ChunkList::from_chunk_list(vec![parent.clone(), first_id])
+        .unwrap()
+        .gen_obj_id();
+    mgr.put_object(&nested_id, &body).await.unwrap();
+    mgr.add_chunk_by_same_as(&nested, (bytes.len() + first.len()) as u64, &nested_id)
+        .await
+        .unwrap();
+    let (mut reader, _) = mgr.open_chunk_reader(&nested, 0).await.unwrap();
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, [bytes.as_slice(), first.as_slice()].concat());
+
+    mgr.add_chunk_by_same_as(&parent, bytes.len() as u64 + 1, &list_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mgr.open_chunk_reader(&parent, 0).await,
+        Err(NdnError::InvalidData(_))
+    ));
+    let (cyclic_id, body) = ChunkList::from_chunk_list(vec![parent.clone()])
+        .unwrap()
+        .gen_obj_id();
+    mgr.put_object(&cyclic_id, &body).await.unwrap();
+    mgr.add_chunk_by_same_as(&parent, bytes.len() as u64, &cyclic_id)
+        .await
+        .unwrap();
+    assert!(matches!(
+        mgr.open_chunk_reader(&parent, 0).await,
+        Err(NdnError::InvalidData(_))
+    ));
+}
