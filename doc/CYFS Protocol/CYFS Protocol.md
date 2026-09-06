@@ -1062,7 +1062,7 @@ Content-Type: application/cyfs-named-object+json
 
 协议只定义下面几件事：
 
-1. body **MUST** 是 canonical JSON 形式的 `NamedObject`。
+1. body **MUST** 是 canonical JSON 形式的 `NamedObject`。对象类型不能从任意业务字段推断；类型化对象在请求中带 `cyfs-obj-id: <ObjectId>`，接收端使用其中的类型前缀重新计算并核对正文 SHA-256。未提供该 header 的普通 JSON 对象使用 `jobj` 类型。正文不会因转投或重试而改变。
 2. body **MUST NOT** 直接携带 `NamedData` 或 Chunk 数据。如果 `NamedObject` 内部引用了大附件、`FileObject` 或 `ChunkList`，target Zone **MUST** 在自己后续主动 Pull。
 3. 如果 `<sem_path>` 上既没有处理逻辑，也没有显式配置的缓存接收路由，target Zone **MUST** 返回明确失败，建议使用 `404` 并附带 `cyfs-dispatch-error: no-handler`。已配置的 upstream 暂时不可用与路径没有 handler 是两种情况；前者可以按下文进入接收侧缓存。
 4. 是否接受、如何落地、ACL 如何判定、最终写到哪里，CYFS 协议不规定，由 target Zone 自行决定。
@@ -1120,9 +1120,9 @@ PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
 
 理由是 `NamedObject` 是 immutable 的，对它内部字段做“写”在语义上不存在；要更新只能投递一个新对象。
 
-#### dispatch 结果与接收侧缓存（2026-09-05 设计补充，待实现）
+#### dispatch 结果与接收侧缓存（2026-09-05）
 
-本节补充协议约定，不表示现有 gateway 或应用 service 已实现。部署允许公网 VPS 运行 Zone Gateway、家庭网络中的 OOD 运行 upstream；Gateway 仅在 upstream 失效时尽力暂存小对象，在恢复后转投。缓存组件只依赖 CYFS NamedObject 与请求上下文，不依赖 BuckyOS、MsgObject schema 或 ContactMgr。
+本节定义协议约定。ndn-lib 已提供结果、查询和投递身份解析；Gateway 的 NamedInboxCacheServer 已实现基础缓存与自排空。部署允许公网 VPS 运行 Zone Gateway、家庭网络中的 OOD 运行 upstream；Gateway 仅在 upstream 失效时尽力暂存小对象，在恢复后转投。缓存组件只依赖 CYFS NamedObject 与请求上下文，不依赖 BuckyOS、MsgObject schema 或 ContactMgr。
 
 这是尽力而为的接收侧缓存：`cached` 之后对象仍可能丢失。只有 `accepted` 才是发送方可据以认定投递成功的结果；缓存成功不移交发送方的保管与重试责任，不要求 Gateway 提供 100% 不丢的持久队列或永久回执。
 
@@ -1182,7 +1182,7 @@ PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
 GET cyfs://$target_zone/<sem_path>?dispatch-status=<ObjectId>
 ```
 
-它只查询这一个接收点对该对象的投递结果，不读取 inbox 列表或对象正文。query 参数是本节新增的协议能力，尚非现有实现。
+它只查询这一个接收点对该对象的投递结果，不读取 inbox 列表或对象正文。query 参数用于本节定义的可选查询能力。
 
 - 有记录：返回 `200`、`cyfs-dispatch-status` 及上述状态体；因此查询中的 HTTP 200 也可以描述 cached 或 rejected。缓存服务只有在对象当前仍存在时才可回答 cached；accepted 必须来自 upstream 的明确确认或对该确认的有效记录。
 - 无可用记录：返回 `404`、`cyfs-dispatch-error: unknown-dispatch`；这表示查询方无法确认，不能解释为“从未接收”或投递被拒绝。

@@ -4,6 +4,8 @@ mod action_obj;
 mod base_content;
 mod chunk;
 mod cyfs_http;
+mod cyfs_dispatch;
+pub use cyfs_dispatch::*;
 mod dirobj;
 mod fileobj;
 mod hash;
