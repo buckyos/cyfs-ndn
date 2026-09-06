@@ -1064,7 +1064,7 @@ Content-Type: application/cyfs-named-object+json
 
 1. body **MUST** 是 canonical JSON 形式的 `NamedObject`。
 2. body **MUST NOT** 直接携带 `NamedData` 或 Chunk 数据。如果 `NamedObject` 内部引用了大附件、`FileObject` 或 `ChunkList`，target Zone **MUST** 在自己后续主动 Pull。
-3. 如果 `<sem_path>` 上没有挂处理逻辑，target Zone **MUST** 返回明确失败，建议使用 `404` 并附带 `cyfs-dispatch-error: no-handler`。
+3. 如果 `<sem_path>` 上既没有处理逻辑，也没有显式配置的缓存接收路由，target Zone **MUST** 返回明确失败，建议使用 `404` 并附带 `cyfs-dispatch-error: no-handler`。已配置的 upstream 暂时不可用与路径没有 handler 是两种情况；前者可以按下文进入接收侧缓存。
 4. 是否接受、如何落地、ACL 如何判定、最终写到哪里，CYFS 协议不规定，由 target Zone 自行决定。
 
 #### ACL 与请求上下文
@@ -1119,6 +1119,81 @@ PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
 ```
 
 理由是 `NamedObject` 是 immutable 的，对它内部字段做“写”在语义上不存在；要更新只能投递一个新对象。
+
+#### dispatch 结果与接收侧缓存（2026-09-05 设计补充，待实现）
+
+本节补充协议约定，不表示现有 gateway 或应用 service 已实现。部署允许公网 VPS 运行 Zone Gateway、家庭网络中的 OOD 运行 upstream；Gateway 仅在 upstream 失效时尽力暂存小对象，在恢复后转投。缓存组件只依赖 CYFS NamedObject 与请求上下文，不依赖 BuckyOS、MsgObject schema 或 ContactMgr。
+
+这是尽力而为的接收侧缓存：`cached` 之后对象仍可能丢失。只有 `accepted` 才是发送方可据以认定投递成功的结果；缓存成功不移交发送方的保管与重试责任，不要求 Gateway 提供 100% 不丢的持久队列或永久回执。
+
+调用方区分四种结果：
+
+| 结果 | 语义 | 建议 HTTP 映射 |
+| --- | --- | --- |
+| 无响应 `no_response` | 未取得可确认的投递结果；可能已经产生接收或缓存副作用，不能推断对方没有收到 | 客户端超时、连接中断，或无法确认结果的网关错误；不是成功响应中的状态值 |
+| 明确拒绝 `rejected` | 本次投递被入口或 upstream 明确拒绝；必须携带原因及是否允许重试，不撤销此前已确认的 accepted | `400/403/404/413` 等；缓存满可用 `503` + `Retry-After` |
+| 已经缓存 `cached` | 接收侧缓存组件在响应时成功写入完整小对象及转投所需信息，将按配置尽力转投；对象后续仍可能丢失，upstream 尚未确认接收 | `202` |
+| 已经接收 `accepted` | 目标 upstream 已完成其持久接收事务，或确认同一投递此前已接收 | `200`，首次创建也可用 `201` |
+
+`accepted` 不代表用户已读、Agent 已处理、附件已下载，也不代表群中所有成员已拿到副本。`cached` 不代表对象已进入应用 inbox。HTTP `2xx` 本身不足以判断两者。
+
+可确认响应 **MUST** 带 `cyfs-dispatch-status: rejected|cached|accepted`，并返回 `application/json` 状态体；响应不是不可变 NamedObject。状态体至少包含 `obj_id`（ObjectId 字符串）、`target`（不含查询参数的规范化 `cyfs://<zone>/<semantic_path>` 字符串）和 `status`（与 header 一致）。拒绝响应还必须包含稳定的 `reason` 字符串与 `retryable` 布尔值。状态响应使用 `Cache-Control: no-store`。无法解析对象时，拒绝响应可以省略 `obj_id`。
+
+状态是对已认证请求者的回答；`cyfs-original-user` 声明本身不提供认证。缓存写入、转投和查询必须保留并使用经验证的来源上下文；对象正文不得因为转投而改写。
+
+##### upstream 优先与 fallback
+
+```text
+请求 → gateway process-chain 安全过滤与显式路由
+     → 直接尝试 upstream（正常路径不经过缓存）
+        ├─ accepted → 返回已经接收
+        ├─ 明确业务拒绝 → 原样返回拒绝，不进入缓存
+        └─ 暂不可用或结果未知 → 配置的 named-inbox-cache-server
+                               ├─ 缓存写入成功 → 返回已经缓存
+                               └─ 写入失败 → 返回失败，不承诺缓存
+```
+
+只有显式配置的语义路径可以使用默认缓存服务。默认是这些路由的缺省缓存目标，不是接收任意未知路径的 catch-all。安全过滤拒绝的请求不得通过缓存绕过；upstream 的明确业务拒绝同样不能触发 fallback。
+
+连接失败、超时以及路由策略明确标记的临时不可用可以触发 fallback。不能把所有非 `2xx` 或所有 `5xx` 无条件当成 upstream 不可用。普通 HTTP 响应若无法解析为本协议结果，不能伪装成 accepted。
+
+请求已经发给 upstream 但响应丢失时，允许缓存同一对象，转投依赖目标处理的幂等性。若此时缓存也写入失败，最终结果仍是 `no_response`（目标处理结果未知）；网关可以返回 `504` 和 `cyfs-dispatch-error: upstream-outcome-unknown`，但不能声称 upstream 明确拒绝。若可以确定请求尚未发给 upstream 且缓存已满，则可以明确返回可重试的 `rejected/cache-full`。
+
+##### 尽力缓存与排空
+
+1. 返回 `cached` 前，缓存组件必须实际完成本次写入，保存完整小对象、目标路径及必要来源上下文；尚未写入、写入失败或仅保存发送方对象 URL 时不能返回 cached。协议不要求这次缓存写入具备断电不丢保证。
+2. 必须限制单对象大小、条数和总字节数。缓存满则拒绝新写入；相同目标上的重复对象不重复占额。配置的过期清理、故障或缓存重建可以导致对象消失，这不违反 cached 语义。
+3. 不因缓存接收而抓取附件、Chunk 或其他被引用内容。
+4. Gateway 按配置持续尝试：取出对象但暂不删除 → 直接投给 upstream → 依据结果删除或继续保留。失败时可以退避；worker 的并发、重启恢复和存储方式由实现决定，不要求协议级持久租约队列。
+5. upstream 明确返回 `accepted`（包括幂等重复接收）后，删除缓存项并释放正文引用。不要把“开始转投”当作成功；upstream 暂时失败或结果未知时继续保留仍存在的缓存项，供之后尝试。
+6. upstream 明确永久拒绝时，可停止排空并清理对应缓存项，记录原因供诊断。保留终态回执是可选优化，不是缓存成功所承诺的责任。
+7. 可以配置缓存 TTL。已知过期时间可用 `expires_at_ms` 提示，但它不是最短保管承诺；发送方不能依赖对象在此之前一定存在。缓存不延长原授权有效期，upstream 仍执行应用准入规则。
+8. 排空不能再次经过同一个 fallback 入口；worker 直接投配置的 upstream。upstream 返回 cached 仍不算投递成功，不按 accepted 清理；本版不引入多级缓存责任移交。
+
+缓存条目和 upstream 幂等身份至少区分 `(target_zone, semantic_path, obj_id)`。不能仅按 obj_id 去重，因为同一对象可以投递给多个接收点。直接投递、发送方重试与后台排空使用相同身份，upstream 在业务接收事务中去重，对此前已接收的重复投递仍返回 accepted。
+
+发送方重试可能先成功、缓存随后才转投；upstream 必须处理这种重复。发送方一旦获得 accepted，不得被迟到的 cached、无响应或临时拒绝降级。缓存服务可以通过本地并发控制减少重复，但不承担 exactly-once 保证。
+
+##### 投递结果查询
+
+为支持响应丢失和 cached 后的后续确认，本补充定义一个可选查询能力；幂等重新 PUT 已足以完成发送重试，实现缓存组件不以前置实现完整回执系统为条件：
+
+```text
+GET cyfs://$target_zone/<sem_path>?dispatch-status=<ObjectId>
+```
+
+它只查询这一个接收点对该对象的投递结果，不读取 inbox 列表或对象正文。query 参数是本节新增的协议能力，尚非现有实现。
+
+- 有记录：返回 `200`、`cyfs-dispatch-status` 及上述状态体；因此查询中的 HTTP 200 也可以描述 cached 或 rejected。缓存服务只有在对象当前仍存在时才可回答 cached；accepted 必须来自 upstream 的明确确认或对该确认的有效记录。
+- 无可用记录：返回 `404`、`cyfs-dispatch-error: unknown-dispatch`；这表示查询方无法确认，不能解释为“从未接收”或投递被拒绝。
+- 状态源不可用：返回 `503/504`；不得将查询失败伪装成 `rejected`。
+- 查询必须认证，并按请求者对该投递的权限返回结果，不能作为公开 inbox 探测接口。
+
+Gateway 优先查询 upstream；upstream 失效时可查询缓存。缓存的回答只描述自身已知事实，不是整个 Zone 的完整历史。查询结果中用 `source: upstream|cache` 标识来源；缓存无记录可以表示从未缓存、已丢失、已过期或已转投删除，不能据此判定业务拒绝。upstream 不支持此可选查询时，发送方直接幂等重投，不要求扫描远端 inbox。
+
+本版不要求缓存保留已删除对象的终态回执，也不要求查询在 OOD 离线时总能给出最终结果。可选结果记录过期后，返回 unknown 是正常行为。
+
+发送方得到 cached 后必须继续保存原对象及未完成投递记录，并按自己的重试策略继续推进；可先查询，但只在得到 accepted 后才标记成功。查询 unknown、缓存丢失、查询不可用或再次无响应时，均可退避后用相同目标和相同对象重新 PUT。cached 可以降低重试频率，但不能无限推迟重试截止时间。发送方放弃或达到自身保留期限时应明确记录失败/放弃，不能把 cached 转成成功。修改正文会生成新的 ObjectId，属于另一条投递。
 
 ### 语义路径目录的两种形态
 
@@ -1594,6 +1669,7 @@ http://$zone_id/$container_id/@/key/@/content
 - `cyfs-inner-proof`: `Array<json>`。用于证明 `$child_objid = resolve($parent_obj, inner_path)`；典型场景是大容器或 Merkle Tree 路径证明。
 - `cyfs-chunk-size`: `u64`。当返回的是 Chunk 或 Chunk Range 时，表示该 Chunk 的完整大小，不受 HTTP Range 影响。
 - `cyfs-dispatch-error`: `String`。dispatch 失败原因，例如 `no-handler`。
+- `cyfs-dispatch-status`: `rejected | cached | accepted`。dispatch 与投递状态查询的结果；定义见接收侧缓存补充。`no_response` 是调用方观察结果，不是此 header 的取值。
 - `cyfs-list-mode`: `String`。语义路径目录响应的实际形态，建议取值为 `strict` 或 `loose`。
 - `cyfs-list-truncated`: `Boolean`。语义路径目录响应是否被截断；形态 B 响应中必须明确声明。
 
