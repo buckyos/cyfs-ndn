@@ -29,7 +29,7 @@ WebDAV（RFC 4918 + ACL 3744 + DASL 5323 + BIND 5842）的核心假设是：
 1. **资源的身份就是 URL**，属性挂在 URL 上；
 2. **服务器是唯一的数据源**，内容不可寻址、不可离线验证；
 3. **一致性靠独占锁**（LOCK/UNLOCK），没有失效通知，客户端靠轮询；
-4. **复制就是复制字节**（COPY），移动就是搬运；
+4. **复制面向路径资源**（COPY），不暴露内容寻址对象与 COW overlay 语义；
 5. **元数据是无类型的 XML property bag**，没有来源、没有置信度、没有可寻址的关联项。
 
 而 BuckyOS 的现实是：内容寻址（ObjId）、Base/Upper overlay、单写租约、跨 Zone Pull、
@@ -43,7 +43,7 @@ AI 派生元数据、多维权限（含"能否进 AI 管线"）。这五条假�
 | 元数据 | dead property 绑 URL，rename 即失联 | meta 绑 **ObjId**（内容），带 `ns/source/confidence/provenance` |
 | 上传 | `PUT`，无查重、断点靠非标准 Range PUT | `probe(hash)` 秒传 → tus 续传 → `commit`；天然去重 |
 | 下载 | `GET`，只能信 TLS + 服务器 | Range GET + mtree path proof，可多源并发、可走 CDN |
-| 复制 / 快照 | `COPY` 复制字节，大目录不可用 | `bind_ref` / `publish_dir`：O(1) 建引用或快照；绑定与目标身份分离 |
+| 复制 / 快照 | 路径资源的 `COPY`，是否复用底层数据由实现决定 | COPY 创建独立副本：native FS 复制或 CYFS 对象复用 + COW（§5.3）；`bind_ref` 建引用，`publish_dir` 生成快照 |
 | 并发 | `LOCK` 独占写锁（实现普遍形同虚设） | file lease（fencing seq）+ Container `revision` CAS + 主动 recall |
 | 变更通知 | 无（轮询） | `watch` SSE：`container_changed(ref,revision)` / `meta_changed` / `lease_recall` |
 | 聚合视图 | 无；用 `BIND` 会造成"文件被复制"的错觉 | `View` / `Collection` 是一等 Container，可被 DFS Entry 引用；成员仍携带真实 `canonical_path` |
@@ -634,6 +634,39 @@ bind_ref {
 若服务器本机旁路创建了同名 native 项，服务端不得把 reference 静默改绑到该项，按 §5.2 返回 conflict。
 递归操作默认不跟随 reference，见 §3.1.1。
 
+#### COPY：独立副本与两种执行路径
+
+**COPY 的语义是保留源，在目标位置创建独立副本。** 两份副本的后续写入与删除彼此独立，
+但可以共享不可变内容对象或底层数据块，无须在复制时立即复制全部字节。
+`bind_ref` 创建的是指向目标的导航引用；指向 LiveRef 的引用仍会看到目标后续的变化。
+`publish_dir` 生成的是不可变目录版本，可作为复制的基础；普通 COPY 的目标支持后续独立写入。
+
+复制按后端能力采用以下两种执行路径：
+
+1. **系统 native FS 复制接口（含 FUSE 挂载路径）。** 应用或服务通过操作系统提供的文件系统接口完成复制，
+   目录按需递归处理。底层支持 reflink / COW 等优化时可以复用数据，否则复制文件字节。
+   FUSE 是文件系统访问入口，实际能否加速取决于挂载实现及底层能力。
+2. **未来直接接入 `cyfs-ndn/src/cyfs/src` 的对象级复制。** 对已提交的文件，目标创建独立的 native
+   Binding，复用同一个不可变 FileObjId；对已发布的目录，目标复用同一个 DirObjId，
+   后续写入时惰性创建自己的 inode / overlay。两边共享不可变 base，各自维护写入状态，
+   因而 COPY 在通常的已发布对象场景下主要是一次快速的 **COW（写时复制）操作**，
+   不需要复制全部文件内容，也不需要立即展开目录的所有 children。
+
+这两条路径可以衔接：通过 FUSE 发起的系统复制，也可以由底层 CYFS 实现对象复用与 COW。
+客户端使用相同的独立副本语义，具体数据是否需要搬运由后端决定。
+
+**COW 快速路径的前提**是复用的对象完整代表本次要复制的源版本。源文件仍在写入、目录存在未发布的
+upper 或下层变更时，需要先提交 / 发布一致版本，或明确返回等待 / 失败状态；不得把旧 base_obj_id
+当作包含最新变更的副本。准备版本可能需要遍历、计算或 I/O，所以整个 COPY 并非无条件 O(1)。
+两种路径都需处理权限、目标名称冲突与并发变更；递归复制默认不跟随 reference（§3.1.1）。
+
+对象复用与惰性写入的设计见 [Ops_v3 §3.1–§3.3、§6.1](./NamedFileSystem_Ops_v3.md)。
+当前 [NamedFileMgr::copy_file / copy_dir](../src/cyfs/src/named_file_mgr.rs) 已有通过 `set_file` /
+`set_dir` 复用 obj_id 的基础路径；未发布目录的复制分支仍未实现，完整 COW 接入以上述版本一致性要求为准。
+本节约定复制语义与执行路径，具体 RPC 由复制扩展提供；当前 BuckyOS 的 native FS 复制扩展见
+[nfs_server.md §10](../../buckyos/product/bucky_file/nfs_server.md)，包括 `copy_capabilities`、`copy_submit`、
+`copy_list`、`copy_get`、`copy_decide`、`copy_cancel`。
+
 #### 上传流程（去重 + 断点，对应 PRD 9.7）
 
 ```
@@ -1203,7 +1236,8 @@ POST /nfs/v1/batch
 
 - **WebDAV**：需要在服务端建账号或开匿名访问，ACL 粒度到 collection，撤销靠改 ACL。
   接收方每次访问都要回源鉴权。无法表达"只读一个快照"。
-- **NFSP**：`publish_dir` 生成不可变 `DirObjId`（O(1)），`grant` 签发限定该子树的 cap。
+- **NFSP**：`publish_dir` 生成不可变 `DirObjId`，`grant` 签发限定该子树的 cap。
+  已发布对象可直接复用；存在未发布变更时，需要先生成完整版本（见 §5.3 的 COPY 前提与 Ops_v3 §6.1）。
   接收方拿到的是一个**冻结的、可验证的、可从任意 CDN 加速的**子树；即使原目录后续被修改，
   分享出去的快照也不受影响——这是"分享一个版本"而不是"分享一个可变位置"，
   而后者正是网盘分享链接最常见的事故来源。
