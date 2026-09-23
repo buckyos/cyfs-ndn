@@ -542,6 +542,21 @@ impl NamedLocalStoreDB {
 
         match existing_state.as_deref() {
             Some("present") => {
+                let stored: String = tx
+                    .query_row(
+                        "SELECT obj_data FROM objects WHERE obj_id = ?1",
+                        params![obj_id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| NdnError::DbError(e.to_string()))?;
+
+                if stored != obj_str {
+                    return Err(NdnError::AlreadyExists(format!(
+                        "object {} already exists with different content",
+                        obj_id
+                    )));
+                }
+
                 // Already present, just touch LRU
                 tx.execute(
                     "UPDATE objects SET last_access_time = MAX(last_access_time, ?1)
