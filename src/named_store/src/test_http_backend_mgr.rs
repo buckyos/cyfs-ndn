@@ -739,6 +739,29 @@ mod tests {
         assert_eq!(mgr.get_object(&obj_id).await.unwrap(), data);
     }
 
+    /// Re-put of the same obj_id with different content must be reported, and
+    /// must not silently keep the old body.
+    #[tokio::test]
+    async fn object_conflicting_put_is_rejected() {
+        let env = setup_test_env().await;
+        let mgr = &env.mgr;
+
+        let obj_id = make_obj_id(0x4002);
+        let original = r#"{"v": 1}"#;
+        mgr.put_object(&obj_id, original).await.unwrap();
+
+        let err = mgr
+            .put_object(&obj_id, r#"{"v": 2}"#)
+            .await
+            .expect_err("conflicting put must fail");
+        assert!(
+            matches!(err, NdnError::AlreadyExists(_)),
+            "unexpected error: {err:?}"
+        );
+
+        assert_eq!(mgr.get_object(&obj_id).await.unwrap(), original);
+    }
+
     /// Many objects and chunks written, then batch-verified.
     #[tokio::test]
     async fn batch_write_read_verify() {
