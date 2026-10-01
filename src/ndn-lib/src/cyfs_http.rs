@@ -1,6 +1,7 @@
 use crate::{NdnError, NdnResult, ObjId};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use url::{form_urlencoded, Url};
 
@@ -113,6 +114,8 @@ pub fn cyfs_parse_url(cyfs_url: &str) -> NdnResult<CyfsParsedUrl> {
 // =============================================================
 
 pub const CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON: &str = "application/cyfs-named-object+json";
+/// Dispatch body is a compact JWT whose claims are the NamedObject.
+pub const CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT: &str = "application/cyfs-named-object+jwt";
 
 pub const CYFS_HEADER_DISPATCH_ERROR: &str = "cyfs-dispatch-error";
 pub const CYFS_DISPATCH_ERROR_NO_HANDLER: &str = "no-handler";
@@ -141,17 +144,42 @@ pub fn validate_cyfs_dispatch_url(parsed: &CyfsParsedUrl) -> NdnResult<()> {
     Ok(())
 }
 
-/// Check `Content-Type` for a dispatch body. Parameters such as `charset=utf-8`
-/// are accepted.
+/// Encoding of a NamedObject dispatch body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CyfsNamedObjectEncoding {
+    /// Canonical JSON (`application/cyfs-named-object+json`).
+    Json,
+    /// Compact JWT with the object as claims (`application/cyfs-named-object+jwt`).
+    Jwt,
+}
+
+impl CyfsNamedObjectEncoding {
+    pub fn content_type(&self) -> &'static str {
+        match self {
+            Self::Json => CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON,
+            Self::Jwt => CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT,
+        }
+    }
+
+    /// Parse a `Content-Type` value. Parameters such as `charset=utf-8` are
+    /// accepted.
+    pub fn from_content_type(content_type: &str) -> Option<Self> {
+        let mime = content_type.split(';').next().unwrap_or("").trim();
+        if mime.eq_ignore_ascii_case(CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON) {
+            Some(Self::Json)
+        } else if mime.eq_ignore_ascii_case(CYFS_CONTENT_TYPE_NAMED_OBJECT_JWT) {
+            Some(Self::Jwt)
+        } else {
+            None
+        }
+    }
+}
+
+/// Check `Content-Type` for a dispatch body: either NamedObject encoding.
+/// Parameters such as `charset=utf-8` are accepted.
 pub fn is_cyfs_named_object_content_type(content_type: &str) -> bool {
-    content_type
-        .split(';')
-        .next()
-        .map(|v| {
-            v.trim()
-                .eq_ignore_ascii_case(CYFS_CONTENT_TYPE_NAMED_OBJECT_JSON)
-        })
-        .unwrap_or(false)
+    CyfsNamedObjectEncoding::from_content_type(content_type).is_some()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -675,6 +703,17 @@ mod tests {
             "Application/CYFS-Named-Object+JSON; charset=utf-8"
         ));
         assert!(!is_cyfs_named_object_content_type("application/json"));
+        assert_eq!(
+            CyfsNamedObjectEncoding::from_content_type("application/cyfs-named-object+jwt"),
+            Some(CyfsNamedObjectEncoding::Jwt)
+        );
+        assert_eq!(
+            CyfsNamedObjectEncoding::from_content_type("application/cyfs-named-object+json"),
+            Some(CyfsNamedObjectEncoding::Json)
+        );
+        assert!(is_cyfs_named_object_content_type(
+            "application/cyfs-named-object+jwt; charset=utf-8"
+        ));
     }
 
     #[test]

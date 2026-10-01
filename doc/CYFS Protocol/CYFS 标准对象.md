@@ -623,21 +623,65 @@ pub struct RelationObject {
 
 `MsgObject` 是不可变消息对象。
 
+> **v2（2026-09-30，breaking change）**：本节是 MsgObject v2 的定义。相对 v1：
+>
+> - 新增 `to_session`，指定目标实体下的具名会话；`thread.topic` 只作语义 hint，不再参与路由；
+> - 新增 `relates_to`（编辑、撤回、回应、话题）与 `mentions`（提及）；
+> - 删除 `proof` 字段。需要签名时，与其它标准对象一样使用 §5.2 的 JWT 形式（见 16.5）；
+> - 删除 `thread.tunnel_id`（transport 信息属于投递层，不属于消息语义）。
+>
+> `msgobj.rs` 已按本节实现。v1 对象里的 `proof` 在反序列化时落入 `meta`，`MsgObject::validate()` 会拒绝它。
+
 ```rust
 pub struct MsgObject {
     pub from: DID,
     pub to: Vec<DID>,
     pub kind: MsgObjKind,
-    pub thread: TopicThread,
+    pub to_session: Option<String>,        // v2，见 16.1
+    pub thread: TopicThread,               // 见 16.2
+    pub relates_to: Option<MsgRelation>,   // v2，见 16.3
+    pub mentions: Option<MsgMentions>,     // v2，见 16.4
     pub workspace: Option<DID>,
     pub created_at_ms: u64,
     pub expires_at_ms: Option<u64>,
     pub nonce: Option<u64>,
     pub content: MsgContent,
-    pub proof: Option<String>,
     pub meta: BTreeMap<String, serde_json::Value>,
 }
+
+pub struct TopicThread {
+    pub topic: Option<String>,
+    pub reply_to: Option<ObjId>,
+    pub correlation_id: Option<String>,
+}
+
+pub struct MsgRelation {
+    pub rel: MsgRelType,        // edit | redact | reaction | thread；其它值保留为 Unknown
+    pub target: ObjId,          // 被关联的消息，必须是 cymsg
+    pub key: Option<String>,    // 仅 reaction：回应内容，例如一个 emoji
+}
+
+pub struct MsgMentions {
+    pub dids: Vec<DID>,
+    pub all: bool,
+}
 ```
+
+序列化规则：
+
+- `Option` 字段为 `None` 时省略；`thread` 的三个字段都为空时整体省略。
+- `MsgMentions.dids` 为空时省略，`all` 为 `false` 时省略；两者都省略时 `mentions` 必须为 `None`，不能序列化为空对象。
+- `to_session` 不能是空字符串。
+- `rel` 使用 snake_case。
+- `meta` 是 flatten 的扩展字段，键不能与上面的字段名冲突。`proof` 是保留名，不能作为 `meta` 的键。
+
+这些规则保证同一语义只有一种 canonical JSON，也使不使用 v2 字段、也没有 `proof` 的消息与 v1 得到相同的 ObjId。
+
+实现：
+
+- 反序列化保持宽松，已存储的旧记录总能读出；对象级规则（`to_session`、`mentions`、`relates_to`、`meta` 保留键）由 `MsgObject::validate()` 检查，接收方在入口调用，失败即拒绝。
+- `MsgObject::from_json_value_checked(value)` 反序列化、校验，并确认对象重新序列化后的 ObjId 与收到的 JSON 一致（拒绝 `"mentions":{}`、`null` 字段等非 canonical 写法），返回由收到的 JSON 计算的 ObjId。
+- 序列化时空的 `mentions` 被省略，因此本实现不会产生 `"mentions":{}`。
 
 `kind` 使用 snake_case 枚举：
 
@@ -648,7 +692,80 @@ pub struct MsgObject {
 - `event`
 - `operation`
 
-`MsgContent`：
+### 16.1 寻址：`to` 与 `to_session`
+
+- `to` 是接收实体的 DID 列表。
+- `to_session` 指定接收实体下的具名会话，对应 MailboxAddress 的 session 部分（`to[0]/to_session`）。省略表示默认会话。
+- `to_session` 只能在 `to` 恰有一个 DID 时使用。多目标消息带 `to_session` 是非法对象，接收方拒绝。
+- 取值规则与 MailboxAddress 的 session 部分相同：1–200 个字符，不含首尾空白和控制字符，不能是 `.` 或 `..`。
+- 接收方如何对待 `to_session` 由接收实体决定。托管会话的实体（例如群）必须严格按它路由：会话不存在时拒绝，不能退回默认会话。个人收件方可以把它映射到自己的本地会话。
+- `to_session` 属于对象内容，参与 ObjId 计算，签名时也在 JWT claims 中，任何环节都不能改写。
+
+### 16.2 语义线索：`thread`
+
+- `topic`：发送方给出的主题标签等语义 hint。接收方可以用它辅助归类，但**不能**把它当作路由依据。v1 中用 `topic` 指定会话的做法改用 `to_session`。
+- `reply_to`：被回复的消息。
+- `correlation_id`：发送方用于关联请求与响应的标识。
+- v1 的 `tunnel_id` 已删除。
+
+### 16.3 消息关系：`relates_to`
+
+原消息不可变，所有修改都以新消息表达。关系消息是一条普通的 MsgObject，用 `relates_to` 指向另一条消息：
+
+| `rel` | 含义 | 约束 |
+| --- | --- | --- |
+| `edit` | 用本消息的 `content` 替换原消息的展示内容 | `from` 必须等于原消息的 `from`；`content` 是完整的新内容，不是差量；每次编辑都指向原消息，不指向上一次编辑；不能编辑关系消息 |
+| `redact` | 撤回或删除原消息 | 发送者是原消息作者，或是接收实体规则授权的操作者（例如群管理员）；`content.content` 可以写明原因；撤回原消息同时使它的编辑和回应失效；撤回一条 `reaction` 就是取消该回应 |
+| `reaction` | 对原消息的回应 | `key` 必填，不超过 64 字节；`content` 可以为空；同一个 `(from, target, key)` 只算一次 |
+| `thread` | 本消息属于以原消息为根的话题 | 根消息本身不能是 `thread` 关系消息 |
+
+通用规则：
+
+- 关系消息的 `to`、`to_session` 和 `kind` 必须与原消息相同。接收方发现不一致时拒绝。
+- 多条编辑的先后，由接收方分配的顺序决定，不由 `created_at_ms` 决定。
+- 除 `reaction` 外，关系消息的 `content.content` 应当包含可读的回落文本，例如「[已编辑] …」「撤回了一条消息」。
+- 接收方不认识的 `rel` 值：保留消息，按普通消息展示，不执行任何关系语义。
+- 是否接受某条关系消息（例如编辑时间窗、谁可以删除他人消息），由接收实体的规则决定。
+
+### 16.4 提及：`mentions`
+
+- `dids` 是被提及的 DID；`all` 表示提及目标会话的全体参与者。
+- 提醒语义只来自这个字段，接收方不解析正文中的 `@` 文本。正文中如何显示提及由客户端决定。
+- 接收方可以按自己的规则忽略或拒绝提及，例如群只允许有权限的成员使用 `all`。
+
+### 16.5 签名：JWT 形式
+
+MsgObject 不设专门的签名字段。需要证明消息确实由 `from` 创建、之后没有被改动时，与 `PathObject`、`InclusionProof` 等标准对象一样，使用 §5.2 的 JWT 形式：
+
+```text
+JWT header = {"alg":"EdDSA","kid":"<签名密钥的 DID URL>"}
+JWT claims = MsgObject 的 JSON
+```
+
+- `alg` 目前只使用 `EdDSA`（Ed25519），与 `named_obj_to_jwt` 一致。
+- `kid` 指向的验证方法必须属于 `from`：要么直接列在 `from` 的 DID Document 中，要么是该 DID Document 授权的设备或 Agent 密钥。
+- 验证步骤：用 `kid` 对应的公钥验证 JWT 签名；确认该密钥属于 `from`；按 §5.2 从 claims 计算 ObjId。
+- 签名覆盖整个对象，包括 `to_session`、`relates_to`、`mentions` 和 `created_at_ms`。
+- ObjId 只由 claims 计算，与签名无关。因此同一条消息的 JSON 形式与 JWT 形式是同一个 ObjId，编辑、回应、去重都不受是否签名影响。
+- 签名无法伪造，也无法用来改动内容；但它可能在传递中被丢掉，只剩 JSON 形式。只有 JSON 形式的消息，来源只由投递或提供它的一方背书。需要强证明的一方，必须取得 JWT 形式。
+- 以 JWT 形式收到 MsgObject 的一方，在保存和转发时应当保留 JWT 原文，供后续读者验证。
+- 依赖签名的接收方必须校验。托管会话的实体（例如群）收到签名无效的 JWT 必须拒绝，不能把它降级为 JSON 形式接受。
+- 跨 Zone 投递 JWT 形式的消息时，使用 `application/cyfs-named-object+jwt`（《CYFS Protocol》dispatch 一节）。
+- 密钥轮换后如何验证历史消息，本版不定义。
+
+实现：
+
+- `MsgObject::to_jwt(key, kid)`：先 `validate()`，再以 `named_obj_to_jwt` 签名。
+- `verify_msg_object_jwt(jwt, public_key)`：要求 header 的 `alg = EdDSA` 且带 `kid`，校验签名，再按 `from_json_value_checked` 解出对象；不要求 `exp` 等 JWT 注册声明。
+- `decode_msg_object_jwt(jwt)`：只解码不验签，供不依赖签名的场景使用。
+- 两者返回 `MsgObjectJwt { msg, obj_id, kid }`。`kid` 对应的公钥由接收方解析；`MsgObjectJwt::kid_did()` 取出 `kid` 的 DID 部分，接收方据此确认密钥属于 `from`。
+
+### 16.6 时间与去重
+
+- `created_at_ms` 是发送方声明的创建时间，只用于展示。接收方不能用它作为排序、同步游标或权限时间窗的依据；需要顺序时，由接收方（例如群 host）在接受消息时自行分配。
+- 去重按 ObjId 进行。两条内容完全相同的消息会得到同一个 ObjId，因此发送方应当为每条消息填写随机的 `nonce`，避免被误判为重复消息。
+
+### 16.7 MsgContent
 
 ```rust
 pub struct MsgContent {
@@ -667,18 +784,23 @@ pub struct MsgContent {
 - `data_obj`：引用一个 `ObjId`，可带 `uri_hint`。
 - `service_did`：引用一个 DID 服务。
 
-示例：
+### 16.8 示例
+
+群消息（发往群的具名会话 `release`，提及 Bob；需要签名时，把这段 JSON 作为 JWT claims，见 16.5）：
 
 ```json
 {
   "from": "did:web:alice.example.com",
-  "to": ["did:web:bob.example.com", "did:web:carol.example.com"],
-  "kind": "chat",
+  "to": ["did:web:team.example.com"],
+  "kind": "group_msg",
+  "to_session": "release",
   "thread": {
-    "topic": "release",
+    "topic": "发布准备",
     "reply_to": "cymsg:010203040506",
-    "correlation_id": "corr-001",
-    "tunnel_id": "tnl-001"
+    "correlation_id": "corr-001"
+  },
+  "mentions": {
+    "dids": ["did:web:bob.example.com"]
   },
   "workspace": "did:web:workspace.example.com",
   "created_at_ms": 1700000000000,
@@ -707,9 +829,47 @@ pub struct MsgContent {
       }
     ]
   },
-  "proof": "proof-001",
   "priority": 1,
   "lang": "zh-CN"
+}
+```
+
+回应（Bob 对上一条消息点赞）：
+
+```json
+{
+  "from": "did:web:bob.example.com",
+  "to": ["did:web:team.example.com"],
+  "kind": "group_msg",
+  "to_session": "release",
+  "relates_to": {
+    "rel": "reaction",
+    "target": "cymsg:0a0b0c0d",
+    "key": "👍"
+  },
+  "created_at_ms": 1700000005000,
+  "nonce": 42,
+  "content": {}
+}
+```
+
+管理员删除消息：
+
+```json
+{
+  "from": "did:web:admin.example.com",
+  "to": ["did:web:team.example.com"],
+  "kind": "group_msg",
+  "to_session": "release",
+  "relates_to": {
+    "rel": "redact",
+    "target": "cymsg:0a0b0c0d"
+  },
+  "created_at_ms": 1700000009000,
+  "nonce": 43,
+  "content": {
+    "content": "管理员删除了一条消息：违反群规"
+  }
 }
 ```
 
@@ -876,18 +1036,32 @@ pub struct RelationObject {
     pub exp: Option<u64>,
 }
 
+// v2（§16）
 pub struct MsgObject {
     pub from: DID,
     pub to: Vec<DID>,
     pub kind: MsgObjKind,
+    pub to_session: Option<String>,
     pub thread: TopicThread,
+    pub relates_to: Option<MsgRelation>,
+    pub mentions: Option<MsgMentions>,
     pub workspace: Option<DID>,
     pub created_at_ms: u64,
     pub expires_at_ms: Option<u64>,
     pub nonce: Option<u64>,
     pub content: MsgContent,
-    pub proof: Option<String>,
     pub meta: BTreeMap<String, serde_json::Value>,
+}
+
+pub struct MsgRelation {
+    pub rel: MsgRelType,
+    pub target: ObjId,
+    pub key: Option<String>,
+}
+
+pub struct MsgMentions {
+    pub dids: Vec<DID>,
+    pub all: bool,
 }
 
 pub struct ReceiptObj {

@@ -465,8 +465,8 @@ mod tests {
     use crate::cyfs_http::cyfs_get_obj_id_from_url;
     use crate::{
         ActionObject, CanonValue, InclusionProof, MachineContent, MsgContent, MsgContentFormat,
-        MsgObjKind, MsgObject, PathObject, ReceiptObj, ReceiptStatus, RefItem, RefRole, RefTarget,
-        RelationObject, TopicThread, ACTION_TYPE_VIEWED,
+        MsgMentions, MsgObjKind, MsgObject, PathObject, ReceiptObj, ReceiptStatus, RefItem,
+        RefRole, RefTarget, RelationObject, TopicThread, ACTION_TYPE_VIEWED,
     };
     use name_lib::DID;
     use serde::{Deserialize, Serialize};
@@ -858,13 +858,19 @@ mod tests {
         machine_data.insert("urgent".to_string(), CanonValue::Bool(true));
         let msg_object = MsgObject {
             from: did_web("alice.example.com"),
-            to: vec![did_web("bob.example.com"), did_web("carol.example.com")],
-            kind: MsgObjKind::Chat,
+            to: vec![did_web("team.example.com")],
+            kind: MsgObjKind::GroupMsg,
+            to_session: Some("release".to_string()),
             thread: TopicThread {
-                topic: Some("release".to_string()),
+                topic: Some("发布准备".to_string()),
                 reply_to: Some(ObjId::new("cymsg:010203040506").unwrap()),
                 correlation_id: Some("corr-001".to_string()),
             },
+            relates_to: None,
+            mentions: Some(MsgMentions {
+                dids: vec![did_web("bob.example.com")],
+                all: false,
+            }),
             workspace: Some(did_web("workspace.example.com")),
             created_at_ms: 1_700_000_000_000,
             expires_at_ms: Some(1_700_086_400_000),
@@ -886,7 +892,6 @@ mod tests {
                     label: Some("attachment".to_string()),
                 }],
             },
-            proof: Some("proof-001".to_string()),
             meta: BTreeMap::from([
                 ("priority".to_string(), json!(1)),
                 ("lang".to_string(), json!("zh-CN")),

@@ -1052,6 +1052,10 @@ CYFS 定义一个标准写 verb：
 PUT cyfs://$target_zone_id/<sem_path>
 Content-Type: application/cyfs-named-object+json
 <body: NamedObject canonical JSON>
+
+PUT cyfs://$target_zone_id/<sem_path>
+Content-Type: application/cyfs-named-object+jwt
+<body: JWT compact 字符串，claims 为 NamedObject>
 ```
 
 语义是：
@@ -1062,7 +1066,7 @@ Content-Type: application/cyfs-named-object+json
 
 协议只定义下面几件事：
 
-1. body **MUST** 是 canonical JSON 形式的 `NamedObject`。对象类型不能从任意业务字段推断；类型化对象在请求中带 `cyfs-obj-id: <ObjectId>`，接收端使用其中的类型前缀重新计算并核对正文 SHA-256。未提供该 header 的普通 JSON 对象使用 `jobj` 类型。正文不会因转投或重试而改变。
+1. body **MUST** 是 canonical JSON 形式的 `NamedObject`，或者是以该对象为 claims 的签名 JWT（`Content-Type: application/cyfs-named-object+jwt`，body 为 JWT compact 字符串）。对象类型不能从任意业务字段推断；类型化对象在请求中带 `cyfs-obj-id: <ObjectId>`，接收端使用其中的类型前缀重新计算并核对：JSON 形式核对正文 SHA-256，JWT 形式按《CYFS 标准对象》§5.2 从 claims 计算，与签名无关。未提供该 header 的普通 JSON 对象使用 `jobj` 类型。是否校验 JWT 签名、信任哪些签名者，由 target Zone 的业务逻辑决定。正文不会因转投或重试而改变，接收侧缓存按原 Content-Type 保存和转投。ndn-lib 实现：`CyfsNamedObjectEncoding::from_content_type` 识别两种 Content-Type，`validate_cyfs_dispatch_body` 按编码核对并返回 ObjectId（JSON 形式为 `validate_cyfs_dispatch_object`，JWT 形式为 `validate_cyfs_dispatch_object_jwt`）。
 2. body **MUST NOT** 直接携带 `NamedData` 或 Chunk 数据。如果 `NamedObject` 内部引用了大附件、`FileObject` 或 `ChunkList`，target Zone **MUST** 在自己后续主动 Pull。
 3. 如果 `<sem_path>` 上既没有处理逻辑，也没有显式配置的缓存接收路由，target Zone **MUST** 返回明确失败，建议使用 `404` 并附带 `cyfs-dispatch-error: no-handler`。已配置的 upstream 暂时不可用与路径没有 handler 是两种情况；前者可以按下文进入接收侧缓存。
 4. 是否接受、如何落地、ACL 如何判定、最终写到哪里，CYFS 协议不规定，由 target Zone 自行决定。

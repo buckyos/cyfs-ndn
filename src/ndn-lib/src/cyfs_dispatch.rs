@@ -1,4 +1,4 @@
-use crate::{build_obj_id, NdnError, NdnResult, ObjId};
+use crate::{build_obj_id, CyfsNamedObjectEncoding, NdnError, NdnResult, ObjId};
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -90,6 +90,45 @@ pub fn validate_cyfs_dispatch_object(body: &[u8], claimed: Option<&str>) -> NdnR
     if canonical != body {
         return Err(invalid("dispatch body must be canonical JSON"));
     }
+    dispatch_object_id(&canonical, claimed)
+}
+
+/// JWT form (`application/cyfs-named-object+jwt`): the body is a compact JWT
+/// and the ObjectId is computed from its claims (`CYFS 标准对象` §5.2), so it
+/// does not depend on the signature. Whether to verify the signature and whom
+/// to trust is up to the target Zone.
+pub fn validate_cyfs_dispatch_object_jwt(body: &[u8], claimed: Option<&str>) -> NdnResult<ObjId> {
+    let jwt = std::str::from_utf8(body).map_err(|_| invalid("invalid UTF-8"))?;
+    let parts: Vec<&str> = jwt.split('.').collect();
+    let is_b64url = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty() || !is_b64url(part)) {
+        return Err(invalid("dispatch body must be a compact JWT"));
+    }
+    let claims = name_lib::decode_jwt_claim_without_verify(jwt)
+        .map_err(|_| invalid("invalid NamedObject JWT claims"))?;
+    if !claims.is_object() {
+        return Err(invalid("dispatch JWT claims must be a JSON object"));
+    }
+    let canonical = serde_jcs::to_vec(&claims).map_err(|_| invalid("invalid canonical JSON"))?;
+    dispatch_object_id(&canonical, claimed)
+}
+
+/// Validate a dispatch body in the encoding named by its Content-Type.
+pub fn validate_cyfs_dispatch_body(
+    encoding: CyfsNamedObjectEncoding,
+    body: &[u8],
+    claimed: Option<&str>,
+) -> NdnResult<ObjId> {
+    match encoding {
+        CyfsNamedObjectEncoding::Json => validate_cyfs_dispatch_object(body, claimed),
+        CyfsNamedObjectEncoding::Jwt => validate_cyfs_dispatch_object_jwt(body, claimed),
+    }
+}
+
+fn dispatch_object_id(canonical: &[u8], claimed: Option<&str>) -> NdnResult<ObjId> {
     let claimed = claimed.map(ObjId::new).transpose()?;
     let ty = claimed
         .as_ref()
@@ -101,7 +140,7 @@ pub fn validate_cyfs_dispatch_object(body: &[u8], claimed: Option<&str>) -> NdnR
     }
     let id = build_obj_id(
         ty,
-        std::str::from_utf8(body).map_err(|_| invalid("invalid UTF-8"))?,
+        std::str::from_utf8(canonical).map_err(|_| invalid("invalid UTF-8"))?,
     );
     if id.is_chunk() || ty == "pack" || claimed.as_ref().is_some_and(|v| *v != id) {
         return Err(invalid("dispatch ObjectId does not match NamedObject"));
@@ -296,6 +335,51 @@ mod tests {
             assert!(validate_cyfs_dispatch_object(bad, None).is_err());
         }
         assert!(validate_cyfs_dispatch_object(body, Some("jobj:00")).is_err());
+    }
+
+    #[test]
+    fn dispatch_jwt_body_identity_comes_from_claims() {
+        let private_key = jsonwebtoken::EncodingKey::from_ed_pem(
+            b"-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJBRONAzbwpIOwm0ugIQNyZJrDXxZF7HoPWAZesMedOr\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let claims = serde_json::json!({"b": [1, 2], "a": "x"});
+        let jwt =
+            crate::named_obj_to_jwt(&claims, &private_key, Some("did:web:a#k".into())).unwrap();
+        let json_body = serde_jcs::to_vec(&claims).unwrap();
+        assert!(validate_cyfs_dispatch_object(&json_body, Some("cymsg:00")).is_err());
+
+        let id = validate_cyfs_dispatch_object(&json_body, None).unwrap();
+        assert_eq!(
+            validate_cyfs_dispatch_object_jwt(jwt.as_bytes(), None).unwrap(),
+            id,
+            "JSON and JWT forms share one ObjectId"
+        );
+        let typed = crate::build_obj_id("cymsg", std::str::from_utf8(&json_body).unwrap());
+        assert_eq!(
+            validate_cyfs_dispatch_body(
+                CyfsNamedObjectEncoding::Jwt,
+                jwt.as_bytes(),
+                Some(&typed.to_string())
+            )
+            .unwrap(),
+            typed
+        );
+        for bad in [
+            format!(" {jwt}"),
+            format!("{jwt}\n"),
+            "a.b".to_string(),
+            "a..c".to_string(),
+            "e30.W10.c2ln".to_string(), // claims `[]` is not an object
+        ] {
+            assert!(
+                validate_cyfs_dispatch_object_jwt(bad.as_bytes(), None).is_err(),
+                "{bad}"
+            );
+        }
+        // A JSON body is not accepted as JWT and vice versa.
+        assert!(validate_cyfs_dispatch_object_jwt(&json_body, None).is_err());
+        assert!(validate_cyfs_dispatch_object(jwt.as_bytes(), None).is_err());
     }
 
     #[test]

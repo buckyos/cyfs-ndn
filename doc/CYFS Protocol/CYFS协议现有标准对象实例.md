@@ -62,8 +62,10 @@ cyact:3dcf493420e0d82f36e9c3ea4484c3cc29b5001694354d05b03199f14d88dcef:{"action"
 
 ### 2.6 `cymsg` / `MsgObject`
 
+MsgObject v2 实例（群的具名会话 `release`，提及 Bob），与《CYFS 标准对象》§16.8 第一个示例相同。
+
 ```text
-cymsg:179fa355bad0e0a154f3654b61fe4187d78561fea73bd83f79dff81d0f7a1676:{"content":{"content":"{\"status\":\"ok\"}","format":"application/json","machine":{"data":{"level":3,"urgent":true},"intent":"sync"},"refs":[{"label":"attachment","role":"input","target":{"obj_id":"cyfile:1234567890abcdef","type":"data_obj","uri_hint":"cyfs://hello.txt"}}],"title":"Hello"},"created_at_ms":1700000000000,"expires_at_ms":1700086400000,"from":"did:web:alice.example.com","kind":"chat","lang":"zh-CN","nonce":7,"priority":1,"proof":"proof-001","thread":{"correlation_id":"corr-001","reply_to":"cymsg:010203040506","topic":"release","tunnel_id":"tnl-001"},"to":["did:web:bob.example.com","did:web:carol.example.com"],"workspace":"did:web:workspace.example.com"}
+cymsg:535396821c77ebea40eb91725b6523a7e60e5544f10c1052d34903a5d1de28dc:{"content":{"content":"{\"status\":\"ok\"}","format":"application/json","machine":{"data":{"level":3,"urgent":true},"intent":"sync"},"refs":[{"label":"attachment","role":"input","target":{"obj_id":"cyfile:1234567890abcdef","type":"data_obj","uri_hint":"cyfs://hello.txt"}}],"title":"Hello"},"created_at_ms":1700000000000,"expires_at_ms":1700086400000,"from":"did:web:alice.example.com","kind":"group_msg","lang":"zh-CN","mentions":{"dids":["did:web:bob.example.com"]},"nonce":7,"priority":1,"thread":{"correlation_id":"corr-001","reply_to":"cymsg:010203040506","topic":"发布准备"},"to":["did:web:team.example.com"],"to_session":"release","workspace":"did:web:workspace.example.com"}
 ```
 
 ### 2.7 `cyrece` / `ReceiptObj`
