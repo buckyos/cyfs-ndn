@@ -1,7 +1,7 @@
 //! Message object definitions.
 
 use crate::{
-    build_named_object_by_json, named_obj_to_jwt, NamedObject, NdnError, NdnResult, ObjId,
+    named_obj_to_jwt, try_build_named_object_by_json, NamedObject, NdnError, NdnResult, ObjId,
     OBJ_TYPE_MSG, OBJ_TYPE_RECEIPT,
 };
 use buckyos_kit::buckyos_get_unix_timestamp;
@@ -543,11 +543,13 @@ impl MsgObject {
     /// sure it re-serializes to the same canonical JSON. Returns the ObjId
     /// computed from `value` itself.
     pub fn from_json_value_checked(value: serde_json::Value) -> NdnResult<(Self, ObjId)> {
-        let (obj_id, _) = build_named_object_by_json(OBJ_TYPE_MSG, &value);
+        let (obj_id, _) = try_build_named_object_by_json(OBJ_TYPE_MSG, &value)?;
         let msg: MsgObject = serde_json::from_value(value)
             .map_err(|e| NdnError::DecodeError(format!("invalid MsgObject: {}", e)))?;
         msg.validate()?;
-        let (normalized_id, _) = msg.gen_obj_id();
+        let normalized = serde_json::to_value(&msg)
+            .map_err(|e| NdnError::InvalidData(format!("serialize MsgObject failed: {}", e)))?;
+        let (normalized_id, _) = try_build_named_object_by_json(OBJ_TYPE_MSG, &normalized)?;
         if normalized_id != obj_id {
             return Err(NdnError::InvalidData(
                 "MsgObject JSON is not in canonical form".to_string(),
@@ -1382,6 +1384,16 @@ mod tests {
             },
             ..MsgObject::default()
         }
+    }
+
+    #[test]
+    fn test_msg_checked_rejects_canonicalization_errors() {
+        let mut raw = serde_json::to_value(base_group_msg()).unwrap();
+        raw["extension"] = serde_json::from_str(r#"{"n":1e400}"#).unwrap();
+        assert!(matches!(
+            MsgObject::from_json_value_checked(raw),
+            Err(NdnError::InvalidData(_))
+        ));
     }
 
     #[test]

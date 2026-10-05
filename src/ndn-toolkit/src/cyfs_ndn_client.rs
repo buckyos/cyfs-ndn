@@ -22,8 +22,8 @@ use tokio::sync::Mutex;
 use tokio_util::io::StreamReader;
 
 use ndn_lib::{
-    apply_cyfs_req_headers, build_named_object_by_json, calculate_qcid_from_file_with_metadata,
-    copy_chunk, cyfs_parse_url, get_cyfs_resp_headers, verify_named_object_from_str,
+    apply_cyfs_req_headers, calculate_qcid_from_file_with_metadata, copy_chunk, cyfs_parse_url,
+    get_cyfs_resp_headers, try_build_named_object_by_json, verify_named_object_from_str,
     CYFSHttpReqHeaders, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkList, ChunkReader,
     CyfsParent, CyfsParsedUrl, FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult,
     ObjId, PathObject, ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN,
@@ -1129,7 +1129,7 @@ fn recompute_parent_obj_id(obj_json: &Value) -> NdnResult<ObjId> {
         ));
     };
 
-    let (obj_id, _) = build_named_object_by_json(obj_type, obj_json);
+    let (obj_id, _) = try_build_named_object_by_json(obj_type, obj_json)?;
     Ok(obj_id)
 }
 

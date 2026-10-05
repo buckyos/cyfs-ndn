@@ -138,6 +138,7 @@ obj_type UTF-8 bytes || ":" || obj_hash bytes
 实现函数：
 
 - `build_named_object_by_json(obj_type, json_value)`
+- `try_build_named_object_by_json(obj_type, json_value)`：返回 `NdnResult<(ObjId, String)>`，用于需要处理错误的调用方。
 - `build_obj_id(obj_type, obj_json_str)`
 - `verify_named_object(obj_id, json_value)`
 - `verify_named_object_from_str(obj_id, obj_str)`
@@ -146,7 +147,8 @@ obj_type UTF-8 bytes || ":" || obj_hash bytes
 
 - 对象字段缺失、字段值为 `null`、字段值为默认值但被序列化出来，都会产生不同的 ObjId。
 - 当前很多结构通过 `skip_serializing_if` 省略空值或默认值；协议实现必须按实际 serde 形态对齐。
-- `serde_jcs::to_string` 失败时当前实现会退化为 `"{}"`。协议实现不应依赖这个容错路径，生成对象前应保证 JSON 可 canonicalize。
+- JCS 序列化失败必须拒绝对象，不能退化为 `"{}"` 或生成空对象的 ObjId。`try_build_named_object_by_json` 返回 `NdnError::InvalidData`；保留旧签名的 `build_named_object_by_json` 在失败时 panic，仅适用于已知可 canonicalize 的输入。
+- `verify_named_object` 在 JCS 序列化失败时返回 `false`；返回 `NdnResult` 的 JSON/JWT 构建、加载校验接口传播错误。
 
 ### 5.2 JWT 对象
 

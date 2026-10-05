@@ -319,7 +319,8 @@ pub fn load_named_obj_and_verify<T: DeserializeOwned>(
     obj_data_str: &str,
 ) -> NdnResult<T> {
     let obj_json = load_named_object_from_obj_str(obj_data_str)?;
-    if !verify_named_object(obj_id, &obj_json) {
+    let (actual_id, _) = try_build_named_object_by_json(&obj_id.obj_type, &obj_json)?;
+    if actual_id != *obj_id {
         return Err(NdnError::InvalidId(format!(
             "verify named object failed for obj_id:{}",
             obj_id
@@ -368,34 +369,51 @@ pub fn build_obj_id(obj_type: &str, obj_json_str: &str) -> ObjId {
     ObjId::new_by_raw(obj_type.to_string(), hash_value)
 }
 
+/// Build an object ID and its canonical JSON, rejecting values JCS cannot encode.
+pub fn try_build_named_object_by_json(
+    obj_type: &str,
+    json_value: &serde_json::Value,
+) -> NdnResult<(ObjId, String)> {
+    let json_str = serde_jcs::to_string(json_value).map_err(|e| {
+        NdnError::InvalidData(format!(
+            "canonicalize named object ({obj_type}) failed: {e}"
+        ))
+    })?;
+    let obj_id = build_obj_id(obj_type, &json_str);
+    Ok((obj_id, json_str))
+}
+
+/// Compatibility wrapper for callers whose values are known to support JCS.
+/// Use [`try_build_named_object_by_json`] for fallible or untrusted input.
+///
+/// # Panics
+///
+/// Panics if JCS serialization fails. Failed input is never replaced with `{}`.
 pub fn build_named_object_by_json(
     obj_type: &str,
     json_value: &serde_json::Value,
 ) -> (ObjId, String) {
-    let json_str = serde_jcs::to_string(json_value).unwrap_or_else(|_| "{}".to_string());
-    let obj_id = build_obj_id(obj_type, &json_str);
-    (obj_id, json_str)
+    try_build_named_object_by_json(obj_type, json_value)
+        .expect("failed to canonicalize named object")
 }
 
 pub fn build_named_object_by_jwt(obj_type: &str, jwt_str: &str) -> NdnResult<(ObjId, String)> {
     let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
         .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
-    let (obj_id, json_str) = build_named_object_by_json(obj_type, &claims);
-    Ok((obj_id, json_str))
+    try_build_named_object_by_json(obj_type, &claims)
 }
 
+/// Return false on either an ID mismatch or a JCS serialization failure.
 pub fn verify_named_object(obj_id: &ObjId, json_value: &serde_json::Value) -> bool {
-    let (obj_id2, json_str) = build_named_object_by_json(obj_id.obj_type.as_str(), json_value);
-    if obj_id2 != *obj_id {
-        return false;
-    }
-    return true;
+    try_build_named_object_by_json(&obj_id.obj_type, json_value)
+        .is_ok_and(|(actual_id, _)| actual_id == *obj_id)
 }
 
 pub fn verify_named_object_from_str(obj_id: &ObjId, obj_str: &str) -> NdnResult<serde_json::Value> {
     let obj_json = serde_json::from_str(obj_str)
         .map_err(|e| NdnError::InvalidId(format!("failed to parse obj_str:{}", e.to_string())))?;
-    if !verify_named_object(obj_id, &obj_json) {
+    let (actual_id, _) = try_build_named_object_by_json(&obj_id.obj_type, &obj_json)?;
+    if actual_id != *obj_id {
         return Err(NdnError::InvalidId(format!(
             "verify named object failed:{}",
             obj_str
@@ -408,11 +426,8 @@ pub fn verify_named_object_from_jwt(obj_id: &ObjId, jwt_str: &str) -> NdnResult<
     let claims = name_lib::decode_jwt_claim_without_verify(jwt_str)
         .map_err(|e| NdnError::DecodeError(format!("decode jwt failed:{}", e.to_string())))?;
 
-    let (obj_id2, json_str) = build_named_object_by_json(obj_id.obj_type.as_str(), &claims);
-    if obj_id2 != *obj_id {
-        return Ok(false);
-    }
-    return Ok(true);
+    let (actual_id, _) = try_build_named_object_by_json(&obj_id.obj_type, &claims)?;
+    Ok(actual_id == *obj_id)
 }
 
 pub fn load_named_object_from_obj_str(obj_str: &str) -> NdnResult<serde_json::Value> {
@@ -656,6 +671,75 @@ mod tests {
 
         assert_eq!(json_str, r#"{"a":1,"b":1}"#);
         assert_eq!(obj_id, build_obj_id("jobj", r#"{"a":1,"b":1}"#));
+    }
+
+    #[test]
+    fn test_named_object_rejects_canonicalization_errors() {
+        // The dev dependency enables arbitrary_precision so these are valid
+        // Values, but their numbers cannot be represented by JCS's finite f64.
+        let empty_id = build_obj_id("jobj", "{}");
+        for input in [r#"{"n":1e400}"#, r#"{"nested":[{"n":-2e400}]}"#] {
+            let value: serde_json::Value = serde_json::from_str(input).unwrap();
+            let err = try_build_named_object_by_json("jobj", &value).unwrap_err();
+            assert!(
+                matches!(err, NdnError::InvalidData(ref msg) if msg.contains("invalid float value"))
+            );
+            assert!(!verify_named_object(&empty_id, &value));
+            assert!(matches!(
+                verify_named_object_from_str(&empty_id, input),
+                Err(NdnError::InvalidData(_))
+            ));
+            assert!(matches!(
+                load_named_obj_and_verify::<serde_json::Value>(&empty_id, input),
+                Err(NdnError::InvalidData(_))
+            ));
+        }
+
+        // An actual empty object remains valid and keeps its existing ID.
+        assert_eq!(
+            try_build_named_object_by_json("jobj", &json!({})).unwrap(),
+            (empty_id.clone(), "{}".to_string())
+        );
+        assert!(verify_named_object(&empty_id, &json!({})));
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to canonicalize named object")]
+    fn test_legacy_builder_does_not_replace_failed_input() {
+        let value = serde_json::from_str(r#"{"n":1e400}"#).unwrap();
+        build_named_object_by_json("jobj", &value);
+    }
+
+    #[test]
+    fn test_named_object_jwt_rejects_canonicalization_errors() {
+        let claims: serde_json::Value = serde_json::from_str(r#"{"n":1e400}"#).unwrap();
+        let key = EncodingKey::from_secret(b"canonicalization-test-key");
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let jwt = encode(&header, &claims, &key).unwrap();
+        let empty_id = build_obj_id("jobj", "{}");
+
+        assert!(matches!(
+            build_named_object_by_jwt("jobj", &jwt),
+            Err(NdnError::InvalidData(_))
+        ));
+        assert!(matches!(
+            verify_named_object_from_jwt(&empty_id, &jwt),
+            Err(NdnError::InvalidData(_))
+        ));
+        assert!(matches!(
+            load_named_obj_and_verify::<serde_json::Value>(&empty_id, &jwt),
+            Err(NdnError::InvalidData(_))
+        ));
+
+        let valid_claims = json!({"b": 1.0, "a": 2});
+        let valid_jwt = encode(&header, &valid_claims, &key).unwrap();
+        let expected = build_named_object_by_json("jobj", &valid_claims);
+        assert_eq!(
+            build_named_object_by_jwt("jobj", &valid_jwt).unwrap(),
+            expected
+        );
+        assert!(verify_named_object_from_jwt(&expected.0, &valid_jwt).unwrap());
+        assert!(!verify_named_object_from_jwt(&empty_id, &valid_jwt).unwrap());
     }
 
     fn assert_jcs_fixture(case_name: &str, input_json: &str, expected_canonical_json: &str) {

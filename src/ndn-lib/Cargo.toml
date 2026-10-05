@@ -56,3 +56,5 @@ tempfile = { workspace = true }
 [dev-dependencies]
 
 env_logger = "*"
+# Exercise real JCS errors from out-of-range numbers without changing production features.
+serde_json = { workspace = true, features = ["arbitrary_precision"] }

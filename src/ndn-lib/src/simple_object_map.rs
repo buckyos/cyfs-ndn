@@ -1,7 +1,7 @@
 //Simple Object Map是相对元素较少的map
 
 use crate::{
-    build_named_object_by_json, build_named_object_by_jwt, object::ObjId, NdnError, NdnResult,
+    build_named_object_by_jwt, object::ObjId, try_build_named_object_by_json, NdnError, NdnResult,
     OBJ_TYPE_OBJMAP,
 };
 use name_lib::{decode_json_from_jwt_with_pk, decode_jwt_claim_without_verify};
@@ -46,8 +46,7 @@ impl SimpleMapItem {
         match self {
             SimpleMapItem::ObjId(obj_id) => Ok((obj_id.clone(), "".to_string())),
             SimpleMapItem::Object(obj_type, obj_value) => {
-                let (obj_id, obj_str) = build_named_object_by_json(obj_type, obj_value);
-                Ok((obj_id, obj_str))
+                try_build_named_object_by_json(obj_type, obj_value)
             }
             SimpleMapItem::ObjectJwt(obj_type, obj_value) => {
                 let (obj_id, obj_str) = build_named_object_by_jwt(obj_type, obj_value)?;
@@ -162,7 +161,8 @@ impl SimpleObjectMap {
         for (key, value) in self.body.iter() {
             match value {
                 SimpleMapItem::Object(obj_type, obj_value) => {
-                    let (sub_obj_id, _json_str) = build_named_object_by_json(obj_type, obj_value);
+                    let (sub_obj_id, _json_str) =
+                        try_build_named_object_by_json(obj_type, obj_value)?;
                     real_map.insert(key.clone(), sub_obj_id.to_string());
                 }
                 SimpleMapItem::ObjId(v) => {
@@ -180,9 +180,7 @@ impl SimpleObjectMap {
             .as_object_mut()
             .unwrap()
             .insert("body".to_string(), body);
-        let real_obj = serde_json::to_value(real_obj).expect("Failed to serialize SimpleObjectMap");
-        let (id, json_str) = build_named_object_by_json(result_obj_type, &real_obj);
-        Ok((id, json_str))
+        try_build_named_object_by_json(result_obj_type, real_obj)
     }
 
     //gen_obj_id会消耗self,防止构造id后潜在的修改
@@ -240,6 +238,29 @@ mod test {
     use crate::*;
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
+
+    #[test]
+    fn test_object_map_rejects_uncanonicalizable_child() {
+        let value = serde_json::from_str(r#"{"n":1e400}"#).unwrap();
+        let item = SimpleMapItem::Object("jobj".to_string(), value);
+        assert!(matches!(item.get_obj_id(), Err(NdnError::InvalidData(_))));
+
+        let mut map = SimpleObjectMap::new();
+        map.insert("child".to_string(), item);
+        assert!(matches!(
+            map.gen_obj_id_with_real_obj(OBJ_TYPE_OBJMAP, &mut json!({})),
+            Err(NdnError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn test_object_map_rejects_uncanonicalizable_parent() {
+        let mut parent = serde_json::from_str(r#"{"meta":{"n":1e400}}"#).unwrap();
+        assert!(matches!(
+            SimpleObjectMap::new().gen_obj_id_with_real_obj(OBJ_TYPE_OBJMAP, &mut parent),
+            Err(NdnError::InvalidData(_))
+        ));
+    }
 
     #[test]
     fn test_simple_object_map() {

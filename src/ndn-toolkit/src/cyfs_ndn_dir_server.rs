@@ -38,8 +38,8 @@ use tokio::sync::mpsc;
 
 use named_store::{ChunkLocalInfo, NamedDataMgr};
 use ndn_lib::{
-    apply_cyfs_resp_headers, build_named_object_by_json, caculate_qcid_from_file,
-    calculate_file_chunk_id, calculate_qcid_from_file_with_metadata, named_obj_to_jwt,
+    apply_cyfs_resp_headers, caculate_qcid_from_file, calculate_file_chunk_id,
+    calculate_qcid_from_file_with_metadata, named_obj_to_jwt, try_build_named_object_by_json,
     CYFSHttpRespHeaders, ChunkId, ChunkReader, ChunkType, CyfsParent, DirObject, FileObject,
     NdnError, NdnResult, ObjId, PathObject, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
@@ -480,7 +480,7 @@ impl NdnDirServer {
         // resp=raw always returns the raw NamedObject JSON with no CYFS
         // headers — the shortcut is disabled in this mode.
         if resp_raw {
-            let (_, canonical) = build_named_object_by_json(&obj_type, &obj_json);
+            let (_, canonical) = try_build_named_object_by_json(&obj_type, &obj_json)?;
             return serve_raw_bytes(
                 Bytes::from(canonical.into_bytes()),
                 CONTENT_TYPE_CYFS_OBJECT,
@@ -505,7 +505,8 @@ impl NdnDirServer {
             if let Ok(file_obj) = serde_json::from_value::<FileObject>(obj_json.clone()) {
                 let content_obj_id = ObjId::new(file_obj.content.as_str())?;
                 if content_obj_id.is_chunk() {
-                    let (_, file_canonical) = build_named_object_by_json(OBJ_TYPE_FILE, &obj_json);
+                    let (_, file_canonical) =
+                        try_build_named_object_by_json(OBJ_TYPE_FILE, &obj_json)?;
                     let mut cyfs_headers = CYFSHttpRespHeaders::default();
                     cyfs_headers.obj_id = Some(content_obj_id.clone());
                     cyfs_headers.chunk_size = Some(file_obj.size);
@@ -523,7 +524,8 @@ impl NdnDirServer {
                         .await;
                 }
                 if content_obj_id.is_chunk_list() {
-                    let (_, file_canonical) = build_named_object_by_json(OBJ_TYPE_FILE, &obj_json);
+                    let (_, file_canonical) =
+                        try_build_named_object_by_json(OBJ_TYPE_FILE, &obj_json)?;
                     let mut cyfs_headers = CYFSHttpRespHeaders::default();
                     cyfs_headers.obj_id = Some(content_obj_id.clone());
                     cyfs_headers.chunk_size = Some(file_obj.size);
@@ -544,7 +546,7 @@ impl NdnDirServer {
         }
 
         // Generic NamedObject response.
-        let (_, canonical) = build_named_object_by_json(&obj_type, &obj_json);
+        let (_, canonical) = try_build_named_object_by_json(&obj_type, &obj_json)?;
         let body_bytes = Bytes::from(canonical.into_bytes());
         let mut headers = CYFSHttpRespHeaders::default();
         headers.obj_id = Some(obj_id);
@@ -561,7 +563,7 @@ impl NdnDirServer {
         root_obj_json: serde_json::Value,
         steps: &[Vec<String>],
     ) -> NdnResult<(serde_json::Value, Vec<String>)> {
-        let (_, root_canonical) = build_named_object_by_json(&root_obj_type, &root_obj_json);
+        let (_, root_canonical) = try_build_named_object_by_json(&root_obj_type, &root_obj_json)?;
         let mut parents: Vec<String> = vec![root_canonical];
         let mut cur_json = root_obj_json;
 
@@ -580,7 +582,7 @@ impl NdnDirServer {
                 NdnError::DecodeError(format!("parse intermediate object JSON: {}", e))
             })?;
             let (_, next_canonical) =
-                build_named_object_by_json(next_id.obj_type.as_str(), &next_json);
+                try_build_named_object_by_json(next_id.obj_type.as_str(), &next_json)?;
             parents.push(next_canonical);
             cur_json = next_json;
         }
@@ -665,7 +667,8 @@ impl NdnDirServer {
             let json_str = self.config.store_mgr.get_object(&obj_id).await?;
             let obj_value: serde_json::Value = serde_json::from_str(&json_str)
                 .map_err(|e| NdnError::DecodeError(format!("parse final named object: {}", e)))?;
-            let (_, canonical) = build_named_object_by_json(obj_id.obj_type.as_str(), &obj_value);
+            let (_, canonical) =
+                try_build_named_object_by_json(obj_id.obj_type.as_str(), &obj_value)?;
             let body_bytes = Bytes::from(canonical.into_bytes());
             let mut cyfs_headers = CYFSHttpRespHeaders::default();
             cyfs_headers.obj_id = Some(obj_id);
@@ -992,7 +995,8 @@ impl NdnDirServer {
         apply_template_to_file(&mut file_obj, template);
         let file_json = serde_json::to_value(&file_obj)
             .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;
-        let (file_obj_id, file_obj_str) = build_named_object_by_json(OBJ_TYPE_FILE, &file_json);
+        let (file_obj_id, file_obj_str) =
+            try_build_named_object_by_json(OBJ_TYPE_FILE, &file_json)?;
 
         // Register the chunk with the store according to mode. We do this
         // before writing the sidecar so a crash leaves the store consistent
