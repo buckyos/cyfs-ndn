@@ -811,6 +811,12 @@
 - 受限能力需要显式配置开启
 - 若入口是 NodeGateway，应再叠加 Zone 内身份鉴别
 
+BuckyOS 部署（nfs-server 承接 `/ndm/proxy/v1/*`）按会话主体逐请求授权，规则与 Zone 协议相同
+（`named-data-mgr-zone-protocol.md` §2.4）：写 chunk 与 `put_object` 需要 `obj://ndm/uploads`，
+读接口与对象查询需要 `obj://ndm/objects` 读权限或该对象由本主体上传/登记，`pin`/`unpin`/`unpin_owner`
+需要 `obj://ndm/manage`，或 `obj://ndm/retain` 且 owner 位于本主体前缀 `<app 主体>/<用户>/` 之下，
+其余受限能力只开放给 `obj://ndm/manage`。受限能力在 handler 内开启，由前置授权决定是否放行。
+
 ## 14. 与现有 Zone Gateway 协议的差异
 
 这份协议与 `named-data-mgr-zone-protocol.md` 的差异必须保持清晰：

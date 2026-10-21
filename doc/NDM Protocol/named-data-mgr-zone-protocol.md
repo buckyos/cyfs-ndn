@@ -43,6 +43,7 @@
 | `/ndm/v1/uploads` | `POST` | 创建 chunk 上传会话 |
 | `/ndm/v1/uploads/{session_id}` | `HEAD` | 查询会话状态 |
 | `/ndm/v1/uploads/{session_id}` | `PATCH` | 追加 chunk 数据 |
+| `/ndm/v1/uploads/{session_id}` | `DELETE` | 终止会话（仅 BuckyOS nfs-server 实现，见 §2.4） |
 | `/ndm/v1/store/{method}` | `POST` | 结构化 Store JSON API |
 
 
@@ -55,6 +56,33 @@
 - `default_app_quota`: `512 MiB`
 
 后台 GC 每 `60s` 扫描一次，清理超时的未完成上传会话。
+
+### 2.4 BuckyOS 部署：nfs-server 承接与鉴权
+
+`NamedDataMgrZoneGateway` 本身不做身份认证，只能放在负责鉴权的宿主之后。BuckyOS 的 Zone 网关把
+`/ndm/*` 转发给 nfs-server（buckyos `src/frame/nfs_server/src/ndm/`），协议报文不变，差异如下：
+
+- **每个请求都要已验证的会话**：`Authorization: Bearer <session_token>` 优先，否则用 SSO cookie
+  （`buckyos_session_token` 等）；没有有效凭证返回 `401 unauthenticated`。websdk 的 tus 上传会带 Bearer。
+- **授权**复用 RBAC，主体是 token 的用户与目标 App/服务，两者都要放行：
+  `obj://ndm/uploads` write（上传、登记自己的对象、查重类查询）、`obj://ndm/objects` read（读取任意对象/chunk）、
+  `obj://ndm/retain` write（在自己的 owner 前缀 `<app 主体>/<用户>/` 下 pin/unpin）、
+  `obj://ndm/manage` write（删除、GC、fs anchor、edge、任意 owner 的 pin）。默认策略：普通用户与已安装 App
+  只有 uploads；管理员四项都有；frame 服务有 uploads/objects/retain；读写模式 Agent 有 objects；
+  System/内核服务按既有 `obj://*` 策略。匿名与分享链接 token 不获得任何 NDM 权限。
+- **上传会话属于创建它的会话主体**（用户 + 目标 App）：别人对该会话的 `HEAD`/`PATCH`/`DELETE` 一律 `404`，
+  只持有 session_id 不能操作。会话与暂存字节持久化在 nfs-server，重启后可续传；`Upload-Metadata.app_id`
+  不再参与配额与幂等键，配额按主体计（默认 512 MiB 暂存，超出先淘汰该主体最旧的未完成会话，仍不足返回 `507`）。
+- **支持 tus termination**：`DELETE /ndm/v1/uploads/{id}` 删除会话、暂存文件和该会话的租约，不删除 chunk；
+  `OPTIONS` 的 `Tus-Extension` 为 `creation,expiration,termination`。闲置超过 TTL 的未完成会话连同暂存文件被清理，
+  `PATCH` 返回 `410 session_expired`。
+- **完成的 chunk 有租约**：写入 named store 后以 `ndm-upload:<session_id>` 加 24 小时 Lease pin，
+  `put_object` 登记的对象以 `ndm-hold:<主体>` 加同样的租约，给消息、动态、应用包等业务留出建立自己保留的时间。
+- **`put_object` 校验对应关系**：对象体必须哈希到给出的 id（ChunkList 按 chunk list 的 id 规则），
+  它引用的 chunk / 子对象必须是本主体上传、写入或登记过的（有 manage 权限除外）；`add_chunk_by_same_as`
+  要求 chunk list 由本主体登记。秒传（`chunk_hash` 已存在）不证明持有内容，属已知风险。
+- **读取**：`get_object` / `open_object` / `get_dir_child` / `query_object_by_id` 需要 objects 读权限，或该对象由本主体
+  上传/登记；知道 obj_id 不构成读取权。
 
 ## 3. 通用响应与错误模型
 

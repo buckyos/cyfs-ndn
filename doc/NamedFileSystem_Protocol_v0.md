@@ -361,7 +361,7 @@ PRD 9.2 明确要求：`public` 目录下的文件要同时显示存储路径和
   { "kind": "cyfs",   "url": "cyfs://o/$zoneid/sha256:abcd...", "immutable": true },
   { "kind": "public", "url": "https://alice.buckyos.io/public/report.pdf" },
   { "kind": "pinned", "url": "https://alice.buckyos.io/ndn/sha256:abcd...?context=cyfs:///home/public/report.pdf", "immutable": true },
-  { "kind": "signed", "url": "https://alice.buckyos.io/s/eyJhb...", "expires_at": 1756699999,
+  { "kind": "signed", "url": "https://share.alice.buckyos.io/s/eyJhb...", "expires_at": 1756699999,
     "cap_id": "cap_7f3a", "revocable": true }
 ]
 ```
@@ -373,6 +373,11 @@ PRD 9.2 明确要求：`public` 目录下的文件要同时显示存储路径和
 注意 `pinned` 条目由服务端生成时已带上 `context` 参数（该文件的逻辑路径，见 §7.3.1）：
 指向裸 ObjId 的 URL 自身不携带任何命名空间信息，服务端又**不做 ObjId → 路径反查**，
 所以鉴权上下文必须在 URL 生成时就固化进去。`signed` 条目的 context 则封在 cap token 内部。
+
+**BuckyOS 实现（nfs-server，2026-10）**：`signed` 只返回给该文件 owner，列出其仍有效的分享链接，
+主机为 `share.<zone>`（与控制台不同源，访客页不加载 SDK、不读控制台 cookie）；
+`public` 只对 `srv/publish` 下的文件返回 `https://public.<zone>/<相对路径>`，表示路径可访问，
+不表示对象已就绪；`cyfs`、`pinned` 尚未实现。
 
 ### 3.7 派生表示（缩略图 / 预览）
 
@@ -832,6 +837,12 @@ grant { "args": { "subtree": {"realm":"dfs","path":"/home/public/trip"},
 相对 WebDAV ACL 的差别：cap 是**可离线验证**的签名凭证，不需要接收方在本 Zone 有账号，
 也不需要每次访问回源查 ACL；跨 Zone 分享天然可用。撤销通过 `cap_id` 黑名单 + 短 TTL。
 
+**BuckyOS 实现（nfs-server，2026-10）**：分享链接由扩展方法 `share.create` 签发，目标是**快照对象**
+而不是活路径：源文件或目录先写成不可变的 named object 并被该分享保留，cap 的 subtree 记为
+`obj:<root_obj_id>`。token = `HMAC(secret, cap_id)`，服务端只存哈希，owner 可再次取回链接；
+数据面 `https://share.<zone>/s/{token}` 每请求核对撤销、到期与分享状态（不做离线验证），
+停止、到期与不存在一律 404。`grant` 签发的活子树 cap 在 `/s/*` 不放行。
+
 ### 5.6 通知（watch）
 
 ```
@@ -951,12 +962,18 @@ reference / derived 边不属于 I1 的实体树，但协议边界必须强制�
 | 模式 | 用途 | 形式 |
 |---|---|---|
 | session cookie | 同源的 File Browser | 常规 |
-| cap in path | 分享链接、`<img src>` | `https://.../s/{token}/...` |
+| cap in path | 分享链接、`<img src>` | `https://share.<zone>/s/{token}/...` |
 | 公开 | `public` 目录下的内容 | 无凭证 |
 
 对 Frozen 内容有一个重要简化：**知道 ObjId 本身就接近一种能力**（256 bit 不可猜）。
 但这不足以作为访问控制——它只保证不可枚举。`public` 之外的内容仍需凭证。
 **【待决策】** 是否为"知道 ObjId 即可读"开一个 Zone 级开关（对内网/可信 CDN 场景有用）。
+
+NFSP 的路径授权只管 NFSP 命名空间与它签发的分享链接，不等于原始对象的全库读取权。Zone 的 NDM
+网关（`/ndm/v1/*`、`/ndm/proxy/v1/*`，BuckyOS 由 nfs-server 承接）另按会话主体授权：只有上传或登记
+该对象的会话、或经 RBAC 明确授予对象读取权的主体可以经 NDM 读取；持有某个 NFSP 路径的读权，
+不会让该路径对应的对象经 NDM 对任何人可读。规则见 cyfs-ndn `NDM Protocol/named-data-mgr-zone-protocol.md`
+的鉴权一节。
 
 #### 7.3.1 `context` 参数：ObjId 访问的鉴权上下文
 
