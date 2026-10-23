@@ -155,17 +155,9 @@ MetaIndexDb::create_or_open(path)
 
 `is_dev_mode` 当前通过 `pkg.cfg.json` 是否存在推导，且没有参与 `load()` 的模式选择。应该删除，或者在另一个需求中重新定义；不得继续用它表示 MetaDb 是否启用。
 
-## 7. 配置迁移
+## 7. 配置字段
 
-旧配置：
-
-```json
-{
-  "enable_strict_mode": true
-}
-```
-
-新配置：
+配置文件只识别 `enable_meta_db`：
 
 ```json
 {
@@ -173,21 +165,7 @@ MetaIndexDb::create_or_open(path)
 }
 ```
 
-建议迁移规则：
-
-```text
-enable_strict_mode = true  -> enable_meta_db = true
-enable_strict_mode = false -> enable_meta_db = false
-```
-
-需要注意：旧的 `false` 会先尝试 metadata DB，再回退目录；新的 `false` 将完全不访问 DB。这是有意的行为变化，升级说明中必须明确标注。
-
-兼容窗口内可以在反序列化时接受旧字段，但：
-
-- 新旧字段不能同时出现；同时出现应报配置冲突。
-- 序列化时只输出 `enable_meta_db`。
-- 读取旧字段时应输出一次弃用日志。
-- 兼容逻辑应在约定版本后删除。
+序列化只输出 `enable_meta_db`。旧字段 `enable_strict_mode` 不做映射，按未知字段忽略，`enable_meta_db` 取默认值 `false`。
 
 ## 8. 与 PackageId/Prefix 的边界
 
@@ -237,7 +215,7 @@ MetaDb 和目录两条加载路径必须接收同一个结构化 `PackageId` 解
 - 查询现有 DB 不再隐式创建数据库文件或表。
 - MetaDb 关闭时，加载链路不会访问 metadata DB。
 - 两条路径共享统一的 `PackageId/Prefix` 解析结果。
-- 配置迁移、错误语义和上述测试全部完成。
+- 错误语义和上述测试全部完成。
 
 ## 11. 实现与升级说明
 
@@ -248,6 +226,4 @@ MetaDb 和目录两条加载路径必须接收同一个结构化 `PackageId` 解
 - MetaDb 加载会校验包名、版本、tag、索引 ObjId 和 `PackageMeta` 计算得到的 ObjId，并只加载精确对象目录。
 - 目录加载只接受无版本请求或显式 ObjId 请求；不能由目录表达的版本、tag 和范围请求返回明确错误。
 - `MetaIndexDb::open_existing_readonly()` 负责只读查询并校验完整性/schema，`MetaIndexDb::create_or_open()` 只用于创建和更新流程。
-- 兼容窗口内仍可反序列化旧配置字段；新旧字段同时出现会报冲突，读取旧字段只记录一次弃用日志，序列化只产生新字段。
-
-升级时需要特别注意：旧配置值 `false` 曾表示“先查询 MetaDb，失败后回退目录”；迁移为 `enable_meta_db: false` 后会从一开始只走目录解析，完全不访问 MetaDb。这是有意的不兼容行为变化。
+- 配置只识别 `enable_meta_db`，不再映射旧字段 `enable_strict_mode`。

@@ -63,7 +63,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 use tokio::fs as tokio_fs;
 use tokio::sync::{oneshot, Mutex as TokioMutex};
 
@@ -150,9 +150,7 @@ impl Default for PackageEnvConfig {
 struct PackageEnvConfigWire {
     prefix: Option<String>,
     enable_link: bool,
-    enable_meta_db: Option<bool>,
-    #[serde(rename = "enable_strict_mode")]
-    legacy_meta_db_mode: Option<bool>,
+    enable_meta_db: bool,
     index_db_path: Option<String>,
     parent: Option<PathBuf>,
     ready_only: bool,
@@ -167,8 +165,7 @@ impl Default for PackageEnvConfigWire {
         Self {
             prefix: defaults.prefix,
             enable_link: defaults.enable_link,
-            enable_meta_db: None,
-            legacy_meta_db_mode: None,
+            enable_meta_db: defaults.enable_meta_db,
             index_db_path: defaults.index_db_path,
             parent: defaults.parent,
             ready_only: defaults.ready_only,
@@ -185,24 +182,6 @@ impl<'de> Deserialize<'de> for PackageEnvConfig {
         D: Deserializer<'de>,
     {
         let wire = PackageEnvConfigWire::deserialize(deserializer)?;
-        let enable_meta_db = match (wire.enable_meta_db, wire.legacy_meta_db_mode) {
-            (Some(_), Some(_)) => {
-                return Err(serde::de::Error::custom(
-                    "enable_meta_db conflicts with deprecated enable_strict_mode",
-                ));
-            }
-            (Some(value), None) => value,
-            (None, Some(value)) => {
-                static LEGACY_MODE_WARNING: Once = Once::new();
-                LEGACY_MODE_WARNING.call_once(|| {
-                    warn!(
-                        "package config field enable_strict_mode is deprecated; use enable_meta_db"
-                    );
-                });
-                value
-            }
-            (None, None) => false,
-        };
         if let Some(prefix) = wire.prefix.as_deref() {
             PackagePrefix::parse(prefix).map_err(serde::de::Error::custom)?;
         }
@@ -210,7 +189,7 @@ impl<'de> Deserialize<'de> for PackageEnvConfig {
         Ok(Self {
             prefix: wire.prefix,
             enable_link: wire.enable_link,
-            enable_meta_db,
+            enable_meta_db: wire.enable_meta_db,
             index_db_path: wire.index_db_path,
             parent: wire.parent,
             ready_only: wire.ready_only,
@@ -1306,27 +1285,16 @@ mod tests {
     }
 
     #[test]
-    fn test_package_env_config_migration_and_conflict() {
-        let legacy = serde_json::from_str::<PackageEnvConfig>(
-            r#"{"enable_strict_mode":true,"prefix":"nightly-linux-amd64"}"#,
-        )
-        .unwrap();
-        assert!(legacy.enable_meta_db);
-
-        let serialized = serde_json::to_value(&legacy).unwrap();
-        assert_eq!(serialized["enable_meta_db"], true);
-        assert!(serialized.get("enable_strict_mode").is_none());
-
-        let conflict = serde_json::from_str::<PackageEnvConfig>(
-            r#"{"enable_meta_db":true,"enable_strict_mode":false}"#,
-        );
-        assert!(conflict.is_err());
-
+    fn test_package_env_config_parse() {
         let current = serde_json::from_str::<PackageEnvConfig>(
-            r#"{"enable_meta_db":false,"prefix":"nightly-linux-amd64"}"#,
+            r#"{"enable_meta_db":true,"prefix":"nightly-linux-amd64"}"#,
         )
         .unwrap();
-        assert!(!current.enable_meta_db);
+        assert!(current.enable_meta_db);
+        assert_eq!(
+            serde_json::to_value(&current).unwrap()["enable_meta_db"],
+            true
+        );
 
         assert!(
             serde_json::from_str::<PackageEnvConfig>(r#"{"prefix":"nightly-freebsd-amd64"}"#)
