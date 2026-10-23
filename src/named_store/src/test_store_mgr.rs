@@ -399,3 +399,58 @@ async fn same_as_reader_preserves_order_offsets_and_rejects_cycles() {
         Err(NdnError::InvalidData(_))
     ));
 }
+
+#[tokio::test]
+async fn extract_object_chunklist_directory_and_cleanup() {
+    use ndn_lib::{ChunkType, NamedObject};
+    let root = tempfile::tempdir().unwrap();
+    let store = NamedStore::get_named_store_by_path(root.path().join("store")).await.unwrap();
+    let store_id = store.store_id().to_string();
+    let mgr = NamedDataMgr::new();
+    mgr.register_store(Arc::new(Mutex::new(store))).await;
+    mgr.add_layout(create_layout_with_epoch(1, vec![create_test_target(&store_id, 1, true, false)])).await;
+    let mut chunks = Vec::new();
+    for data in [b"first".as_slice(), b"second".as_slice()] {
+        let hash = ndn_lib::ChunkHasher::new(None).unwrap().calc_from_bytes(data);
+        let chunk = ChunkId::from_mix_hash_result(data.len() as u64, &hash, ChunkType::Mix256);
+        mgr.put_chunk(&chunk, data).await.unwrap();
+        chunks.push(chunk);
+    }
+    let (list_id, list_json) = ChunkList::from_chunk_list(chunks).unwrap().gen_obj_id();
+    mgr.put_object(&list_id, &list_json).await.unwrap();
+    let file = FileObject::new("hello.txt".into(), 11, list_id.to_string());
+    let (file_id, file_json) = file.gen_obj_id();
+    mgr.put_object(&file_id, &file_json).await.unwrap();
+    let empty = DirObject::new(Some("empty".into()));
+    let (empty_id, empty_json) = empty.gen_obj_id().unwrap();
+    mgr.put_object(&empty_id, &empty_json).await.unwrap();
+    let mut dir = DirObject::new(Some("root".into()));
+    dir.object_map.body.insert("hello.txt".into(), SimpleMapItem::ObjId(file_id.clone()));
+    dir.object_map.body.insert("empty".into(), SimpleMapItem::ObjId(empty_id));
+    let (id, body) = dir.gen_obj_id().unwrap();
+    mgr.put_object(&id, &body).await.unwrap();
+    let destination = root.path().join("output");
+    mgr.extract_object(&id, &destination).await.unwrap();
+    assert_eq!(std::fs::read(destination.join("hello.txt")).unwrap(), b"firstsecond");
+    assert!(destination.join("empty").is_dir());
+    assert!(mgr.extract_object(&id, &destination).await.is_err());
+    assert_eq!(std::fs::read(destination.join("hello.txt")).unwrap(), b"firstsecond");
+    let mut invalid = DirObject::new(None);
+    invalid.object_map.body.insert("../escape".into(), SimpleMapItem::ObjId(file_id));
+    let (invalid_id, invalid_json) = invalid.gen_obj_id().unwrap();
+    mgr.put_object(&invalid_id, &invalid_json).await.unwrap();
+    let invalid_destination = root.path().join("invalid");
+    assert!(mgr.extract_object(&invalid_id, &invalid_destination).await.is_err());
+    assert!(!invalid_destination.exists());
+    assert!(!root.path().join("escape").exists());
+    let bad_size = FileObject::new("bad.txt".into(), 12, list_id.to_string());
+    let (bad_id, bad_json) = bad_size.gen_obj_id();
+    mgr.put_object(&bad_id, &bad_json).await.unwrap();
+    assert!(mgr.extract_object(&bad_id, &invalid_destination).await.is_err());
+    assert!(!invalid_destination.exists());
+    let empty_file = FileObject::new("zero".into(), 0, String::new());
+    let (empty_file_id, empty_file_json) = empty_file.gen_obj_id();
+    mgr.put_object(&empty_file_id, &empty_file_json).await.unwrap();
+    mgr.extract_object(&empty_file_id, &invalid_destination).await.unwrap();
+    assert_eq!(std::fs::metadata(invalid_destination).unwrap().len(), 0);
+}

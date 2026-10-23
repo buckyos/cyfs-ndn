@@ -78,3 +78,11 @@ store_mgr本身偏只读，因此必须使用store的API来写入Chunk
 
 
 
+
+## FileObject / DirObject 的本地提取
+
+`NamedDataMgr::open_reader(&ObjId, Option<String>)` 返回 `(ChunkReader, u64)`，可读取单 chunk、ChunkList、FileObject 及 DirObject 的内部文件路径；读取不会隐式落盘。
+
+`NamedDataMgr::extract_object(&ObjId, &Path)` 将 FileObject / DirObject 提取到调用方提供的、不存在的目标路径。它复用上述 reader，逐块复制并核对 FileObject 大小，保留目录树和空目录；目录入口仅允许文件和目录，拒绝路径穿越、分隔符、NUL、冒号以及超过 256 层的目录。目标已存在时失败且不修改它；本次提取失败只删除本次创建的目标，不删除 NamedStore 对象或共享引用。调用方负责目标祖先路径的权限与符号链接检查、业务授权和提交。
+
+服务应先校验用户对入口 ObjId 的读取权限。提取期间可使用独立 owner 的临时 recursive pin；完成为实体文件后，持久性由目标文件系统负责，不依赖 NDM 上传 holding 的 24 小时 lease。仅引用对象的业务仍需自己的 retention，不能用本地提取 API 替代。

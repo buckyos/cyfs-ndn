@@ -1065,6 +1065,62 @@ impl NamedDataMgr {
         Ok((reader, total))
     }
 
+    pub async fn extract_object(&self, obj_id: &ObjId, destination: &Path) -> NdnResult<()> {
+        if !obj_id.is_file_object() && !obj_id.is_dir_object() {
+            return Err(NdnError::InvalidObjType("extraction requires a file or directory".into()));
+        }
+        let mut owned = false;
+        let result = async {
+            let mut pending = vec![(obj_id.clone(), destination.to_path_buf(), None, 0usize)];
+            while let Some((id, path, inline, depth)) = pending.pop() {
+                if depth > 256 {
+                    return Err(NdnError::InvalidData("directory nesting exceeds 256".into()));
+                }
+                let body = match inline {
+                    Some(body) => body,
+                    None => self.get_object(&id).await?,
+                };
+                if id.is_dir_object() {
+                    let dir: DirObject = load_named_obj(&body)?;
+                    tokio::fs::create_dir(&path).await?;
+                    if path == destination { owned = true; }
+                    for (name, child) in dir.object_map.body {
+                        if name.is_empty() || name == "." || name == ".."
+                            || name.contains(['/', '\\', '\0', ':'])
+                        {
+                            return Err(NdnError::InvalidData(format!("unsafe directory entry: {name:?}")));
+                        }
+                        let (child_id, inline) = child.get_obj_id()?;
+                        if !child_id.is_file_object() && !child_id.is_dir_object() {
+                            return Err(NdnError::InvalidObjType(format!("unsupported directory entry: {child_id}")));
+                        }
+                        pending.push((child_id, path.join(name), (!inline.is_empty()).then_some(inline), depth + 1));
+                    }
+                } else {
+                    let file: FileObject = load_named_obj(&body)?;
+                    let mut output = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&path).await?;
+                    if path == destination { owned = true; }
+                    if file.content.is_empty() && file.size == 0 { continue; }
+                    let content = ObjId::new(&file.content)?;
+                    if !content.is_chunk() && !content.is_chunk_list() {
+                        return Err(NdnError::InvalidObjType("file content must be a chunk or chunk list".into()));
+                    }
+                    let (mut input, size) = self.open_reader(&content, None).await?;
+                    if size != file.size || tokio::io::copy(&mut input, &mut output).await? != file.size {
+                        return Err(NdnError::InComplete(format!("file size mismatch: {id}")));
+                    }
+                    output.sync_all().await?;
+                }
+            }
+            Ok(())
+        }.await;
+        if result.is_err() && owned {
+            if obj_id.is_dir_object() { let _ = tokio::fs::remove_dir_all(destination).await; }
+            else { let _ = tokio::fs::remove_file(destination).await; }
+        }
+        result
+    }
+
     /// Same as [`open_reader`] but also returns the resolved terminal `ObjId`
     /// (the chunk or chunklist that actually backs the reader) so callers
     /// (e.g. NDM Proxy gateway) can surface it as protocol metadata.
