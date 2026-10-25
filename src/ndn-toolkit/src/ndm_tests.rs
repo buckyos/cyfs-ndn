@@ -150,6 +150,97 @@ fn deterministic_bytes(len: usize, seed: usize) -> Vec<u8> {
         .collect()
 }
 
+#[tokio::test]
+async fn remote_file_import_roundtrips_empty_single_and_multiple_chunks() {
+    let srv = TestServer::start(false).await;
+    let client = srv.client();
+    let source = TempDir::new().unwrap();
+    for (case, size, local_file) in [
+        ("empty", 0, false),
+        ("single", 48 * 1024, false),
+        ("multiple", ndn_lib::CHUNK_DEFAULT_SIZE as usize + 127, false),
+        ("local-single", 48 * 1024, true),
+        (
+            "local-multiple",
+            ndn_lib::CHUNK_DEFAULT_SIZE as usize + 257,
+            true,
+        ),
+    ] {
+        let bytes = deterministic_bytes(size, case.len());
+        let path = source.path().join(case);
+        tokio::fs::write(&path, &bytes).await.unwrap();
+        let mode = if local_file {
+            ndn_lib::StoreMode::LocalFile(path.clone(), 0..size as u64, false)
+        } else {
+            ndn_lib::StoreMode::StoreInNamedMgr
+        };
+        let (file, id, encoded) = crate::cacl_file_object(
+            Some(&client),
+            &path,
+            &FileObject::default(),
+            true,
+            &crate::CheckMode::ByFullHash,
+            mode,
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert_eq!(client.get_object(&id).await.unwrap(), encoded, "{case}");
+        assert_eq!(file.size, size as u64, "{case}");
+        assert_eq!(
+            ObjId::new(&file.content).unwrap().is_chunk_list(),
+            size as u64 > ndn_lib::CHUNK_DEFAULT_SIZE,
+            "{case}",
+        );
+        assert!(client.is_object_stored(&id, None).await.unwrap(), "{case}");
+        let chunks = crate::get_chunklist_from_known_named_object(
+            &client,
+            &id,
+            &serde_json::from_str(&encoded).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            chunks.len(),
+            if size as u64 > ndn_lib::CHUNK_DEFAULT_SIZE {
+                2
+            } else {
+                1
+            },
+            "{case}",
+        );
+        let (mut reader, total) = client.open_reader(&id, None).await.unwrap();
+        let mut restored = Vec::new();
+        reader.read_to_end(&mut restored).await.unwrap();
+        assert_eq!(total, size as u64, "{case}");
+        assert_eq!(restored, bytes, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn remote_file_import_rejects_invalid_source_ranges() {
+    let srv = TestServer::start(false).await;
+    let client = srv.client();
+    let source = TempDir::new().unwrap();
+    let path = source.path().join("source.bin");
+    tokio::fs::write(&path, b"0123456789").await.unwrap();
+    let chunk = calc_chunk_id(b"4567");
+    for range in [Some(8..4), Some(4..15), Some(4..7), None] {
+        let info = named_store::ChunkLocalInfo {
+            path: path.to_string_lossy().to_string(),
+            range,
+            ..Default::default()
+        };
+        let result = crate::NamedObjectStore::add_chunk_by_link_to_local_file(
+            &client, &chunk, 4, &info,
+        )
+        .await;
+        assert!(matches!(result, Err(NdnError::InvalidParam(_))), "{result:?}");
+    }
+    assert!(!client.have_chunk(&chunk).await);
+}
+
 // ==================== GEN: 通用协议 ====================
 
 /// GEN-03: 路由存在但 method 错误 → 405 / unsupported。

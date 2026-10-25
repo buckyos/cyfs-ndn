@@ -248,6 +248,21 @@ impl NamedStore {
     pub async fn query_chunk_state(&self, chunk_id: &ChunkId) -> NdnResult<(ChunkStoreState, u64)> {
         let chunk_item = self.get_chunk_item(chunk_id).await;
         if let Ok(chunk_item) = chunk_item {
+            if let ChunkStoreState::LocalLink(ref info) = chunk_item.chunk_state {
+                if self
+                    .open_local_link_reader(chunk_id, &chunk_item, info, 0)
+                    .await
+                    .is_err()
+                {
+                    let stored = self.backend.get_chunk_state(chunk_id).await?;
+                    return if stored.presence.exists() && stored.chunk_size == chunk_item.chunk_size
+                    {
+                        Ok((ChunkStoreState::Completed, stored.chunk_size))
+                    } else {
+                        Ok((ChunkStoreState::NotExist, 0))
+                    };
+                }
+            }
             Ok((chunk_item.chunk_state, chunk_item.chunk_size))
         } else {
             Ok((ChunkStoreState::NotExist, 0))
@@ -267,8 +282,16 @@ impl NamedStore {
             }
             ChunkStoreState::LocalLink(ref local_info) => {
                 // LocalLink: 直接读取外部文件
-                self.open_local_link_reader(chunk_id, &chunk_item, local_info, offset)
+                match self
+                    .open_local_link_reader(chunk_id, &chunk_item, local_info, offset)
                     .await
+                {
+                    Ok(reader) => Ok(reader),
+                    Err(error) => match self.backend.open_chunk_reader(chunk_id, offset).await {
+                        Ok(reader) if reader.1 == chunk_item.chunk_size => Ok(reader),
+                        _ => Err(error),
+                    },
+                }
             }
             _ => Err(NdnError::Internal(format!(
                 "chunk {} state not support open reader! state:{}",
@@ -443,7 +466,25 @@ impl NamedStore {
             .open_chunk_writer(chunk_id, chunk_size, reader)
             .await?;
 
-        if outcome == ChunkWriteOutcome::Written {
+        if outcome == ChunkWriteOutcome::AlreadyExists {
+            let stored = self.backend.get_chunk_state(chunk_id).await?;
+            if !stored.presence.exists() {
+                return Err(NdnError::NotFound(chunk_id.to_string()));
+            }
+            if stored.chunk_size != chunk_size {
+                return Err(NdnError::InvalidParam(format!(
+                    "chunk {} already has size {}, requested {}",
+                    chunk_id.to_string(),
+                    stored.chunk_size,
+                    chunk_size
+                )));
+            }
+        }
+
+        if outcome == ChunkWriteOutcome::Written
+            || !matches!(self.get_chunk_item(chunk_id).await, Ok(item)
+                if item.chunk_state == ChunkStoreState::Completed && item.chunk_size == chunk_size)
+        {
             let chunk_item = ChunkItem::new_completed(chunk_id, chunk_size);
             self.db.set_chunk_item(&chunk_item)?;
         }
@@ -858,6 +899,125 @@ mod tests {
             NdnError::VerifyError(_) | NdnError::InvalidLink(_) => {}
             other => panic!("unexpected error: {:?}", other),
         }
+        assert_eq!(
+            store.query_chunk_state(&chunk_id).await.unwrap(),
+            (ChunkStoreState::NotExist, 0)
+        );
+        assert!(!store.have_chunk(&chunk_id).await);
+    }
+
+    #[tokio::test]
+    async fn existing_chunk_rejects_wrong_size_without_changing_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let data = b"existing chunk metadata must match its committed bytes";
+        let chunk_id = calc_chunk_id(data);
+        store.put_chunk(&chunk_id, data).await.unwrap();
+
+        let wrong_data = vec![0; data.len() + 1];
+        let error = store
+            .put_chunk_by_reader(
+                &chunk_id,
+                wrong_data.len() as u64,
+                Box::pin(std::io::Cursor::new(wrong_data)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, NdnError::InvalidParam(_)));
+        let stored = store.get_chunk_item(&chunk_id).await.unwrap();
+        assert_eq!(stored.chunk_state, ChunkStoreState::Completed);
+        assert_eq!(stored.chunk_size, data.len() as u64);
+        assert_eq!(store.get_chunk_data(&chunk_id).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn missing_local_link_can_be_uploaded_again() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let data = b"local link removed before upload";
+        let chunk_id = calc_chunk_id(data);
+        let file = temp_dir.path().join("external.bin");
+        fs::write(&file, data).await.unwrap();
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(&file).await.unwrap();
+        let info = ChunkLocalInfo::new(
+            file.to_string_lossy().into_owned(),
+            qcid.to_string(),
+            &metadata,
+            None,
+        );
+        store
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
+            .await
+            .unwrap();
+        assert!(store.have_chunk(&chunk_id).await);
+
+        fs::remove_file(&file).await.unwrap();
+        assert_eq!(
+            store.query_chunk_state(&chunk_id).await.unwrap(),
+            (ChunkStoreState::NotExist, 0)
+        );
+        assert!(!store.have_chunk(&chunk_id).await);
+        store.put_chunk(&chunk_id, data).await.unwrap();
+        assert_eq!(
+            store.query_chunk_state(&chunk_id).await.unwrap(),
+            (ChunkStoreState::Completed, data.len() as u64)
+        );
+        assert_eq!(store.get_chunk_data(&chunk_id).await.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn missing_local_link_reuses_committed_backend_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = NamedStore::get_named_store_by_path(temp_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let data = b"committed bytes survive their old local link";
+        let chunk_id = calc_chunk_id(data);
+        store.put_chunk(&chunk_id, data).await.unwrap();
+        let file = temp_dir.path().join("external.bin");
+        fs::write(&file, data).await.unwrap();
+        let (qcid, metadata) = calculate_qcid_from_file_with_metadata(&file).await.unwrap();
+        let info = ChunkLocalInfo::new(
+            file.to_string_lossy().into_owned(),
+            qcid.to_string(),
+            &metadata,
+            None,
+        );
+        store
+            .add_chunk_by_link_to_local_file(&chunk_id, data.len() as u64, &info)
+            .await
+            .unwrap();
+        fs::remove_file(&file).await.unwrap();
+
+        assert_eq!(
+            store.query_chunk_state(&chunk_id).await.unwrap(),
+            (ChunkStoreState::Completed, data.len() as u64)
+        );
+        assert_eq!(store.get_chunk_data(&chunk_id).await.unwrap(), data);
+        let (mut reader, size) = store.open_chunk_reader(&chunk_id, 5).await.unwrap();
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(tail, data[5..]);
+
+        let outcome = store
+            .put_chunk_by_reader(
+                &chunk_id,
+                data.len() as u64,
+                Box::pin(std::io::Cursor::new(data)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, ChunkWriteOutcome::AlreadyExists);
+        assert_eq!(
+            store.get_chunk_item(&chunk_id).await.unwrap().chunk_state,
+            ChunkStoreState::Completed
+        );
+        assert_eq!(store.get_chunk_data(&chunk_id).await.unwrap(), data);
     }
 
     #[tokio::test]
