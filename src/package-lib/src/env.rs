@@ -36,6 +36,7 @@ Other major flows:
   - 获取写锁
   - 读取 `PackageMeta`
   - 如需要先递归安装依赖
+  - 非强制安装且对象目录已存在时，修复友好路径后直接返回 `PackageAlreadyInstalled`，不访问 store
   - 通过 `named_store_config_path + http_backend_links` 构造 `NamedStoreMgr`
   - 安装前先检查 `FileObject.content` 引用的数据是否已全部在 store 中
   - 用 `open_reader` 打开包内容 reader，最终统一落到 `do_install_pkg_from_data`
@@ -49,6 +50,7 @@ Other major flows:
   - 将 tar.gz reader 解压到 ObjId 对应的对象目录
   - 若当前包是 latest，再根据 `enable_link` 维护 `work_dir/<unique_name>` 友好路径
   - Windows 没有创建符号链接的权限时，友好路径改用 directory junction
+  - 链接建不出来（如 FAT/exFAT、网络盘）或 `enable_link = false` 时，复制对象目录到友好路径
   - 对象目录已存在时返回 `PackageAlreadyInstalled`，但会先修复缺失或失效的友好路径
 
 - `try_update_index_db(new_index_db)`
@@ -706,6 +708,17 @@ impl PackageEnv {
         // 2)  使用ndn-toolkit的辅助函数，将fileobj还原为本地文件，并解压安装到env中
         // 3） 注意，如果通过named_store_config_path配置的named_store_mgr没有这个chunk，则失败。下载是安装的前置逻辑,package-lib本身不管理下载
 
+        // 已安装的包修复友好路径只需要对象目录，不依赖包内容（named store 里可能已经没有）
+        if !force_install
+            && self
+                .repair_installed_pkg(pkg_meta, &real_meta_obj_id)
+                .await?
+        {
+            return Err(PkgError::PackageAlreadyInstalled(
+                real_meta_obj_id.to_string(),
+            ));
+        }
+
         if pkg_meta.content.is_empty() {
             return Err(PkgError::InstallError(
                 pkg_id,
@@ -923,47 +936,23 @@ impl PackageEnv {
         // 若该包是 latest，再额外维护单一友好路径 `work_dir/<unique_name>`。
         let package_name = PackageName::parse(&pkg_meta.name)?;
         let pkg_id = pkg_meta.try_get_package_id()?;
+        if !force_install && self.repair_installed_pkg(pkg_meta, meta_obj_id).await? {
+            return Err(PkgError::PackageAlreadyInstalled(meta_obj_id.to_string()));
+        }
         info!("extract pkg {} from chunk", package_name);
 
         let buf_reader = BufReader::new(chunk_reader);
         let gz_decoder = GzipDecoder::new(buf_reader);
         let mut archive = Archive::new(gz_decoder);
-        let object_dir_name = meta_obj_id.to_filename();
-        let synlink_target = format!("./pkgs/{}/{}", package_name, object_dir_name);
-        let target_dir = self
-            .get_install_dir()
-            .join(package_name.to_string())
-            .join(&object_dir_name);
-        let friendly_path = self
-            .work_dir
-            .join(format!("./{}", package_name.unique_name));
+        let (synlink_target, target_dir, friendly_path) =
+            self.get_pkg_install_paths(&package_name, meta_obj_id);
         if target_dir.exists() {
-            if force_install {
-                info!(
-                    "force install pkg {}, remove target dir {}",
-                    meta_obj_id,
-                    target_dir.display()
-                );
-                tokio::fs::remove_dir_all(&target_dir).await?;
-            } else {
-                if tokio::fs::metadata(&friendly_path).await.is_err()
-                    && self.is_latest_version(&pkg_id)?
-                {
-                    info!(
-                        "pkg {} already installed, repair friendly path {}",
-                        meta_obj_id,
-                        friendly_path.display()
-                    );
-                    self.update_friendly_path(
-                        &pkg_id,
-                        &synlink_target,
-                        &target_dir,
-                        &friendly_path,
-                    )
-                    .await?;
-                }
-                return Err(PkgError::PackageAlreadyInstalled(meta_obj_id.to_string()));
-            }
+            info!(
+                "force install pkg {}, remove target dir {}",
+                meta_obj_id,
+                target_dir.display()
+            );
+            tokio::fs::remove_dir_all(&target_dir).await?;
         }
 
         tokio::fs::create_dir_all(&target_dir).await?;
@@ -977,6 +966,32 @@ impl PackageEnv {
             .await
     }
 
+    // 对象目录已存在即视为已安装，返回 true；若是 latest 且友好路径缺失或失效，先修复友好路径
+    async fn repair_installed_pkg(
+        &self,
+        pkg_meta: &PackageMeta,
+        meta_obj_id: &ObjId,
+    ) -> PkgResult<bool> {
+        let package_name = PackageName::parse(&pkg_meta.name)?;
+        let (synlink_target, target_dir, friendly_path) =
+            self.get_pkg_install_paths(&package_name, meta_obj_id);
+        if !target_dir.exists() {
+            return Ok(false);
+        }
+
+        let pkg_id = pkg_meta.try_get_package_id()?;
+        if tokio::fs::metadata(&friendly_path).await.is_err() && self.is_latest_version(&pkg_id)? {
+            info!(
+                "pkg {} already installed, repair friendly path {}",
+                meta_obj_id,
+                friendly_path.display()
+            );
+            self.update_friendly_path(&pkg_id, &synlink_target, &target_dir, &friendly_path)
+                .await?;
+        }
+        Ok(true)
+    }
+
     async fn update_friendly_path(
         &self,
         pkg_id: &PackageId,
@@ -986,24 +1001,22 @@ impl PackageEnv {
     ) -> PkgResult<()> {
         remove_friendly_path(friendly_path).await?;
         if self.config.enable_link {
-            #[cfg(target_family = "unix")]
-            tokio::fs::symlink(synlink_target, friendly_path).await?;
-            #[cfg(target_family = "windows")]
-            if let Err(error) = std::os::windows::fs::symlink_dir(synlink_target, friendly_path) {
-                if error.raw_os_error() != Some(ERROR_PRIVILEGE_NOT_HELD) {
-                    return Err(PkgError::IOError(error));
+            match create_friendly_link(synlink_target, target_dir, friendly_path).await {
+                Ok(()) => {
+                    info!(
+                        "create friendly link: {} -> {}",
+                        friendly_path.display(),
+                        synlink_target
+                    );
+                    return Ok(());
                 }
-                warn!(
-                    "no privilege to create symlink {}, create junction instead",
-                    friendly_path.display()
-                );
-                create_junction(target_dir, friendly_path).await?;
+                Err(error) => warn!(
+                    "create friendly link {} failed, copying latest pkg {} instead: {}",
+                    friendly_path.display(),
+                    pkg_id.to_string(),
+                    error
+                ),
             }
-            info!(
-                "create friendly link: {} -> {}",
-                friendly_path.display(),
-                synlink_target
-            );
         } else {
             warn!(
                 "env {} does not support link mode, copying latest pkg {} to friendly path {}",
@@ -1011,23 +1024,30 @@ impl PackageEnv {
                 pkg_id.to_string(),
                 friendly_path.display()
             );
-            let target_dir = target_dir.to_path_buf();
-            let friendly_path_clone = friendly_path.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                let mut options = CopyOptions::new();
-                options.copy_inside = true;
-                copy(&target_dir, &friendly_path_clone, &options)
-            })
-            .await
-            .map_err(|e| PkgError::InstallError(pkg_id.to_string(), e.to_string()))?
-            .map_err(|e| PkgError::InstallError(pkg_id.to_string(), e.to_string()))?;
-            info!(
-                "copy pkg {} to friendly path {} OK.",
-                pkg_id.to_string(),
-                friendly_path.display()
-            );
         }
 
+        let source_dir = target_dir.to_path_buf();
+        let friendly_path_clone = friendly_path.to_path_buf();
+        let copy_result = tokio::task::spawn_blocking(move || {
+            let mut options = CopyOptions::new();
+            options.copy_inside = true;
+            copy(&source_dir, &friendly_path_clone, &options)
+        })
+        .await
+        .map_err(|e| PkgError::InstallError(pkg_id.to_string(), e.to_string()))
+        .and_then(|result| {
+            result.map_err(|e| PkgError::InstallError(pkg_id.to_string(), e.to_string()))
+        });
+        if let Err(error) = copy_result {
+            // 不留下复制了一半的目录，下次安装检查时才会重新修复
+            let _ = remove_friendly_path(friendly_path).await;
+            return Err(error);
+        }
+        info!(
+            "copy pkg {} to friendly path {} OK.",
+            pkg_id.to_string(),
+            friendly_path.display()
+        );
         Ok(())
     }
 
@@ -1139,6 +1159,24 @@ impl PackageEnv {
         meta_db_path
     }
 
+    // 返回 (友好路径的链接目标, 对象目录, 友好路径)
+    fn get_pkg_install_paths(
+        &self,
+        package_name: &PackageName,
+        meta_obj_id: &ObjId,
+    ) -> (String, PathBuf, PathBuf) {
+        let object_dir_name = meta_obj_id.to_filename();
+        let synlink_target = format!("./pkgs/{}/{}", package_name, object_dir_name);
+        let target_dir = self
+            .get_install_dir()
+            .join(package_name.to_string())
+            .join(&object_dir_name);
+        let friendly_path = self
+            .work_dir
+            .join(format!("./{}", package_name.unique_name));
+        (synlink_target, target_dir, friendly_path)
+    }
+
     fn get_pkg_object_dir(&self, meta_obj_id: &str, pkg_meta: &PackageMeta) -> PkgResult<PathBuf> {
         let pkg_name = PackageName::parse(&pkg_meta.name)?.to_string();
         let real_obj_id = ObjId::new(meta_obj_id)
@@ -1211,6 +1249,29 @@ async fn remove_friendly_path(friendly_path: &Path) -> PkgResult<()> {
         tokio_fs::remove_file(friendly_path).await?;
     } else {
         tokio_fs::remove_dir_all(friendly_path).await?;
+    }
+    Ok(())
+}
+
+#[cfg_attr(target_family = "unix", allow(unused_variables))]
+async fn create_friendly_link(
+    synlink_target: &str,
+    target_dir: &Path,
+    friendly_path: &Path,
+) -> PkgResult<()> {
+    #[cfg(target_family = "unix")]
+    tokio::fs::symlink(synlink_target, friendly_path).await?;
+    #[cfg(target_family = "windows")]
+    if let Err(error) = std::os::windows::fs::symlink_dir(synlink_target, friendly_path) {
+        // 普通权限运行且没开开发者模式时没有建符号链接的权限，junction 不需要权限
+        if error.raw_os_error() != Some(ERROR_PRIVILEGE_NOT_HELD) {
+            return Err(PkgError::IOError(error));
+        }
+        warn!(
+            "no privilege to create symlink {}, create junction instead",
+            friendly_path.display()
+        );
+        create_junction(target_dir, friendly_path).await?;
     }
     Ok(())
 }
@@ -2087,6 +2148,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_install_pkg_repairs_friendly_path_without_package_content() {
+        let (mut env, temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let mut pkg_meta = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        // 包内容不在任何 named store 中，env 也没有配置 named_store_config_path
+        pkg_meta.content = "mix256:deadbeef".to_string();
+        let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
+        install_test_archive(&env, temp.path(), &pkg_meta, &meta_obj_id)
+            .await
+            .unwrap();
+
+        let friendly_path = env.work_dir.join("test.pkg");
+        remove_friendly_path(&friendly_path).await.unwrap();
+        let err = env
+            .install_pkg("test.pkg#1.0.0", false, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PkgError::PackageAlreadyInstalled(_)));
+        assert_eq!(
+            tokio_fs::read_to_string(friendly_path.join("bin/hello.txt"))
+                .await
+                .unwrap(),
+            "hello from package"
+        );
+    }
+
+    #[tokio::test]
     async fn test_install_newer_version_replaces_friendly_link() {
         let (env, temp) = setup_test_env().await;
         let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
@@ -2112,6 +2200,40 @@ mod tests {
                 .await
                 .unwrap(),
             "v2"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn test_update_friendly_path_copies_when_link_fails() {
+        let (env, _temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        let pkg_id = pkg_meta.try_get_package_id().unwrap();
+        let target_dir = env.work_dir.join("object");
+        tokio_fs::create_dir_all(target_dir.join("bin"))
+            .await
+            .unwrap();
+        tokio_fs::write(target_dir.join("bin/hello.txt"), "copied")
+            .await
+            .unwrap();
+        let friendly_path = env.work_dir.join("test.pkg");
+
+        // 超过 PATH_MAX 的链接目标让 symlink 失败
+        let too_long_target = "x".repeat(8192);
+        env.update_friendly_path(&pkg_id, &too_long_target, &target_dir, &friendly_path)
+            .await
+            .unwrap();
+        assert!(!tokio_fs::symlink_metadata(&friendly_path)
+            .await
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            tokio_fs::read_to_string(friendly_path.join("bin/hello.txt"))
+                .await
+                .unwrap(),
+            "copied"
         );
     }
 
