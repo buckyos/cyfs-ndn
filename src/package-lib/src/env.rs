@@ -1218,10 +1218,15 @@ async fn remove_friendly_path(friendly_path: &Path) -> PkgResult<()> {
 #[cfg(target_family = "windows")]
 async fn create_junction(target_dir: &Path, junction_path: &Path) -> PkgResult<()> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let real_target_dir = tokio_fs::canonicalize(target_dir).await?;
+    let real_target_dir = real_target_dir.to_string_lossy();
+    let real_target_dir = real_target_dir
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&real_target_dir);
     let output = tokio::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
         .raw_arg(format!("\"{}\"", junction_path.display()))
-        .raw_arg(format!("\"{}\"", target_dir.display()))
+        .raw_arg(format!("\"{}\"", real_target_dir))
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .await?;
@@ -1230,7 +1235,7 @@ async fn create_junction(target_dir: &Path, junction_path: &Path) -> PkgResult<(
             junction_path.display().to_string(),
             format!(
                 "mklink /J to {} failed: {}{}",
-                target_dir.display(),
+                real_target_dir,
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
