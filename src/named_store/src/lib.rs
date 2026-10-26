@@ -34,7 +34,7 @@ pub use limit_reader::*;
 pub use local_fs_backend::{LocalFsBackend, LocalFsBackendConfig};
 pub use named_store::{NamedLocalConfig, NamedLocalStore, NamedStore, ObjectState};
 pub use ndm::*;
-pub use ndm_node_gateway::{NamedDataMgrNodeGateway, NdmNodeGatewayConfig};
+pub use ndm_node_gateway::{chunk_reader_to_body, NamedDataMgrNodeGateway, NdmNodeGatewayConfig};
 pub use ndm_zone_gateway::{NamedDataMgrZoneGateway, NdmZoneGatewayConfig};
 pub use outbox_sender::{
     EdgeRouter, HttpEdgeRouter, LoopbackRouter, MgrEdgeRouter, OutboxSender, OutboxSenderConfig,

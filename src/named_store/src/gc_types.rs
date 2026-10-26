@@ -174,6 +174,17 @@ impl PinRequest {
     }
 }
 
+/// One pin row, as listed by owner (reconcile of external retention indexes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinInfo {
+    pub obj_id: ObjId,
+    pub owner: String,
+    pub scope: PinScope,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
 /// Debug info for expand state inspection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExpandDebug {
@@ -198,4 +209,13 @@ pub struct GcReport {
     pub evicted_objects: u64,
     pub evicted_chunks: u64,
     pub skipped_protected: u64,
+}
+
+/// One maintenance round of the GC host (`NamedDataMgr::maintenance_round`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MaintenanceReport {
+    pub edges_delivered: u64,
+    pub edges_retried: u64,
+    pub pins_expired: u64,
+    pub gc: GcReport,
 }

@@ -919,7 +919,8 @@ fn request_body_into_chunk_reader(
     Box::pin(tokio_util::io::StreamReader::new(stream))
 }
 
-fn chunk_reader_to_body(reader: ChunkReader, total: u64) -> BoxBody<Bytes, ServerError> {
+/// Streams `total` bytes of `reader` as a response body; a short read aborts the body.
+pub fn chunk_reader_to_body(reader: ChunkReader, total: u64) -> BoxBody<Bytes, ServerError> {
     let rx = chunk_reader_to_channel(reader, total);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     BodyExt::boxed(StreamBody::new(stream))

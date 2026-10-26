@@ -1026,6 +1026,57 @@ impl NamedLocalStoreDB {
         Ok(count)
     }
 
+    /// Pins whose owner starts with `owner_prefix`, ordered by `(owner, obj_id)`,
+    /// strictly after `after` (the last `(owner, obj_id)` of the previous page).
+    pub fn list_pins_by_owner(
+        &self,
+        owner_prefix: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> NdnResult<Vec<PinInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let upper = format!("{owner_prefix}\u{10FFFF}");
+        let (after_owner, after_obj) = after.unwrap_or(("", ""));
+        let mut stmt = conn
+            .prepare(
+                "SELECT obj_id, owner, scope, created_at, expires_at FROM pins
+                 WHERE owner >= ?1 AND owner < ?2 AND (owner, obj_id) > (?3, ?4)
+                 ORDER BY owner, obj_id LIMIT ?5",
+            )
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                params![owner_prefix, upper, after_owner, after_obj, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let mut pins = Vec::new();
+        for row in rows {
+            let (obj_id, owner, scope, created_at, expires_at) =
+                row.map_err(|e| NdnError::DbError(e.to_string()))?;
+            let (Ok(obj_id), Some(scope)) = (ObjId::new(&obj_id), PinScope::from_str(&scope)) else {
+                warn!("list_pins_by_owner: skip malformed pin {} {}", obj_id, owner);
+                continue;
+            };
+            pins.push(PinInfo {
+                obj_id,
+                owner,
+                scope,
+                created_at: created_at as u64,
+                expires_at: expires_at.map(|v| v as u64),
+            });
+        }
+        Ok(pins)
+    }
+
     // ================================================================
     // fs_anchor operations
     // ================================================================

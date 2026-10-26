@@ -10,7 +10,9 @@ members = [
     "./cyfs",
     "./fs_meta",
     "./fs_daemon",
-    "./ndn-toolkit"
+    "./ndn-toolkit",
+    "./bucket_store",
+    "./s3_gateway"
 ]
 
 [workspace.package]

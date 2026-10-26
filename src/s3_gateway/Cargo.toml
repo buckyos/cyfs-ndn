@@ -1,0 +1,27 @@
+[package]
+name = "s3_gateway"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+log = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+buckyos-http-server = { workspace = true }
+ndn-lib = { path = "../ndn-lib" }
+named_store = { path = "../named_store" }
+bucket_store = { path = "../bucket_store" }
+sha2 = "0.10"
+hmac = "0.12"
+md-5 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = { workspace = true }

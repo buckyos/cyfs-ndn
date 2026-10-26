@@ -548,6 +548,19 @@ impl NamedStore {
         self.db.unpin_owner(owner)
     }
 
+    pub async fn list_pins_by_owner(
+        &self,
+        owner_prefix: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> NdnResult<Vec<PinInfo>> {
+        self.db.list_pins_by_owner(owner_prefix, after, limit)
+    }
+
+    pub async fn expire_pins(&self) -> NdnResult<usize> {
+        self.db.expire_pins()
+    }
+
     pub async fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         self.db.fs_acquire(obj_id, inode_id, field_tag)
     }

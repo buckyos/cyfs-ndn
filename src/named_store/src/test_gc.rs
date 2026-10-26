@@ -1511,3 +1511,44 @@ fn test_fs_release_inode_only_removes_last_expand_reason() {
     assert!(peek_outbox(&db).is_empty());
     assert_expand(&db, &child, 1, true, ItemState::Present);
 }
+
+// ──────────── list_pins_by_owner: prefix range + keyset paging ────────────
+
+#[test]
+fn test_list_pins_by_owner_prefix_and_paging() {
+    let db = test_db();
+    let ids: Vec<ObjId> = (0..5).map(|i| file_id(&format!("lp{i}"))).collect();
+    for id in &ids {
+        db.pin(id, "bucket:user/a/alice/docs", PinScope::Recursive, None).unwrap();
+    }
+    db.pin(&ids[0], "bucket:user/a/alice/docs2", PinScope::Skeleton, None).unwrap();
+    db.pin(&ids[1], "bucket-snapshot:s1", PinScope::Recursive, None).unwrap();
+    db.pin(&ids[2], "other", PinScope::Lease, Some(std::time::Duration::from_secs(60))).unwrap();
+
+    let all = db.list_pins_by_owner("bucket:", None, 100).unwrap();
+    assert_eq!(all.len(), 6);
+    assert!(all.iter().all(|p| p.owner.starts_with("bucket:")));
+    assert!(all.windows(2).all(|w| (&w[0].owner, w[0].obj_id.to_string()) < (&w[1].owner, w[1].obj_id.to_string())));
+
+    let exact = db.list_pins_by_owner("bucket:user/a/alice/docs2", None, 100).unwrap();
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].scope, PinScope::Skeleton);
+
+    let mut paged = Vec::new();
+    let mut cursor: Option<(String, String)> = None;
+    loop {
+        let after = cursor.as_ref().map(|(o, i)| (o.as_str(), i.as_str()));
+        let page = db.list_pins_by_owner("bucket:", after, 2).unwrap();
+        if page.is_empty() {
+            break;
+        }
+        let last = page.last().unwrap();
+        cursor = Some((last.owner.clone(), last.obj_id.to_string()));
+        paged.extend(page);
+    }
+    assert_eq!(paged, all);
+
+    let lease = db.list_pins_by_owner("other", None, 10).unwrap();
+    assert_eq!(lease[0].scope, PinScope::Lease);
+    assert!(lease[0].expires_at.is_some());
+}

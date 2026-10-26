@@ -10,7 +10,7 @@
 /// 1. Try current layout first
 /// 2. If NotFound, try previous layouts
 /// 3. Return the first successful result or final error
-use crate::gc_types::{CascadeStateP0, EdgeMsg, ExpandDebug, PinScope};
+use crate::gc_types::{CascadeStateP0, EdgeMsg, ExpandDebug, MaintenanceReport, PinInfo, PinScope};
 use crate::{
     ChunkLocalInfo, ChunkStoreState, ChunkWriteOutcome, HttpBackendConfig, LayoutVersion,
     NamedDataStoreBackend, NamedLocalConfig, NamedStore, NamedStoreHttpBackend, ObjectState,
@@ -1366,6 +1366,86 @@ impl NamedDataMgr {
             total += store_guard.unpin_owner(owner).await?;
         }
         Ok(total)
+    }
+
+    /// Pins whose owner starts with `owner_prefix` across all stores, ordered by
+    /// `(owner, obj_id)` and strictly after `after`; page with the last item.
+    pub async fn list_pins_by_owner(
+        &self,
+        owner_prefix: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> NdnResult<Vec<PinInfo>> {
+        let stores = self.stores.read().await;
+        let mut pins = Vec::new();
+        for store in stores.values() {
+            let store_guard = store.lock().await;
+            pins.extend(store_guard.list_pins_by_owner(owner_prefix, after, limit).await?);
+        }
+        pins.sort_by(|a, b| (&a.owner, a.obj_id.to_string()).cmp(&(&b.owner, b.obj_id.to_string())));
+        pins.truncate(limit);
+        Ok(pins)
+    }
+
+    /// Record a read of `obj_id` for LRU (flushed by the GC host).
+    pub async fn touch(&self, obj_id: &ObjId) {
+        if let Some(store) = self.select_store_for_write(obj_id).await {
+            store.lock().await.touch(obj_id);
+        }
+    }
+
+    /// Delivers ready outbox edges of every store to the store owning each referee.
+    /// Each store lock is released before delivery, so loopback edges cannot deadlock.
+    pub async fn deliver_outbox(&self, batch: usize) -> NdnResult<(u64, u64)> {
+        let stores: Vec<_> = self.stores.read().await.values().cloned().collect();
+        let (mut delivered, mut retried) = (0u64, 0u64);
+        for store in stores {
+            let entries = store.lock().await.fetch_outbox_ready(batch).await?;
+            for entry in entries {
+                let result = self.apply_edge(entry.msg.clone()).await;
+                let store_guard = store.lock().await;
+                match result {
+                    Ok(()) => {
+                        store_guard.complete_outbox_entry(entry.seq).await?;
+                        delivered += 1;
+                    }
+                    Err(e) => {
+                        warn!("deliver edge seq={} failed: {}", entry.seq, e);
+                        store_guard.retry_outbox_entry(entry.seq).await?;
+                        retried += 1;
+                    }
+                }
+            }
+        }
+        Ok((delivered, retried))
+    }
+
+    /// One round of the Zone's GC host: drain cascade edges, flush LRU, expire
+    /// pins, and (only with `evict`) evict class-0 objects.
+    pub async fn maintenance_round(&self, evict: bool) -> NdnResult<MaintenanceReport> {
+        let mut report = MaintenanceReport::default();
+        loop {
+            let (delivered, retried) = self.deliver_outbox(256).await?;
+            report.edges_delivered += delivered;
+            report.edges_retried += retried;
+            if delivered == 0 || report.edges_delivered >= 100_000 {
+                break;
+            }
+        }
+        let stores: Vec<_> = self.stores.read().await.values().cloned().collect();
+        for store in stores {
+            let store_guard = store.lock().await;
+            store_guard.flush_lru().await?;
+            report.pins_expired += store_guard.expire_pins().await? as u64;
+            if evict {
+                let gc = store_guard.gc_round(0).await?;
+                report.gc.freed_bytes += gc.freed_bytes;
+                report.gc.evicted_objects += gc.evicted_objects;
+                report.gc.evicted_chunks += gc.evicted_chunks;
+                report.gc.skipped_protected += gc.skipped_protected;
+            }
+        }
+        Ok(report)
     }
 
     /// Acquire an fs anchor in the bucket owning `obj_id`.
