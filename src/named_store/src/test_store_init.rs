@@ -111,3 +111,25 @@ fn remote_store_base_url_uses_link_map() {
     let base_url = resolve_remote_store_base_url(&entry, &links).unwrap();
     assert_eq!(base_url, "http://store-node.bns.did/ndn");
 }
+
+#[tokio::test]
+async fn gc_removes_unretained_chunk_bytes_from_the_backend() {
+    let temp_dir = tempdir().unwrap();
+    let store = NamedStore::get_named_store_by_path(temp_dir.path().join("store")).await.unwrap();
+    let kept = b"kept by a pin".to_vec();
+    let loose = b"nobody keeps this".to_vec();
+    let (kept_id, loose_id) = (calc_chunk_id(&kept), calc_chunk_id(&loose));
+    store.put_chunk(&kept_id, &kept).await.unwrap();
+    store.put_chunk(&loose_id, &loose).await.unwrap();
+    store.pin(&kept_id.to_obj_id(), "bucket:t", PinScope::Recursive, None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let mut report = crate::GcReport::default();
+    store.gc_chunks(0, 0, &mut report).await.unwrap();
+    assert_eq!((report.evicted_chunks, report.freed_bytes), (1, loose.len() as u64));
+    assert!(store.get_chunk_data(&loose_id).await.is_err());
+    assert_eq!(store.get_chunk_data(&kept_id).await.unwrap(), kept);
+
+    let report = store.gc_round(0).await.unwrap();
+    assert_eq!(report.evicted_chunks, 0, "the default grace keeps fresh unretained chunks");
+}

@@ -749,6 +749,24 @@ async fn gc_round(target_bytes):
 - 不需要转 shadow，因为 class 0 的定义已经保证它不承担任何当前有效的 cascade 责任；
 - 如果扫描到过期 class（物化列漂移），事务内 double-check 会把它修正回来。
 
+**chunk 字节**（实现：`NamedStore::gc_chunks`，`gc_round` 在对象一轮之后执行）：chunk 的 `owned_bytes` 在 `chunk_items`，
+`objects` 里最多只有它的 shadow 行，所以 chunk 单独扫描。`chunk_items.eviction_class` 不物化，候选条件在查询里直接算：
+
+```sql
+SELECT chunk_id, owned_bytes FROM chunk_items c
+WHERE state = 'present' AND owned_bytes > 0
+  AND MAX(create_time, update_time, last_access_time) < now - CHUNK_GC_GRACE_SECS
+  AND NOT EXISTS (active pin on c.chunk_id)
+  AND NOT EXISTS (incoming_refs WHERE referee = c.chunk_id)
+  AND fs_anchor_count(c.chunk_id) = 0
+ORDER BY MAX(create_time, last_access_time)
+```
+
+- `CHUNK_GC_GRACE_SECS = 24h`：上传先落 chunk、后登记/绑定根对象，最后一次写入或读取后 24 小时内不回收没有保留的 chunk
+  （与 NDM 上传的 `ndm-hold` 24h Lease 对齐）。`flush_lru` 同时刷新 `chunk_items.last_access_time`。
+- 删除时事务内再查一次 pin / incoming / anchor，删掉 `chunk_items` 行与它的 shadow 行，再删 backend 里的字节；
+  `SameAs` / `LocalLink` 的 `owned_bytes = 0`，不会被回收（LocalLink 的文件不属于 store）。
+
 ### 7.3 metadata sweep（低优先级）
 
 单独的后台任务可以清理：

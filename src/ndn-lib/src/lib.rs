@@ -335,6 +335,7 @@ pub enum KnownStandardObject {
     Dir(DirObject, String),
     File(FileObject, String),
     ChunkList(ChunkList, String),
+    Msg(MsgObject, String),
 }
 
 impl KnownStandardObject {
@@ -367,6 +368,21 @@ impl KnownStandardObject {
                     chunk_list,
                     obj_data.to_string(),
                 ));
+            }
+            OBJ_TYPE_MSG => {
+                let value = if obj_data.trim_start().starts_with('{') {
+                    serde_json::from_str(obj_data).map_err(|e| {
+                        NdnError::InvalidParam(format!("parse msg object from json failed: {}", e))
+                    })?
+                } else {
+                    name_lib::decode_jwt_claim_without_verify(obj_data).map_err(|e| {
+                        NdnError::InvalidParam(format!("parse msg object from jwt failed: {}", e))
+                    })?
+                };
+                let msg: MsgObject = serde_json::from_value(value).map_err(|e| {
+                    NdnError::InvalidParam(format!("parse msg object failed: {}", e))
+                })?;
+                return Ok(KnownStandardObject::Msg(msg, obj_data.to_string()));
             }
             _ => {
                 return Err(NdnError::InvalidParam(format!(
@@ -403,6 +419,19 @@ impl KnownStandardObject {
                 }
                 return Ok(child_objs);
             }
+            // A message's children are the data objects it carries (attachments);
+            // replied-to / related messages are references, not content.
+            KnownStandardObject::Msg(msg, _) => {
+                return Ok(msg
+                    .content
+                    .refs
+                    .iter()
+                    .filter_map(|r| match &r.target {
+                        RefTarget::DataObj { obj_id, .. } => Some((obj_id.clone(), None)),
+                        RefTarget::ServiceDid { .. } => None,
+                    })
+                    .collect());
+            }
         }
     }
 }
@@ -410,6 +439,30 @@ impl KnownStandardObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn msg_object_children_are_its_data_refs() {
+        let attachment = ObjId::new("cyfile:0123456789abcdef0123456789abcdef").unwrap();
+        let mut msg = MsgObject::default();
+        msg.content.refs = vec![
+            RefItem {
+                role: RefRole::Input,
+                target: RefTarget::DataObj { obj_id: attachment.clone(), uri_hint: None },
+                label: None,
+            },
+            RefItem {
+                role: RefRole::Context,
+                target: RefTarget::ServiceDid { did: name_lib::DID::from_str("did:web:svc.example.com").unwrap() },
+                label: None,
+            },
+        ];
+        msg.thread.reply_to = Some(ObjId::new("cymsg:00112233445566778899aabbccddeeff").unwrap());
+        let value = serde_json::to_value(&msg).unwrap();
+        let (msg_id, msg_str) = try_build_named_object_by_json(OBJ_TYPE_MSG, &value).unwrap();
+        let known = KnownStandardObject::from_obj_data(&msg_id, &msg_str).unwrap();
+        let children: Vec<ObjId> = known.get_child_objs().unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(children, vec![attachment]);
+    }
 
     #[test]
     fn test_nfs_path_split() {

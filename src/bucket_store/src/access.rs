@@ -8,7 +8,6 @@ use crate::types::*;
 use rand::RngCore;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -415,8 +414,10 @@ fn random_hex(bytes: usize) -> String {
 }
 
 pub(crate) fn token_hash(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
+    name_lib::bearer_token::digest(token)
 }
+
+pub const ACCESS_TOKEN_PREFIX: &str = "bkt";
 
 /// Does a grant/token scope (`prefix`) cover the target? Returns the narrowing prefix for lists.
 fn covers(scope_prefix: &str, target: Target, action: Action) -> Option<Option<String>> {
@@ -657,6 +658,9 @@ impl Access<'_> {
     // ---------- tokens ----------
 
     fn find_token(&self, token: &str) -> BucketResult<Option<AccessToken>> {
+        if !name_lib::bearer_token::has_form(ACCESS_TOKEN_PREFIX, token) {
+            return Ok(None);
+        }
         let hash = token_hash(token);
         self.db.read(|conn| {
             conn.query_row(&format!("SELECT {TOKEN_COLS} FROM bucket_access_tokens WHERE token_hash = ?1"), params![hash], token_from_row)
@@ -713,7 +717,7 @@ impl Access<'_> {
             }
         }
         let token_id = format!("t_{}", random_hex(10));
-        let token = format!("bkt_{}", random_hex(24));
+        let token = name_lib::bearer_token::issue(ACCESS_TOKEN_PREFIX);
         self.db.write(|tx| {
             tx.execute(
                 "INSERT INTO bucket_access_tokens (token_id, token_hash, bucket_id, prefix, key, actions, expires_at, max_uses,

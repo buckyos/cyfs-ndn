@@ -959,19 +959,21 @@ pub struct PackageMeta {
 
 ## 19. 当前可识别的标准对象子项遍历
 
-`KnownStandardObject::from_obj_data()` 当前只识别三类对象：
+`KnownStandardObject::from_obj_data()` 当前识别四类对象：
 
 - `cydir` -> `KnownStandardObject::Dir`
 - `cyfile` -> `KnownStandardObject::File`
 - `clist` -> `KnownStandardObject::ChunkList`
+- `cymsg` -> `KnownStandardObject::Msg`（正文是 JSON 或 JWT，JWT 只取 claims，不验签）
 
 `get_child_objs()` 的行为：
 
 - 对 `DirObject`：遍历目录 `body`，返回每个子项 ObjId；如果子项是内嵌对象/JWT，同时返回归一化后的子对象 JSON 字符串。
 - 对 `FileObject`：解析 `content` 为 ObjId 并返回。
 - 对 `ChunkList`：返回每个 `ChunkId` 对应的 ObjId。
+- 对 `MsgObject`：返回 `content.refs` 里每个 `DataObj` 的 `obj_id`（附件）。`ServiceDid` 引用、`thread.reply_to`、`relates_to.target` 指向的是别的消息或服务，不是这条消息的内容，不算子项。
 
-这说明当前实现把目录、文件、ChunkList 作为 NDN 递归拉取的核心可展开对象。
+这些子项就是 named store 级联展开（`parse_obj_refs`）与 NDN 递归拉取的边：Recursive pin 一条消息会级联保留它的附件；NDM 登记一条消息对象时，登记者也要持有它引用的附件。
 
 ## 20. Rust 参考结构
 

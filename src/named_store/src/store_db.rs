@@ -1357,6 +1357,69 @@ impl NamedLocalStoreDB {
         Ok(results)
     }
 
+    /// Unprotected completed chunks with owned bytes, least recently used
+    /// first; a chunk written or read within `grace_secs` is never a candidate
+    /// (uploads bind their roots after the chunks land).
+    pub fn list_chunk_gc_candidates(&self, limit: usize, grace_secs: u64) -> NdnResult<Vec<(String, u64)>> {
+        let now = unix_timestamp() as i64;
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.chunk_id, c.owned_bytes FROM chunk_items c
+                 WHERE c.state = 'present' AND c.owned_bytes > 0
+                   AND MAX(c.create_time, c.update_time, c.last_access_time) < ?2
+                   AND NOT EXISTS (SELECT 1 FROM pins p WHERE p.obj_id = c.chunk_id
+                                   AND (p.expires_at IS NULL OR p.expires_at > ?3))
+                   AND NOT EXISTS (SELECT 1 FROM incoming_refs r WHERE r.referee = c.chunk_id)
+                   AND COALESCE((SELECT o.fs_anchor_count FROM objects o WHERE o.obj_id = c.chunk_id), 0) = 0
+                 ORDER BY MAX(c.create_time, c.last_access_time) ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let results = stmt
+            .query_map(params![limit as i64, now - grace_secs as i64, now], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|e| NdnError::DbError(e.to_string()))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(results)
+    }
+
+    /// Drops an unprotected chunk's row; the caller removes its bytes from the
+    /// backend. Returns the owned bytes freed, or 0 if it became protected.
+    pub fn try_evict_chunk(&self, chunk_id: &str) -> NdnResult<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let has_pin = Self::has_active_pin_tx(&tx, chunk_id)?;
+        let has_incoming = Self::has_incoming_tx(&tx, chunk_id)?;
+        let fs_count = Self::get_fs_anchor_count_tx(&tx, chunk_id)?;
+        if has_pin || has_incoming || fs_count > 0 {
+            return Ok(0);
+        }
+        let owned: i64 = tx
+            .query_row(
+                "SELECT owned_bytes FROM chunk_items WHERE chunk_id = ?1 AND state = 'present'",
+                params![chunk_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if owned <= 0 {
+            return Ok(0);
+        }
+        tx.execute("DELETE FROM chunk_items WHERE chunk_id = ?1", params![chunk_id])
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM objects WHERE obj_id = ?1 AND state = 'shadow'",
+            params![chunk_id],
+        )
+        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        Ok(owned as u64)
+    }
+
     /// Try to evict a single object. Returns owned_bytes freed, or 0 if protected.
     pub fn try_evict_object(&self, obj_id_str: &str) -> NdnResult<u64> {
         let mut conn = self.conn.lock().unwrap();
@@ -1409,6 +1472,12 @@ impl NamedLocalStoreDB {
             tx.execute(
                 "UPDATE objects SET last_access_time = MAX(last_access_time, ?1)
                  WHERE obj_id = ?2",
+                params![*ts as i64, obj_id],
+            )
+            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            tx.execute(
+                "UPDATE chunk_items SET last_access_time = MAX(last_access_time, ?1)
+                 WHERE chunk_id = ?2",
                 params![*ts as i64, obj_id],
             )
             .map_err(|e| NdnError::DbError(e.to_string()))?;

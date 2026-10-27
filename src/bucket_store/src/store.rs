@@ -682,6 +682,21 @@ impl BucketStore {
                 return Err(e);
             }
         };
+        for (op, result) in ops.iter().zip(&results) {
+            match (op, result) {
+                (Op::Put(p), BatchResult::Put(r)) => {
+                    log::info!("bucket bind {} key={} obj_id={} version={} by {actor}", bucket.bucket_id, p.req.key, p.req.obj_id, r.version)
+                }
+                (Op::Delete { key, .. }, BatchResult::Delete(r)) => log::info!(
+                    "bucket unbind {} key={key} version={:?} deleted={} marker={} by {actor}",
+                    bucket.bucket_id,
+                    r.version,
+                    r.deleted,
+                    r.delete_marker
+                ),
+                _ => {}
+            }
+        }
         self.finish_unpins(&bucket.bucket_id, &fx.unpin).await;
         self.emit(fx.events);
         self.check_quota_warnings(&bucket);

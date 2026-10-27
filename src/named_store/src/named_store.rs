@@ -44,6 +44,10 @@ pub enum ObjectState {
 /// Default relatime threshold: 60 seconds between DB flushes for the same key.
 const LRU_RELATIME_THRESHOLD_SECS: u64 = 60;
 
+/// Unretained chunk bytes live at least this long after their last write or
+/// read: the window an upload has to bind (or lease) the object it belongs to.
+pub const CHUNK_GC_GRACE_SECS: u64 = 24 * 3600;
+
 /// 通用 Named Store：使用 `NamedDataStoreBackend` 进行 chunk I/O，
 /// 使用 `NamedLocalStoreDB` 管理元数据（chunk 状态、GC、pin、outbox 等）。
 ///
@@ -635,7 +639,42 @@ impl NamedStore {
             }
         }
 
+        self.gc_chunks(target_bytes, CHUNK_GC_GRACE_SECS, &mut report).await?;
         Ok(report)
+    }
+
+    /// Chunk bytes are owned by `chunk_items`, not `objects` (GC design §4.1).
+    pub(crate) async fn gc_chunks(&self, target_bytes: u64, grace_secs: u64, report: &mut GcReport) -> NdnResult<()> {
+        let batch_size = 100;
+        loop {
+            if target_bytes > 0 && report.freed_bytes >= target_bytes {
+                return Ok(());
+            }
+            let candidates = self.db.list_chunk_gc_candidates(batch_size, grace_secs)?;
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            for (chunk_id_str, _owned_bytes) in &candidates {
+                let freed = self.db.try_evict_chunk(chunk_id_str)?;
+                if freed == 0 {
+                    report.skipped_protected += 1;
+                    continue;
+                }
+                if let Ok(chunk_id) = ChunkId::new(chunk_id_str) {
+                    if let Err(e) = self.backend.remove_chunk(&chunk_id).await {
+                        warn!("GC: chunk {} row dropped but its bytes were not removed: {}", chunk_id_str, e);
+                    }
+                }
+                report.evicted_chunks += 1;
+                report.freed_bytes += freed;
+                if target_bytes > 0 && report.freed_bytes >= target_bytes {
+                    return Ok(());
+                }
+            }
+            if target_bytes == 0 {
+                return Ok(());
+            }
+        }
     }
 
     pub async fn forced_gc_until(&self, target_bytes: u64) -> NdnResult<u64> {

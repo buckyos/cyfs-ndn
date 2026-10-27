@@ -301,7 +301,7 @@ pub fn validate_key(key: &str) -> BucketResult<()> {
 pub struct BucketDecl {
     pub kind: BucketKind,
     pub data_policy: DataPolicy,
-    #[serde(default = "default_scope")]
+    #[serde(default = "default_scope", skip_serializing_if = "is_default_scope")]
     pub scope: BucketScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub versioning: Option<bool>,
@@ -317,6 +317,12 @@ pub struct BucketDecl {
 
 fn default_scope() -> BucketScope {
     BucketScope::User
+}
+
+/// Defaults stay out of the serialized form, so a declaration round-trips to the
+/// bytes an AppDoc was signed with.
+fn is_default_scope(scope: &BucketScope) -> bool {
+    *scope == BucketScope::User
 }
 
 impl BucketDecl {
@@ -616,6 +622,17 @@ impl BucketInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declarations_serialize_without_defaults() {
+        for text in [
+            r#"{"kind":"data","data_policy":"app_data"}"#,
+            r#"{"kind":"object","data_policy":"documents","scope":"zone","versioning":false}"#,
+        ] {
+            let decl: BucketDecl = serde_json::from_str(text).unwrap();
+            assert_eq!(serde_json::to_string(&decl).unwrap(), text);
+        }
+    }
 
     #[test]
     fn bucket_id_round_trip() {

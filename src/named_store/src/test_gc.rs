@@ -1552,3 +1552,73 @@ fn test_list_pins_by_owner_prefix_and_paging() {
     assert_eq!(lease[0].scope, PinScope::Lease);
     assert!(lease[0].expires_at.is_some());
 }
+
+// ──────────── chunk bytes: reclaimed only when unretained and past grace ────────────
+
+fn completed_chunk(db: &NamedLocalStoreDB, tag: &str, size: u64, age_secs: u64) -> ChunkId {
+    let hash = ndn_lib::ChunkHasher::new(None).unwrap().calc_from_bytes(tag.as_bytes());
+    let chunk_id = ChunkId::from_mix_hash_result_by_hash_method(size, &hash, ndn_lib::HashMethod::Sha256).unwrap();
+    let mut item = ChunkItem::new_completed(&chunk_id, size);
+    item.create_time -= age_secs;
+    item.update_time -= age_secs;
+    db.set_chunk_item(&item).unwrap();
+    chunk_id
+}
+
+fn chunk_candidates(db: &NamedLocalStoreDB, grace: u64) -> Vec<String> {
+    db.list_chunk_gc_candidates(100, grace).unwrap().into_iter().map(|(id, _)| id).collect()
+}
+
+#[test]
+fn test_chunk_gc_respects_retention_and_grace() {
+    let db = test_db();
+    let old = completed_chunk(&db, "old", 4096, 3 * 86400);
+    let fresh = completed_chunk(&db, "fresh", 4096, 60);
+    let file = file_id("file_with_old_chunk");
+    db.set_object(&file, "cyfile", &make_file_json(&old.to_obj_id())).unwrap();
+
+    db.pin(&file, "bucket:x", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+    assert!(chunk_candidates(&db, 3600).is_empty(), "a retained chunk and a fresh one are no candidates");
+    assert_eq!(db.try_evict_chunk(&old.to_string()).unwrap(), 0);
+
+    db.unpin(&file, "bucket:x").unwrap();
+    drain_outbox(&db);
+    assert_eq!(chunk_candidates(&db, 3600), vec![old.to_string()]);
+    assert_eq!(chunk_candidates(&db, 30).len(), 2);
+
+    db.pin(&old.to_obj_id(), "lease:x", PinScope::Lease, Some(std::time::Duration::from_secs(600))).unwrap();
+    assert!(chunk_candidates(&db, 3600).is_empty(), "an active lease protects the chunk");
+    db.unpin(&old.to_obj_id(), "lease:x").unwrap();
+
+    assert_eq!(db.try_evict_chunk(&old.to_string()).unwrap(), 4096);
+    assert!(db.get_chunk_item(&old).is_err());
+    assert!(db.get_chunk_item(&fresh).is_ok());
+}
+
+#[test]
+fn test_recursive_pin_on_msg_object_protects_its_attachment() {
+    let db = test_db();
+    let chunk = completed_chunk(&db, "attachment-bytes", 2048, 3 * 86400);
+    let file = file_id("attachment");
+    db.set_object(&file, "cyfile", &make_file_json(&chunk.to_obj_id())).unwrap();
+    let mut msg = ndn_lib::MsgObject::default();
+    msg.content.refs = vec![ndn_lib::RefItem {
+        role: ndn_lib::RefRole::Input,
+        target: ndn_lib::RefTarget::DataObj { obj_id: file.clone(), uri_hint: None },
+        label: None,
+    }];
+    let (msg_id, msg_str) =
+        ndn_lib::try_build_named_object_by_json(ndn_lib::OBJ_TYPE_MSG, &serde_json::to_value(&msg).unwrap()).unwrap();
+    db.set_object(&msg_id, ndn_lib::OBJ_TYPE_MSG, &msg_str).unwrap();
+
+    db.pin(&msg_id, "bucket:zone/msg/_/messages", PinScope::Recursive, None).unwrap();
+    drain_outbox(&db);
+    assert_expand(&db, &file, 1, true, ItemState::Present);
+    assert!(chunk_candidates(&db, 0).is_empty());
+
+    db.unpin(&msg_id, "bucket:zone/msg/_/messages").unwrap();
+    drain_outbox(&db);
+    assert_expand(&db, &file, 0, false, ItemState::Present);
+    assert_eq!(chunk_candidates(&db, 0), vec![chunk.to_string()]);
+}
