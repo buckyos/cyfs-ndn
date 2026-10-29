@@ -995,7 +995,7 @@ impl PackageEnv {
     async fn update_friendly_path(
         &self,
         pkg_id: &PackageId,
-        synlink_target: &str,
+        synlink_target: &Path,
         target_dir: &Path,
         friendly_path: &Path,
     ) -> PkgResult<()> {
@@ -1006,7 +1006,7 @@ impl PackageEnv {
                     info!(
                         "create friendly link: {} -> {}",
                         friendly_path.display(),
-                        synlink_target
+                        synlink_target.display()
                     );
                     return Ok(());
                 }
@@ -1164,16 +1164,12 @@ impl PackageEnv {
         &self,
         package_name: &PackageName,
         meta_obj_id: &ObjId,
-    ) -> (String, PathBuf, PathBuf) {
-        let object_dir_name = meta_obj_id.to_filename();
-        let synlink_target = format!("./pkgs/{}/{}", package_name, object_dir_name);
-        let target_dir = self
-            .get_install_dir()
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        let synlink_target = Path::new("pkgs")
             .join(package_name.to_string())
-            .join(&object_dir_name);
-        let friendly_path = self
-            .work_dir
-            .join(format!("./{}", package_name.unique_name));
+            .join(meta_obj_id.to_filename());
+        let target_dir = self.work_dir.join(&synlink_target);
+        let friendly_path = self.work_dir.join(&package_name.unique_name);
         (synlink_target, target_dir, friendly_path)
     }
 
@@ -1255,7 +1251,7 @@ async fn remove_friendly_path(friendly_path: &Path) -> PkgResult<()> {
 
 #[cfg_attr(target_family = "unix", allow(unused_variables))]
 async fn create_friendly_link(
-    synlink_target: &str,
+    synlink_target: &Path,
     target_dir: &Path,
     friendly_path: &Path,
 ) -> PkgResult<()> {
@@ -2129,7 +2125,7 @@ mod tests {
 
         let stale_dir = env.work_dir.join("stale");
         tokio_fs::create_dir_all(&stale_dir).await.unwrap();
-        env.update_friendly_path(&pkg_id, "./stale", &stale_dir, &friendly_path)
+        env.update_friendly_path(&pkg_id, Path::new("stale"), &stale_dir, &friendly_path)
             .await
             .unwrap();
         tokio_fs::remove_dir(&stale_dir).await.unwrap();
@@ -2221,9 +2217,14 @@ mod tests {
 
         // 超过 PATH_MAX 的链接目标让 symlink 失败
         let too_long_target = "x".repeat(8192);
-        env.update_friendly_path(&pkg_id, &too_long_target, &target_dir, &friendly_path)
-            .await
-            .unwrap();
+        env.update_friendly_path(
+            &pkg_id,
+            Path::new(&too_long_target),
+            &target_dir,
+            &friendly_path,
+        )
+        .await
+        .unwrap();
         assert!(!tokio_fs::symlink_metadata(&friendly_path)
             .await
             .unwrap()
@@ -2268,6 +2269,24 @@ mod tests {
         assert!(tokio_fs::metadata(target_dir.join("bin/hello.txt"))
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_friendly_link_target_is_relative_object_dir() {
+        let (env, _temp) = setup_test_env().await;
+        let owner = DID::from_str("did:bns:buckyos.ai").unwrap();
+        let pkg_meta = PackageMeta::new("test.pkg", "1.0.0", "test", &owner, None);
+        let meta_obj_id = insert_pkg_meta_to_db(&env, &pkg_meta);
+        let package_name = PackageName::parse(&pkg_meta.name).unwrap();
+
+        let (synlink_target, target_dir, friendly_path) =
+            env.get_pkg_install_paths(&package_name, &meta_obj_id);
+        assert!(synlink_target.is_relative());
+        assert_eq!(env.work_dir.join(&synlink_target), target_dir);
+        assert_eq!(friendly_path, env.work_dir.join("test.pkg"));
+        // Windows 解析符号链接目标时不把 `/` 当分隔符
+        #[cfg(target_family = "windows")]
+        assert!(!synlink_target.to_string_lossy().contains('/'));
     }
 
     #[tokio::test]
