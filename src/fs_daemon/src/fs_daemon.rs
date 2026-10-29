@@ -1226,7 +1226,7 @@ fn map_ndn_err(err: NdnError) -> i32 {
         NdnError::PermissionDenied(_) => EPERM,
         NdnError::Unsupported(_) => ENOSYS,
         NdnError::IoError(_) => EIO,
-        NdnError::DbError(_) => EIO,
+        NdnError::DbError(_) | NdnError::SqliteError { .. } => EIO,
         NdnError::OffsetTooLarge(_) => EINVAL,
         NdnError::InvalidObjType(_) => EINVAL,
         NdnError::InvalidData(_) => EINVAL,

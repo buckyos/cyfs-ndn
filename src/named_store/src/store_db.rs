@@ -2,10 +2,25 @@ use crate::gc_types::*;
 use log::{debug, warn};
 use ndn_lib::{ChunkId, KnownStandardObject, NdnError, NdnResult, ObjId};
 use rusqlite::types::{FromSql, ToSql, ValueRef};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::ops::Range;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// SQLite's busy handler waits in bounded increments while acquiring a write
+// lock. This is a lock-wait budget, not a deadline for the entire API call.
+const WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn db_error(error: rusqlite::Error) -> NdnError {
+    match error {
+        rusqlite::Error::SqliteFailure(code, detail) => NdnError::SqliteError {
+            code: code.extended_code & 0xff,
+            extended_code: code.extended_code,
+            message: detail.unwrap_or_else(|| code.to_string()),
+        },
+        other => NdnError::DbError(other.to_string()),
+    }
+}
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
@@ -216,12 +231,15 @@ impl NamedLocalStoreDB {
         debug!("NamedLocalStoreDB: new db path: {}", db_path);
         let conn = Connection::open(&db_path).map_err(|e| {
             warn!("NamedLocalStoreDB: open db failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
+            db_error(e)
         })?;
+
+        // Make the contention policy explicit, including single-statement writes.
+        conn.busy_timeout(WRITE_LOCK_TIMEOUT).map_err(db_error)?;
 
         // Enable WAL for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         let db = Self {
             db_path,
@@ -229,6 +247,16 @@ impl NamedLocalStoreDB {
         };
         db.init_tables()?;
         Ok(db)
+    }
+
+    /// Acquire SQLite's cross-connection/process write lock before any reads.
+    /// DEFERRED read-then-write transactions can fail to upgrade a WAL snapshot
+    /// even with a busy timeout. IMMEDIATE waits at admission instead; once it
+    /// succeeds, reads and writes share the current, exclusively writable state.
+    /// A timeout is returned to the caller without replaying partial statements.
+    fn write_transaction(conn: &mut Connection) -> NdnResult<Transaction<'_>> {
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)
     }
 
     fn init_tables(&self) -> NdnResult<()> {
@@ -336,7 +364,7 @@ impl NamedLocalStoreDB {
         )
         .map_err(|e| {
             warn!("NamedLocalStoreDB: init tables failed! {}", e.to_string());
-            NdnError::DbError(e.to_string())
+            db_error(e)
         })?;
         Ok(())
     }
@@ -368,7 +396,7 @@ impl NamedLocalStoreDB {
                 )
                 .map_err(|e| {
                     warn!("NamedLocalStoreDB: insert chunk failed! {}", e);
-                    NdnError::DbError(e.to_string())
+                    db_error(e)
                 })?;
             }
             ChunkStoreState::SameAs(chunk_list_id) => {
@@ -388,7 +416,7 @@ impl NamedLocalStoreDB {
                 )
                 .map_err(|e| {
                     warn!("NamedLocalStoreDB: insert chunk failed! {}", e);
-                    NdnError::DbError(e.to_string())
+                    db_error(e)
                 })?;
             }
             _ => {
@@ -419,7 +447,7 @@ impl NamedLocalStoreDB {
                 )
                 .map_err(|e| {
                     warn!("NamedLocalStoreDB: insert chunk failed! {}", e);
-                    NdnError::DbError(e.to_string())
+                    db_error(e)
                 })?;
             }
         }
@@ -438,7 +466,7 @@ impl NamedLocalStoreDB {
                 "SELECT chunk_size, chunk_state, create_time, update_time, local_path, local_info
                  FROM chunk_items WHERE chunk_id = ?1",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         let chunk = stmt
             .query_row(params![chunk_id.to_string()], |row| {
@@ -471,7 +499,7 @@ impl NamedLocalStoreDB {
                 }
                 _ => {
                     warn!("NamedLocalStoreDB: get chunk failed! {}", e.to_string());
-                    NdnError::DbError(e.to_string())
+                    db_error(e)
                 }
             })?;
 
@@ -480,21 +508,19 @@ impl NamedLocalStoreDB {
 
     pub fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
         tx.execute(
             "DELETE FROM chunk_items WHERE chunk_id = ?1",
             params![chunk_id.to_string()],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         // Also clean up any incoming_refs / outbox referencing this chunk
         tx.execute(
             "DELETE FROM incoming_refs WHERE referee = ?1",
             params![chunk_id.to_string()],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -503,9 +529,7 @@ impl NamedLocalStoreDB {
         let logical_size = obj_str.len() as i64;
         let owned_bytes = obj_str.len() as i64;
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         Self::put_object_in_tx(
             &tx,
@@ -517,7 +541,7 @@ impl NamedLocalStoreDB {
             owned_bytes,
         )?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -538,7 +562,8 @@ impl NamedLocalStoreDB {
                 params![obj_id.to_string()],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()
+            .map_err(db_error)?;
 
         match existing_state.as_deref() {
             Some("present") => {
@@ -548,7 +573,7 @@ impl NamedLocalStoreDB {
                         params![obj_id.to_string()],
                         |row| row.get(0),
                     )
-                    .map_err(|e| NdnError::DbError(e.to_string()))?;
+                    .map_err(db_error)?;
 
                 if stored != obj_str {
                     return Err(NdnError::AlreadyExists(format!(
@@ -563,7 +588,7 @@ impl NamedLocalStoreDB {
                      WHERE obj_id = ?2",
                     params![now_time as i64, obj_id.to_string()],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
                 return Ok(false); // no state change
             }
             Some("shadow") => {
@@ -581,7 +606,7 @@ impl NamedLocalStoreDB {
                         obj_id.to_string()
                     ],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
                 // Promote cascade_state for anchors pointing at this obj
                 Self::promote_anchor_cascade_state_on_present_tx(tx, obj_id)?;
                 // Recompute + reconcile since state changed
@@ -606,7 +631,7 @@ impl NamedLocalStoreDB {
                         owned_bytes,
                     ],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
                 // For new inserts, no anchors/pins exist yet, class stays 0
                 return Ok(true);
             }
@@ -621,7 +646,7 @@ impl NamedLocalStoreDB {
     fn get_object_with_conn(conn: &Connection, obj_id: &ObjId) -> NdnResult<(String, String)> {
         let mut stmt = conn
             .prepare("SELECT obj_type, obj_data, state FROM objects WHERE obj_id = ?1")
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         let result = stmt
             .query_row(params![obj_id.to_string()], |row| {
@@ -630,7 +655,7 @@ impl NamedLocalStoreDB {
             })
             .map_err(|e| {
                 warn!("NamedLocalStoreDB: query object failed! {}", e.to_string());
-                NdnError::DbError(e.to_string())
+                db_error(e)
             })?;
 
         if result.2 == "shadow" {
@@ -649,7 +674,7 @@ impl NamedLocalStoreDB {
             "DELETE FROM objects WHERE obj_id = ?1",
             params![obj_id.to_string()],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         Ok(())
     }
 
@@ -667,7 +692,7 @@ impl NamedLocalStoreDB {
              VALUES (?1, '', '', ?2, ?2, 'shadow', 0, 0, 0, 0, 0)",
             params![obj_id, now],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         // Also check chunk_items if this looks like a chunk
         // We unify: objects table holds all items for GC purposes.
         // Chunks also get shadow rows in the objects table for GC tracking.
@@ -684,7 +709,7 @@ impl NamedLocalStoreDB {
                 params![obj_id, now],
                 |row| row.get(0),
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(count > 0)
     }
 
@@ -697,7 +722,7 @@ impl NamedLocalStoreDB {
                 params![obj_id, now],
                 |row| row.get(0),
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(count > 0)
     }
 
@@ -710,7 +735,7 @@ impl NamedLocalStoreDB {
                 params![obj_id, now],
                 |row| row.get(0),
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(count > 0)
     }
 
@@ -721,7 +746,7 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(count > 0)
     }
 
@@ -732,6 +757,8 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
+            .optional()
+            .map_err(db_error)?
             .unwrap_or(0);
         Ok(count)
     }
@@ -743,7 +770,8 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()
+            .map_err(db_error)?;
         Ok(state)
     }
 
@@ -754,6 +782,8 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
+            .optional()
+            .map_err(db_error)?
             .unwrap_or(0);
         Ok(val != 0)
     }
@@ -776,7 +806,7 @@ impl NamedLocalStoreDB {
             "UPDATE objects SET eviction_class = ?1 WHERE obj_id = ?2",
             params![class, obj_id],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         Ok(())
     }
 
@@ -789,7 +819,8 @@ impl NamedLocalStoreDB {
                 params![obj_id.to_string()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .ok();
+            .optional()
+            .map_err(db_error)?;
 
         if let Some((obj_type, obj_data)) = result {
             if !obj_type.is_empty() && !obj_data.is_empty() {
@@ -815,7 +846,8 @@ impl NamedLocalStoreDB {
                     params![obj_id.to_string()],
                     |row| row.get(0),
                 )
-                .ok();
+                .optional()
+                .map_err(db_error)?;
             if let Some(target_str) = same_as_target {
                 if let Ok(target_id) = ObjId::new(&target_str) {
                     return Ok(vec![target_id]);
@@ -855,7 +887,7 @@ impl NamedLocalStoreDB {
                 "UPDATE objects SET children_expanded = 1 WHERE obj_id = ?1",
                 params![obj_id_str],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
             let children = Self::parse_obj_refs_tx(tx, obj_id)?;
             let now = unix_timestamp() as i64;
@@ -866,7 +898,7 @@ impl NamedLocalStoreDB {
                      VALUES ('add', ?1, ?2, ?3, ?4)",
                     params![child.to_string(), obj_id_str, epoch, now],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
             }
         }
 
@@ -875,7 +907,7 @@ impl NamedLocalStoreDB {
                 "UPDATE objects SET children_expanded = 0 WHERE obj_id = ?1",
                 params![obj_id_str],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
             let children = Self::parse_obj_refs_tx(tx, obj_id)?;
             let now = unix_timestamp() as i64;
@@ -886,7 +918,7 @@ impl NamedLocalStoreDB {
                      VALUES ('remove', ?1, ?2, ?3, ?4)",
                     params![child.to_string(), obj_id_str, epoch, now],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
             }
         }
 
@@ -905,14 +937,14 @@ impl NamedLocalStoreDB {
              WHERE obj_id = ?1 AND scope = 'recursive' AND cascade_state = 'Pending'",
             params![obj_id_str],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
 
         tx.execute(
             "UPDATE fs_anchors SET cascade_state = 'Materializing'
              WHERE obj_id = ?1 AND cascade_state = 'Pending'",
             params![obj_id_str],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         Ok(())
     }
 
@@ -928,9 +960,7 @@ impl NamedLocalStoreDB {
         ttl: Option<std::time::Duration>,
     ) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &obj_id_str)?;
@@ -961,20 +991,18 @@ impl NamedLocalStoreDB {
                 expires_at,
             ],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
 
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
     pub fn unpin(&self, obj_id: &ObjId, owner: &str) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         let deleted = tx
@@ -982,37 +1010,35 @@ impl NamedLocalStoreDB {
                 "DELETE FROM pins WHERE obj_id = ?1 AND owner = ?2",
                 params![obj_id_str, owner],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         if deleted > 0 {
             Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
             Self::reconcile_expand_state_tx(&tx, obj_id)?;
         }
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
     /// Unpin all entries for an owner. Returns number of affected objects.
     pub fn unpin_owner(&self, owner: &str) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         // Collect affected obj_ids first
         let mut stmt = tx
             .prepare("SELECT DISTINCT obj_id FROM pins WHERE owner = ?1")
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let obj_ids: Vec<String> = stmt
             .query_map(params![owner], |row| row.get(0))
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
         drop(stmt);
 
         tx.execute("DELETE FROM pins WHERE owner = ?1", params![owner])
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         for oid_str in &obj_ids {
             Self::recompute_eviction_class_tx(&tx, oid_str)?;
@@ -1022,7 +1048,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(count)
     }
 
@@ -1043,7 +1069,7 @@ impl NamedLocalStoreDB {
                  WHERE owner >= ?1 AND owner < ?2 AND (owner, obj_id) > (?3, ?4)
                  ORDER BY owner, obj_id LIMIT ?5",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let rows = stmt
             .query_map(
                 params![owner_prefix, upper, after_owner, after_obj, limit as i64],
@@ -1057,13 +1083,16 @@ impl NamedLocalStoreDB {
                     ))
                 },
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let mut pins = Vec::new();
         for row in rows {
-            let (obj_id, owner, scope, created_at, expires_at) =
-                row.map_err(|e| NdnError::DbError(e.to_string()))?;
-            let (Ok(obj_id), Some(scope)) = (ObjId::new(&obj_id), PinScope::from_str(&scope)) else {
-                warn!("list_pins_by_owner: skip malformed pin {} {}", obj_id, owner);
+            let (obj_id, owner, scope, created_at, expires_at) = row.map_err(db_error)?;
+            let (Ok(obj_id), Some(scope)) = (ObjId::new(&obj_id), PinScope::from_str(&scope))
+            else {
+                warn!(
+                    "list_pins_by_owner: skip malformed pin {} {}",
+                    obj_id, owner
+                );
                 continue;
             };
             pins.push(PinInfo {
@@ -1083,9 +1112,7 @@ impl NamedLocalStoreDB {
 
     pub fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &obj_id_str)?;
@@ -1104,28 +1131,26 @@ impl NamedLocalStoreDB {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![obj_id_str, inode_id as i64, field_tag as i64, cascade_state, now],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         if inserted > 0 {
             tx.execute(
                 "UPDATE objects SET fs_anchor_count = fs_anchor_count + 1 WHERE obj_id = ?1",
                 params![obj_id_str],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         }
 
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
     pub fn fs_release(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         let deleted = tx
@@ -1133,38 +1158,36 @@ impl NamedLocalStoreDB {
                 "DELETE FROM fs_anchors WHERE obj_id = ?1 AND inode_id = ?2 AND field_tag = ?3",
                 params![obj_id_str, inode_id as i64, field_tag as i64],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         if deleted > 0 {
             tx.execute(
                 "UPDATE objects SET fs_anchor_count = MAX(0, fs_anchor_count - 1) WHERE obj_id = ?1",
                 params![obj_id_str],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         }
 
         Self::recompute_eviction_class_tx(&tx, &obj_id_str)?;
         Self::reconcile_expand_state_tx(&tx, obj_id)?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
     /// Release all fs_anchors for a given inode. Returns number of affected objects.
     pub fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let mut stmt = tx
             .prepare("SELECT DISTINCT obj_id FROM fs_anchors WHERE inode_id = ?1")
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let obj_ids: Vec<String> = stmt
             .query_map(params![inode_id as i64], |row| row.get(0))
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
         drop(stmt);
 
         // For each affected object, count how many anchors will be removed
@@ -1175,19 +1198,19 @@ impl NamedLocalStoreDB {
                     params![oid_str, inode_id as i64],
                     |row| row.get(0),
                 )
-                .unwrap_or(0);
+                .map_err(db_error)?;
             tx.execute(
                 "UPDATE objects SET fs_anchor_count = MAX(0, fs_anchor_count - ?1) WHERE obj_id = ?2",
                 params![anchor_count, oid_str],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         }
 
         tx.execute(
             "DELETE FROM fs_anchors WHERE inode_id = ?1",
             params![inode_id as i64],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
 
         for oid_str in &obj_ids {
             Self::recompute_eviction_class_tx(&tx, oid_str)?;
@@ -1197,7 +1220,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(count)
     }
 
@@ -1207,9 +1230,7 @@ impl NamedLocalStoreDB {
 
     pub fn apply_edge(&self, msg: &EdgeMsg) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         let referee_str = msg.referee.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &referee_str)?;
@@ -1222,21 +1243,21 @@ impl NamedLocalStoreDB {
                      VALUES (?1, ?2, ?3, ?4)",
                     params![referee_str, msg.referrer.to_string(), msg.target_epoch as i64, now],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
             }
             EdgeOp::Remove => {
                 tx.execute(
                     "DELETE FROM incoming_refs WHERE referee = ?1 AND referrer = ?2",
                     params![referee_str, msg.referrer.to_string()],
                 )
-                .map_err(|e| NdnError::DbError(e.to_string()))?;
+                .map_err(db_error)?;
             }
         }
 
         Self::recompute_eviction_class_tx(&tx, &referee_str)?;
         Self::reconcile_expand_state_tx(&tx, &msg.referee)?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -1254,7 +1275,7 @@ impl NamedLocalStoreDB {
                  FROM edge_outbox WHERE next_try_at <= ?1
                  ORDER BY seq ASC LIMIT ?2",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         let entries = stmt
             .query_map(params![now, limit as i64], |row| {
@@ -1272,8 +1293,10 @@ impl NamedLocalStoreDB {
                     row.get::<_, i64>(7)?,
                 ))
             })
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?
+            .into_iter()
             .filter_map(
                 |(seq, op_str, referee_str, referrer_str, epoch, created, attempts, next_try)| {
                     let op = EdgeOp::from_str(&op_str)?;
@@ -1302,7 +1325,7 @@ impl NamedLocalStoreDB {
     pub fn complete_outbox_entry(&self, seq: i64) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM edge_outbox WHERE seq = ?1", params![seq])
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(())
     }
 
@@ -1317,7 +1340,7 @@ impl NamedLocalStoreDB {
              WHERE seq = ?2",
             params![now, seq],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
         Ok(())
     }
 
@@ -1326,7 +1349,7 @@ impl NamedLocalStoreDB {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM edge_outbox", [], |row| row.get(0))
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         Ok(count as u64)
     }
 
@@ -1344,15 +1367,15 @@ impl NamedLocalStoreDB {
                  ORDER BY last_access_time ASC
                  LIMIT ?1",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         let results = stmt
             .query_map(params![limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
 
         Ok(results)
     }
@@ -1360,7 +1383,11 @@ impl NamedLocalStoreDB {
     /// Unprotected completed chunks with owned bytes, least recently used
     /// first; a chunk written or read within `grace_secs` is never a candidate
     /// (uploads bind their roots after the chunks land).
-    pub fn list_chunk_gc_candidates(&self, limit: usize, grace_secs: u64) -> NdnResult<Vec<(String, u64)>> {
+    pub fn list_chunk_gc_candidates(
+        &self,
+        limit: usize,
+        grace_secs: u64,
+    ) -> NdnResult<Vec<(String, u64)>> {
         let now = unix_timestamp() as i64;
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -1375,14 +1402,14 @@ impl NamedLocalStoreDB {
                  ORDER BY MAX(c.create_time, c.last_access_time) ASC
                  LIMIT ?1",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let results = stmt
             .query_map(params![limit as i64, now - grace_secs as i64, now], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
             })
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
         Ok(results)
     }
 
@@ -1390,9 +1417,7 @@ impl NamedLocalStoreDB {
     /// backend. Returns the owned bytes freed, or 0 if it became protected.
     pub fn try_evict_chunk(&self, chunk_id: &str) -> NdnResult<u64> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
         let has_pin = Self::has_active_pin_tx(&tx, chunk_id)?;
         let has_incoming = Self::has_incoming_tx(&tx, chunk_id)?;
         let fs_count = Self::get_fs_anchor_count_tx(&tx, chunk_id)?;
@@ -1405,27 +1430,30 @@ impl NamedLocalStoreDB {
                 params![chunk_id],
                 |row| row.get(0),
             )
+            .optional()
+            .map_err(db_error)?
             .unwrap_or(0);
         if owned <= 0 {
             return Ok(0);
         }
-        tx.execute("DELETE FROM chunk_items WHERE chunk_id = ?1", params![chunk_id])
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.execute(
+            "DELETE FROM chunk_items WHERE chunk_id = ?1",
+            params![chunk_id],
+        )
+        .map_err(db_error)?;
         tx.execute(
             "DELETE FROM objects WHERE obj_id = ?1 AND state = 'shadow'",
             params![chunk_id],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
+        tx.commit().map_err(db_error)?;
         Ok(owned as u64)
     }
 
     /// Try to evict a single object. Returns owned_bytes freed, or 0 if protected.
     pub fn try_evict_object(&self, obj_id_str: &str) -> NdnResult<u64> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         // Double-check: still class 0 with no protection?
         let has_pin = Self::has_active_pin_tx(&tx, obj_id_str)?;
@@ -1435,7 +1463,7 @@ impl NamedLocalStoreDB {
         if has_pin || has_incoming || fs_count > 0 {
             // Drift correction: recompute class
             Self::recompute_eviction_class_tx(&tx, obj_id_str)?;
-            tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+            tx.commit().map_err(db_error)?;
             return Ok(0);
         }
 
@@ -1445,28 +1473,28 @@ impl NamedLocalStoreDB {
                 params![obj_id_str],
                 |row| row.get(0),
             )
+            .optional()
+            .map_err(db_error)?
             .unwrap_or(0);
 
         tx.execute("DELETE FROM objects WHERE obj_id = ?1", params![obj_id_str])
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
 
         // Also remove from chunk_items if it's a chunk
         tx.execute(
             "DELETE FROM chunk_items WHERE chunk_id = ?1",
             params![obj_id_str],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(owned as u64)
     }
 
     /// Batch update last_access_time using MAX(old, new).
     pub fn batch_touch_last_access_with_max(&self, items: &[(String, u64)]) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         for (obj_id, ts) in items {
             tx.execute(
@@ -1474,16 +1502,16 @@ impl NamedLocalStoreDB {
                  WHERE obj_id = ?2",
                 params![*ts as i64, obj_id],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
             tx.execute(
                 "UPDATE chunk_items SET last_access_time = MAX(last_access_time, ?1)
                  WHERE chunk_id = ?2",
                 params![*ts as i64, obj_id],
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         }
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -1503,7 +1531,7 @@ impl NamedLocalStoreDB {
                 rusqlite::Error::QueryReturnedNoRows => {
                     NdnError::NotFound(format!("pin not found: {} / {}", obj_id.to_string(), owner))
                 }
-                _ => NdnError::DbError(e.to_string()),
+                _ => db_error(e),
             })?;
 
         CascadeStateP0::from_str(&state_str)
@@ -1531,7 +1559,7 @@ impl NamedLocalStoreDB {
                     inode_id,
                     field_tag
                 )),
-                _ => NdnError::DbError(e.to_string()),
+                _ => db_error(e),
             })?;
 
         CascadeStateP0::from_str(&state_str)
@@ -1568,7 +1596,7 @@ impl NamedLocalStoreDB {
                 rusqlite::Error::QueryReturnedNoRows => {
                     NdnError::NotFound(format!("object not found: {}", obj_id_str))
                 }
-                _ => NdnError::DbError(e.to_string()),
+                _ => db_error(e),
             })?;
 
         let incoming_count: i64 = conn
@@ -1577,7 +1605,7 @@ impl NamedLocalStoreDB {
                 params![obj_id_str],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .map_err(db_error)?;
 
         let now = unix_timestamp() as i64;
         let has_recursive: bool = conn
@@ -1587,7 +1615,7 @@ impl NamedLocalStoreDB {
                 params![obj_id_str, now],
                 |row| Ok(row.get::<_, i64>(0)? > 0),
             )
-            .unwrap_or(false);
+            .map_err(db_error)?;
 
         let has_skeleton: bool = conn
             .query_row(
@@ -1596,7 +1624,7 @@ impl NamedLocalStoreDB {
                 params![obj_id_str, now],
                 |row| Ok(row.get::<_, i64>(0)? > 0),
             )
-            .unwrap_or(false);
+            .map_err(db_error)?;
 
         let has_lease: bool = conn
             .query_row(
@@ -1605,7 +1633,7 @@ impl NamedLocalStoreDB {
                 params![obj_id_str, now],
                 |row| Ok(row.get::<_, i64>(0)? > 0),
             )
-            .unwrap_or(false);
+            .map_err(db_error)?;
 
         Ok(ExpandDebug {
             obj_id: obj_id.clone(),
@@ -1626,9 +1654,7 @@ impl NamedLocalStoreDB {
     /// Expire pins past their TTL. Returns number of expired pins.
     pub fn expire_pins(&self) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
         let now = unix_timestamp() as i64;
 
         let mut stmt = tx
@@ -1636,19 +1662,19 @@ impl NamedLocalStoreDB {
                 "SELECT DISTINCT obj_id FROM pins
                  WHERE expires_at IS NOT NULL AND expires_at <= ?1",
             )
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+            .map_err(db_error)?;
         let obj_ids: Vec<String> = stmt
             .query_map(params![now], |row| row.get(0))
-            .map_err(|e| NdnError::DbError(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
         drop(stmt);
 
         tx.execute(
             "DELETE FROM pins WHERE expires_at IS NOT NULL AND expires_at <= ?1",
             params![now],
         )
-        .map_err(|e| NdnError::DbError(e.to_string()))?;
+        .map_err(db_error)?;
 
         for oid_str in &obj_ids {
             Self::recompute_eviction_class_tx(&tx, oid_str)?;
@@ -1658,7 +1684,7 @@ impl NamedLocalStoreDB {
         }
 
         let count = obj_ids.len();
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(count)
     }
 
@@ -1671,7 +1697,7 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
+            .map_err(db_error)?;
         Ok(count > 0)
     }
 
@@ -1684,7 +1710,8 @@ impl NamedLocalStoreDB {
                 params![obj_id],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()
+            .map_err(db_error)?;
         Ok(state)
     }
 
@@ -1701,9 +1728,7 @@ impl NamedLocalStoreDB {
         let owned_bytes = obj_str.len() as i64;
 
         let mut conn = self.conn.lock().unwrap();
-        let tx = conn
-            .transaction()
-            .map_err(|e| NdnError::DbError(e.to_string()))?;
+        let tx = Self::write_transaction(&mut conn)?;
 
         Self::put_object_in_tx(
             &tx,
@@ -1715,7 +1740,7 @@ impl NamedLocalStoreDB {
             owned_bytes,
         )?;
 
-        tx.commit().map_err(|e| NdnError::DbError(e.to_string()))?;
+        tx.commit().map_err(db_error)?;
         Ok(())
     }
 }

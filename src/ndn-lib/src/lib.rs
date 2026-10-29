@@ -60,6 +60,14 @@ pub enum NdnError {
     IoError(String),
     #[error("db error: {0}")]
     DbError(String),
+    /// SQLite engine failure, retaining both the primary and extended result
+    /// codes so callers can distinguish contention from I/O or corruption.
+    #[error("db error: {message} (SQLite code {code}, extended code {extended_code})")]
+    SqliteError {
+        code: i32,
+        extended_code: i32,
+        message: String,
+    },
     #[error("chunk not completed: {0}")]
     InComplete(String),
     #[error("remote error: {0}")]
