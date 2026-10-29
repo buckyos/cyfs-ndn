@@ -118,7 +118,7 @@ Binding 除定位字段外，还保存 `obj_type`、`size`、`content_type`、`m
 
 `documents` / `collected` 不接受声明级 `quota_mib`。temp 默认单对象上限为 2 GiB，cache 为 256 MiB，可通过配额配置覆盖；这些是绑定层限制，原生 HTTP 单次上传另有 32 MiB 限制。
 
-`origin` 包含 author、source、collected_at 和可选 proof。当前仅检查 author 是 DID，source 以 `cyfs://`、`obj://` 或 `did:` 开头，不验证 proof。ambient 允许内容子树不完整，但绑定时描述对象正文必须存在。
+`origin` 包含 author、source、collected_at 和可选 proof。当前仅检查 author 是 DID，source 以 `https://`（跨 Zone 对象 URL，如 HomeStation 入口）、`cyfs://`、`obj://` 或 `did:` 开头，不验证 proof。ambient 允许内容子树不完整，但绑定时描述对象正文必须存在。
 
 Skeleton 的实际语义由底层 GC 决定：保护对象自身，并作为子项展开的硬屏障，不能把它解释为 Recursive 的弱化版本。参见 [named_store GC 方案](GC/named_store_gc.md)。
 

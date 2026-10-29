@@ -75,7 +75,7 @@ pub fn normalize_cyfs_dispatch_target(zone: &str, path: &str) -> NdnResult<Strin
     if host.is_empty() {
         return Err(invalid("invalid dispatch zone"));
     }
-    Ok(format!("cyfs://{host}{normalized}"))
+    Ok(format!("https://{host}{normalized}"))
 }
 
 /// A type is not inferable from arbitrary NamedObject business fields. A typed
@@ -310,7 +310,7 @@ mod tests {
     fn dispatch_target_and_object_identity() {
         assert_eq!(
             normalize_cyfs_dispatch_target("ALICE.example.", "/%69nbox").unwrap(),
-            "cyfs://alice.example/inbox"
+            "https://alice.example/inbox"
         );
         for path in [
             "/", "/a/../b", "/a/%2e/b", "/a/@/b", "/a/%40/b", "/a%2fb", "/a//b", "/a?b", "/a/%",
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn dispatch_results_require_protocol_confirmation() {
         let id = validate_cyfs_dispatch_object(b"{}", None).unwrap();
-        let target = "cyfs://alice.example/inbox";
+        let target = "https://alice.example/inbox";
         for (status, code) in [
             (CyfsDispatchStatus::Accepted, 201),
             (CyfsDispatchStatus::Cached, 202),
@@ -409,7 +409,7 @@ mod tests {
                 &headers,
                 &body,
                 &id,
-                "cyfs://alice.example/other",
+                "https://alice.example/other",
                 false
             )
             .is_err());

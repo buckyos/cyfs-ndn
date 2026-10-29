@@ -1049,11 +1049,11 @@ Zone 间 **没有上传公共内容** 的概念。如果 `ZoneA` 给 `ZoneB` 发
 CYFS 定义一个标准写 verb：
 
 ```text
-PUT cyfs://$target_zone_id/<sem_path>
+PUT https://$target_zone/<sem_path>
 Content-Type: application/cyfs-named-object+json
 <body: NamedObject canonical JSON>
 
-PUT cyfs://$target_zone_id/<sem_path>
+PUT https://$target_zone/<sem_path>
 Content-Type: application/cyfs-named-object+jwt
 <body: JWT compact 字符串，claims 为 NamedObject>
 ```
@@ -1061,6 +1061,8 @@ Content-Type: application/cyfs-named-object+jwt
 语义是：
 
 > 我创建了一个 `NamedObject`，希望把它投递到你 NDN 路径 `<sem_path>` 对应的逻辑接收点。
+
+投递 target（接收点身份）统一写成 `https://<zone-host>/<sem_path>`（2026-10-29，BuckyOS `doc/key url.md` §6 / 裁决 D11）：跨 Zone 引用服务对象与投递 NamedObject 都用 https，由 `normalize_cyfs_dispatch_target` 产出，发送端、Gateway 缓存与接收端共用同一字符串。
 
 使用 `PUT` 而不是 `POST`，是因为 CYFS 对象是内容寻址、immutable 的。同一对象重复投递应该收敛到同一结果，这正是 `PUT` 的幂等语义。
 
@@ -1095,10 +1097,10 @@ ACL 不是 `dispatch` 的协议级问题。target Zone 的后端 service 可以�
 示例：
 
 ```text
-PUT cyfs://$ood/did:bns:my-group/inbox
-PUT cyfs://$ood/did:bns:my-group/sub/eng/inbox
-PUT cyfs://$ood/cyobj:article-xxx/comments
-PUT cyfs://$ood/did:bns:bob/inbox
+PUT https://$zone/did:bns:my-group/inbox
+PUT https://$zone/did:bns:my-group/sub/eng/inbox
+PUT https://$zone/cyobj:article-xxx/comments
+PUT https://$zone/did:bns:bob/inbox
 ```
 
 这是 RESTful 推荐，不是协议硬约束。建议生态遵循这个隐喻，是因为它让读和写的路径形态同构：`GET .../inbox` 和 `PUT .../inbox` 操作的是同一个逻辑接收点。
@@ -1118,8 +1120,8 @@ cyfs://$zoneid/<sem_path>(/@/<inner_path_step>)*
 `dispatch` 遵循同样规则，但 **不允许带 `inner_path` 段**：
 
 ```text
-PUT cyfs://$zoneid/<sem_path>          # 合法
-PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
+PUT https://$zone/<sem_path>          # 合法
+PUT https://$zone/<sem_path>/@/<...>  # 非法
 ```
 
 理由是 `NamedObject` 是 immutable 的，对它内部字段做“写”在语义上不存在；要更新只能投递一个新对象。
@@ -1141,7 +1143,7 @@ PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
 
 `accepted` 不代表用户已读、Agent 已处理、附件已下载，也不代表群中所有成员已拿到副本。`cached` 不代表对象已进入应用 inbox。HTTP `2xx` 本身不足以判断两者。
 
-可确认响应 **MUST** 带 `cyfs-dispatch-status: rejected|cached|accepted`，并返回 `application/json` 状态体；响应不是不可变 NamedObject。状态体至少包含 `obj_id`（ObjectId 字符串）、`target`（不含查询参数的规范化 `cyfs://<zone>/<semantic_path>` 字符串）和 `status`（与 header 一致）。拒绝响应还必须包含稳定的 `reason` 字符串与 `retryable` 布尔值。状态响应使用 `Cache-Control: no-store`。无法解析对象时，拒绝响应可以省略 `obj_id`。
+可确认响应 **MUST** 带 `cyfs-dispatch-status: rejected|cached|accepted`，并返回 `application/json` 状态体；响应不是不可变 NamedObject。状态体至少包含 `obj_id`（ObjectId 字符串）、`target`（不含查询参数的规范化 `https://<zone>/<semantic_path>` 字符串）和 `status`（与 header 一致）。拒绝响应还必须包含稳定的 `reason` 字符串与 `retryable` 布尔值。状态响应使用 `Cache-Control: no-store`。无法解析对象时，拒绝响应可以省略 `obj_id`。
 
 状态是对已认证请求者的回答；`cyfs-original-user` 声明本身不提供认证。缓存写入、转投和查询必须保留并使用经验证的来源上下文；对象正文不得因为转投而改写。
 
@@ -1183,7 +1185,7 @@ PUT cyfs://$zoneid/<sem_path>/@/<...>  # 非法
 为支持响应丢失和 cached 后的后续确认，本补充定义一个可选查询能力；幂等重新 PUT 已足以完成发送重试，实现缓存组件不以前置实现完整回执系统为条件：
 
 ```text
-GET cyfs://$target_zone/<sem_path>?dispatch-status=<ObjectId>
+GET https://$target_zone/<sem_path>?dispatch-status=<ObjectId>
 ```
 
 它只查询这一个接收点对该对象的投递结果，不读取 inbox 列表或对象正文。query 参数用于本节定义的可选查询能力。

@@ -390,8 +390,8 @@ impl Origin {
         if name_lib::DID::from_str(&self.author).is_err() {
             return Err(BucketError::InvalidArgument(format!("origin.author '{}' is not a DID", self.author)));
         }
-        if !(self.source.starts_with("cyfs://") || self.source.starts_with("obj://") || self.source.starts_with("did:")) {
-            return Err(BucketError::InvalidArgument("origin.source is a cyfs://, obj:// address or a Zone DID".into()));
+        if !["https://", "cyfs://", "obj://", "did:"].iter().any(|prefix| self.source.starts_with(prefix)) {
+            return Err(BucketError::InvalidArgument("origin.source is an https://, cyfs://, obj:// address or a Zone DID".into()));
         }
         Ok(())
     }
