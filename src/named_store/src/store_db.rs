@@ -2,14 +2,114 @@ use crate::gc_types::*;
 use log::{debug, warn};
 use ndn_lib::{ChunkId, KnownStandardObject, NdnError, NdnResult, ObjId};
 use rusqlite::types::{FromSql, ToSql, ValueRef};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{ffi, params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use std::cell::Cell;
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::ops::Range;
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// SQLite's busy handler waits in bounded increments while acquiring a write
-// lock. This is a lock-wait budget, not a deadline for the entire API call.
+// Lock-wait budget of one write call, shared by in-process admission and
+// SQLite's cross-connection/process write lock. It is not a deadline for the
+// entire API call.
 const WRITE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+// SQLite's default busy handler backs off to one retry per 100ms. Writers that
+// commit back-to-back release the lock for only microseconds, so such a waiter
+// can starve for the whole budget. Retry at ~1ms (jittered) instead.
+const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+thread_local! {
+    // Deadline of the write call running on this thread. SQLite invokes the
+    // busy handler synchronously on the thread executing the statement.
+    static WRITE_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+fn busy_handler(attempt: i32) -> bool {
+    let remaining = match WRITE_DEADLINE.get() {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        // Statements outside a write call budget their sleeps like SQLite's
+        // own handler does.
+        None => WRITE_LOCK_TIMEOUT.saturating_sub(BUSY_RETRY_INTERVAL * attempt.max(0) as u32),
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    // Sleep 0.5–1.5ms so retries do not alias with another writer's cadence.
+    let jitter = RandomState::new().hash_one(attempt) % 1000;
+    let delay = BUSY_RETRY_INTERVAL / 2 + Duration::from_micros(jitter);
+    std::thread::sleep(delay.min(remaining));
+    true
+}
+
+fn database_busy() -> NdnError {
+    NdnError::SqliteError {
+        code: ffi::SQLITE_BUSY,
+        extended_code: ffi::SQLITE_BUSY,
+        message: "database is locked".to_string(),
+    }
+}
+
+type WriteGate = parking_lot::Mutex<()>;
+
+/// Process-wide write gate shared by every connection to the same database file.
+fn shared_write_gate(db_path: &str) -> Arc<WriteGate> {
+    static GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<WriteGate>>>> = OnceLock::new();
+    // `:memory:` and other non-file databases are private to their connection.
+    let Ok(path) = std::fs::canonicalize(db_path) else {
+        return Arc::new(WriteGate::new(()));
+    };
+    let mut gates = GATES.get_or_init(Default::default).lock().unwrap();
+    if let Some(gate) = gates.get(&path).and_then(Weak::upgrade) {
+        return gate;
+    }
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    let gate = Arc::new(WriteGate::new(()));
+    gates.insert(path, Arc::downgrade(&gate));
+    gate
+}
+
+/// In-process write admission, held until the write statement or transaction
+/// finishes. Writers in one process queue FIFO here instead of polling
+/// SQLite's lock, which only arbitrates between processes.
+struct WriteAdmission<'a> {
+    guard: Option<parking_lot::MutexGuard<'a, ()>>,
+}
+
+impl Drop for WriteAdmission<'_> {
+    fn drop(&mut self) {
+        WRITE_DEADLINE.set(None);
+        if let Some(guard) = self.guard.take() {
+            // Hand the gate to the longest waiter; an unfair unlock would let
+            // this thread's next write barge ahead of it.
+            parking_lot::MutexGuard::unlock_fair(guard);
+        }
+    }
+}
+
+/// IMMEDIATE transaction holding write admission. Fields drop in declaration
+/// order, so an uncommitted transaction rolls back before the gate is passed on.
+struct WriteTransaction<'a> {
+    tx: Transaction<'a>,
+    _admission: WriteAdmission<'a>,
+}
+
+impl<'a> std::ops::Deref for WriteTransaction<'a> {
+    type Target = Transaction<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+impl WriteTransaction<'_> {
+    fn commit(self) -> rusqlite::Result<()> {
+        self.tx.commit()
+    }
+}
 
 fn db_error(error: rusqlite::Error) -> NdnError {
     match error {
@@ -224,6 +324,7 @@ impl ChunkItem {
 pub struct NamedLocalStoreDB {
     pub db_path: String,
     conn: Mutex<Connection>,
+    write_gate: Arc<WriteGate>,
 }
 
 impl NamedLocalStoreDB {
@@ -235,18 +336,33 @@ impl NamedLocalStoreDB {
         })?;
 
         // Make the contention policy explicit, including single-statement writes.
-        conn.busy_timeout(WRITE_LOCK_TIMEOUT).map_err(db_error)?;
+        conn.busy_handler(Some(busy_handler)).map_err(db_error)?;
 
         // Enable WAL for better concurrent read performance
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(db_error)?;
 
+        let write_gate = shared_write_gate(&db_path);
         let db = Self {
             db_path,
             conn: Mutex::new(conn),
+            write_gate,
         };
         db.init_tables()?;
         Ok(db)
+    }
+
+    /// Admit one write call: wait FIFO behind other writers to this file in
+    /// this process, then let SQLite's busy handler wait for other processes,
+    /// both within one WRITE_LOCK_TIMEOUT budget. Every write must hold this.
+    fn admit_writer(&self) -> NdnResult<WriteAdmission<'_>> {
+        let deadline = Instant::now() + WRITE_LOCK_TIMEOUT;
+        let guard = self
+            .write_gate
+            .try_lock_until(deadline)
+            .ok_or_else(database_busy)?;
+        WRITE_DEADLINE.set(Some(deadline));
+        Ok(WriteAdmission { guard: Some(guard) })
     }
 
     /// Acquire SQLite's cross-connection/process write lock before any reads.
@@ -254,9 +370,18 @@ impl NamedLocalStoreDB {
     /// even with a busy timeout. IMMEDIATE waits at admission instead; once it
     /// succeeds, reads and writes share the current, exclusively writable state.
     /// A timeout is returned to the caller without replaying partial statements.
-    fn write_transaction(conn: &mut Connection) -> NdnResult<Transaction<'_>> {
-        conn.transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(db_error)
+    fn write_transaction<'a>(
+        &'a self,
+        conn: &'a mut Connection,
+    ) -> NdnResult<WriteTransaction<'a>> {
+        let admission = self.admit_writer()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        Ok(WriteTransaction {
+            tx,
+            _admission: admission,
+        })
     }
 
     fn init_tables(&self) -> NdnResult<()> {
@@ -375,6 +500,7 @@ impl NamedLocalStoreDB {
 
     pub fn set_chunk_item(&self, chunk_item: &ChunkItem) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
+        let _admission = self.admit_writer()?;
 
         match &chunk_item.chunk_state {
             ChunkStoreState::LocalLink(local_info) => {
@@ -508,7 +634,7 @@ impl NamedLocalStoreDB {
 
     pub fn remove_chunk(&self, chunk_id: &ChunkId) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
         tx.execute(
             "DELETE FROM chunk_items WHERE chunk_id = ?1",
             params![chunk_id.to_string()],
@@ -529,7 +655,7 @@ impl NamedLocalStoreDB {
         let logical_size = obj_str.len() as i64;
         let owned_bytes = obj_str.len() as i64;
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         Self::put_object_in_tx(
             &tx,
@@ -670,6 +796,7 @@ impl NamedLocalStoreDB {
 
     pub fn remove_object(&self, obj_id: &ObjId) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
+        let _admission = self.admit_writer()?;
         conn.execute(
             "DELETE FROM objects WHERE obj_id = ?1",
             params![obj_id.to_string()],
@@ -960,7 +1087,7 @@ impl NamedLocalStoreDB {
         ttl: Option<std::time::Duration>,
     ) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &obj_id_str)?;
@@ -1002,7 +1129,7 @@ impl NamedLocalStoreDB {
 
     pub fn unpin(&self, obj_id: &ObjId, owner: &str) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         let deleted = tx
@@ -1024,7 +1151,7 @@ impl NamedLocalStoreDB {
     /// Unpin all entries for an owner. Returns number of affected objects.
     pub fn unpin_owner(&self, owner: &str) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         // Collect affected obj_ids first
         let mut stmt = tx
@@ -1112,7 +1239,7 @@ impl NamedLocalStoreDB {
 
     pub fn fs_acquire(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &obj_id_str)?;
@@ -1150,7 +1277,7 @@ impl NamedLocalStoreDB {
 
     pub fn fs_release(&self, obj_id: &ObjId, inode_id: u64, field_tag: u32) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let obj_id_str = obj_id.to_string();
         let deleted = tx
@@ -1178,7 +1305,7 @@ impl NamedLocalStoreDB {
     /// Release all fs_anchors for a given inode. Returns number of affected objects.
     pub fn fs_release_inode(&self, inode_id: u64) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let mut stmt = tx
             .prepare("SELECT DISTINCT obj_id FROM fs_anchors WHERE inode_id = ?1")
@@ -1230,7 +1357,7 @@ impl NamedLocalStoreDB {
 
     pub fn apply_edge(&self, msg: &EdgeMsg) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         let referee_str = msg.referee.to_string();
         Self::upsert_shadow_if_absent_tx(&tx, &referee_str)?;
@@ -1324,6 +1451,7 @@ impl NamedLocalStoreDB {
     /// Mark outbox entry as completed (delete it).
     pub fn complete_outbox_entry(&self, seq: i64) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
+        let _admission = self.admit_writer()?;
         conn.execute("DELETE FROM edge_outbox WHERE seq = ?1", params![seq])
             .map_err(db_error)?;
         Ok(())
@@ -1332,6 +1460,7 @@ impl NamedLocalStoreDB {
     /// Bump retry for outbox entry with exponential backoff.
     pub fn retry_outbox_entry(&self, seq: i64) -> NdnResult<()> {
         let conn = self.conn.lock().unwrap();
+        let _admission = self.admit_writer()?;
         let now = unix_timestamp() as i64;
         // Simple backoff: 2^attempts seconds, capped at 300s
         conn.execute(
@@ -1417,7 +1546,7 @@ impl NamedLocalStoreDB {
     /// backend. Returns the owned bytes freed, or 0 if it became protected.
     pub fn try_evict_chunk(&self, chunk_id: &str) -> NdnResult<u64> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
         let has_pin = Self::has_active_pin_tx(&tx, chunk_id)?;
         let has_incoming = Self::has_incoming_tx(&tx, chunk_id)?;
         let fs_count = Self::get_fs_anchor_count_tx(&tx, chunk_id)?;
@@ -1453,7 +1582,7 @@ impl NamedLocalStoreDB {
     /// Try to evict a single object. Returns owned_bytes freed, or 0 if protected.
     pub fn try_evict_object(&self, obj_id_str: &str) -> NdnResult<u64> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         // Double-check: still class 0 with no protection?
         let has_pin = Self::has_active_pin_tx(&tx, obj_id_str)?;
@@ -1494,7 +1623,7 @@ impl NamedLocalStoreDB {
     /// Batch update last_access_time using MAX(old, new).
     pub fn batch_touch_last_access_with_max(&self, items: &[(String, u64)]) -> NdnResult<()> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         for (obj_id, ts) in items {
             tx.execute(
@@ -1654,7 +1783,7 @@ impl NamedLocalStoreDB {
     /// Expire pins past their TTL. Returns number of expired pins.
     pub fn expire_pins(&self) -> NdnResult<usize> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
         let now = unix_timestamp() as i64;
 
         let mut stmt = tx
@@ -1728,7 +1857,7 @@ impl NamedLocalStoreDB {
         let owned_bytes = obj_str.len() as i64;
 
         let mut conn = self.conn.lock().unwrap();
-        let tx = Self::write_transaction(&mut conn)?;
+        let tx = self.write_transaction(&mut conn)?;
 
         Self::put_object_in_tx(
             &tx,

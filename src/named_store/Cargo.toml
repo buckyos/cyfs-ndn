@@ -11,6 +11,7 @@ tokio = { workspace = true }
 rusqlite = { workspace = true }
 name-lib = { workspace = true }
 once_cell = "*"
+parking_lot = "0.12"
 ndn-lib = { path = "../ndn-lib" }
 async-trait = {workspace = true}
 buckyos-kit = {workspace = true}
