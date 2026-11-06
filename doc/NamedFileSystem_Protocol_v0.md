@@ -106,7 +106,7 @@ pNFS layout、attribute bitmap），NFSP 在这些点上直接借鉴；但它们
 | **MetaRecord** | 一条带命名空间与来源的元数据。锚定在 ObjId（内容）或 LiveRef（可变节点）上。 |
 | **Cap** | 能力凭证。签名的、可离线验证的、限定 `(subtree, ops, expiry)` 的令牌。分享链接与 AI 管线授权都用它。 |
 | **AccessUrl** | 同一份内容的一个可访问入口。一个文件可以同时有多个（fs path / cyfs ObjId / public URL / signed URL）。 |
-| **Context** | 数据面请求的鉴权上下文（`?context=` 参数）：客户端声明的"我从哪个逻辑路径得到这个 ObjId"，通常是 DFS 原始路径。服务端沿它做正向解析后裁决访问，见 §7.3.1。 |
+| **Context** | 数据面请求的鉴权上下文（`?context=` 参数）：客户端声明的"我从哪个逻辑路径得到这个 ObjId"，通常是 DFS 原始路径。服务端沿它做正向解析后裁决访问，见 §7.3.1。`/ndn/` 不用它，改用 `hint`。 |
 
 ---
 
@@ -360,7 +360,7 @@ PRD 9.2 明确要求：`public` 目录下的文件要同时显示存储路径和
   { "kind": "fs",     "url": "cyfs:///home/public/report.pdf", "primary": true },
   { "kind": "cyfs",   "url": "cyfs://o/$zoneid/sha256:abcd...", "immutable": true },
   { "kind": "public", "url": "https://alice.buckyos.io/public/report.pdf" },
-  { "kind": "pinned", "url": "https://alice.buckyos.io/ndn/sha256:abcd...?context=cyfs:///home/public/report.pdf", "immutable": true },
+  { "kind": "pinned", "url": "https://alice.buckyos.io/ndn/sha256:abcd...", "immutable": true },
   { "kind": "signed", "url": "https://share.alice.buckyos.io/s/eyJhb...", "expires_at": 1756699999,
     "cap_id": "cap_7f3a", "revocable": true }
 ]
@@ -370,9 +370,9 @@ PRD 9.2 明确要求：`public` 目录下的文件要同时显示存储路径和
 多域名 = 服务端返回多个 `public` 条目；版本化链接 = `kind: pinned`（指向 ObjId，天然不可变）；
 临时链接 = `kind: signed`（cap token，带 `expires_at` 且可撤销）。
 
-注意 `pinned` 条目由服务端生成时已带上 `context` 参数（该文件的逻辑路径，见 §7.3.1）：
-指向裸 ObjId 的 URL 自身不携带任何命名空间信息，服务端又**不做 ObjId → 路径反查**，
-所以鉴权上下文必须在 URL 生成时就固化进去。`signed` 条目的 context 则封在 cap token 内部。
+注意 `pinned` 条目只在内容已公开提供时才是这样的裸 URL。指向裸 ObjId 的 URL 自身不携带任何命名空间信息，
+服务端又**不做 ObjId → 路径反查**，所以非公开内容的 `pinned` 条目要由服务端在生成时带上 `hint` 令牌
+（见 §7.3.1），这时它和 `signed` 一样有期限。`signed` 条目的 context 则封在 cap token 内部。
 
 **BuckyOS 实现（nfs-server，2026-10）**：`signed` 只返回给该文件 owner，列出其仍有效的分享链接，
 主机为 `share.<zone>`（与控制台不同源，访客页不加载 SDK、不读控制台 cookie）；
@@ -393,7 +393,7 @@ GET /nfs/v1/repr/{obj_id}/{profile}?context={原对象逻辑路径}
 
 `context` 填**原对象**的逻辑路径（不是派生对象自己的——派生对象没有路径）；
 派生表示继承原对象的访问裁决，规则见 §7.3.1。302 返回的数据面 URL 由服务端带好
-放行凭据（context 或短时 token），客户端原样使用。
+放行凭据（`hint` 令牌），客户端原样使用。
 
 好处：缩略图与原文件走同一套去重、分发、验证机制；同一张图在多个 Topic 里出现只生成一次；
 浏览器可以直接 `<img src="/nfs/v1/repr/sha256:.../thumb256">`。
@@ -411,7 +411,7 @@ GET /nfs/v1/repr/{obj_id}/{profile}?context={原对象逻辑路径}
 | 控制面 | `POST /nfs/v1/{method}`，JSON in/out | 所有元数据操作 |
 | 批量 | `POST /nfs/v1/batch` | COMPOUND-lite，见 §4.3 |
 | 通知面 | `GET /nfs/v1/watch` | SSE（`text/event-stream`） |
-| 数据面（读） | `GET /ndn/{obj_id}?context={path}`、`GET /nfs/v1/repr/{obj_id}/{profile}?context={path}` | 裸 URL，支持 Range，可直接用于 `<img>/<video>`；`context` 为可选鉴权上下文（通常是 DFS 原始路径，§7.3.1） |
+| 数据面（读） | `GET /ndn/{obj_id}[?hint={hint}]`、`GET /nfs/v1/repr/{obj_id}/{profile}?context={path}` | 裸 URL，支持 Range，可直接用于 `<img>/<video>` 和 ffmpeg；`hint` 带授权根路径和令牌，`context` 是 repr 的鉴权上下文（通常是 DFS 原始路径，§7.3.1） |
 | 上传查缺 | `POST /nfs/v1/probe` | 批量 `FindMissingBlobs`，秒传的前提 |
 | 数据面（写） | 复用 `POST /ndm/v1/uploads`（tus 1.0.0） | 见 §5.3 |
 
@@ -897,8 +897,8 @@ data: {"path":"cyfs:///home/private","dims":["index.semantic"]}
 整棵子树（包括所有缩略图）都可以被浏览器 HTTP 缓存、Service Worker、乃至 CDN 无条件缓存。
 WebDAV 里做不到这件事，因为 URL 背后的内容随时可能变。
 
-注意第一档的共享缓存（CDN）只适用于无需 `context` 即可放行的内容（public / D8 开关）；
-凭 `context` 鉴权放行的响应是 `Cache-Control: private`，内容依旧不可变、
+注意第一档的共享缓存（CDN）只适用于公开提供的内容；
+凭 `hint` 令牌或 `context` 放行的响应是 `Cache-Control: private`，内容依旧不可变、
 浏览器本地依旧可无限缓存，但不进共享缓存。见 §7.3.1。
 
 ### 6.2 ETag = ObjId
@@ -967,7 +967,7 @@ reference / derived 边不属于 I1 的实体树，但协议边界必须强制�
 
 对 Frozen 内容有一个重要简化：**知道 ObjId 本身就接近一种能力**（256 bit 不可猜）。
 但这不足以作为访问控制——它只保证不可枚举。`public` 之外的内容仍需凭证。
-**【待决策】** 是否为"知道 ObjId 即可读"开一个 Zone 级开关（对内网/可信 CDN 场景有用）。
+**【已定】** 不提供"知道 ObjId 即可读"的开关（D8）。
 
 NFSP 的路径授权只管 NFSP 命名空间与它签发的分享链接，不等于原始对象的全库读取权。Zone 的 NDM
 网关（`/ndm/v1/*`、`/ndm/proxy/v1/*`，BuckyOS 由 nfs-server 承接）另按会话主体授权：只有上传或登记
@@ -975,14 +975,17 @@ NFSP 的路径授权只管 NFSP 命名空间与它签发的分享链接，不等
 不会让该路径对应的对象经 NDM 对任何人可读。规则见 cyfs-ndn `NDM Protocol/named-data-mgr-zone-protocol.md`
 的鉴权一节。
 
-#### 7.3.1 `context` 参数：ObjId 访问的鉴权上下文
+#### 7.3.1 ObjId 访问的鉴权上下文：`hint` 与 `context`
 
-上表回答"主体是谁"（凭证），但对 `GET /ndn/{obj_id}` 还差半步：ObjId 是纯内容寻址，
+**`GET /ndn/{obj_id}` 的判定【已定】**（BuckyOS 仓库 `doc/arch/应用对象桶 Bucket 设计.md` §4.6.5，D22）：
+授权根在 Zone 的公开提供集里就放行；否则看 `hint` 里的令牌；其余一律 404。它不读会话，也不消费 `context`。
+`hint` 的语法见 `CYFS Protocol.md` 的"标准 HTTP 读取与 `hint`"。
+
+上表回答"主体是谁"（凭证），但对带会话的 `GET /nfs/v1/repr/{obj_id}/{profile}` 还差半步：ObjId 是纯内容寻址，
 URL 本身不携带"这份内容在命名空间里位于何处、受哪条 policy 管辖"的信息。
-为此，数据面请求**鼓励携带**（SHOULD）`context` 参数——通常就是该对象在 DFS 里的原始路径：
+为此，这类请求要带 `context` 参数——通常就是该对象在 DFS 里的原始路径：
 
 ```
-GET /ndn/{obj_id}?context=cyfs:///home/photos/2026/cover.jpg
 GET /nfs/v1/repr/{obj_id}/thumb256?context=cyfs:///home/photos/2026/cover.jpg
 ```
 
@@ -999,23 +1002,19 @@ GET /nfs/v1/repr/{obj_id}/thumb256?context=cyfs:///home/photos/2026/cover.jpg
   (b) 当前主体（session / cap）对该路径具有 `read` 权限。
   两者都通过才放行，并以**该路径的有效 policy** 作为本次访问的裁决依据。
 - 验证失败（路径不存在、解析结果不含此 obj_id、主体无权限）**等同于未携带 `context`**：
-  回退到"裸 ObjId 请求"的默认裁决——裁决多宽即下方【待决策】的档位问题。
+  回退到"裸 ObjId 请求"的默认裁决，即下方选定的档位。
   服务端刻意不区分"context 声明不实"与"无权限"，避免把命名空间结构泄露给探测者。
 
-**【现状】** `named_store_server` 的 `GET /ndn/{obj_id}` 目前**不做任何鉴权**：
-知道 ObjId 即可读，`context` 参数尚未被消费。因此 v0 阶段 context 的定位是
-**鼓励携带、先行铺路**：客户端从现在起就在请求中带上它（resolve/list 已把路径
-送到了客户端手里，成本为零），服务端先透传并落审计日志；将来鉴权启用时行为
-平滑收紧，无需改动任何客户端。
+**【现状】** Zone 里还没有服务提供 `GET /ndn/{obj_id}`：网关没有这条路由，cyfs-ndn 的 `NdnDirServer`
+不判权，也没有部署在 Zone 里。不能把不判权的处理器直接接到网关。
 
-**【待决策】鉴权的宽窄。** 启用鉴权后，"裸 ObjId 请求（无 context、无 cap）给不给读"
-是一个谱系，收在哪一档必须与用户的心智模型对齐，需要仔细设计：
+**【已定】鉴权的宽窄（D12）。** "裸 ObjId 请求（无 cap）给不给读"是一个谱系，选定 L2：
 
-| 档位 | 语义 | 问题 |
+| 档位 | 语义 | 结论 |
 |---|---|---|
-| L0（现状） | 不鉴权，知道 ObjId 即可读；context 仅审计 | 与"私密目录的文件外人读不到"的直觉冲突 |
-| L1 | 裸请求按 public / D8 开关裁决；带 context 且验证通过则按该路径 policy 放行 | 折中；D8 决定内网 / 可信 CDN 场景的宽松度 |
-| L2 | 非 public 一律强制 context（或 cap），否则拒绝 | 与 G2 有张力：Frozen"可从任意源拉取"、跨 Zone Pull、邻居互拉都建立在裸 ObjId 语义上 |
+| L0 | 不鉴权，知道 ObjId 即可读 | 不采用：与"私密目录的文件外人读不到"的直觉冲突 |
+| L1 | 裸请求按 public 裁决；带 context 且验证通过则按该路径 policy 放行 | 不采用：`/ndn/` 不读会话，`context` 证明不了请求者是谁 |
+| L2 | 非 public 一律要凭证，否则拒绝 | **采用**，凭证是 `hint` 里的令牌。G2 的多源分发由公开内容保留：公开对象和公开缓存仍可裸取，非公开内容的跨 Zone Pull 带令牌 |
 
 张力的根源在内容寻址本身：同一内容可能同时被公开路径与私密路径引用（去重），
 "这份文件是私密的"在对象平面并不是一个良定义的属性；而 Frozen 的全部缓存 / 分发价值
@@ -1043,12 +1042,13 @@ ObjectId → 逻辑路径的反查。** 对象平面的任何组件都不得维�
 
 推论：服务端**无法**替客户端补全 context。一个不带 context、不带 cap 的裸
 `GET /ndn/{obj_id}`，服务端没有任何合法途径查出"它属于哪个目录、该用哪条 policy"，
-只能按 public / D8 开关裁决。这不是实现上的偷懒，而是刻意的结构保证——
+只能看它是否在公开提供集里。公开提供集位于入口层，只回答"是否公开"，不返回路径，
+也只含本来就公开的内容，不算反查。这不是实现上的偷懒，而是刻意的结构保证——
 不变式检查点在协议 handler 内（G6），而"查不到"比"承诺不查"更强。
 
-与缓存的交互（§6.1）：`context` 位于 query string，会进入 HTTP 缓存键。
-对 `public` 内容与 D8 开关放行的内容，客户端应**省略** `context`，
-保住 `immutable` 缓存与 CDN 命中；凭 `context` 放行的响应则标
+与缓存的交互（§6.1）：`hint` 和 `context` 都位于 query string，会进入 HTTP 缓存键。
+公开根对象不需要 `hint`，保住 `immutable` 缓存与 CDN 命中；公开根下的子对象要带 `hint.path`，
+缓存键因此带上根对象，换来不用维护物化的闭包表。凭令牌或 `context` 放行的响应标
 `Cache-Control: private`——内容本身仍不可变，但"这个主体可以读它"这一裁决
 不可被共享缓存复用。
 
@@ -1230,11 +1230,11 @@ POST /nfs/v1/batch
 | D5 | 是否增加文件级 upload session | 是，v0.5 |
 | D6 | `search` 是否流式 | 可选 feature `search.stream`，v1 |
 | D7 | 管线权限粒度 | 目录级 + 文件级覆盖 |
-| D8 | "知道 ObjId 即可读"是否开 Zone 级开关 | 待定，默认关；无论开关，`context` 正向鉴权路径不变（§7.3.1） |
+| D8 | "知道 ObjId 即可读"是否开 Zone 级开关 | 已定：不提供（§7.3） |
 | D9 | 隐私目录是否生成缩略图 | 待定，倾向于跟随 `ai.process` 维度 |
 | D10 | `list` 游标在并发变更下的语义 | 不重置，返回 `revision_changed` 由客户端决策 |
 | D11 | watch 断线重连是否保证不丢事件 | 否，提供 `resync` 事件即可 |
-| D12 | 数据面鉴权的宽窄（裸 ObjId 请求的默认裁决档位） | 待仔细设计（§7.3.1 档位表 L0–L2）。v0 现状为 L0（不鉴权），`context` 鼓励携带、先落审计；宽了与隐私直觉冲突，窄了伤害 Frozen 的多源分发价值（G2），需与用户心智模型对齐 |
+| D12 | 数据面鉴权的宽窄（裸 ObjId 请求的默认裁决档位） | 已定：L2，凭证是 `hint` 里的令牌；公开内容仍可裸取，保留 G2 的多源分发（§7.3.1） |
 | D13 | DFS native entry 与 filedb virtual binding 被旁路写成同名时如何呈现 | 协议返回 `conflicts[]` + `NAMESPACE_CONFLICT`，不得静默覆盖或改绑；具体修复 UI 待产品定案 |
 
 ---

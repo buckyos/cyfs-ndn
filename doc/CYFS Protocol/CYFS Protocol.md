@@ -2,7 +2,7 @@
 
 > `CYFS` 或 `cyfs://` 都是在说协议；单独说 `cyfs` 时，通常指基于 CYFS Protocol 定义的标准对象实现的 DFS。
 
-当前文档状态：0.91 修订草案，领先现有代码实现。本版在 0.9 基础上补充 **No-Push 的精确定义**、**跨 Zone 小对象投递 `dispatch`**、**语义路径目录的两种形态** 与 **PathObject 的 sub-host DID 公钥扩展**。
+当前文档状态：0.91 修订草案，领先现有代码实现。本版在 0.9 基础上补充 **No-Push 的精确定义**、**跨 Zone 小对象投递 `dispatch`**、**语义路径目录的两种形态**、**PathObject 的 sub-host DID 公钥扩展** 与 **标准 HTTP 读取和 `hint`**。
 
 本次修订（在 0.91 基础上）将"强名字"与"端到端发布消费场景"整合进协议正文，并新增"数字内容的发行"与"内容生命周期"两章，明确 BNS 强名字作为 CYFS 数字内容网络入口与信任锚点的定位。其中 OwnerDocument / ZoneDocument 的字段、签名规则、密钥分级、撤销与轮换协议**仍归 BNS 文档规范**，本文档只引用其名称并定义它们对内容网络的契约。
 
@@ -668,6 +668,34 @@ readme.md 的 FileObject JSON
 - 客户端已经通过其它请求独立验证了根对象，此次只是批量读取其 child 对象的 raw JSON 或 raw value。
 
 如果对语义 URL 直接使用 `resp=raw`，那么它在可信性上就退化成了传统 HTTP GET：客户端可以得到数据，但**不能**依赖这次响应本身证明“这个语义路径当前确实绑定到了这个对象”。
+
+### 标准 HTTP 读取与 `hint`
+
+`/ndn/` 上的 O Link 必须能被不懂 CYFS 的标准 HTTP 工具直接读取，例如 ffmpeg、curl 和浏览器的 `<video>`：
+
+- **FileObject 的 O Link 返回文件字节**，等同于 `/@/content`。ChunkList 返回拼接后的字节流。
+- **支持单段 Range**：`bytes=a-b`、`bytes=a-`、`bytes=-n`，可以跨 Chunk 边界，返回 `206`、`Content-Range`、`Content-Length` 和 `Accept-Ranges: bytes`。多段 Range 可以返回完整内容，无法满足时返回 `416`。
+- **`cyfs-*` Header 是附加信息**：CYFS 客户端用它验证，普通工具可以忽略。
+
+这些工具不方便设置自定义 Header，所以读取的授权上下文放在 URL 参数 `hint` 里：
+
+```text
+GET http://$zone_id/ndn/$obj_id[/@/$inner_path][?hint=$hint]
+```
+
+`hint` 是 URL 编码后的规范化 JSON，字段都可选：
+
+```json
+{ "path": "$root_obj_id/@/content/@/3", "token": "$access_token" }
+```
+
+- `path` 给出授权根和从根到目标的路径，语法同 `inner_path`。走完必须等于 URL 里的 `$obj_id`，此时 URL 不能再带 `inner_path`。不带 `path` 时，授权根就是 `$obj_id`。
+- `token` 是读取授权根的访问令牌，格式由 Zone 定义。它的语义和 `cyfs-access-code` 相同，用于无法设置 Header 的场景。
+- 按授权根放行时，路径只能走结构包含关系：`FileObject.content`、`ChunkList` 的元素和 `DirObject` 的子项。其他字段里的 `ObjectId` 不构成包含关系。
+- `hint` 不改变寻址结果，也不影响内容校验。知道 `ObjectId` 不等于可以读取，未授权和对象不存在的响应不可区分（`404`）。
+- 带令牌的 URL 只在请求时拼接，不能写进 `NamedObject`，否则会改变对象的 `ObjectId`。
+
+协议只定义语法，谁能读由 Zone 决定。BuckyOS 的判定规则见 BuckyOS 仓库的 `doc/arch/应用对象桶 Bucket 设计.md` §4.6.5。
 
 ### ChunkList
 

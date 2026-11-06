@@ -83,6 +83,8 @@
   要求 chunk list 由本主体登记。秒传（`chunk_hash` 已存在）不证明持有内容，属已知风险。
 - **读取**：`get_object` / `open_object` / `get_dir_child` / `query_object_by_id` 需要 objects 读权限，或该对象由本主体
   上传/登记；知道 obj_id 不构成读取权。
+- **`/ndn/*` 不属于本协议**：`NamedDataMgrZoneGateway` 命中它仍返回 `405`。BuckyOS 计划由 nfs-server 的公开读取入口承接，
+  判定规则见 BuckyOS 仓库的 `doc/arch/应用对象桶 Bucket 设计.md` §4.6.5。
 
 ## 3. 通用响应与错误模型
 
