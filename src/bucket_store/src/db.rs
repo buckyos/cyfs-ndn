@@ -333,6 +333,20 @@ pub(crate) fn current_binding(conn: &Connection, id: &BucketId, key: &str) -> Bu
         .optional()?)
 }
 
+/// A current binding of `obj_id` in the bucket that has not expired.
+pub(crate) fn live_binding_of(conn: &Connection, id: &BucketId, obj_id: &str, now: i64) -> BucketResult<Option<Binding>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {BINDING_COLS} FROM bindings WHERE bucket_id = ?1 AND obj_id = ?2 AND is_current = 1 AND is_delete_marker = 0
+                 AND (expires_at IS NULL OR expires_at > ?3) LIMIT 1"
+            ),
+            params![id.to_string(), obj_id, now],
+            binding_from_row,
+        )
+        .optional()?)
+}
+
 pub(crate) fn version_binding(conn: &Connection, id: &BucketId, key: &str, version: u64) -> BucketResult<Option<Binding>> {
     Ok(conn
         .query_row(

@@ -12,7 +12,10 @@ use buckyos_http_server::ServerError;
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderValue, Response, StatusCode};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
-use ndn_lib::{load_named_obj, ChunkId, FileObject, ObjId, CHUNK_DEFAULT_SIZE, OBJ_TYPE_FILE};
+use ndn_lib::{
+    apply_content_policy, apply_security_headers, is_inline_type, load_named_obj, private_cache_control, ChunkId, FileObject, ObjId, CHUNK_DEFAULT_SIZE,
+    OBJ_TYPE_FILE, OCTET_STREAM, SANDBOX_CSP,
+};
 
 pub type HttpBody = BoxBody<Bytes, ServerError>;
 
@@ -25,7 +28,7 @@ pub const OBJECT_CONTENT_TYPE: &str = "application/cyfs+json";
 const PASS_HEADERS: [&str; 5] = ["cache-control", "expires", "content-disposition", "content-language", "content-encoding"];
 const META_PREFIX: &str = "x-bucky-meta-";
 
-fn body(bytes: impl Into<Bytes>) -> HttpBody {
+pub(crate) fn body(bytes: impl Into<Bytes>) -> HttpBody {
     Full::new(bytes.into()).map_err(|never| match never {}).boxed()
 }
 
@@ -169,13 +172,22 @@ impl BucketStore {
 
     /// Serves a binding's content: FileObject bytes with Range, other objects as JSON.
     pub async fn serve_read(&self, bucket: &BucketInfo, b: &Binding, req_headers: &HeaderMap, head: bool) -> Response<HttpBody> {
-        match self.serve_inner(bucket, b, req_headers, head).await {
+        match self.serve_inner(bucket, b, req_headers, head, true).await {
             Ok(r) => r,
             Err(e) => error_response(&e),
         }
     }
 
-    async fn serve_inner(&self, bucket: &BucketInfo, b: &Binding, req_headers: &HeaderMap, head: bool) -> BucketResult<Response<HttpBody>> {
+    /// For the S3 surface, whose clients round-trip the declared type and
+    /// disposition: still sandboxed and `nosniff`, so nothing runs on the origin.
+    pub async fn serve_read_declared(&self, bucket: &BucketInfo, b: &Binding, req_headers: &HeaderMap, head: bool) -> Response<HttpBody> {
+        match self.serve_inner(bucket, b, req_headers, head, false).await {
+            Ok(r) => r,
+            Err(e) => error_response(&e),
+        }
+    }
+
+    async fn serve_inner(&self, bucket: &BucketInfo, b: &Binding, req_headers: &HeaderMap, head: bool, safe: bool) -> BucketResult<Response<HttpBody>> {
         let obj_id = ObjId::new(b.obj_id.as_deref().unwrap_or_default()).map_err(store_err)?;
         if matches!(bucket.data_policy, DataPolicy::Cache | DataPolicy::Ambient) {
             self.touch_binding(b);
@@ -191,10 +203,15 @@ impl BucketStore {
         };
         set(h, header::ETAG, &etag);
         set(h, header::LAST_MODIFIED, &http_date(b.created_at));
-        set(h, header::CACHE_CONTROL, "private, no-cache");
-        for (k, v) in &b.http_headers {
-            if let (Ok(k), Ok(v)) = (header::HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
-                h.insert(k, v);
+        // Only the headers a PUT may store come back, and none of them can widen this response.
+        let stored = |name: &str| b.http_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        match stored("cache-control").filter(|_| !safe) {
+            Some(verbatim) => set(h, header::CACHE_CONTROL, verbatim),
+            None => set(h, header::CACHE_CONTROL, &private_cache_control(stored("cache-control"))),
+        }
+        for name in ["expires", "content-language", "content-encoding"] {
+            if let (Some(v), Ok(name)) = (stored(name), header::HeaderName::from_bytes(name.as_bytes())) {
+                set(h, name, v);
             }
         }
         set(h, header::HeaderName::from_static("x-bucky-version"), &b.version.to_string());
@@ -204,13 +221,15 @@ impl BucketStore {
                 set(h, name, v);
             }
         }
+        apply_security_headers(h, SANDBOX_CSP);
         if none_match(req_headers, &b.etag) {
             *r.status_mut() = StatusCode::NOT_MODIFIED;
             return Ok(r);
         }
         if obj_id.obj_type != OBJ_TYPE_FILE {
             let Ok(text) = self.ndm.get_object(&obj_id).await else { return Err(self.missing(bucket, b).await) };
-            set(r.headers_mut(), header::CONTENT_TYPE, b.content_type.as_deref().unwrap_or(OBJECT_CONTENT_TYPE));
+            let declared = b.content_type.as_deref().filter(|t| !safe || is_inline_type(t)).unwrap_or(OBJECT_CONTENT_TYPE);
+            set(r.headers_mut(), header::CONTENT_TYPE, declared);
             set(r.headers_mut(), header::CONTENT_LENGTH, &text.len().to_string());
             if !head {
                 *r.body_mut() = body(text);
@@ -223,8 +242,21 @@ impl BucketStore {
             .content_type
             .clone()
             .or_else(|| file.meta.get("mime").and_then(|v| v.as_str()).map(String::from))
-            .unwrap_or_else(|| "application/octet-stream".into());
-        set(r.headers_mut(), header::CONTENT_TYPE, &mime);
+            .unwrap_or_else(|| OCTET_STREAM.into());
+        if safe {
+            let disposition = stored("content-disposition").filter(|v| v.trim_start().to_ascii_lowercase().starts_with("attachment"));
+            let policy = apply_content_policy(r.headers_mut(), &mime, Some(file_name_of(&b.key)), false);
+            if let Some(v) = disposition {
+                set(r.headers_mut(), header::CONTENT_DISPOSITION, v);
+            } else if let Some(v) = stored("content-disposition").filter(|_| policy.inline) {
+                set(r.headers_mut(), header::CONTENT_DISPOSITION, v);
+            }
+        } else {
+            set(r.headers_mut(), header::CONTENT_TYPE, &mime);
+            if let Some(v) = stored("content-disposition") {
+                set(r.headers_mut(), header::CONTENT_DISPOSITION, v);
+            }
+        }
         set(r.headers_mut(), header::ACCEPT_RANGES, "bytes");
         let len = file.size;
         let range = match parse_range(header_str(req_headers, "range"), len) {

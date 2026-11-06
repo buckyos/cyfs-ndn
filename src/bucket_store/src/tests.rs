@@ -645,7 +645,7 @@ async fn data_plane_put_get_range_head_304() {
     let resp = e.store.serve_read(&bucket, &b, &HeaderMap::new(), false).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers()["content-type"], "image/png");
-    assert_eq!(resp.headers()["cache-control"], "max-age=60");
+    assert_eq!(resp.headers()["cache-control"], "private, max-age=60");
     assert_eq!(resp.headers()["etag"], format!("\"{}\"", r.etag));
     assert_eq!(body_bytes(resp).await, b"0123456789");
     let mut range = HeaderMap::new();
@@ -706,4 +706,418 @@ fn futures_are_send(store: Arc<BucketStore>, c: Caller, id: BucketId) {
     send(store.put_bytes(&id, &c, "k", bytes::Bytes::new(), &HeaderMap::new()));
     send(store.grant(&id, &c, GrantRequest { grantee: Grantee { kind: GranteeKind::User, id: String::new() }, prefix: String::new(), actions: ActionSet::default(), expires_at: None }));
     send(store.set_quota(&id, &c, QuotaUpdate::default(), false));
+}
+
+mod ndn {
+    use super::*;
+    use crate::content::chunk_id_of;
+    use crate::ndn_read::ndn_not_found;
+    use ndn_lib::{ChunkId, ChunkList, DirObject, FileObject, MsgContent, MsgObject, MsgObjKind, NamedObject, RefItem, RefRole, RefTarget};
+    use std::str::FromStr;
+
+    async fn stored_chunk(store: &BucketStore, bytes: &[u8]) -> ChunkId {
+        let id = chunk_id_of(bytes).unwrap();
+        store.ndm().put_chunk(&id, bytes).await.unwrap();
+        id
+    }
+
+    /// A file of three chunks: "aaaaa" "bbbbb" "ccc".
+    async fn three_chunk_file(store: &BucketStore) -> (ObjId, ObjId, Vec<ChunkId>) {
+        let mut chunks = Vec::new();
+        for piece in [&b"aaaaa"[..], b"bbbbb", b"ccc"] {
+            chunks.push(stored_chunk(store, piece).await);
+        }
+        let (list_id, list_str) = ChunkList::from_chunk_list(chunks.clone()).unwrap().gen_obj_id();
+        store.ndm().put_object(&list_id, &list_str).await.unwrap();
+        let (file_id, body) = FileObject::new("movie.mp4".into(), 13, list_id.to_string()).gen_obj_id();
+        store.ndm().put_object(&file_id, &body).await.unwrap();
+        (file_id, list_id, chunks)
+    }
+
+    fn get(path: &str) -> NdnRequest {
+        let (p, q) = path.split_once('?').map(|(p, q)| (p, Some(q))).unwrap_or((path, None));
+        NdnRequest::parse(p, q).unwrap()
+    }
+
+    fn encoded_hint(hint: &NdnHint) -> String {
+        hint.to_canonical().bytes().map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        }).collect()
+    }
+
+    fn range(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("range", v.parse().unwrap());
+        h
+    }
+
+    async fn read(store: &BucketStore, req: &NdnRequest, h: &HeaderMap) -> (u16, HeaderMap, Vec<u8>) {
+        let r = store.serve_ndn(req, NdnAccess::Public, h, false).await;
+        let (status, headers) = (r.status().as_u16(), r.headers().clone());
+        (status, headers, body_bytes(r).await)
+    }
+
+    #[test]
+    fn a_path_hint_and_an_inner_path_are_exclusive() {
+        let hint = NdnHint { path: Some("x".into()), token: None };
+        let id = ObjId::new_by_raw("cyfile".to_string(), vec![1; 32]).to_string();
+        let err = NdnRequest::parse(&format!("/ndn/{id}/@/content"), Some(&format!("hint={}", encoded_hint(&hint)))).unwrap_err();
+        assert_eq!(err.0, "hint.path and an inner path cannot be combined");
+        assert!(NdnRequest::parse(&format!("/ndn/{id}"), Some("hint=%7B")).is_err(), "syntax");
+        assert!(NdnRequest::parse("/ndn/not-an-id", None).is_err());
+        assert!(NdnRequest::parse(&format!("/ndn/{id}"), Some("hint=a&hint=b")).is_err(), "repeated");
+    }
+
+    #[tokio::test]
+    async fn file_bytes_with_every_range_form() {
+        let e = env().await;
+        let (file, _, _) = three_chunk_file(&e.store).await;
+        let req = get(&format!("/ndn/{}", file.to_string()));
+        let (status, h, body) = read(&e.store, &req, &HeaderMap::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"aaaaabbbbbccc");
+        assert_eq!(h["content-length"], "13");
+        assert_eq!(h["accept-ranges"], "bytes");
+        assert_eq!(h["etag"], format!("\"{}\"", file.to_string()));
+        assert_eq!(h["cache-control"], "public, max-age=31536000, immutable");
+        assert_eq!(h["x-content-type-options"], "nosniff");
+        assert_eq!(h["referrer-policy"], "no-referrer");
+        assert_eq!(h["content-type"], "video/mp4", "from the name when the object declares nothing");
+
+        let (status, h, body) = read(&e.store, &req, &range("bytes=3-6")).await;
+        assert_eq!((status, body.as_slice()), (206, &b"aabb"[..]), "crosses a chunk boundary");
+        assert_eq!(h["content-range"], "bytes 3-6/13");
+        assert_eq!(h["content-length"], "4");
+        let (status, h, body) = read(&e.store, &req, &range("bytes=9-")).await;
+        assert_eq!((status, body.as_slice()), (206, &b"bccc"[..]), "open end");
+        assert_eq!(h["content-range"], "bytes 9-12/13");
+        let (status, _, body) = read(&e.store, &req, &range("bytes=-2")).await;
+        assert_eq!((status, body.as_slice()), (206, &b"cc"[..]), "suffix");
+        let (status, _, body) = read(&e.store, &req, &range("bytes=0-1,3-4")).await;
+        assert_eq!((status, body.len()), (200, 13), "several ranges get the whole object");
+        let (status, h, _) = read(&e.store, &req, &range("bytes=99-")).await;
+        assert_eq!(status, 416);
+        assert_eq!(h["content-range"], "bytes */13");
+
+        let head = e.store.serve_ndn(&req, NdnAccess::Public, &range("bytes=0-1"), true).await;
+        assert_eq!(head.status(), 206);
+        assert_eq!(head.headers()["content-length"], "2");
+        assert!(body_bytes(head).await.is_empty());
+
+        let mut ifrange = range("bytes=0-1");
+        ifrange.insert("if-range", format!("\"{}\"", file.to_string()).parse().unwrap());
+        assert_eq!(read(&e.store, &req, &ifrange).await.0, 206);
+        ifrange.insert("if-range", "\"other\"".parse().unwrap());
+        let (status, _, body) = read(&e.store, &req, &ifrange).await;
+        assert_eq!((status, body.len()), (200, 13), "a stale validator reads everything");
+
+        let mut inm = HeaderMap::new();
+        inm.insert("if-none-match", format!("\"{}\"", file.to_string()).parse().unwrap());
+        assert_eq!(read(&e.store, &req, &inm).await.0, 304);
+    }
+
+    #[tokio::test]
+    async fn empty_file_raw_json_and_private_responses() {
+        let e = env().await;
+        let (file, list, _) = three_chunk_file(&e.store).await;
+        let (empty, body) = FileObject::new("empty.txt".into(), 0, String::new()).gen_obj_id();
+        e.store.ndm().put_object(&empty, &body).await.unwrap();
+        let req = get(&format!("/ndn/{}", empty.to_string()));
+        let (status, h, bytes) = read(&e.store, &req, &HeaderMap::new()).await;
+        assert_eq!((status, bytes.len()), (200, 0));
+        assert_eq!(h["content-length"], "0");
+        assert_eq!(read(&e.store, &req, &range("bytes=0-")).await.0, 200, "nothing to slice");
+
+        let raw = get(&format!("/ndn/{}?resp=raw", file.to_string()));
+        let (status, h, bytes) = read(&e.store, &raw, &HeaderMap::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(h["content-type"], crate::ndn_read::OBJECT_JSON_TYPE);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["content"], list.to_string());
+        assert!(!h.contains_key("cyfs-obj-id"));
+
+        let private = e.store.serve_ndn(&get(&format!("/ndn/{}", file.to_string())), NdnAccess::Token, &HeaderMap::new(), false).await;
+        assert_eq!(private.headers()["cache-control"], "private");
+    }
+
+    #[tokio::test]
+    async fn active_types_are_opaque_and_raw_content_has_no_type() {
+        let e = env().await;
+        let html = file(&e.store, "x.html", b"<script>1</script>").await;
+        let body = e.store.ndm().get_object(&ObjId::new(&html).unwrap()).await.unwrap();
+        let mut obj: FileObject = load_named_file(&body);
+        obj.meta.insert("mime".into(), serde_json::json!("text/html"));
+        let (id, body) = obj.gen_obj_id();
+        e.store.ndm().put_object(&id, &body).await.unwrap();
+        let (status, h, _) = read(&e.store, &get(&format!("/ndn/{}", id.to_string())), &HeaderMap::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(h["content-type"], "application/octet-stream");
+        assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment"));
+        assert!(h["content-security-policy"].to_str().unwrap().starts_with("sandbox"));
+        let (file_id, _, chunks) = three_chunk_file(&e.store).await;
+        let hint = NdnHint { path: Some(format!("{}/@/content/@/1", file_id.to_string())), token: None };
+        let (status, h, bytes) = read(&e.store, &get(&format!("/ndn/{}?hint={}", chunks[1].to_string(), encoded_hint(&hint))), &HeaderMap::new()).await;
+        assert_eq!((status, bytes.as_slice()), (200, &b"bbbbb"[..]));
+        assert_eq!(h["content-type"], "application/octet-stream");
+    }
+
+    fn load_named_file(body: &str) -> FileObject {
+        ndn_lib::load_named_obj(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn walks_only_along_containment() {
+        let e = env().await;
+        let (file_id, list_id, chunks) = three_chunk_file(&e.store).await;
+        let hint = |path: String| encoded_hint(&NdnHint { path: Some(path), token: None });
+
+        // The walk reaches the chunk; a URL naming another object does not.
+        let path = format!("{}/@/content/@/2", file_id.to_string());
+        let good = get(&format!("/ndn/{}?hint={}", chunks[2].to_string(), hint(path.clone())));
+        assert_eq!(read(&e.store, &good, &HeaderMap::new()).await.2, b"ccc");
+        let wrong_target = get(&format!("/ndn/{}?hint={}", chunks[0].to_string(), hint(path)));
+        assert_eq!(read(&e.store, &wrong_target, &HeaderMap::new()).await.0, 404);
+        let list = get(&format!("/ndn/{}?hint={}", list_id.to_string(), hint(format!("{}/@/content", file_id.to_string()))));
+        assert_eq!(read(&e.store, &list, &HeaderMap::new()).await.2, b"aaaaabbbbbccc");
+        let inner = get(&format!("/ndn/{}/@/content/@/1", file_id.to_string()));
+        assert_eq!(read(&e.store, &inner, &HeaderMap::new()).await.2, b"bbbbb");
+        for bad in ["/@/content/@/9", "/@/content/@/01", "/@/content/@/+1", "/@/name", "/@/size", "/@/meta"] {
+            assert_eq!(read(&e.store, &get(&format!("/ndn/{}{}", file_id.to_string(), bad)), &HeaderMap::new()).await.0, 404, "{bad}");
+        }
+
+        // A public object naming a private one in a meta field reaches nothing.
+        let secret = file(&e.store, "secret.txt", b"secret").await;
+        let mut obj = FileObject::new("pub.txt".into(), 3, chunks[2].to_string());
+        obj.meta.insert("secret".into(), serde_json::json!(secret));
+        let (public, body) = obj.gen_obj_id();
+        e.store.ndm().put_object(&public, &body).await.unwrap();
+        for bad in [format!("{}/@/meta/@/secret", public.to_string()), format!("{}/@/secret", public.to_string())] {
+            let req = get(&format!("/ndn/{secret}?hint={}", hint(bad)));
+            assert_eq!(read(&e.store, &req, &HeaderMap::new()).await.0, 404);
+        }
+
+        // content pointing at a whole FileObject is not a content edge either.
+        let (wrapper, body) = FileObject::new("wrap.txt".into(), 6, secret.clone()).gen_obj_id();
+        e.store.ndm().put_object(&wrapper, &body).await.unwrap();
+        assert_eq!(read(&e.store, &get(&format!("/ndn/{}", wrapper.to_string())), &HeaderMap::new()).await.0, 404);
+        assert_eq!(read(&e.store, &get(&format!("/ndn/{}/@/content", wrapper.to_string())), &HeaderMap::new()).await.0, 404);
+
+        // A message's attachments are references, not containment.
+        let msg = MsgObject {
+            from: name_lib::DID::from_str("did:web:a.example.com").unwrap(),
+            to: vec![name_lib::DID::from_str("did:web:b.example.com").unwrap()],
+            kind: MsgObjKind::Chat,
+            to_session: None,
+            thread: Default::default(),
+            relates_to: None,
+            mentions: None,
+            workspace: None,
+            created_at_ms: 1,
+            expires_at_ms: None,
+            nonce: None,
+            content: MsgContent {
+                refs: vec![RefItem { role: RefRole::Input, target: RefTarget::DataObj { obj_id: ObjId::new(&secret).unwrap(), uri_hint: None }, label: Some("x".into()) }],
+                ..Default::default()
+            },
+            meta: Default::default(),
+        };
+        let (msg_id, msg_str) = msg.gen_obj_id();
+        e.store.ndm().put_object(&msg_id, &msg_str).await.unwrap();
+        for bad in ["0", "content", "refs", "attachments"] {
+            assert_eq!(read(&e.store, &get(&format!("/ndn/{}/@/{bad}", msg_id.to_string())), &HeaderMap::new()).await.0, 404, "{bad}");
+        }
+        let req = get(&format!("/ndn/{secret}?hint={}", hint(format!("{}/@/content/@/refs/@/0", msg_id.to_string()))));
+        assert_eq!(read(&e.store, &req, &HeaderMap::new()).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn directories_walk_their_entries() {
+        let e = env().await;
+        let chunk = stored_chunk(&e.store, b"inside").await;
+        let inner = FileObject::new("a.txt".into(), 6, chunk.to_string());
+        let (inner_id, inner_str) = inner.gen_obj_id();
+        e.store.ndm().put_object(&inner_id, &inner_str).await.unwrap();
+        let mut sub = DirObject::new(Some("sub".into()));
+        sub.add_file("a.txt".into(), serde_json::to_value(&inner).unwrap(), 6).unwrap();
+        let (sub_id, sub_str) = sub.gen_obj_id().unwrap();
+        e.store.ndm().put_object(&sub_id, &sub_str).await.unwrap();
+        let mut root = DirObject::new(Some("root".into()));
+        root.add_directory("sub".into(), sub_id.clone(), 6).unwrap();
+        let (root_id, root_str) = root.gen_obj_id().unwrap();
+        e.store.ndm().put_object(&root_id, &root_str).await.unwrap();
+
+        let (status, h, bytes) = read(&e.store, &get(&format!("/ndn/{}", root_id.to_string())), &range("bytes=0-1")).await;
+        assert_eq!(status, 200, "objects do not slice");
+        assert!(!h.contains_key("accept-ranges"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["body"]["sub"].is_string());
+        let (status, _, bytes) = read(&e.store, &get(&format!("/ndn/{}/@/sub/@/a.txt", root_id.to_string())), &HeaderMap::new()).await;
+        assert_eq!((status, bytes.as_slice()), (200, &b"inside"[..]));
+        assert_eq!(read(&e.store, &get(&format!("/ndn/{}/@/sub/a.txt", root_id.to_string())), &HeaderMap::new()).await.2, b"inside");
+        assert_eq!(read(&e.store, &get(&format!("/ndn/{}/@/nope", root_id.to_string())), &HeaderMap::new()).await.0, 404);
+        assert!(NdnRequest::parse(&format!("/ndn/{}/@/../x", root_id.to_string()), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn evicted_content_is_404_for_get_and_head() {
+        let e = env().await;
+        let chunk_id = stored_chunk(&e.store, b"gone soon").await;
+        let (file_id, body) = FileObject::new("g.txt".into(), 9, chunk_id.to_string()).gen_obj_id();
+        e.store.ndm().put_object(&file_id, &body).await.unwrap();
+        let req = get(&format!("/ndn/{}", file_id.to_string()));
+        assert_eq!(read(&e.store, &req, &HeaderMap::new()).await.0, 200);
+        e.store.ndm().remove_chunk(&chunk_id).await.unwrap();
+        assert_eq!(read(&e.store, &req, &HeaderMap::new()).await.0, 404);
+        assert_eq!(e.store.serve_ndn(&req, NdnAccess::Public, &HeaderMap::new(), true).await.status(), 404);
+        assert_eq!(ndn_not_found().status(), 404);
+    }
+
+    async fn token_env() -> (Env, BucketId, Caller, String) {
+        let e = env().await;
+        let id = user_bucket("app", "alice", "files");
+        e.store.ensure_bucket(&id, &decl("data", "app_data", serde_json::json!({}))).unwrap();
+        let c = caller("alice", "app", &[(&id, ALL)]);
+        let obj = file(&e.store, "a.txt", b"first").await;
+        e.store.put(&id, &c, put("k/a", &obj)).await.unwrap();
+        (e, id, c, obj)
+    }
+
+    fn token_req(key: Option<&str>, prefix: Option<&str>, actions: &[Action]) -> TokenRequest {
+        TokenRequest {
+            key: key.map(String::from),
+            prefix: prefix.map(String::from),
+            actions: actions.iter().copied().collect(),
+            expires_at: now_ms() + 60_000,
+            max_uses: None,
+            bind_user_id: None,
+            bind_app_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn token_covers_only_the_current_binding_of_its_key() {
+        let (e, id, c, obj) = token_env().await;
+        let root = ObjId::new(&obj).unwrap();
+        let issued = e.store.create_access_token(&id, &c, token_req(Some("k/a"), None, &[Action::Read])).await.unwrap();
+        assert!(e.store.ndn_token_covers(&issued.token, &root));
+        let other = ObjId::new(&file(&e.store, "b.txt", b"second").await).unwrap();
+        assert!(!e.store.ndn_token_covers(&issued.token, &other), "another object");
+        // Rebinding the key moves the token with it; the old root is out.
+        e.store.put(&id, &c, put("k/a", &other.to_string())).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&issued.token, &root));
+        assert!(e.store.ndn_token_covers(&issued.token, &other));
+        e.store.delete(&id, &c, "k/a", None, None).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&issued.token, &other), "unbound");
+    }
+
+    #[tokio::test]
+    async fn only_read_only_unbound_key_tokens_count() {
+        let (e, id, c, obj) = token_env().await;
+        let root = ObjId::new(&obj).unwrap();
+        assert!(!e.store.ndn_token_covers("bkt_notatoken", &root));
+        assert!(!e.store.ndn_token_covers(&name_lib::bearer_token::issue("bkt"), &root));
+
+        let prefix = e.store.create_access_token(&id, &c, token_req(None, Some("k/"), &[Action::Read])).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&prefix.token, &root), "prefix token");
+        let write = e.store.create_access_token(&id, &c, token_req(Some("k/a"), None, &[Action::Read, Action::Write])).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&write.token, &root), "write token");
+        let mut bound = token_req(Some("k/a"), None, &[Action::Read]);
+        bound.bind_user_id = Some("alice".into());
+        let bound = e.store.create_access_token(&id, &c, bound).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&bound.token, &root), "bound to a user");
+        let mut bound = token_req(Some("k/a"), None, &[Action::Read]);
+        bound.bind_app_id = Some("app".into());
+        let bound = e.store.create_access_token(&id, &c, bound).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&bound.token, &root), "bound to an app");
+        let mut limited = token_req(Some("k/a"), None, &[Action::Read]);
+        limited.max_uses = Some(5);
+        let limited = e.store.create_access_token(&id, &c, limited).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&limited.token, &root), "use-limited token");
+
+        let revoked = e.store.create_access_token(&id, &c, token_req(Some("k/a"), None, &[Action::Read])).await.unwrap();
+        assert!(e.store.ndn_token_covers(&revoked.token, &root));
+        e.store.revoke_access_token(&c, &revoked.token_id).await.unwrap();
+        assert!(!e.store.ndn_token_covers(&revoked.token, &root), "revoked");
+
+        let mut short = token_req(Some("k/a"), None, &[Action::Read]);
+        short.expires_at = now_ms() + 30;
+        let short = e.store.create_access_token(&id, &c, short).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!e.store.ndn_token_covers(&short.token, &root), "expired");
+    }
+
+    #[tokio::test]
+    async fn an_issuer_lists_and_revokes_its_own_tokens_on_a_documents_bucket() {
+        let e = env().await;
+        let id = user_bucket("app", "alice", "docs");
+        e.store.ensure_bucket(&id, &decl("data", "documents", serde_json::json!({}))).unwrap();
+        let service = caller("app", "app", &[(&id, ALL)]);
+        let other = caller("other", "other", &[(&id, ALL)]);
+        let obj = file(&e.store, "a.txt", b"doc").await;
+        e.store.put(&id, &service, put("a", &obj)).await.unwrap();
+        let issued = e.store.create_access_token(&id, &service, token_req(Some("a"), None, &[Action::Read])).await.unwrap();
+        assert!(e.store.list_access_tokens(&id, &other).await.unwrap().is_empty());
+        assert!(e.store.list_access_tokens(&id, &Caller::anonymous(None)).await.is_err());
+        let mine = e.store.list_access_tokens(&id, &service).await.unwrap();
+        assert_eq!(mine.iter().map(|t| t.token_id.as_str()).collect::<Vec<_>>(), [issued.token_id.as_str()]);
+        e.store.revoke_access_token(&service, &issued.token_id).await.unwrap();
+        assert!(e.store.list_access_tokens(&id, &service).await.unwrap()[0].revoked_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_expired_binding_grants_nothing() {
+        let e = env().await;
+        let id = user_bucket("app", "alice", "tmp");
+        e.store.ensure_bucket(&id, &decl("data", "temp", serde_json::json!({"default_ttl_days": 1}))).unwrap();
+        let c = caller("alice", "app", &[(&id, ALL)]);
+        let obj = file(&e.store, "t.txt", b"short").await;
+        let mut req = put("t", &obj);
+        req.expires_at = Some(now_ms() + 30);
+        e.store.put(&id, &c, req).await.unwrap();
+        let root = ObjId::new(&obj).unwrap();
+        let issued = e.store.create_access_token(&id, &c, token_req(Some("t"), None, &[Action::Read])).await.unwrap();
+        assert!(e.store.ndn_bound_in(&id, &root).unwrap());
+        assert!(e.store.ndn_token_covers(&issued.token, &root));
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(!e.store.ndn_bound_in(&id, &root).unwrap());
+        assert!(!e.store.ndn_token_covers(&issued.token, &root));
+    }
+}
+
+#[tokio::test]
+async fn data_plane_never_runs_active_content_or_widens_caching() {
+    let e = env().await;
+    let id = user_bucket("app", "alice", "web");
+    e.store.ensure_bucket(&id, &decl("data", "app_data", serde_json::json!({}))).unwrap();
+    let c = caller("alice", "app", &[(&id, RW)]);
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "text/html".parse().unwrap());
+    h.insert("cache-control", "public, max-age=99".parse().unwrap());
+    h.insert("content-disposition", "inline".parse().unwrap());
+    e.store.put_bytes(&id, &c, "x.html", bytes::Bytes::from_static(b"<script>1</script>"), &h).await.unwrap();
+    let (bucket, b) = e.store.open_for_read(&id, &c, "x.html", None).await.unwrap();
+    let resp = e.store.serve_read(&bucket, &b, &HeaderMap::new(), false).await;
+    let h = resp.headers();
+    assert_eq!(h["content-type"], "application/octet-stream");
+    assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment"));
+    assert_eq!(h["cache-control"], "private, max-age=99");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["referrer-policy"], "no-referrer");
+    assert!(h["content-security-policy"].to_str().unwrap().starts_with("sandbox"));
+
+    // An SVG keeps its type; only the sandbox keeps its scripts from running.
+    let mut h = HeaderMap::new();
+    h.insert("content-type", "image/svg+xml".parse().unwrap());
+    e.store.put_bytes(&id, &c, "x.svg", bytes::Bytes::from_static(b"<svg/>"), &h).await.unwrap();
+    let (bucket, b) = e.store.open_for_read(&id, &c, "x.svg", None).await.unwrap();
+    let resp = e.store.serve_read(&bucket, &b, &HeaderMap::new(), false).await;
+    assert_eq!(resp.headers()["content-type"], "image/svg+xml");
+    assert!(resp.headers()["content-security-policy"].to_str().unwrap().starts_with("sandbox"));
+
+    // The stored headers the S3 surface round-trips keep their type there, still sandboxed.
+    let (bucket, b) = e.store.open_for_read(&id, &c, "x.html", None).await.unwrap();
+    let resp = e.store.serve_read_declared(&bucket, &b, &HeaderMap::new(), false).await;
+    assert_eq!(resp.headers()["content-type"], "text/html");
+    assert!(resp.headers()["content-security-policy"].to_str().unwrap().starts_with("sandbox"));
+    assert_eq!(resp.headers()["cache-control"], "public, max-age=99");
 }

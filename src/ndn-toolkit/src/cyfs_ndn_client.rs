@@ -23,11 +23,12 @@ use tokio_util::io::StreamReader;
 
 use ndn_lib::{
     apply_cyfs_req_headers, calculate_qcid_from_file_with_metadata, copy_chunk, cyfs_parse_url,
-    get_cyfs_resp_headers, try_build_named_object_by_json, verify_named_object_from_str,
-    CYFSHttpReqHeaders, CYFSHttpRespHeaders, ChunkHasher, ChunkId, ChunkList, ChunkReader,
-    CyfsParent, CyfsParsedUrl, FileObject, NdnAction, NdnError, NdnProgressCallback, NdnResult,
-    ObjId, PathObject, ProgressCallbackResult, StoreMode, CYFS_CASCADES_MAX_LEN,
-    OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE, OBJ_TYPE_PATH,
+    get_cyfs_resp_headers, ndn_join_path, redact_url_query, try_build_named_object_by_json,
+    verify_named_object_from_str, CYFSHttpReqHeaders, CYFSHttpRespHeaders, ChunkHasher, ChunkId,
+    ChunkList, ChunkReader, CyfsParent, CyfsParsedUrl, FileObject, NdnAction, NdnError, NdnHint,
+    NdnProgressCallback, NdnResult, ObjId, PathObject, ProgressCallbackResult, StoreMode,
+    CYFS_CASCADES_MAX_LEN, NDN_PATH_PREFIX, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
+    OBJ_TYPE_PATH,
 };
 
 // =====================================================================
@@ -287,15 +288,16 @@ impl CyfsHttpTransport for ReqwestCyfsTransport {
                 req = req.header(name, value);
             }
 
+            // The URL may carry a read token in its hint: keep it out of the error.
             let response = req
                 .send()
                 .await
-                .map_err(|e| NdnError::RemoteError(format!("request failed: {}", e)))?;
+                .map_err(|e| NdnError::RemoteError(format!("request failed: {}", e.without_url())))?;
             let status = response.status();
             let headers = response.headers().clone();
             let content_length = response.content_length();
             let stream = response.bytes_stream().map(|result| {
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.without_url().to_string()))
             });
 
             Ok(CyfsTransportResponse {
@@ -364,6 +366,19 @@ pub struct CyfsNdnClient {
     path_verifier: Arc<dyn PathObjectVerifier>,
 }
 
+/// A URL with a `hint` may hold a read token: it is never followed anywhere else.
+fn hint_aware_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().iter().any(|u| u.query_pairs().any(|(k, _)| k == "hint")) {
+            attempt.stop()
+        } else if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 pub struct CyfsNdnClientBuilder {
     http_builder: reqwest::ClientBuilder,
     transport: Option<Arc<dyn CyfsHttpTransport>>,
@@ -377,7 +392,9 @@ pub struct CyfsNdnClientBuilder {
 impl CyfsNdnClientBuilder {
     pub fn new() -> Self {
         Self {
-            http_builder: Client::builder().timeout(std::time::Duration::from_secs(30)),
+            http_builder: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .redirect(hint_aware_redirects()),
             transport: None,
             default_store_mgr: None,
             default_remote_url: None,
@@ -528,13 +545,33 @@ impl CyfsNdnClient {
         self.gen_obj_url(obj_id)
     }
 
+    /// A request for a part of `base`'s object: the same authorization context
+    /// on the same host, none anywhere else.
+    fn related_request(&self, base: &ResolvedUrl, url: String) -> CyfsNdnRequestBuilder {
+        let inherit = base.same_host(&url);
+        let mut request = self.get(url);
+        if inherit {
+            request.req_headers = base.inherited.clone();
+        }
+        request
+    }
+
+    /// The URL of a part reached by `walk`: by path on `/ndn/`, else by its id.
+    fn part_url(&self, base: &ResolvedUrl, obj_id: &ObjId, walk: &str, raw: bool) -> NdnResult<String> {
+        match base.ndn_related_url(obj_id, walk, raw) {
+            Some(url) => Ok(url),
+            None => self.resolve_related_url(base, obj_id),
+        }
+    }
+
     async fn fetch_verified_object_by_id(
         &self,
         base: &ResolvedUrl,
         obj_id: &ObjId,
+        walk: &str,
     ) -> NdnResult<VerifiedObject> {
-        let url = self.resolve_related_url(base, obj_id)?;
-        self.get(url)
+        let url = self.part_url(base, obj_id, walk, true)?;
+        self.related_request(base, url)
             .obj_id(obj_id.clone())
             .send()
             .await?
@@ -631,7 +668,8 @@ impl CyfsNdnRequestBuilder {
             )));
         }
 
-        let resolved_url = ResolvedUrl::parse(&self.url, self.resp_raw)?;
+        let mut resolved_url = ResolvedUrl::parse(&self.url, self.resp_raw)?;
+        resolved_url.inherited = self.req_headers.clone();
         let mut headers = HeaderMap::new();
 
         if let Some(range) = self.range.as_ref() {
@@ -672,7 +710,7 @@ impl CyfsNdnRequestBuilder {
         if !(status.is_success() || status == StatusCode::PARTIAL_CONTENT) {
             return Err(NdnError::from_http_status(
                 status,
-                resolved_url.transport_url.clone(),
+                redact_url_query(&resolved_url.transport_url),
             ));
         }
 
@@ -702,7 +740,8 @@ impl CyfsNdnRequestBuilder {
         self,
         local_path: impl Into<PathBuf>,
     ) -> NdnResult<CyfsPullResult> {
-        self.send()
+        self.for_pull()
+            .send()
             .await?
             .pull(StoreMode::LocalFile(local_path.into(), 0..0, false), None)
             .await
@@ -713,7 +752,8 @@ impl CyfsNdnRequestBuilder {
         local_path: impl Into<PathBuf>,
         store_mgr: &NamedDataMgr,
     ) -> NdnResult<CyfsPullResult> {
-        self.send()
+        self.for_pull()
+            .send()
             .await?
             .pull(
                 StoreMode::LocalFile(local_path.into(), 0..0, true),
@@ -723,10 +763,21 @@ impl CyfsNdnRequestBuilder {
     }
 
     pub async fn pull_to_named_store(self, store_mgr: &NamedDataMgr) -> NdnResult<CyfsPullResult> {
-        self.send()
+        self.for_pull()
+            .send()
             .await?
             .pull(StoreMode::StoreInNamedMgr, Some(store_mgr.clone()))
             .await
+    }
+
+    /// `/ndn/` serves a FileObject's bytes by default; a pull starts from the
+    /// object so it can verify and store it, then fetches its parts by walk.
+    fn for_pull(self) -> Self {
+        if ResolvedUrl::is_ndn_url(&self.url) {
+            self.raw()
+        } else {
+            self
+        }
     }
 }
 
@@ -749,6 +800,23 @@ struct ResolvedUrl {
     parsed_full: Url,
     parsed: CyfsParsedUrl,
     locator: Option<ObjLocator>,
+    /// `/ndn/` URLs: how to reach an object contained in this one.
+    ndn: Option<NdnContext>,
+    /// CYFS request headers, repeated on sub-requests to the same host only.
+    inherited: CYFSHttpReqHeaders,
+}
+
+#[derive(Clone)]
+struct NdnContext {
+    /// The authorization root and the walk to this URL's object.
+    walk: String,
+    token: Option<String>,
+}
+
+impl std::fmt::Debug for NdnContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NdnContext").field("walk", &self.walk).field("token", &self.token.as_ref().map(|_| "***")).finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -789,13 +857,57 @@ impl ResolvedUrl {
             None
         };
 
+        let ndn = Self::ndn_context(&parsed_full, &parsed)?;
         Ok(Self {
             original_url: url.to_string(),
             transport_url,
             parsed_full,
             parsed,
             locator,
+            ndn,
+            inherited: CYFSHttpReqHeaders::default(),
         })
+    }
+
+    fn is_ndn_url(url: &str) -> bool {
+        Url::parse(url).is_ok_and(|u| u.path().starts_with(NDN_PATH_PREFIX))
+    }
+
+    fn ndn_context(full: &Url, parsed: &CyfsParsedUrl) -> NdnResult<Option<NdnContext>> {
+        let Some(obj_id) = parsed.url_obj_id.as_ref().filter(|_| full.path().starts_with(NDN_PATH_PREFIX)) else {
+            return Ok(None);
+        };
+        let hint = match full.query_pairs().find(|(k, _)| k == "hint") {
+            Some((_, raw)) => NdnHint::parse(&raw).map_err(|e| NdnError::InvalidParam(e.to_string()))?,
+            None => NdnHint::default(),
+        };
+        let walk = hint.path.unwrap_or_else(|| {
+            let mut walk = obj_id.to_string();
+            for step in &parsed.inner_path_steps {
+                walk = ndn_join_path(&walk, step);
+            }
+            walk
+        });
+        Ok(Some(NdnContext { walk, token: hint.token }))
+    }
+
+    /// `/ndn/<obj_id>` of an object this URL's object contains, reached by
+    /// `walk` from here; the same host, root and token. `None` off `/ndn/`.
+    fn ndn_related_url(&self, obj_id: &ObjId, walk: &str, raw: bool) -> Option<String> {
+        let ndn = self.ndn.as_ref()?;
+        let mut url = self.parsed_full.clone();
+        url.set_path(&format!("{NDN_PATH_PREFIX}{}", obj_id.to_string()));
+        let hint = NdnHint { path: Some(ndn_join_path(&ndn.walk, walk)), token: ndn.token.clone() };
+        let mut query = hint.to_query().unwrap_or_default();
+        if raw {
+            query.push_str("&resp=raw");
+        }
+        url.set_query(Some(&query));
+        Some(url.to_string())
+    }
+
+    fn same_host(&self, url: &str) -> bool {
+        Url::parse(url).is_ok_and(|u| u.host_str() == self.parsed_full.host_str() && u.port_or_known_default() == self.parsed_full.port_or_known_default())
     }
 
     fn url_obj_id(&self) -> Option<&ObjId> {
@@ -960,8 +1072,8 @@ impl CyfsResponseMeta {
         }
 
         Ok(Self {
-            requested_url: resolved_url.original_url.clone(),
-            transport_url: resolved_url.transport_url.clone(),
+            requested_url: redact_url_query(&resolved_url.original_url),
+            transport_url: redact_url_query(&resolved_url.transport_url),
             known_obj_id,
             url_obj_id: resolved_url.url_obj_id().cloned(),
             url_inner_path_steps: resolved_url.inner_path_steps().to_vec(),
@@ -1414,6 +1526,7 @@ impl CyfsNdnResponse {
                     chunk_list,
                     None,
                     0,
+                    "",
                 )
                 .await;
         }
@@ -1510,7 +1623,7 @@ impl CyfsNdnResponse {
         let header_chunk_size = self.meta.cyfs_headers.chunk_size;
         let is_range_request = self.request.range.is_some();
         let progress_callback = self.request.progress_callback.clone();
-        let original_url = self.request.resolved_url.original_url.clone();
+        let original_url = redact_url_query(&self.request.resolved_url.original_url);
         let mut reader = self.reader();
 
         // For a Range request, the server returns a sub-slice, so full
@@ -1739,13 +1852,24 @@ impl CyfsNdnClient {
         target_store_mgr: Option<NamedDataMgr>,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
     ) -> NdnResult<CyfsPullResult> {
+        if file_obj.content.is_empty() && file_obj.size == 0 {
+            if let Some(store_mgr) = target_store_mgr.as_ref() {
+                store_mgr.put_object(&file_obj_store.obj_id, &file_obj_store.obj_str).await?;
+            }
+            return Ok(CyfsPullResult {
+                obj_id: Some(file_obj_store.obj_id.clone()),
+                total_size: 0,
+                chunk_count: 0,
+                stored_objects: vec![file_obj_store.obj_id],
+            });
+        }
         let content_obj_id = ObjId::new(file_obj.content.as_str())?;
 
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::from_obj_id(&content_obj_id);
-            let url = self.resolve_related_url(base, &chunk_id.to_obj_id())?;
+            let url = self.part_url(base, &chunk_id.to_obj_id(), "content", false)?;
             return self
-                .get(url)
+                .related_request(base, url)
                 .obj_id(chunk_id.to_obj_id())
                 .progress_callback_opt(progress_callback)
                 .send()
@@ -1771,7 +1895,7 @@ impl CyfsNdnClient {
         }
 
         let chunk_list_obj = self
-            .fetch_verified_object_by_id(base, &content_obj_id)
+            .fetch_verified_object_by_id(base, &content_obj_id, "content")
             .await?;
         let chunk_list = ChunkList::from_json_value(chunk_list_obj.obj_json)?;
         let chunklist_store = KnownObjectToStore {
@@ -1789,6 +1913,7 @@ impl CyfsNdnClient {
                 chunk_list,
                 Some(file_obj_store.clone()),
                 file_obj.size,
+                "content/@/",
             )
             .await?;
 
@@ -1803,7 +1928,7 @@ impl CyfsNdnClient {
 
         call_progress_callback(
             &progress_callback,
-            base.original_url.clone(),
+            redact_url_query(&base.original_url),
             NdnAction::FileOK(file_obj_store.obj_id.clone(), file_obj.size),
         )
         .await?;
@@ -1823,6 +1948,7 @@ impl CyfsNdnClient {
         chunk_list: ChunkList,
         file_obj: Option<KnownObjectToStore>,
         file_size: u64,
+        chunk_walk_prefix: &str,
     ) -> NdnResult<CyfsPullResult> {
         let mut local_writer = open_local_writer_if_needed(&pull_mode).await?;
         let mut pending_links = Vec::new();
@@ -1834,16 +1960,17 @@ impl CyfsNdnClient {
                 .await?;
         }
 
-        for chunk_id in chunk_list.body.iter() {
+        for (index, chunk_id) in chunk_list.body.iter().enumerate() {
             let chunk_size = chunk_id.get_length().ok_or_else(|| {
                 NdnError::InvalidData(format!(
                     "chunk {} does not include length",
                     chunk_id.to_string()
                 ))
             })?;
-            let chunk_url = self.resolve_related_url(base, &chunk_id.to_obj_id())?;
+            let walk = format!("{chunk_walk_prefix}{index}");
+            let chunk_url = self.part_url(base, &chunk_id.to_obj_id(), &walk, false)?;
             let chunk_resp = self
-                .get(chunk_url)
+                .related_request(base, chunk_url)
                 .obj_id(chunk_id.to_obj_id())
                 .progress_callback_opt(progress_callback.clone())
                 .send()

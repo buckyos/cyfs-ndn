@@ -19,3 +19,6 @@ mod cyfs_tests;
 
 #[cfg(test)]
 mod ndm_tests;
+
+#[cfg(test)]
+mod ndn_pull_tests;

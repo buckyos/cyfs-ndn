@@ -428,7 +428,7 @@ impl S3Gateway {
         let mut resp = if not_modified {
             empty(StatusCode::NOT_MODIFIED)
         } else {
-            self.store.serve_read(&bucket_now, &b, &headers, ctx.method == Method::HEAD).await
+            self.store.serve_read_declared(&bucket_now, &b, &headers, ctx.method == Method::HEAD).await
         };
         if resp.status().is_client_error() || resp.status().is_server_error() {
             let status = resp.status();

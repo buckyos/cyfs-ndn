@@ -231,6 +231,14 @@ availability 通过 `is_object_stored` 检查：完整本地内容为 local；am
 
 原生 HTTP 读路径对对象执行 `NamedDataMgr::touch`，并节流更新 cache / ambient 绑定的 last_access_at。cache 内容丢失时尝试惰性解绑，返回 404 `content_evicted`；ambient 返回 404 `origin_unavailable`；其他策略返回 `content_not_available`。当前没有按 origin 自动拉取。
 
+### 5.1 响应不扩大授权
+
+`serve_read` 面向与 Desktop 同源的 `/bucket/v1`，用 `ndn_lib` 的 `apply_content_policy`：只有图片、音视频、PDF、纯文本带声明的类型并内联，其余一律 `application/octet-stream` 并强制下载，都带 `nosniff`、`no-referrer` 和 CSP（`sandbox` 兜住 `image/svg+xml`，PDF 例外）。Binding 的 `http_headers` 只回放 PUT 允许存的几项，不能绕过；存的 `Cache-Control` 经 `private_cache_control` 去掉 `public` 等，凭身份或令牌放行的响应不进共享缓存。`serve_read_declared` 给 S3 面用：声明的类型和缓存头原样回放（客户端要 round-trip），同样带 `sandbox`。
+
+### 5.2 `/ndn/` 读取核心（`ndn_read.rs`）
+
+buckyos 设计 §4.6.5 的读取部分。宿主判定授权根（公开桶命中 `ndn_bound_in`，或 `ndn_token_covers`：只读、单 key、未绑定主体、无 `max_uses`、未撤销未过期，且当前绑定等于授权根），`serve_ndn` 负责其余：路径只走 `File.content`、`ChunkList[i]`、`Dir` 子项，走完必须等于 URL 的对象；FileObject 返回文件字节，ChunkList 拼接，Chunk 原样，其他对象规范 JSON；Range 三种形式、多段回落整体、416、HEAD、`If-None-Match`、`If-Range`，`resp=raw` 返回对象 JSON。`hint` 的规范形式和 URL 构造在 `ndn_lib::NdnHint`，服务端、`CyfsNdnClient` 和 `buckyos_api::ndn_read_url` 共用一份。
+
 ## 6. 权限与能力令牌
 
 权限实现位于 [access.rs](../src/bucket_store/src/access.rs)。动作集为 `list`、`read`、`create`、`write`、`delete`、`manage`；write 蕴含 create，其他动作不自动互相蕴含。

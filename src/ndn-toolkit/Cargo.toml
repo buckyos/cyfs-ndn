@@ -46,6 +46,7 @@ name-client = { workspace = true }
 buckyos-kit = { workspace = true }
 buckyos-http-server = { workspace = true }
 [dev-dependencies]
+bucket_store = { path = "../bucket_store" }
 tempfile = { workspace = true }
 url = { workspace = true }
 base64 = "0.22"

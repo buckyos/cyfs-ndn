@@ -500,6 +500,8 @@ pub struct DeleteResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Availability {
+    /// An ambient binding's content is on its way from its origin.
+    Fetching,
     Local,
     Evicted,
     Remote,

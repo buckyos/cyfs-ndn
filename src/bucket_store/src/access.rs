@@ -683,6 +683,22 @@ impl Access<'_> {
         self.find_token(token)?.ok_or(BucketError::TokenInvalid)
     }
 
+    /// The `(bucket, key)` of a token `/ndn/` accepts: read-only, one key, bound to
+    /// no principal, live, and without `max_uses` (one pull is many requests, and
+    /// nothing counts them there, so a limited token would silently be unlimited).
+    pub fn ndn_read_token(&self, token: &str) -> BucketResult<Option<(BucketId, String)>> {
+        let Some(t) = self.find_token(token)? else { return Ok(None) };
+        let read_only = t.actions.iter().eq([Action::Read]);
+        let usable = read_only
+            && t.prefix.is_none()
+            && t.bind_user_id.is_none()
+            && t.bind_app_id.is_none()
+            && t.max_uses.is_none()
+            && t.revoked_at.is_none()
+            && t.expires_at > now_ms();
+        Ok(t.key.filter(|_| usable).map(|key| (t.bucket_id, key)))
+    }
+
     pub async fn create_token(&self, bucket: &BucketInfo, caller: &Caller, req: TokenRequest) -> BucketResult<IssuedToken> {
         let now = now_ms();
         let target = match (&req.key, &req.prefix) {
@@ -896,10 +912,20 @@ impl crate::store::BucketStore {
         self.access().revoke_token(&bucket, caller, token_id).await
     }
 
+    /// A manager sees every token of the bucket; an issuer always sees what it
+    /// issued, so it can revoke it (a service on a user's documents bucket, say).
     pub async fn list_access_tokens(&self, id: &BucketId, caller: &Caller) -> BucketResult<Vec<AccessToken>> {
         let bucket = self.bucket(id)?;
-        self.access().require_manage(&bucket, caller).await?;
-        self.access().list_tokens(id)
+        let managed = self.access().require_manage(&bucket, caller).await;
+        let tokens = self.access().list_tokens(id)?;
+        if managed.is_ok() {
+            return Ok(tokens);
+        }
+        if caller.user.is_none() && caller.app.is_none() {
+            return managed.map(|_| Vec::new());
+        }
+        let me = caller.principal();
+        Ok(tokens.into_iter().filter(|t| t.created_by == me).collect())
     }
 
     /// What a presented `bkt_` token is for (routing token-only data-plane requests).
