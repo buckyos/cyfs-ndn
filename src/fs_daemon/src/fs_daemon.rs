@@ -1228,6 +1228,7 @@ fn map_ndn_err(err: NdnError) -> i32 {
         NdnError::IoError(_) => EIO,
         NdnError::DbError(_) | NdnError::SqliteError { .. } => EIO,
         NdnError::OffsetTooLarge(_) => EINVAL,
+        NdnError::TooLarge(_) => libc::EFBIG,
         NdnError::InvalidObjType(_) => EINVAL,
         NdnError::InvalidData(_) => EINVAL,
         NdnError::Internal(_) => EIO,

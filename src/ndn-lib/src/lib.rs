@@ -82,6 +82,9 @@ pub enum NdnError {
     DecodeError(String),
     #[error("offset too large: {0}")]
     OffsetTooLarge(String),
+    /// The content is over the limit the caller set; none of it was fetched.
+    #[error("content too large: {0}")]
+    TooLarge(String),
     #[error("invalid obj type: {0}")]
     InvalidObjType(String),
 

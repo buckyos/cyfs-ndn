@@ -230,6 +230,118 @@ async fn a_source_without_chunks_never_counts_as_complete_even_with_local_copies
     assert!(r.is_err());
 }
 
+/// A file whose `size` says one thing and whose content is `pieces`.
+async fn file_declaring(store: &BucketStore, size: u64, pieces: &[&[u8]]) -> ObjId {
+    let mut chunks = Vec::new();
+    for piece in pieces {
+        let id = chunk_id(piece);
+        store.ndm().put_chunk(&id, piece).await.unwrap();
+        chunks.push(id);
+    }
+    let content = if let [only] = chunks.as_slice() {
+        only.to_string()
+    } else {
+        let (list, list_str) = ChunkList::from_chunk_list(chunks).unwrap().gen_obj_id();
+        store.ndm().put_object(&list, &list_str).await.unwrap();
+        list.to_string()
+    };
+    let (file, body) = FileObject::new("f.bin".into(), size, content).gen_obj_id();
+    store.ndm().put_object(&file, &body).await.unwrap();
+    file
+}
+
+#[tokio::test]
+async fn a_limited_pull_counts_the_chunks_not_what_the_file_declares() {
+    let e = env().await;
+    let lying = file_declaring(&e.source, 3, &[b"first-", b"second-", b"third"]).await;
+    let lying_one = file_declaring(&e.source, 3, &[b"far more than three bytes"]).await;
+    let honest = file_declaring(&e.source, 18, &[b"first-", b"second-", b"third"]).await;
+    let declares_big = file_declaring(&e.source, 1024, &[b"small"]).await;
+    for (key, id) in [("a/lying", &lying), ("a/one", &lying_one), ("a/honest", &honest), ("a/big", &declares_big)] {
+        let req = PutRequest { key: key.into(), obj_id: id.to_string(), ..Default::default() };
+        e.source.put(&e.public, &Caller::system(), req).await.unwrap();
+    }
+    let url = |id: &ObjId| format!("https://zone-a.example/ndn/{}", id.to_string());
+    let pull = |id: ObjId, limit: u64| {
+        let (client, transport) = client(e.source.clone(), e.public.clone(), false);
+        let target = e.target.clone();
+        let url = url(&id);
+        async move {
+            let result = client.get(url).max_bytes(limit).pull_to_named_store(&target).await;
+            let chunks = transport.requests.lock().unwrap().iter().filter(|(u, _)| u.contains("/ndn/mix")).count();
+            (result, chunks)
+        }
+    };
+
+    // Over the limit by its chunks: refused with no chunk requested, nothing kept.
+    let (result, chunks) = pull(lying.clone(), 10).await;
+    assert!(matches!(result, Err(NdnError::TooLarge(_))), "{:?}", result.err());
+    assert_eq!(chunks, 0);
+    assert!(!e.target.is_object_stored(&lying, None).await.unwrap());
+    let (result, chunks) = pull(lying_one.clone(), 10).await;
+    assert!(matches!(result, Err(NdnError::TooLarge(_))), "{:?}", result.err());
+    assert_eq!(chunks, 0);
+    // Within the limit but not what it declares: a failed verification.
+    let (result, chunks) = pull(lying.clone(), 100).await;
+    assert!(matches!(result, Err(NdnError::VerifyError(_))), "{:?}", result.err());
+    assert_eq!(chunks, 0);
+    let (result, _) = pull(lying_one.clone(), 100).await;
+    assert!(matches!(result, Err(NdnError::VerifyError(_))), "{:?}", result.err());
+    // The declared size alone can also be over.
+    let (result, chunks) = pull(declares_big.clone(), 100).await;
+    assert!(matches!(result, Err(NdnError::TooLarge(_))), "{:?}", result.err());
+    assert_eq!(chunks, 0);
+    // Exactly what it says, at the limit, pulls.
+    let (result, chunks) = pull(honest.clone(), 18).await;
+    assert_eq!(result.unwrap().total_size, 18);
+    assert_eq!(chunks, 3);
+    assert_eq!(read_all(&e.target, &honest).await, b"first-second-third");
+}
+
+#[tokio::test]
+async fn a_limited_pull_refuses_a_chunk_without_a_length() {
+    let e = env().await;
+    let bytes = b"no length in this id";
+    let raw = ChunkHasher::new(None).unwrap().calc_from_bytes(bytes);
+    let plain = ChunkId::from_sha256_result(&raw);
+    assert_eq!(plain.get_length(), None);
+    e.source.ndm().put_chunk(&plain, bytes).await.unwrap();
+    let (file, body) = FileObject::new("p.bin".into(), bytes.len() as u64, plain.to_string()).gen_obj_id();
+    e.source.ndm().put_object(&file, &body).await.unwrap();
+    let req = PutRequest { key: "a/plain".into(), obj_id: file.to_string(), ..Default::default() };
+    e.source.put(&e.public, &Caller::system(), req).await.unwrap();
+    let (client, transport) = client(e.source.clone(), e.public.clone(), false);
+    let url = format!("https://zone-a.example/ndn/{}", file.to_string());
+    let result = client.get(url).max_bytes(1024).pull_to_named_store(&e.target).await;
+    assert!(matches!(result, Err(NdnError::VerifyError(_))), "{:?}", result.err());
+    assert!(!transport.requests.lock().unwrap().iter().any(|(u, _)| u.contains("/ndn/sha256")));
+}
+
+/// A source that never stops talking.
+struct EndlessSource;
+
+impl CyfsHttpTransport for EndlessSource {
+    fn send(&self, _: CyfsTransportRequest) -> Pin<Box<dyn std::future::Future<Output = ndn_lib::NdnResult<CyfsTransportResponse>> + Send + '_>> {
+        Box::pin(async move {
+            Ok(CyfsTransportResponse {
+                status: reqwest::StatusCode::OK,
+                headers: HeaderMap::new(),
+                content_length: None,
+                body: Box::pin(tokio::io::repeat(b' ')),
+            })
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_endless_object_body_is_not_read_to_its_end() {
+    let (file, _) = FileObject::new("f.bin".into(), 1, "mix256:x".into()).gen_obj_id();
+    let client = CyfsNdnClient::builder().transport(EndlessSource).build().unwrap();
+    let url = format!("https://zone-a.example/ndn/{}", file.to_string());
+    let answer = client.get(url).raw().send().await.unwrap().object_string().await;
+    assert!(matches!(answer, Err(NdnError::InvalidData(_))), "{:?}", answer.err());
+}
+
 #[tokio::test]
 async fn sub_requests_inherit_cyfs_headers_only_on_the_same_host() {
     let e = env().await;
