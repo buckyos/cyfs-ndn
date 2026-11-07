@@ -507,6 +507,7 @@ impl CyfsNdnClient {
             progress_callback: None,
             req_headers: CYFSHttpReqHeaders::default(),
             resp_raw: false,
+            max_bytes: None,
         }
     }
 
@@ -600,6 +601,7 @@ pub struct CyfsNdnRequestBuilder {
     progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
     req_headers: CYFSHttpReqHeaders,
     resp_raw: bool,
+    max_bytes: Option<u64>,
 }
 
 impl CyfsNdnRequestBuilder {
@@ -640,6 +642,15 @@ impl CyfsNdnRequestBuilder {
 
     pub fn access_code(mut self, code: impl Into<String>) -> Self {
         self.req_headers.access_code = Some(code.into());
+        self
+    }
+
+    /// A pull refuses content over `limit` before fetching any of it
+    /// (`NdnError::TooLarge`). A FileObject's `size` is the sender's word, so the
+    /// length comes from the chunk ids themselves: one without a length is
+    /// refused, and a `size` that disagrees is a verification failure.
+    pub fn max_bytes(mut self, limit: u64) -> Self {
+        self.max_bytes = Some(limit);
         self
     }
 
@@ -730,6 +741,7 @@ impl CyfsNdnRequestBuilder {
                 resolved_url,
                 progress_callback: self.progress_callback,
                 range: self.range,
+                max_bytes: self.max_bytes,
             },
             meta,
             response,
@@ -790,6 +802,7 @@ struct RequestContext {
     resolved_url: ResolvedUrl,
     progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
     range: Option<Range<u64>>,
+    max_bytes: Option<u64>,
 }
 
 /// URL parsed with full knowledge of CYFS semantics.
@@ -1365,7 +1378,12 @@ impl CyfsNdnResponse {
         let transport_url = self.meta.transport_url.clone();
         let mut reader = self.reader();
         let mut raw = Vec::new();
-        reader.read_to_end(&mut raw).await?;
+        (&mut reader).take(MAX_OBJECT_BODY_BYTES + 1).read_to_end(&mut raw).await?;
+        if raw.len() as u64 > MAX_OBJECT_BODY_BYTES {
+            return Err(NdnError::InvalidData(format!(
+                "object body is over {MAX_OBJECT_BODY_BYTES} bytes"
+            )));
+        }
         let obj_str = String::from_utf8(raw)
             .map_err(|e| NdnError::DecodeError(format!("response body is not utf-8: {}", e)))?;
 
@@ -1401,7 +1419,11 @@ impl CyfsNdnResponse {
     async fn into_verified_chunk_bytes(self, chunk_id: ChunkId) -> NdnResult<Vec<u8>> {
         let mut reader = self.reader();
         let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes).await?;
+        // A source that sends more than the id says is not read to its end.
+        match chunk_id.get_length() {
+            Some(length) => (&mut reader).take(length.saturating_add(1)).read_to_end(&mut bytes).await?,
+            None => reader.read_to_end(&mut bytes).await?,
+        };
         verify_chunk_bytes(&chunk_id, bytes.as_slice())?;
         Ok(bytes)
     }
@@ -1446,6 +1468,9 @@ impl CyfsNdnResponse {
                     metadata_to_store,
                     file_action,
                 } => {
+                    if let Some(limit) = self.request.max_bytes {
+                        check_pull_limit(limit, std::iter::once(&chunk_id), None)?;
+                    }
                     self.pull_raw_chunk(
                         chunk_id,
                         pull_mode,
@@ -1462,6 +1487,9 @@ impl CyfsNdnResponse {
                     file_action,
                     file_size,
                 } => {
+                    if let Some(limit) = self.request.max_bytes {
+                        check_pull_limit(limit, chunk_list.body.iter(), Some(file_size))?;
+                    }
                     let mut result = self
                         .pull_raw_chunk_list(
                             chunk_list,
@@ -1504,6 +1532,7 @@ impl CyfsNdnResponse {
                     pull_mode,
                     target_store_mgr,
                     request.progress_callback,
+                    request.max_bytes,
                 )
                 .await;
         }
@@ -1513,6 +1542,9 @@ impl CyfsNdnResponse {
             let client = self.client.clone();
             let verified_obj = self.into_verified_object().await?;
             let chunk_list = ChunkList::from_json_value(verified_obj.obj_json)?;
+            if let Some(limit) = request.max_bytes {
+                check_pull_limit(limit, chunk_list.body.iter(), None)?;
+            }
             return client
                 .pull_chunk_list_by_object(
                     &request.resolved_url,
@@ -1851,7 +1883,11 @@ impl CyfsNdnClient {
         pull_mode: StoreMode,
         target_store_mgr: Option<NamedDataMgr>,
         progress_callback: Option<Arc<Mutex<NdnProgressCallback>>>,
+        max_bytes: Option<u64>,
     ) -> NdnResult<CyfsPullResult> {
+        if let Some(limit) = max_bytes.filter(|limit| file_obj.size > *limit) {
+            return Err(NdnError::TooLarge(format!("the file declares {} bytes, over {limit}", file_obj.size)));
+        }
         if file_obj.content.is_empty() && file_obj.size == 0 {
             if let Some(store_mgr) = target_store_mgr.as_ref() {
                 store_mgr.put_object(&file_obj_store.obj_id, &file_obj_store.obj_str).await?;
@@ -1867,6 +1903,9 @@ impl CyfsNdnClient {
 
         if content_obj_id.is_chunk() {
             let chunk_id = ChunkId::from_obj_id(&content_obj_id);
+            if let Some(limit) = max_bytes {
+                check_pull_limit(limit, std::iter::once(&chunk_id), Some(file_obj.size))?;
+            }
             let url = self.part_url(base, &chunk_id.to_obj_id(), "content", false)?;
             return self
                 .related_request(base, url)
@@ -1898,6 +1937,9 @@ impl CyfsNdnClient {
             .fetch_verified_object_by_id(base, &content_obj_id, "content")
             .await?;
         let chunk_list = ChunkList::from_json_value(chunk_list_obj.obj_json)?;
+        if let Some(limit) = max_bytes {
+            check_pull_limit(limit, chunk_list.body.iter(), Some(file_obj.size))?;
+        }
         let chunklist_store = KnownObjectToStore {
             obj_id: chunk_list_obj.obj_id.clone(),
             obj_str: chunk_list_obj.obj_str.clone(),
@@ -2048,6 +2090,31 @@ impl CyfsNdnClient {
 // =====================================================================
 // Utilities
 // =====================================================================
+
+/// A source decides how long a body is: a named object, a ChunkList of a very large file
+/// included, is far below this.
+const MAX_OBJECT_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether content made of `chunks` may be pulled under `limit`: their own
+/// lengths decide, and `declared` (a FileObject's `size`) must agree with them.
+fn check_pull_limit<'a>(limit: u64, chunks: impl Iterator<Item = &'a ChunkId>, declared: Option<u64>) -> NdnResult<()> {
+    let mut total = 0u64;
+    for chunk in chunks {
+        let length = chunk
+            .get_length()
+            .ok_or_else(|| NdnError::VerifyError(format!("chunk {} does not include length", chunk.to_string())))?;
+        total = total
+            .checked_add(length)
+            .ok_or_else(|| NdnError::TooLarge(format!("the content is over {limit} bytes")))?;
+    }
+    if total > limit {
+        return Err(NdnError::TooLarge(format!("the content is {total} bytes, over {limit}")));
+    }
+    if declared.is_some_and(|declared| declared != total) {
+        return Err(NdnError::VerifyError(format!("declared size {} does not match the {total} bytes of its chunks", declared.unwrap_or_default())));
+    }
+    Ok(())
+}
 
 fn resolve_target_store_mgr(
     pull_mode: &StoreMode,
