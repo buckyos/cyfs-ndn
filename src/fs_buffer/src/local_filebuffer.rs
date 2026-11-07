@@ -13,8 +13,9 @@ use named_store::{
 };
 use ndn_lib::{
     caculate_qcid_from_file, calc_quick_hash, calculate_file_chunk_id,
-    calculate_qcid_from_file_with_metadata, ChunkHasher, ChunkId, ChunkList, FileObject,
-    NamedObject, NdnError, NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
+    calculate_qcid_from_file_with_metadata, probe_local_file_media_meta, probe_media_meta,
+    ChunkHasher, ChunkId, ChunkList, FileObject, MediaByteSource, MediaMeta, NamedObject, NdnError,
+    NdnResult, ObjId, CHUNK_DEFAULT_SIZE,
 };
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -121,6 +122,40 @@ struct ChunkSegment {
     chunk_id: ChunkId,
     offset: u64,
     size: u64,
+}
+
+/// The merged view of an overlay: the diff file over the base chunks.
+struct OverlayByteSource<'a> {
+    named_store_mgr: Arc<NamedDataMgr>,
+    base_chunk_ids: &'a [ChunkId],
+    writer_state: &'a DiffChunkListWriterState,
+}
+
+#[async_trait]
+impl MediaByteSource for OverlayByteSource<'_> {
+    fn size(&self) -> u64 {
+        self.writer_state.total_size
+    }
+
+    async fn read_at(&self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        let base_chunk_list = LocalFileBufferService::simple_chunk_list_from_ids_with_sizes(
+            self.base_chunk_ids.to_vec(),
+            &self.writer_state.base_chunk_sizes,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut reader = DiffChunkListReader::from_writer_state(
+            self.named_store_mgr.clone(),
+            base_chunk_list,
+            self.writer_state,
+            std::io::SeekFrom::Start(offset),
+            None,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut out = vec![0u8; length];
+        reader.read_exact(&mut out).await?;
+        Ok(out)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -552,17 +587,19 @@ impl LocalFileBufferService {
         diff_file_path: &PathBuf,
         merged_chunk_list: ChunkList,
         merged_chunk_sizes: &[u64],
+        media_meta: &MediaMeta,
         logical_qcid: Option<ChunkId>,
         existing_linked_at: Option<u64>,
     ) -> NdnResult<FinalizeData> {
         let content_layout = self.overlay_content_layout(merged_chunk_list, merged_chunk_sizes)?;
         let file_size: u64 = merged_chunk_sizes.iter().sum();
         let content_obj_id = content_layout.content_obj_id();
-        let file_obj = FileObject::new(
+        let mut file_obj = FileObject::new(
             format!("inode-{}", file_inode_id),
             file_size,
             content_obj_id.to_string(),
         );
+        file_obj.apply_media_meta(media_meta);
         let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
 
         Ok(FinalizeData {
@@ -597,26 +634,36 @@ impl LocalFileBufferService {
             .map_err(|_| NdnError::InvalidState("filebuffer diff_state poisoned".to_string()))?
             .clone();
         let writer_state = self.overlay_writer_state(fb, &base_chunk_ids, &diff_state)?;
-        let logical_qcid = if let Some(named_store_mgr) = self.get_named_store_mgr()? {
+        let (logical_qcid, media_meta) = if let Some(named_store_mgr) = self.get_named_store_mgr()? {
             let base_chunk_list = Self::simple_chunk_list_from_ids_with_sizes(
                 base_chunk_ids.clone(),
                 &writer_state.base_chunk_sizes,
             )?;
             let mut reader = DiffChunkListReader::from_writer_state(
-                named_store_mgr,
+                named_store_mgr.clone(),
                 base_chunk_list,
                 &writer_state,
                 std::io::SeekFrom::Start(0),
                 None,
             )
             .await?;
-            Some(calc_quick_hash(&mut reader, Some(writer_state.total_size)).await?)
+            let logical_qcid = calc_quick_hash(&mut reader, Some(writer_state.total_size)).await?;
+            let source = OverlayByteSource {
+                named_store_mgr,
+                base_chunk_ids: &base_chunk_ids,
+                writer_state: &writer_state,
+            };
+            let name = format!("inode-{}", fb.file_inode_id);
+            let media_meta = probe_media_meta(&source, &name, None).await;
+            (Some(logical_qcid), media_meta)
         } else {
+            // The base chunks are out of reach, so only part of the merged bytes
+            // could be read: nothing about the file can be stated for certain.
             log::warn!(
                 "overlay logical qcid unavailable without named_store_mgr, inode={}",
                 fb.file_inode_id
             );
-            None
+            (None, MediaMeta::default())
         };
         let merged_state = DiffChunkListWriter::rebuild_merged_state_from_writer_state(
             &base_chunk_ids,
@@ -628,6 +675,7 @@ impl LocalFileBufferService {
             &fb.diff_file_path,
             merged_state.merged_chunk_list,
             &merged_state.merged_chunk_sizes,
+            &media_meta,
             logical_qcid,
             existing_linked_at,
         )?;
@@ -837,11 +885,10 @@ impl LocalFileBufferService {
             .calculate_content_layout(diff_file_path, file_size)
             .await?;
         let content_obj_id = content_layout.content_obj_id();
-        let file_obj = FileObject::new(
-            format!("inode-{}", file_inode_id),
-            file_size,
-            content_obj_id.to_string(),
-        );
+        let name = format!("inode-{}", file_inode_id);
+        let media_meta = probe_local_file_media_meta(diff_file_path, &name, None).await;
+        let mut file_obj = FileObject::new(name, file_size, content_obj_id.to_string());
+        file_obj.apply_media_meta(&media_meta);
         let (file_obj_id, file_obj_str) = file_obj.gen_obj_id();
         let logical_qcid = Some(caculate_qcid_from_file(diff_file_path).await?);
 
@@ -1763,6 +1810,103 @@ mod tests {
 
         // idempotent
         service.finalize(fb.handle_id.clone()).await.unwrap();
+    }
+
+    // A file written through a buffer is named `inode-N`: only its bytes can tell the type.
+    #[tokio::test]
+    async fn test_finalized_file_object_carries_the_common_meta() {
+        let dir = tempdir().unwrap();
+        let store_mgr = create_test_store_mgr(dir.path()).await;
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0)
+            .with_named_store_mgr(store_mgr.clone());
+        let fb = service
+            .alloc_buffer(&NfsPath("/photo.gif".to_string()), 110, vec![], &test_lease(), Some(64))
+            .await
+            .unwrap();
+        let gif = b"GIF89a\x03\x00\x02\x00\x00\x00\x00";
+        service.append(&fb, gif).await.unwrap();
+        service.close(&fb).await.unwrap();
+        assert!(service.cacl_name(&fb).await.unwrap());
+
+        let mut file_obj = FileObject::new(
+            format!("inode-{}", fb.file_inode_id),
+            gif.len() as u64,
+            ChunkHasher::new(None)
+                .unwrap()
+                .calc_mix_chunk_id_from_bytes(gif)
+                .unwrap()
+                .to_obj_id()
+                .to_string(),
+        );
+        file_obj.apply_media_meta(&MediaMeta {
+            mime: Some("image/gif".to_string()),
+            width: Some(3),
+            height: Some(2),
+            ..MediaMeta::default()
+        });
+        let record = service.get_buffer(&fb.handle_id).await.unwrap();
+        let linked = record.diff_state.read().unwrap().linked_obj_id.clone();
+        assert_eq!(linked, Some(file_obj.gen_obj_id().0));
+    }
+
+    // Overlay: the bytes come from the diff file, read through the merged view.
+    #[tokio::test]
+    async fn test_overlay_file_object_probes_the_merged_view() {
+        let dir = tempdir().unwrap();
+        let store_mgr = create_test_store_mgr(dir.path()).await;
+        let service = LocalFileBufferService::new(dir.path().to_path_buf(), 0)
+            .with_named_store_mgr(store_mgr.clone());
+        let base_chunk_bytes = b"base-chunk";
+        let base_chunk = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(base_chunk_bytes)
+            .unwrap();
+        store_mgr
+            .put_chunk(&base_chunk, base_chunk_bytes)
+            .await
+            .unwrap();
+        let gif = b"GIF89a\x03\x00\x02\x00\x00\x00\x00";
+        let fb = service
+            .alloc_buffer(
+                &NfsPath("/overlay.gif".to_string()),
+                111,
+                vec![base_chunk.clone()],
+                &test_lease(),
+                None,
+            )
+            .await
+            .unwrap();
+        fs::write(&fb.diff_file_path, gif).await.unwrap();
+        {
+            let mut state = fb.diff_state.write().unwrap();
+            state.chunk_indices = vec![0];
+            state.diff_chunk_sizes = vec![gif.len() as u64];
+            state.base_chunk_sizes = vec![base_chunk.get_length().unwrap()];
+            state.merged_chunk_sizes = vec![gif.len() as u64];
+            state.total_size = gif.len() as u64;
+            state.position = state.total_size;
+        }
+        service.flush(&fb).await.unwrap();
+        assert!(service.cacl_name(&fb).await.unwrap());
+
+        let dirty_chunk = ChunkHasher::new(None)
+            .unwrap()
+            .calc_mix_chunk_id_from_bytes(gif)
+            .unwrap();
+        let mut file_obj = FileObject::new(
+            format!("inode-{}", fb.file_inode_id),
+            gif.len() as u64,
+            dirty_chunk.to_obj_id().to_string(),
+        );
+        file_obj.apply_media_meta(&MediaMeta {
+            mime: Some("image/gif".to_string()),
+            width: Some(3),
+            height: Some(2),
+            ..MediaMeta::default()
+        });
+        let record = service.get_buffer(&fb.handle_id).await.unwrap();
+        let linked = record.diff_state.read().unwrap().linked_obj_id.clone();
+        assert_eq!(linked, Some(file_obj.gen_obj_id().0));
     }
 
     #[tokio::test]

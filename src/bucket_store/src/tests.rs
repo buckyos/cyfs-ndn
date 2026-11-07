@@ -708,6 +708,49 @@ fn futures_are_send(store: Arc<BucketStore>, c: Caller, id: BucketId) {
     send(store.set_quota(&id, &c, QuotaUpdate::default(), false));
 }
 
+// A 3x2 GIF, whatever the name and declared type say.
+const GIF_3X2: &[u8] = b"GIF89a\x03\x00\x02\x00\x00\x00\x00";
+
+#[tokio::test]
+async fn store_bytes_writes_the_common_meta() {
+    let e = env().await;
+    let (obj, _) = store_bytes(e.store.ndm(), "photo.txt", GIF_3X2, Some("text/plain; charset=utf-8")).await.unwrap();
+    assert_eq!(obj.meta["mime"], "image/gif");
+    assert_eq!(obj.meta["width"], 3);
+    assert_eq!(obj.meta["height"], 2);
+    let (text, _) = store_bytes(e.store.ndm(), "note.bin", b"plain words", Some("text/markdown; charset=utf-8")).await.unwrap();
+    assert_eq!(text.meta["mime"], "text/markdown");
+    assert!(!text.meta.contains_key("width"));
+    let (unknown, _) = store_bytes(e.store.ndm(), "blob.bin", b"\x01\x02\x03\x04", Some("application/octet-stream")).await.unwrap();
+    assert!(!unknown.meta.contains_key("mime"), "never written as octet-stream");
+}
+
+// The chunks of a multipart upload are read back through the store, also when
+// the bytes the parser wants sit in the second chunk.
+#[tokio::test]
+async fn put_chunks_probes_the_stored_content() {
+    let e = env().await;
+    let id = user_bucket("photos", "alice", "multi");
+    e.store.ensure_bucket(&id, &decl("data", "app_data", serde_json::json!({}))).unwrap();
+    let c = caller("alice", "photos", &[(&id, RW)]);
+    let stored = |bytes: Vec<u8>| {
+        let chunk_id = crate::content::chunk_id_of(&bytes).unwrap();
+        let ndm = e.store.ndm();
+        async move {
+            ndm.put_chunk(&chunk_id, &bytes).await.unwrap();
+            chunk_id
+        }
+    };
+    let first = stored(GIF_3X2[..8].to_vec()).await;
+    let second = stored(GIF_3X2[8..].to_vec()).await;
+    let req = PutRequest { key: "dir/photo.gif".into(), content_type: Some("image/gif; x=y".into()), ..Default::default() };
+    let put = e.store.put_chunks(&id, &c, vec![first, second], GIF_3X2.len() as u64, req).await.unwrap();
+    let obj_id = ObjId::new(&put.etag).unwrap();
+    let file: ndn_lib::FileObject = ndn_lib::load_named_obj(&e.store.ndm().get_object(&obj_id).await.unwrap()).unwrap();
+    assert_eq!(file.meta["mime"], "image/gif");
+    assert_eq!((&file.meta["width"], &file.meta["height"]), (&serde_json::json!(3), &serde_json::json!(2)));
+}
+
 mod ndn {
     use super::*;
     use crate::content::chunk_id_of;

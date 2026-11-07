@@ -39,8 +39,8 @@ use tokio::sync::mpsc;
 use named_store::{ChunkLocalInfo, NamedDataMgr};
 use ndn_lib::{
     apply_cyfs_resp_headers, caculate_qcid_from_file, calculate_file_chunk_id,
-    calculate_qcid_from_file_with_metadata, named_obj_to_jwt, try_build_named_object_by_json,
-    CYFSHttpRespHeaders, ChunkId, ChunkReader, ChunkType, CyfsParent, DirObject, FileObject,
+    calculate_qcid_from_file_with_metadata, named_obj_to_jwt, probe_local_file_media_meta,
+    try_build_named_object_by_json, CYFSHttpRespHeaders, ChunkId, ChunkReader, ChunkType, CyfsParent, DirObject, FileObject,
     NdnError, NdnResult, ObjId, PathObject, OBJ_TYPE_CHUNK_LIST, OBJ_TYPE_DIR, OBJ_TYPE_FILE,
 };
 
@@ -992,6 +992,7 @@ impl NdnDirServer {
         }
 
         let mut file_obj = FileObject::new(file_name.clone(), chunk_size, chunk_id.to_string());
+        file_obj.apply_media_meta(&probe_local_file_media_meta(file_path, &file_name, None).await);
         apply_template_to_file(&mut file_obj, template);
         let file_json = serde_json::to_value(&file_obj)
             .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;
@@ -1182,7 +1183,9 @@ impl NdnDirServer {
         self.register_chunk_in_store(file_path, &chunk_id, chunk_size)
             .await?;
 
+        let media_meta = probe_local_file_media_meta(file_path, &file_name, None).await;
         let mut file_obj = FileObject::new(file_name, chunk_size, chunk_id.to_string());
+        file_obj.apply_media_meta(&media_meta);
         apply_template_to_file(&mut file_obj, template);
         let file_json = serde_json::to_value(&file_obj)
             .map_err(|e| NdnError::Internal(format!("serialize FileObject failed: {}", e)))?;

@@ -239,6 +239,39 @@ pub struct NamedDataMgr {
     resolve_next_obj_cache: Arc<Mutex<ResolveNextObjCache>>,
 }
 
+/// Random access to the content of a stored file: its chunk or chunk list.
+pub struct NamedContentByteSource<'a> {
+    ndm: &'a NamedDataMgr,
+    content: ObjId,
+    size: u64,
+}
+
+impl<'a> NamedContentByteSource<'a> {
+    pub fn new(ndm: &'a NamedDataMgr, content: ObjId, size: u64) -> Self {
+        Self { ndm, content, size }
+    }
+}
+
+#[async_trait::async_trait]
+impl ndn_lib::MediaByteSource for NamedContentByteSource<'_> {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    async fn read_at(&self, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        let opened = if self.content.is_chunk() {
+            let chunk_id = ChunkId::from_obj_id(&self.content);
+            self.ndm.open_chunk_reader(&chunk_id, offset).await
+        } else {
+            self.ndm.open_chunklist_reader(&self.content, offset).await
+        };
+        let (mut reader, _) = opened.map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut out = vec![0u8; length];
+        tokio::io::AsyncReadExt::read_exact(&mut reader, &mut out).await?;
+        Ok(out)
+    }
+}
+
 impl NamedDataMgr {
     pub async fn get_store_mgr(
         store_config_path: &Path,

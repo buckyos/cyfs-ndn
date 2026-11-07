@@ -285,10 +285,16 @@ impl BucketStore {
                 list_id.to_string()
             }
         };
+        let declared = req.content_type.as_deref();
+        let media_meta = if content.is_empty() {
+            ndn_lib::probe_media_meta(&ndn_lib::MemoryByteSource::new(&[]), &name, declared).await
+        } else {
+            let content_id = ndn_lib::ObjId::new(&content).map_err(store_err)?;
+            let source = named_store::NamedContentByteSource::new(&self.ndm, content_id, size);
+            ndn_lib::probe_media_meta(&source, &name, declared).await
+        };
         let mut file = ndn_lib::FileObject::new(name, size, content);
-        if let Some(m) = &req.content_type {
-            file.meta.insert("mime".into(), serde_json::json!(m));
-        }
+        file.apply_media_meta(&media_meta);
         let (obj_id, body) = ndn_lib::NamedObject::gen_obj_id(&file);
         self.ndm.put_object(&obj_id, &body).await.map_err(store_err)?;
         req.obj_id = obj_id.to_string();

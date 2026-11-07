@@ -2,7 +2,7 @@
 
 use crate::error::*;
 use named_store::NamedDataMgr;
-use ndn_lib::{load_named_obj, ChunkHasher, ChunkId, ChunkList, FileObject, NamedObject, ObjId, CHUNK_DEFAULT_SIZE};
+use ndn_lib::{load_named_obj, probe_media_meta, ChunkHasher, ChunkId, ChunkList, FileObject, MemoryByteSource, NamedObject, ObjId, CHUNK_DEFAULT_SIZE};
 use tokio::io::AsyncReadExt;
 
 pub fn chunk_id_of(bytes: &[u8]) -> BucketResult<ChunkId> {
@@ -39,9 +39,7 @@ pub async fn store_bytes(ndm: &NamedDataMgr, name: &str, bytes: &[u8], mime: Opt
         }
     };
     let mut obj = FileObject::new(name.to_string(), bytes.len() as u64, content);
-    if let Some(m) = mime {
-        obj.meta.insert("mime".into(), serde_json::json!(m));
-    }
+    obj.apply_media_meta(&probe_media_meta(&MemoryByteSource::new(bytes), name, mime).await);
     let (id, body) = obj.gen_obj_id();
     ndm.put_object(&id, &body).await.map_err(store_err)?;
     Ok((obj, id))

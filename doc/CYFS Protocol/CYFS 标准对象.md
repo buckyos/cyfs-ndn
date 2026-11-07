@@ -410,6 +410,39 @@ pub struct FileObject {
 }
 ```
 
+### 10.1 常用 meta
+
+媒体文件的价值就在这些信息里，所以它们属于对象本身，随内容分发。**谁构造 FileObject 谁写，用通用 helper**：Rust 是 `ndn-lib` 的 `probe_media_meta` + `FileObject::apply_media_meta`（实现：`src/ndn-lib/src/media_meta.rs`），TypeScript 是 buckyos-websdk 的 `ndn.probeFileMeta` + `ndn.buildFileObject`。两个实现必须对同样的字节算出同样的结果，否则 ObjId 不同；Rust 是参考实现，并输出 SDK 的测试向量。
+
+例外：包内容（`.pikg` 等）只写 `name`、`size`、`content`。CLI 和服务端都按这三个字段算出同一个 ObjId，不是所有一端都有字节。
+
+下表的键 flatten 在对象顶层。取不到就省略，空对象也不写。
+
+| 键 | 类型 | 适用 | 来源 |
+| --- | --- | --- | --- |
+| `mime` | string，不带参数 | 全部 | 媒体文件以 magic bytes 为准，其它文件依次用调用方声明的类型、扩展名。判断不出就省略，不写 `application/octet-stream`。不存在 `mime_type` 这个键 |
+| `width`、`height` | 整数 | 图片、视频 | 显示尺寸，已应用旋转，所以不另存 orientation |
+| `duration_ms` | 整数 | 音频、视频 | MP4、MOV、m4a 的 `mvhd`，FLAC 的 `STREAMINFO`，WAV 的 `fmt`、`data` |
+| `video_codec`、`audio_codec` | string | MP4、MOV、m4a | `stsd`：`avc1`/`avc3` → `h264`，`hvc1`/`hev1` → `hevc`，`av01` → `av1`，`vp09` → `vp9`，`mp4a` → `aac`，其它省略 |
+| `title`、`artist`、`album` | string | 音频 | ID3v2 的 `TIT2`/`TPE1`/`TALB`，m4a 的 `©nam`/`©ART`/`©alb` |
+| `captured_at` | ISO 8601 string | 照片、视频 | `DateTimeOriginal`，缺失时用 `DateTimeDigitized`，再加 `SubSecTimeOriginal` 和 `OffsetTimeOriginal`（用 Digitized 时也可取对应的 Digitized 标签）。没有时区就不带偏移，读取方不能当 UTC。不用 `DateTime`，它是修改时间。视频取 `com.apple.quicktime.creationdate`，缺失时取 `mvhd`（UTC） |
+| `geo` | `{ lat, lon, alt?, heading?, accuracy_m? }`，WGS84 | 照片、视频 | EXIF GPS（含 `GPSImgDirection`、`GPSHPositioningError`），`com.apple.quicktime.location.ISO6709`（含 `accuracy.horizontal`）或 `©xyz`。`lat`、`lon` 保留 6 位小数，其余保留 1 位 |
+| `camera` | `{ make?, model?, lens? }` | 照片、视频 | EXIF `Make`、`Model`、`LensModel`，`com.apple.quicktime.make`、`model` |
+| `exposure` | `{ iso?, f_number?, exposure_time?, focal_length_mm?, focal_length_35mm? }` | 照片 | EXIF。`exposure_time` 是约分后的分数字符串如 `"1/120"`，整数秒写 `"2"`。`f_number`、`focal_length_mm` 保留 2 位小数 |
+
+解析规则（两个实现都必须遵守，否则 ObjId 不同）：
+
+- 只按需读取，单个文件总读取量不超过 8 MiB，超过就放弃这一组字段。任何解析错误只丢弃这一组字段，不能让构造失败。
+- EXIF 来源：JPEG 的 APP1（按 `Exif\0\0` 前缀找），HEIC、HEIF、AVIF 的 `Exif` item（经 `iinf`、`iloc` 定位），PNG 的 `eXIf`（`IDAT` 之前），WebP 的 `EXIF`，TIFF 及基于 TIFF 的 RAW 直接读 IFD。
+- 尺寸：只有 JPEG 才看 EXIF Orientation（5–8 交换宽高）。HEIF 取主图的 `ispe` 加 `irot`，不叠加 EXIF 方向。视频取 `tkhd` 加旋转矩阵。RAW 取不到就省略。
+- 取整：对绝对值四舍五入再恢复符号，结果是 `-0` 时归一成 `0`。
+- 分母为 0 的 rational、无效日期（如 `0000:00:00 00:00:00`）直接省略。`lat`、`lon` 超出范围，或恰好是 `(0, 0)`，都省略。
+- 字符串取第一个 NUL 之前的值（跳过开头的 NUL），去掉控制字符，trim 后最长 128 个字符。按 Unicode White_Space trim：U+FEFF 不是空白。
+- 探测过程不发起任何网络请求，不做逆地理编码，`geo` 只存坐标。
+- 字节解析不出的尺寸或时长（如 WebM、MP3），浏览器可以用媒体元素补，所以只有这些字段可能因浏览器而异。
+
+相同字节但 meta 不同的文件，FileObject 的 ObjId 不同，和 `name` 不同时一样；chunk 层的去重不受影响。
+
 ## 11. DirObject（ObjType: `cydir`）
 
 实现：`src/ndn-lib/src/dirobj.rs`
