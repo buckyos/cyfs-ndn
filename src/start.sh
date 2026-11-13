@@ -37,10 +37,14 @@ fi
 echo "[2/7] copy build binary to rootfs: ${ROOTFS_BIN_DIR}/fs_daemon"
 mkdir -p "${ROOTFS_BIN_DIR}"
 install -m 0755 "${BUILD_BIN_PATH}" "${ROOTFS_BIN_DIR}/fs_daemon"
+mkdir -p "${ROOTFS_DIR}/share/licenses/cyfs-ndn"
+install -m 0644 "${SCRIPT_DIR}/../LICENSE" "${SCRIPT_DIR}/../NOTICE" "${ROOTFS_DIR}/share/licenses/cyfs-ndn/"
 
 echo "[3/7] copy rootfs binary to ${OPT_BIN_PATH}"
 mkdir -p "${OPT_BIN_DIR}"
 install -m 0755 "${ROOTFS_BIN_DIR}/fs_daemon" "${OPT_BIN_PATH}"
+mkdir -p "${OPT_BASE_DIR}/share/licenses/cyfs-ndn"
+install -m 0644 "${ROOTFS_DIR}/share/licenses/cyfs-ndn/"{LICENSE,NOTICE} "${OPT_BASE_DIR}/share/licenses/cyfs-ndn/"
 
 echo "[4/7] copy rootfs/etc/*.json to ${OPT_ETC_DIR} (no overwrite)"
 mkdir -p "${ROOTFS_ETC_DIR}" "${OPT_ETC_DIR}"

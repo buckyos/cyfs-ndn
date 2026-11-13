@@ -16,6 +16,8 @@ members = [
 ]
 
 [workspace.package]
+license-file = "../LICENSE"
+license = "Apache-2.0"
 version = "0.7.0"
 
 [workspace.dependencies]

@@ -194,3 +194,8 @@ This README is only an entry point for the repository. It does not try to replac
 - Purchase receipt verification
 
 Please refer directly to the corresponding sections in the protocol documentation.
+
+## License
+
+First-party code is licensed under [Apache-2.0](LICENSE). Third-party code and
+dependencies retain their own licenses; see [NOTICE](NOTICE).

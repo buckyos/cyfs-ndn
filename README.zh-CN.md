@@ -194,3 +194,7 @@ cargo run -p fs_daemon -- /mnt/cyfs \
 - 内容购买收据验证流程
 
 请直接查看协议文档对应章节。
+
+## 许可证
+
+项目自有代码采用 [Apache-2.0](LICENSE)。第三方代码和依赖保留各自的许可证及版权声明，见 [NOTICE](NOTICE)。
